@@ -58,9 +58,16 @@ func (id CompatibilityID) Validate() error {
 type CaptureSafety string
 
 const (
-	// CaptureSafetyUnknown is the zero value and the safe default: a target
-	// that has not described its capture behaviour is treated as if it could
-	// materialize without bound.
+	// CaptureSafetyUnknown NAMES the unknown case for a target that wants to
+	// say so explicitly. It is NOT the zero value of CaptureSafety — that is
+	// the empty string — and do not branch on it to find an undescribed
+	// target. A Capabilities nobody filled in carries "", not this, and
+	// `if c.CaptureSafety == CaptureSafetyUnknown` walks straight past exactly
+	// the case it looks like it covers.
+	//
+	// Ask PoolingPermitted instead. It lists the SAFE values and defaults
+	// everything else to unsafe, so the empty string, this constant and any
+	// value a future Core adds are all refused without anyone editing a branch.
 	CaptureSafetyUnknown CaptureSafety = "unknown"
 
 	// CaptureSafetyStreaming reports that high-output tools stream their
@@ -139,12 +146,14 @@ func (c Capabilities) PermittedPlacements() []sessionwire.HostPlacement {
 	// Sorted so the determinism is a property of the VALUE rather than of the
 	// order these two ifs happen to be written in.
 	//
-	// Do not read more into this than it does today: "dedicated" sorts before
-	// "pooled", so the sort currently agrees with the written order and
-	// reordering the ifs would not change the answer. What the sort buys is
-	// that it would keep agreeing if Core renamed either constant into a
-	// different collating position, and the tests pin the VALUES rather than
-	// the positions, so such a rename is caught either way.
+	// This call is UNKILLABLE today and the honest reading is that it buys
+	// nothing yet: "dedicated" sorts before "pooled", so the sort agrees with
+	// the written order and removing it changes no answer any test can see. It
+	// is kept because the alternative is an invariant that holds by accident of
+	// two constants' spelling. TestPlacementConstantsStillCollateAsAssumed is
+	// the tripwire that keeps that from being an untestable claim: if Core ever
+	// renames either constant into a different collating position, it fires and
+	// sends the next reader here.
 	slices.Sort(placements)
 	return placements
 }
@@ -279,13 +288,69 @@ type Runtime interface {
 // Errors
 // ---------------------------------------------------------------------------
 
+// DefinitionErrorCode is a stable, machine-readable reason a definition could
+// not become a Department.
+//
+// It exists because Reason is free text and two rules had already collided in
+// it: the empty Department said "registers no launch target" and a nil target
+// said "no launch target", so a test matching the substring passed for both
+// inputs — it was green for the wrong reason and would have stayed green if the
+// nil-target rule were deleted. A caller branching on a rule needs something
+// that cannot be made ambiguous by rewording a sentence.
+type DefinitionErrorCode string
+
+const (
+	// DefinitionErrorCodeNoRegistrations reports a Department with no
+	// registrations at all.
+	DefinitionErrorCodeNoRegistrations DefinitionErrorCode = "no_registrations"
+
+	// DefinitionErrorCodeDuplicateAgent reports an agent registered more than
+	// once.
+	DefinitionErrorCodeDuplicateAgent DefinitionErrorCode = "duplicate_agent"
+
+	// DefinitionErrorCodeInvalidAgentID reports an agent identity sessionwire
+	// would refuse. The cause is the *sessionwire.IDValidationError.
+	DefinitionErrorCodeInvalidAgentID DefinitionErrorCode = "invalid_agent_id"
+
+	// DefinitionErrorCodeNoTarget reports a registration with a nil target.
+	DefinitionErrorCodeNoTarget DefinitionErrorCode = "no_target"
+
+	// DefinitionErrorCodeInvalidCompatibilityID reports a runtime identity Host
+	// may not write to the wire. The cause is the
+	// *InvalidCompatibilityIDError.
+	DefinitionErrorCodeInvalidCompatibilityID DefinitionErrorCode = "invalid_compatibility_id"
+
+	// DefinitionErrorCodeZeroAdmissionWeight reports a target that would admit
+	// without bound.
+	DefinitionErrorCodeZeroAdmissionWeight DefinitionErrorCode = "zero_admission_weight"
+
+	// DefinitionErrorCodeNoPlacement reports a target that declares neither
+	// pooled nor dedicated support.
+	DefinitionErrorCodeNoPlacement DefinitionErrorCode = "no_placement"
+
+	// DefinitionErrorCodePooledUnsafeCapture reports a target declaring pooled
+	// support whose capture behaviour makes it dedicated-only.
+	DefinitionErrorCodePooledUnsafeCapture DefinitionErrorCode = "pooled_unsafe_capture"
+)
+
 // InvalidDepartmentError reports a definition that could not become a
 // Department. AgentID names the registration at fault and is empty when the
 // fault is the Department as a whole.
+//
+// Code is what a caller branches on. Reason is for a human and may be reworded
+// freely. Cause carries the typed error a lower layer produced — Core's
+// *sessionwire.IDValidationError, or this package's
+// *InvalidCompatibilityIDError — so errors.As reaches it instead of a caller
+// having to substring-match a sentence this type has already changed twice.
 type InvalidDepartmentError struct {
+	Code    DefinitionErrorCode
 	AgentID sessionwire.AgentID
 	Reason  string
+	Cause   error
 }
+
+// Unwrap returns the typed error this one was built from, if any.
+func (e *InvalidDepartmentError) Unwrap() error { return e.Cause }
 
 func (e *InvalidDepartmentError) Error() string {
 	if e.AgentID == "" {

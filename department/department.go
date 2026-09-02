@@ -53,7 +53,10 @@ func New(registrations []Registration) (*Department, error) {
 	// configured later. Sound and cheap to reverse, recorded so the next reader
 	// does not mistake it for a contract.
 	if len(registrations) == 0 {
-		return nil, &InvalidDepartmentError{Reason: "a Department registers no launch target, so this Host can serve nothing"}
+		return nil, &InvalidDepartmentError{
+			Code:   DefinitionErrorCodeNoRegistrations,
+			Reason: "a Department registers no launch target, so this Host can serve nothing",
+		}
 	}
 
 	targets := make(map[sessionwire.AgentID]LaunchTarget, len(registrations))
@@ -63,6 +66,7 @@ func New(registrations []Registration) (*Department, error) {
 		}
 		if _, duplicate := targets[registration.AgentID]; duplicate {
 			return nil, &InvalidDepartmentError{
+				Code:    DefinitionErrorCodeDuplicateAgent,
 				AgentID: registration.AgentID,
 				Reason:  "registered more than once, so which target launches it depends on ordering",
 			}
@@ -77,18 +81,30 @@ func New(registrations []Registration) (*Department, error) {
 // one function so New has one place to call and a new rule has one site.
 func validateRegistration(registration Registration) error {
 	if err := registration.AgentID.Validate(); err != nil {
+		// Cause, not string concatenation. Core documents
+		// IDValidationError.Code as stable precisely so a caller can tell
+		// "too_long" from "invalid_utf8" without matching Error(); folding it
+		// into a sentence here is what destroys that.
 		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodeInvalidAgentID,
 			AgentID: registration.AgentID,
 			Reason:  "agent identity is not a permitted sessionwire identity: " + err.Error(),
+			Cause:   err,
 		}
 	}
 	if registration.Target == nil {
-		return &InvalidDepartmentError{AgentID: registration.AgentID, Reason: "no launch target"}
+		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodeNoTarget,
+			AgentID: registration.AgentID,
+			Reason:  "no launch target",
+		}
 	}
 	if err := registration.Target.CompatibilityID().Validate(); err != nil {
 		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodeInvalidCompatibilityID,
 			AgentID: registration.AgentID,
 			Reason:  "compatibility id is unusable: " + err.Error(),
+			Cause:   err,
 		}
 	}
 
@@ -98,12 +114,14 @@ func validateRegistration(registration Registration) error {
 	// than a deliberate declaration.
 	if capabilities.AdmissionWeight == 0 {
 		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodeZeroAdmissionWeight,
 			AgentID: registration.AgentID,
 			Reason:  "admission weight is zero, so this target would admit without bound",
 		}
 	}
 	if !capabilities.SupportsPooled && !capabilities.SupportsDedicated {
 		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodeNoPlacement,
 			AgentID: registration.AgentID,
 			Reason:  "declares no placement, so it could never be launched",
 		}
@@ -129,6 +147,7 @@ func validateRegistration(registration Registration) error {
 	// and deliberate; it is not what §11.3 asks for.
 	if capabilities.SupportsPooled && !capabilities.PoolingPermitted() {
 		return &InvalidDepartmentError{
+			Code:    DefinitionErrorCodePooledUnsafeCapture,
 			AgentID: registration.AgentID,
 			Reason: "declares pooled support with " + string(capabilities.CaptureSafety) +
 				" capture, which is dedicated-only until the target gains streaming capture",

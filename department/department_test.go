@@ -3,6 +3,7 @@ package department_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,8 +74,12 @@ func TestNewRejectsAnEmptyDepartment(t *testing.T) {
 	if invalid.AgentID != "" {
 		t.Errorf("AgentID = %q, want empty: the fault is the Department, not one agent", invalid.AgentID)
 	}
-	if !strings.Contains(invalid.Reason, "no launch target") {
-		t.Errorf("Reason = %q, want it to say the Department registers no launch target", invalid.Reason)
+	// The CODE, not the Reason. This assertion used to match the substring
+	// "no launch target", which the NIL-TARGET message also contains — so it
+	// passed for a different input than the one it names and would have stayed
+	// green with this rule deleted.
+	if invalid.Code != department.DefinitionErrorCodeNoRegistrations {
+		t.Errorf("Code = %q, want %q", invalid.Code, department.DefinitionErrorCodeNoRegistrations)
 	}
 	if _, err := department.New([]department.Registration{}); !errors.As(err, &invalid) {
 		t.Errorf("New(empty slice) error = %v, want *InvalidDepartmentError", err)
@@ -104,8 +109,8 @@ func TestNewRejectsADuplicateAgentID(t *testing.T) {
 	if invalid.AgentID != "reviewer" {
 		t.Errorf("AgentID = %q, want \"reviewer\"", invalid.AgentID)
 	}
-	if !strings.Contains(invalid.Reason, "registered more than once") {
-		t.Errorf("Reason = %q, want it to say the agent is registered more than once", invalid.Reason)
+	if invalid.Code != department.DefinitionErrorCodeDuplicateAgent {
+		t.Errorf("Code = %q, want %q", invalid.Code, department.DefinitionErrorCodeDuplicateAgent)
 	}
 }
 
@@ -126,37 +131,45 @@ func TestNewRejectsAnInvalidRegistration(t *testing.T) {
 		name         string
 		registration department.Registration
 		agent        sessionwire.AgentID
-		reason       string
+		code         department.DefinitionErrorCode
 	}{
 		{
 			name:         "empty agent id",
 			registration: department.Registration{AgentID: "", Target: target("runtime-a")},
 			agent:        "",
-			reason:       "agent identity",
+			code:         department.DefinitionErrorCodeInvalidAgentID,
 		},
 		{
 			name:         "nil target",
 			registration: department.Registration{AgentID: "reviewer", Target: nil},
 			agent:        "reviewer",
-			reason:       "no launch target",
+			code:         department.DefinitionErrorCodeNoTarget,
 		},
 		{
 			name:         "empty compatibility id",
 			registration: department.Registration{AgentID: "reviewer", Target: target("")},
 			agent:        "reviewer",
-			reason:       "compatibility",
+			code:         department.DefinitionErrorCodeInvalidCompatibilityID,
 		},
 		{
 			name:         "over-long compatibility id",
 			registration: department.Registration{AgentID: "reviewer", Target: target(strings.Repeat("x", sessionwire.MaxIDBytes+1))},
 			agent:        "reviewer",
-			reason:       "compatibility",
+			code:         department.DefinitionErrorCodeInvalidCompatibilityID,
+		},
+		{
+			// The UTF-8 arm had no row at all, so deleting it from Validate
+			// left the suite green while the length arm's control died.
+			name:         "compatibility id that is not valid UTF-8",
+			registration: department.Registration{AgentID: "reviewer", Target: target("runtime-\xff\xfe")},
+			agent:        "reviewer",
+			code:         department.DefinitionErrorCodeInvalidCompatibilityID,
 		},
 		{
 			name:         "pooled with unsafe capture",
 			registration: department.Registration{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: unsafe}},
 			agent:        "reviewer",
-			reason:       "dedicated-only",
+			code:         department.DefinitionErrorCodePooledUnsafeCapture,
 		},
 		{
 			// A target that costs nothing against capacity admits without
@@ -166,14 +179,18 @@ func TestNewRejectsAnInvalidRegistration(t *testing.T) {
 			name:         "zero admission weight",
 			registration: department.Registration{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: zeroWeight}},
 			agent:        "reviewer",
-			reason:       "admission weight",
+			code:         department.DefinitionErrorCodeZeroAdmissionWeight,
 		},
 		{
 			name:         "no placement at all",
 			registration: department.Registration{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: noPlacement}},
 			agent:        "reviewer",
-			reason:       "no placement",
+			code:         department.DefinitionErrorCodeNoPlacement,
 		},
+	}
+
+	if len(tests) == 0 {
+		t.Fatal("no registration rule is exercised")
 	}
 
 	for _, tt := range tests {
@@ -187,10 +204,130 @@ func TestNewRejectsAnInvalidRegistration(t *testing.T) {
 			if invalid.AgentID != tt.agent {
 				t.Errorf("AgentID = %q, want %q", invalid.AgentID, tt.agent)
 			}
-			if !strings.Contains(invalid.Reason, tt.reason) {
-				t.Errorf("Reason = %q, want it to mention %q", invalid.Reason, tt.reason)
+			if invalid.Code != tt.code {
+				t.Errorf("Code = %q, want %q", invalid.Code, tt.code)
+			}
+			if invalid.Reason == "" {
+				t.Error("Reason is empty; the code is for branching and the reason is for the person reading the failure")
 			}
 		})
+	}
+}
+
+// TestNewPreservesTypedCauses is the repository's own rule applied here:
+// return typed errors and preserve causes with Unwrap. Folding a cause into a
+// sentence destroys it — Core documents IDValidationError.Code as "stable for
+// callers that need to distinguish validation failures without matching Error",
+// and a caller that has to substring-match "too_long" is doing exactly what
+// that sentence exists to prevent.
+//
+// The compatibility-id arm is the sharper case: *InvalidCompatibilityIDError is
+// EXPORTED and New is the only production path that constructs one, so without
+// Unwrap it was an exported type no consumer could ever match.
+func TestNewPreservesTypedCauses(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an agent identity carries Core's validation code", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			agent sessionwire.AgentID
+			code  sessionwire.IDValidationCode
+		}{
+			{name: "empty", agent: "", code: sessionwire.IDValidationCodeEmpty},
+			{name: "too long", agent: sessionwire.AgentID(strings.Repeat("a", sessionwire.MaxIDBytes+1)), code: sessionwire.IDValidationCodeTooLong},
+			{name: "invalid utf8", agent: sessionwire.AgentID("\xff\xfe"), code: sessionwire.IDValidationCodeInvalidUTF8},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := department.New([]department.Registration{{AgentID: tt.agent, Target: target("runtime-a")}})
+				var validation *sessionwire.IDValidationError
+				if !errors.As(err, &validation) {
+					t.Fatalf("New error = %v; errors.As did not reach *sessionwire.IDValidationError", err)
+				}
+				if validation.Code != tt.code {
+					t.Errorf("IDValidationError.Code = %q, want %q", validation.Code, tt.code)
+				}
+			})
+		}
+	})
+
+	t.Run("a compatibility id carries this package's typed cause", func(t *testing.T) {
+		t.Parallel()
+		_, err := department.New([]department.Registration{{AgentID: "reviewer", Target: target("")}})
+		var invalidID *department.InvalidCompatibilityIDError
+		if !errors.As(err, &invalidID) {
+			t.Fatalf("New error = %v; errors.As did not reach *department.InvalidCompatibilityIDError, which no consumer could then match", err)
+		}
+		if invalidID.Reason == "" {
+			t.Error("InvalidCompatibilityIDError.Reason is empty")
+		}
+	})
+
+	t.Run("a rule with no lower-layer cause unwraps to nil", func(t *testing.T) {
+		t.Parallel()
+		// Unwrap must not invent a cause. A rule this package decides on its
+		// own — no placement declared — has nothing underneath it, and saying
+		// otherwise would make errors.Is match by accident.
+		_, err := department.New([]department.Registration{{
+			AgentID: "reviewer",
+			Target:  stubTarget{compatibility: "runtime-a", capabilities: department.Capabilities{AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming}},
+		}})
+		var invalid *department.InvalidDepartmentError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("New error = %v, want *InvalidDepartmentError", err)
+		}
+		if unwrapped := errors.Unwrap(invalid); unwrapped != nil {
+			t.Errorf("Unwrap() = %v, want nil", unwrapped)
+		}
+	})
+}
+
+// TestDefinitionErrorCodesAreDistinct is what makes the codes worth having. Two
+// rules sharing a code is the same defect as two rules sharing a Reason
+// substring, which is the defect that produced this type: a test naming one
+// rule passes for the other, and deleting a rule stays green.
+func TestDefinitionErrorCodesAreDistinct(t *testing.T) {
+	t.Parallel()
+
+	unsafe := pooledCapabilities()
+	unsafe.CaptureSafety = department.CaptureSafetyUnknown
+	noPlacement := pooledCapabilities()
+	noPlacement.SupportsPooled, noPlacement.SupportsDedicated = false, false
+	zeroWeight := pooledCapabilities()
+	zeroWeight.AdmissionWeight = 0
+
+	definitions := [][]department.Registration{
+		nil,
+		{registration("reviewer", "runtime-a"), registration("reviewer", "runtime-b")},
+		{{AgentID: "", Target: target("runtime-a")}},
+		{{AgentID: "reviewer", Target: nil}},
+		{{AgentID: "reviewer", Target: target("")}},
+		{{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: zeroWeight}}},
+		{{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: noPlacement}}},
+		{{AgentID: "reviewer", Target: stubTarget{compatibility: "runtime-a", capabilities: unsafe}}},
+	}
+
+	seen := map[department.DefinitionErrorCode]int{}
+	for i, definition := range definitions {
+		_, err := department.New(definition)
+		var invalid *department.InvalidDepartmentError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("definition %d: New error = %v, want *InvalidDepartmentError", i, err)
+		}
+		if invalid.Code == "" {
+			t.Errorf("definition %d: Code is empty", i)
+		}
+		if first, duplicate := seen[invalid.Code]; duplicate {
+			t.Errorf("definitions %d and %d both report code %q; a code shared by two rules cannot tell them apart", first, i, invalid.Code)
+		}
+		seen[invalid.Code] = i
+	}
+	// Floored: one rejected definition per rule, so deleting a row is not a
+	// silent green.
+	if len(seen) != len(definitions) {
+		t.Errorf("saw %d distinct codes over %d definitions", len(seen), len(definitions))
 	}
 }
 
@@ -226,6 +363,21 @@ func TestCaptureSafetyMakesATargetDedicatedOnly(t *testing.T) {
 		{name: "unrecognised", safety: "some_future_capture_mode", wantPooled: false},
 	}
 
+	// Floored, and the count is LOAD-BEARING: the zero-value and
+	// unrecognised-value rows are the entire guarantee that the default arm
+	// refuses what it was not told is safe, and deleting either is a silent
+	// green. A mutant treating the empty string as poolable survived this table
+	// before those two rows existed.
+	//
+	// It is a speed bump, not a guard, and measured as one: deleting the
+	// zero-value row AND editing 6 to 5 in the same commit passes. A count
+	// cannot know which rows matter. What it buys is that the deletion is no
+	// longer silent — it forces a second, deliberate edit with this sentence
+	// attached to it.
+	if len(tests) != 6 {
+		t.Fatalf("the capture-safety table has %d rows, want 6 including the zero value and an unrecognised value. Do not just change this number: the zero-value and unrecognised rows ARE the default arm's guarantee", len(tests))
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -243,6 +395,22 @@ func TestCaptureSafetyMakesATargetDedicatedOnly(t *testing.T) {
 			}
 			if got := capabilities.PoolingPermitted(); got != tt.wantPooled {
 				t.Errorf("PoolingPermitted() with SupportsPooled and %s capture = %v, want %v", tt.safety, got, tt.wantPooled)
+			}
+
+			// N3: a POOLED-ONLY target, the only shape that exercises the
+			// dedicated arm's condition. Every other row here declares
+			// SupportsDedicated, so making that append unconditional survived
+			// the whole suite — and because New refuses pooled + unsafe
+			// capture, this unit table is the only coverage PermittedPlacements
+			// will ever get through any path.
+			pooledOnly := capabilities
+			pooledOnly.SupportsDedicated = false
+			wantPooledOnly := []sessionwire.HostPlacement(nil)
+			if tt.wantPooled {
+				wantPooledOnly = []sessionwire.HostPlacement{sessionwire.HostPlacementPooled}
+			}
+			if got := pooledOnly.PermittedPlacements(); !slices.Equal(got, wantPooledOnly) {
+				t.Errorf("PermittedPlacements() without dedicated support and %s capture = %v, want %v", tt.safety, got, wantPooledOnly)
 			}
 
 			// The declaration still governs: safe capture does not pool a
@@ -281,6 +449,24 @@ func TestCaptureSafetyMakesATargetDedicatedOnly(t *testing.T) {
 				t.Errorf("New with %s capture succeeded while declaring pooled support; that is the silent narrowing this rejects", tt.safety)
 			}
 		})
+	}
+}
+
+// TestPlacementConstantsStillCollateAsAssumed is a tripwire, not a rule.
+//
+// PermittedPlacements sorts, and the sort is unkillable because "dedicated"
+// already sorts before "pooled" — so the code and its comment currently rest on
+// a coincidence of spelling. Rather than leave a justification that is an
+// untestable claim about a hypothetical, which this repository's standing rule
+// forbids, the hypothetical is checked: if Core renames either constant into a
+// different collating position this fails, and whoever fixes it re-reads why
+// the sort is there.
+func TestPlacementConstantsStillCollateAsAssumed(t *testing.T) {
+	t.Parallel()
+
+	if !(sessionwire.HostPlacementDedicated < sessionwire.HostPlacementPooled) {
+		t.Fatalf("Core now collates %q after %q; PermittedPlacements' sort is no longer a no-op, which is exactly why it is there. Re-read its comment before changing anything",
+			sessionwire.HostPlacementDedicated, sessionwire.HostPlacementPooled)
 	}
 }
 
@@ -389,6 +575,65 @@ func TestAgentIDsCannotBeMutatedIntoTheDepartment(t *testing.T) {
 	}
 	if _, err := registry.Target("clobbered"); err == nil {
 		t.Error("Target(clobbered) succeeded; the listing was a window into the registry")
+	}
+}
+
+// TestCompatibilityIDBoundIsExact is the off-by-one row the table did not have.
+// `len(id) > Max` mutated to `>=` survived the whole suite, because nothing
+// registered an id at exactly the limit; Core's own ids_test.go has such a case
+// and this restatement of Core's rule did not.
+func TestCompatibilityIDBoundIsExact(t *testing.T) {
+	t.Parallel()
+
+	atLimit := department.CompatibilityID(strings.Repeat("x", department.MaxCompatibilityIDBytes))
+	if err := atLimit.Validate(); err != nil {
+		t.Errorf("Validate() at exactly %d bytes = %v, want nil", department.MaxCompatibilityIDBytes, err)
+	}
+	overLimit := department.CompatibilityID(strings.Repeat("x", department.MaxCompatibilityIDBytes+1))
+	if err := overLimit.Validate(); err == nil {
+		t.Errorf("Validate() at %d bytes = nil, want an error", department.MaxCompatibilityIDBytes+1)
+	}
+
+	// The bound is BYTES, not runes, which is what Core enforces on the wire
+	// field this is written to. A rune-counting restatement would accept an id
+	// Core rejects.
+	multibyte := department.CompatibilityID(strings.Repeat("\u00e9", department.MaxCompatibilityIDBytes))
+	if err := multibyte.Validate(); err == nil {
+		t.Errorf("Validate() of %d two-byte runes = nil; the bound is bytes, not runes", department.MaxCompatibilityIDBytes)
+	}
+}
+
+// TestCompatibilityIDAgreesWithCore is the drift guard the restatement needs.
+//
+// MaxCompatibilityIDBytes is DERIVED from sessionwire.MaxIDBytes, so the
+// constant cannot drift. The three RULES are hand-copied from Core's
+// unexported validateID and nothing stopped them drifting, which is the same
+// class of defect one level down. Comparing verdicts against a Core identity
+// that shares validateID makes a Core rule change fail here instead of
+// silently letting Host write an id Core will reject.
+func TestCompatibilityIDAgreesWithCore(t *testing.T) {
+	t.Parallel()
+
+	values := []string{
+		"",
+		"runtime-a",
+		strings.Repeat("x", department.MaxCompatibilityIDBytes-1),
+		strings.Repeat("x", department.MaxCompatibilityIDBytes),
+		strings.Repeat("x", department.MaxCompatibilityIDBytes+1),
+		"\xff\xfe",
+		"runtime-\xff",
+		"\u00e9",
+		strings.Repeat("\u00e9", department.MaxCompatibilityIDBytes),
+	}
+	for _, value := range values {
+		hostRejects := department.CompatibilityID(value).Validate() != nil
+		coreRejects := sessionwire.AgentID(value).Validate() != nil
+		if hostRejects != coreRejects {
+			t.Errorf("for %q: department.CompatibilityID rejects = %v, Core's identity rule rejects = %v. The restatement has drifted from validateID", value, hostRejects, coreRejects)
+		}
+	}
+	if len(values) == 0 {
+		t.Fatal("no value was compared")
 	}
 }
 
@@ -515,6 +760,101 @@ func TestRuntimeIsSatisfiedBySegregatedCapabilities(t *testing.T) {
 	if err := runtime.ReleaseResidency(t.Context()); err != nil {
 		t.Errorf("ReleaseResidency() = %v, want nil", err)
 	}
+}
+
+// harnessH41LifecycleShapes is the H4.1 contract, transcribed from the program
+// runbook (03-harness.md, "Add separate interfaces") and NOT read back from the
+// code it checks. It is a literal for the same reason an oracle is a literal:
+// derived from the implementation it would agree with anything.
+//
+//	type IdleWaiter interface { WaitIdle(context.Context) error }
+//	type Liveness   interface { Done() <-chan struct{} }
+//	type Releaser   interface { ReleaseResidency(context.Context) error }
+var harnessH41LifecycleShapes = map[string][]string{
+	"IdleWaiter": {"WaitIdle func(context.Context) error"},
+	"Liveness":   {"Done func() <-chan struct {}"},
+	"Releaser":   {"ReleaseResidency func(context.Context) error"},
+}
+
+// hostRuntimeMethodSet is the whole of Runtime: every method name and signature
+// Host requires of a runtime, sorted, spelled out.
+var hostRuntimeMethodSet = []string{
+	"AgentID func() v1.AgentID",
+	"ApplyCommand func(context.Context, v1.CommandEnvelope) error",
+	"Done func() <-chan struct {}",
+	"ReleaseResidency func(context.Context) error",
+	"SessionID func() v1.SessionID",
+	"SubscribeCommitted func(context.Context, v1.EventID) (<-chan v1.EnduringPublication, error)",
+	"WaitIdle func(context.Context) error",
+}
+
+// TestRuntimeMethodSetMatchesTheH41Contract pins the interface SHAPES, which
+// nothing else here does.
+//
+// The satisfiability assertions in the test above look like they hold these,
+// and they do not. They catch only an UNCOORDINATED edit: rename a method in
+// definition.go alone and the compiler complains, but nobody renames a method
+// uncoordinatedly. A gopls rename touches the interface and the fake in one
+// action, both sides agree, and every compile-time assertion in this package
+// passes while the H4.1 alignment that CLAUDE.md and two commit messages rest
+// on is gone. Measured: renaming the release method to Release across
+// definition.go and this file left the suite green, as did widening Liveness
+// with a Stopped() bool implemented on the fake in the same edit.
+//
+// The rewording above is not cosmetic: an earlier draft opened a line with a
+// method name, and TestDocCommentsNameTheirOwnDeclaration reported it, because
+// that method — being on a test fake — has no doc comment of its own. That is
+// the guard behaving as specified rather than a false positive to suppress, and
+// it is worth knowing it reaches method names in prose, not only declarations.
+//
+// An interface's method set is fully reachable by reflection with NO
+// implementation at all, which is what makes this the right guard: the earlier
+// claim that "nothing about Runtime is assertion-testable until O1.2's adapter
+// exists" was wrong, and wrong in the direction that leaves a documented
+// guarantee unenforced.
+func TestRuntimeMethodSetMatchesTheH41Contract(t *testing.T) {
+	t.Parallel()
+
+	byName := map[string]reflect.Type{
+		"IdleWaiter": reflect.TypeFor[department.IdleWaiter](),
+		"Liveness":   reflect.TypeFor[department.Liveness](),
+		"Releaser":   reflect.TypeFor[department.Releaser](),
+	}
+	if len(harnessH41LifecycleShapes) != len(byName) {
+		t.Fatalf("the transcribed H4.1 contract names %d interfaces and this test resolves %d", len(harnessH41LifecycleShapes), len(byName))
+	}
+	for name, want := range harnessH41LifecycleShapes {
+		typ, ok := byName[name]
+		if !ok {
+			t.Errorf("H4.1 specifies %s and this package does not declare it", name)
+			continue
+		}
+		if got := methodSet(typ); !slices.Equal(got, want) {
+			t.Errorf("%s method set = %q, want H4.1's %q. A different SHAPE for the same capability turns O1.2's adapter from mechanical into semantic; if the divergence is deliberate, change the runbook or say so here rather than letting the two drift silently", name, got, want)
+		}
+	}
+
+	got := methodSet(reflect.TypeFor[department.Runtime]())
+	if !slices.Equal(got, hostRuntimeMethodSet) {
+		t.Errorf("Runtime method set = %q, want %q", got, hostRuntimeMethodSet)
+	}
+	// Floored, because a Runtime that required nothing would satisfy an
+	// empty expectation and every assertion above would be vacuous.
+	if len(got) == 0 || len(hostRuntimeMethodSet) == 0 {
+		t.Fatal("Runtime has no methods, or the expectation is empty; this guard would assert nothing")
+	}
+}
+
+// methodSet returns "Name signature" for every method of an interface type, in
+// the sorted order reflect reports, so a comparison sees a rename, a signature
+// change, an addition and a removal alike.
+func methodSet(typ reflect.Type) []string {
+	methods := make([]string, 0, typ.NumMethod())
+	for i := range typ.NumMethod() {
+		method := typ.Method(i)
+		methods = append(methods, method.Name+" "+method.Type.String())
+	}
+	return methods
 }
 
 type fakeRuntime struct{}
