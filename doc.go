@@ -6,7 +6,8 @@
 // dependency boundary that states this is enforced by import_boundary_test.go
 // rather than by convention.
 //
-// This package currently carries a placeholder Host so the module, its checks
-// and its boundary guard exist ahead of the Department, residency, command and
-// HostLink work that follows.
+// This package currently carries a placeholder Host. The Department it serves
+// — the immutable set of launch targets, and the segregated runtime
+// capabilities Host consumes — lives in the department subpackage; residency,
+// command consumption and HostLink follow.
 package host

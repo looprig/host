@@ -4,6 +4,13 @@
 local registry, command consumption, the HostLink server, warm release and
 drain. Factory consumes Host; Host never consumes Factory.
 
+`department/` holds the immutable Department: agent identity to launch target,
+fixed at construction, plus the segregated Harness session capabilities Host
+requires. Those capability interfaces are declared on HOST'S side because H4.1
+has not landed — when it does, a Harness session either satisfies them or the
+difference is a real disagreement worth seeing, and that is the point of not
+blocking on it.
+
 ## Dependency boundary
 
 `import_boundary_test.go` is the authority, not this list. Keep the two in step.
