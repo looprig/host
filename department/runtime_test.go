@@ -3,10 +3,12 @@ package department_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -188,57 +190,276 @@ func TestAdaptedRuntimeCarriesHostIdentitiesNotHarnessOnes(t *testing.T) {
 }
 
 // assertEveryFieldPropagated requires every field of the value the rig received
-// to be non-zero, walking nested structs.
+// to carry data, so the assertion fails when the struct GROWS and not only when
+// a value changes.
 //
 // It exists because a whole-value comparison covers every field BY VALUE and
-// nothing about the struct's SHAPE, and the difference is the edit that
-// actually happens. Add a field to both RigRestoreRequest and RestoreRequest
-// and forget to wire it into the adapter's literal: got and want both sit at
-// the zero value, they agree, and the comparison passes while the field is
-// silently dropped. A hand-enumerated list of "is this fixture field non-zero"
-// checks goes stale in the very same edit by the very same mechanism — it is
-// the struct's field list written a second time, and the second copy is the one
-// nobody updates. This walks the type instead, so it fails the day the struct
-// GROWS rather than the day a value changes.
+// nothing about the struct's SHAPE. Add a field to both RigRestoreRequest and
+// RestoreRequest, forget to wire it into the adapter's literal, and got and
+// want both sit at the zero value, agree, and pass while the field is silently
+// dropped. A hand-enumerated list of "is this fixture field non-zero" checks
+// goes stale in the very same edit by the very same mechanism — it is the
+// struct's field list written a second time, and the second copy is the one
+// nobody updates.
 //
 // It applies to Create as well as Restore, because the hole is shared. Create's
 // conversion protects against DIVERGENT growth — a field added to one type
 // alone stops the build — and not against COORDINATED growth, where the field
-// is added to both and propagated by neither. Only this catches that.
+// is added to both and propagated by neither.
 //
-// The cost is a real constraint on fixtures: every field must be given a
-// non-zero value, which for a future bool means true. That is defensible rather
-// than merely tolerable — a bool only ever exercised as false is not exercised
-// — but it is a constraint, and whoever hits it should know it was chosen.
+// The cost is a real constraint on fixtures: every field must be given a value
+// that carries data, which for a future bool means true. That is defensible
+// rather than merely tolerable — a bool only ever exercised as false is not
+// exercised — but it is a constraint, and whoever hits it should know it was
+// chosen. See unpropagatedFields for the field classes reflection cannot judge
+// by IsZero alone, all of which are handled explicitly rather than skipped.
 func assertEveryFieldPropagated(t *testing.T, received any) {
 	t.Helper()
-	value := reflect.ValueOf(received)
-	if value.Kind() != reflect.Struct {
-		t.Fatalf("assertEveryFieldPropagated needs a struct, got %s", value.Kind())
+	complaints, err := unpropagatedFields(received)
+	if err != nil {
+		t.Fatalf("assertEveryFieldPropagated: %v", err)
 	}
-	if value.NumField() == 0 {
-		t.Fatalf("%s has no fields, so this assertion would be vacuous", value.Type())
+	for _, complaint := range complaints {
+		t.Error(complaint)
 	}
-	assertFieldsNonZero(t, value, value.Type().Name())
 }
 
-func assertFieldsNonZero(t *testing.T, value reflect.Value, path string) {
-	t.Helper()
+// unpropagatedFields reports every field of received that carries no data. It
+// is separated from the assertion so it can be tested directly, which is the
+// only way to prove a walk does not SILENTLY SKIP a field class — and a guard
+// that skips one is worse than the enumeration it replaced, because the
+// enumeration at least failed visibly when it went stale.
+//
+// Four classes cannot be judged by reflect.Value.IsZero and are handled here.
+// Each was measured rather than assumed:
+//
+//   - SLICES and MAPS: IsZero is true only for a NIL one. A non-nil empty slice
+//     is not the zero value and carries nothing, so it would have passed. Length
+//     is the question, not zero-ness.
+//   - INTERFACES and POINTERS: IsZero is true only when the interface or pointer
+//     is nil. any("") is a non-nil interface holding a zero payload and would
+//     have passed. The payload is unwrapped and asked the same question.
+//   - STRUCTS WITH UNEXPORTED FIELDS: recursing into them is a FALSE POSITIVE,
+//     and time.Time is the case that matters, since sessionwire already carries
+//     ObservedAt and ExpiresAt. A UTC time.Time has wall == 0 and loc == nil —
+//     nil loc IS UTC — so a walk into its fields reports two of three as zero
+//     for a perfectly good timestamp. Foreign structs get a whole-value IsZero
+//     instead; structs whose fields are all exported are still walked, because
+//     for those the per-field answer is both correct and more useful.
+//   - UNEXPORTED FIELDS: reported as unverifiable rather than skipped. A test
+//     outside this package cannot set one, so it would be permanently zero;
+//     saying so is fail-closed, and silently ignoring it is the hole this
+//     comment exists to deny.
+func unpropagatedFields(received any) ([]string, error) {
+	value := reflect.ValueOf(received)
+	if value.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("need a struct, got %s", value.Kind())
+	}
+	if value.NumField() == 0 {
+		return nil, fmt.Errorf("%s has no fields, so this assertion would be vacuous", value.Type())
+	}
+	return walkForData(value, value.Type().Name()), nil
+}
+
+func walkForData(value reflect.Value, path string) []string {
+	var complaints []string
 	for i := range value.NumField() {
-		field := value.Field(i)
-		name := path + "." + value.Type().Field(i).Name
-		if field.Kind() == reflect.Struct {
-			if field.NumField() == 0 {
-				t.Errorf("%s is an empty struct; it can never be non-zero and this walk cannot check it", name)
-				continue
-			}
-			assertFieldsNonZero(t, field, name)
+		field := value.Type().Field(i)
+		name := path + "." + field.Name
+		if !field.IsExported() {
+			complaints = append(complaints, name+" is unexported, so this walk cannot verify it was propagated and a test outside this package cannot set it. Export it, or move the assertion into the package")
 			continue
 		}
-		if field.IsZero() {
-			t.Errorf("%s is the zero value in what the rig received. Either the adapter does not propagate it or the fixture does not set it — for this assertion those are one defect, because a field nobody wired is invisible to a whole-value comparison: want and got agree at zero", name)
+		complaints = append(complaints, valueCarriesData(value.Field(i), name)...)
+	}
+	return complaints
+}
+
+func valueCarriesData(value reflect.Value, name string) []string {
+	switch value.Kind() {
+	case reflect.Slice, reflect.Map:
+		if value.Len() == 0 {
+			return []string{name + " is empty in what the rig received. A non-nil empty slice or map is NOT the zero value, so length is the question here and IsZero would have passed it"}
+		}
+		return nil
+	case reflect.Interface, reflect.Pointer:
+		if value.IsNil() {
+			return []string{name + " is nil in what the rig received"}
+		}
+		return valueCarriesData(value.Elem(), name)
+	case reflect.Struct:
+		if allFieldsExported(value.Type()) {
+			return walkForData(value, name)
+		}
+		// A foreign struct: judged whole rather than walked. Walking time.Time
+		// reports wall and loc as zero for any UTC timestamp.
+		if value.IsZero() {
+			return []string{name + " is the zero " + value.Type().String() + " in what the rig received"}
+		}
+		return nil
+	default:
+		if value.IsZero() {
+			return []string{name + " is the zero value in what the rig received. Either the adapter does not propagate it or the fixture does not set it — for this assertion those are one defect, because a field nobody wired is invisible to a whole-value comparison: want and got agree at zero"}
+		}
+		return nil
+	}
+}
+
+func allFieldsExported(typ reflect.Type) bool {
+	for i := range typ.NumField() {
+		if !typ.Field(i).IsExported() {
+			return false
 		}
 	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// The walk itself
+// ---------------------------------------------------------------------------
+
+type walkNested struct{ Name string }
+
+type walkForeign struct{ hidden string }
+
+type walkProbe struct {
+	Str     string
+	Num     int
+	Flag    bool
+	Slice   []string
+	Map     map[string]string
+	Iface   any
+	Pointer *string
+	When    time.Time
+	Nested  walkNested
+	Foreign walkForeign
+	Bytes   [4]byte
+}
+
+type walkUnexported struct {
+	Str    string
+	hidden string
+}
+
+// TestTheWalkJudgesEveryFieldClass is the test that makes the walk trustworthy,
+// and it exists because a guard that SILENTLY SKIPS a field class is worse than
+// the enumeration it replaced: the enumeration failed visibly when it went
+// stale, and a skipped class fails never.
+//
+// Every row is a field class reflection treats differently, and each is asserted
+// in BOTH directions — a populated value must be accepted and an empty one must
+// be reported. A row with only the negative half would pass against a walk that
+// rejects everything; a row with only the positive half would pass against one
+// that checks nothing.
+func TestTheWalkJudgesEveryFieldClass(t *testing.T) {
+	t.Parallel()
+
+	text := "carried"
+	full := walkProbe{
+		Str:     "carried",
+		Num:     7,
+		Flag:    true,
+		Slice:   []string{"one"},
+		Map:     map[string]string{"k": "v"},
+		Iface:   any("carried"),
+		Pointer: &text,
+		When:    time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC),
+		Nested:  walkNested{Name: "carried"},
+		Foreign: walkForeign{hidden: "carried"},
+		Bytes:   [4]byte{1, 2, 3, 4},
+	}
+
+	t.Run("a fully populated value is accepted", func(t *testing.T) {
+		t.Parallel()
+		complaints, err := unpropagatedFields(full)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if len(complaints) != 0 {
+			t.Errorf("complaints = %q, want none. A walk that rejects a populated value cannot distinguish a dropped field from a supported one", complaints)
+		}
+	})
+
+	// The UTC row is the one that matters most and the one a naive walk gets
+	// wrong: time.Time stores wall == 0 and loc == nil for a UTC timestamp —
+	// nil loc IS UTC — so recursing into its fields reports two of three as
+	// zero for a perfectly good time. sessionwire already carries ObservedAt
+	// and ExpiresAt, so this is a field class Host will meet.
+	t.Run("a UTC time.Time is not reported", func(t *testing.T) {
+		t.Parallel()
+		probe := full
+		probe.When = time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+		complaints, err := unpropagatedFields(probe)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		for _, complaint := range complaints {
+			if strings.Contains(complaint, "When") {
+				t.Errorf("a UTC timestamp was reported as unpropagated: %s", complaint)
+			}
+		}
+	})
+
+	emptied := map[string]func(*walkProbe){
+		"Str":     func(p *walkProbe) { p.Str = "" },
+		"Num":     func(p *walkProbe) { p.Num = 0 },
+		"Flag":    func(p *walkProbe) { p.Flag = false },
+		"Bytes":   func(p *walkProbe) { p.Bytes = [4]byte{} },
+		"When":    func(p *walkProbe) { p.When = time.Time{} },
+		"Foreign": func(p *walkProbe) { p.Foreign = walkForeign{} },
+		"Nested":  func(p *walkProbe) { p.Nested = walkNested{} },
+		// IsZero cannot see these four. A nil slice is the zero value and an
+		// EMPTY NON-NIL one is not, so length is the question; a non-nil
+		// interface or pointer holding a zero payload is likewise not zero.
+		"Slice":       func(p *walkProbe) { p.Slice = []string{} },
+		"Map":         func(p *walkProbe) { p.Map = map[string]string{} },
+		"Iface":       func(p *walkProbe) { p.Iface = any("") },
+		"Pointer":     func(p *walkProbe) { empty := ""; p.Pointer = &empty },
+		"nil slice":   func(p *walkProbe) { p.Slice = nil },
+		"nil pointer": func(p *walkProbe) { p.Pointer = nil },
+		"nil iface":   func(p *walkProbe) { p.Iface = nil },
+	}
+	fields := map[string]string{"nil slice": "Slice", "nil pointer": "Pointer", "nil iface": "Iface"}
+
+	for name, empty := range emptied {
+		t.Run("an empty "+name+" is reported", func(t *testing.T) {
+			t.Parallel()
+			probe := full
+			empty(&probe)
+			complaints, err := unpropagatedFields(probe)
+			if err != nil {
+				t.Fatalf("unpropagatedFields: %v", err)
+			}
+			field := name
+			if mapped, ok := fields[name]; ok {
+				field = mapped
+			}
+			if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "."+field) }) {
+				t.Errorf("emptying %s produced %q, want a complaint naming it. A field class the walk cannot see is a field the guard silently skips", name, complaints)
+			}
+		})
+	}
+
+	t.Run("an unexported field is reported rather than skipped", func(t *testing.T) {
+		t.Parallel()
+		complaints, err := unpropagatedFields(walkUnexported{Str: "carried", hidden: "carried"})
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "hidden") }) {
+			t.Errorf("complaints = %q, want one naming the unexported field. Skipping it silently is the hole this whole test exists to deny", complaints)
+		}
+	})
+
+	t.Run("a non-struct and an empty struct are refused", func(t *testing.T) {
+		t.Parallel()
+		if _, err := unpropagatedFields("not a struct"); err == nil {
+			t.Error("unpropagatedFields accepted a non-struct")
+		}
+		if _, err := unpropagatedFields(struct{}{}); err == nil {
+			t.Error("unpropagatedFields accepted a struct with no fields, which would be a vacuous assertion")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
