@@ -26,7 +26,10 @@ drain. Factory consumes Host; Host never consumes Factory.
   for "this module's content" and means the boundary is a property of the
   module, not of the tree. `nestedModuleAllowlist` is empty and
   `TestModuleContainsNoUndeclaredNestedModule` fails loudly on any undeclared
-  one. If you publish a nested module from here — the workspace does this for
+  one. Both walks share `modfiles.IsIgnoredDirectoryName` and
+  `modfiles.IsBoundaryDirectory` rather than restating them, and the SETS those
+  return are pinned by test — widening either is a hole in both walks at once,
+  which sharing alone does not prevent. If you publish a nested module from here — the workspace does this for
   `flow/store` and `pluto/cmd/pluto` — declare it there and decide, explicitly,
   whether the guard should reach into it.
 - No `replace` directives to local filesystem paths, and no vendoring. A

@@ -622,6 +622,87 @@ func TestModuleContainsNoUndeclaredNestedModule(t *testing.T) {
 	}
 }
 
+// TestModfilesIgnoredDirectoryNamesAreExactlyTheStructuralOnes and
+// TestModfilesBoundaryMarkersAreExactlyGoModAndGit pin the SETS the two walks
+// now share.
+//
+// Sharing a predicate removes the disagreement between the enumerator and this
+// guard; it does not remove the ability to widen the shared answer, and a wider
+// skip set is a hole in both walks simultaneously. "generated" is the mutant
+// that motivated this: a directory the enumerator ignores is not scanned for
+// imports AND is not a nested module, so nothing looks at it at all. These are
+// characterization tests — they were green the moment they were written, and
+// their evidence is that the two mutants die against them.
+func TestModfilesIgnoredDirectoryNamesAreExactlyTheStructuralOnes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ignored bool
+	}{
+		{name: "vendor", ignored: true},
+		{name: "testdata", ignored: true},
+		{name: ".git", ignored: true},
+		{name: ".worktrees", ignored: true},
+		{name: "_scratch", ignored: true},
+		// Widening the set past the structural names is the mutation this
+		// exists to catch: an ignored directory is scanned by neither walk.
+		{name: "generated", ignored: false},
+		{name: "internal", ignored: false},
+		{name: "cmd", ignored: false},
+		{name: "department", ignored: false},
+		{name: "vendored", ignored: false},
+		{name: "testdata2", ignored: false},
+		{name: "realtime", ignored: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := modfiles.IsIgnoredDirectoryName(tt.name); got != tt.ignored {
+				t.Errorf("modfiles.IsIgnoredDirectoryName(%q) = %v, want %v. A directory this walk skips is scanned by NEITHER the import guard nor the nested-module guard, so widening this set opens a hole in both at once", tt.name, got, tt.ignored)
+			}
+		})
+	}
+}
+
+func TestModfilesBoundaryMarkersAreExactlyGoModAndGit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		marker   string
+		boundary bool
+	}{
+		{name: "go.mod", marker: "go.mod", boundary: true},
+		{name: "git checkout", marker: ".git", boundary: true},
+		// go.work is a WORKSPACE file, not a module boundary, and adding it
+		// here is the plausible edit that produced a surviving mutant: the
+		// enumerator would skip the directory and the nested-module guard would
+		// not report it. If Host ever needs that, this row changes first and
+		// the consequence is visible in the diff.
+		{name: "go.work", marker: "go.work", boundary: false},
+		{name: "go.sum alone", marker: "go.sum", boundary: false},
+		{name: "vendor manifest", marker: "vendor.json", boundary: false},
+		{name: "ordinary source", marker: "x.go", boundary: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			writeFixture(t, dir, tt.marker, "")
+			got, err := modfiles.IsBoundaryDirectory(dir)
+			if err != nil {
+				t.Fatalf("modfiles.IsBoundaryDirectory: %v", err)
+			}
+			if got != tt.boundary {
+				t.Errorf("a directory holding %q: modfiles.IsBoundaryDirectory = %v, want %v", tt.marker, got, tt.boundary)
+			}
+		})
+	}
+}
+
 func TestNestedModuleDetection(t *testing.T) {
 	t.Parallel()
 
@@ -768,12 +849,21 @@ func scanImports(root string) (importScan, error) {
 // nested module or repository below root, and the number of directories
 // visited so the caller can tell "none" from "walked nothing".
 //
-// It applies the same exclusions modfiles does — vendor, testdata, and dot- or
-// underscore-prefixed names — because a directory the Go tool never builds is
-// not a nested module of this one, and because the module root's own .git and
-// .worktrees are structural rather than content. A directory is a boundary if
-// it holds go.mod or .git, which is modfiles' own rule, restated here against
-// the same markers so the two cannot disagree about what a boundary is.
+// It CALLS modfiles.IsIgnoredDirectoryName and modfiles.IsBoundaryDirectory
+// rather than restating them. An earlier version retyped both literals and
+// claimed in a comment that the two "cannot disagree about what a boundary is",
+// which was exactly backwards: the guard was enforceable and its agreement with
+// the enumerator was prose. Two mutants survived the entire suite on that gap —
+// adding "go.work" to the enumerator's boundary markers, and "generated" to its
+// ignored names, both plausible one-line edits to a function whose whole job is
+// skipping structural directories — each silently reopening the hole this test
+// exists to close, with make check green.
+//
+// Sharing the predicates makes the two walks agree by construction. It does not
+// stop the shared answer from being WIDENED, which is a hole in both walks at
+// once, so the sets themselves are pinned by
+// TestModfilesIgnoredDirectoryNamesAreExactlyTheStructuralOnes and
+// TestModfilesBoundaryMarkersAreExactlyGoModAndGit.
 func nestedModuleDirectories(root string) ([]string, int, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -788,28 +878,23 @@ func nestedModuleDirectories(root string) ([]string, int, error) {
 		if !entry.IsDir() || path == absoluteRoot {
 			return nil
 		}
-		name := entry.Name()
-		if name == "vendor" || name == "testdata" || name[0] == '.' || name[0] == '_' {
+		if modfiles.IsIgnoredDirectoryName(entry.Name()) {
 			return filepath.SkipDir
 		}
 		directories++
-		for _, marker := range []string{"go.mod", ".git"} {
-			_, statErr := os.Lstat(filepath.Join(path, marker))
-			switch {
-			case statErr == nil:
-				relative, relErr := filepath.Rel(absoluteRoot, path)
-				if relErr != nil {
-					return relErr
-				}
-				nested = append(nested, filepath.ToSlash(relative))
-				return filepath.SkipDir
-			case os.IsNotExist(statErr):
-				continue
-			default:
-				return statErr
-			}
+		boundary, err := modfiles.IsBoundaryDirectory(path)
+		if err != nil {
+			return err
 		}
-		return nil
+		if !boundary {
+			return nil
+		}
+		relative, err := filepath.Rel(absoluteRoot, path)
+		if err != nil {
+			return err
+		}
+		nested = append(nested, filepath.ToSlash(relative))
+		return filepath.SkipDir
 	})
 	if err != nil {
 		return nil, 0, err

@@ -36,10 +36,10 @@ func Files(root string) ([]string, error) {
 			return walkErr
 		}
 		if path != absoluteRoot && entry.IsDir() {
-			if ignoredDirectory(entry.Name()) {
+			if IsIgnoredDirectoryName(entry.Name()) {
 				return filepath.SkipDir
 			}
-			nested, err := nestedBoundary(path)
+			nested, err := IsBoundaryDirectory(path)
 			if err != nil {
 				return err
 			}
@@ -84,7 +84,19 @@ func WriteNull(w io.Writer, paths []string) error {
 	return nil
 }
 
-func ignoredDirectory(name string) bool {
+// IsIgnoredDirectoryName reports whether a directory with this name is excluded
+// from enumeration: vendor and testdata, which the Go tool does not build as
+// module content, and any name the Go tool itself ignores.
+//
+// It is EXPORTED because a second walk over the same tree must exclude exactly
+// what this one excludes. It was not, and the consequence was a copy: the
+// dependency guard's nested-module walk retyped these literals and carried a
+// comment claiming the two could not disagree. They could — widening this
+// function alone silently un-guarded a directory in both walks at once, and two
+// mutants survived the whole suite proving it. Callers share the predicate now;
+// the SET it returns is pinned separately, because sharing makes the two walks
+// agree without stopping the shared answer from being widened.
+func IsIgnoredDirectoryName(name string) bool {
 	return name == "vendor" || name == "testdata" || goIgnoredName(name)
 }
 
@@ -96,9 +108,13 @@ func goIgnoredName(name string) bool {
 	return name != "" && (name[0] == '.' || name[0] == '_')
 }
 
-func nestedBoundary(path string) (bool, error) {
+// IsBoundaryDirectory reports whether dir is owned by a different module or
+// repository, and is therefore not this module's content. It is exported for
+// the same reason IsIgnoredDirectoryName is: it is the definition of a
+// boundary, and there must be exactly one.
+func IsBoundaryDirectory(dir string) (bool, error) {
 	for _, marker := range []string{"go.mod", ".git"} {
-		_, err := os.Lstat(filepath.Join(path, marker))
+		_, err := os.Lstat(filepath.Join(dir, marker))
 		switch {
 		case err == nil:
 			return true, nil
