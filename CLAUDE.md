@@ -29,7 +29,10 @@ drain. Factory consumes Host; Host never consumes Factory.
   one. Both walks share `modfiles.IsIgnoredDirectoryName` and
   `modfiles.IsBoundaryDirectory` rather than restating them, and the SETS those
   return are pinned by test — widening either is a hole in both walks at once,
-  which sharing alone does not prevent. If you publish a nested module from here — the workspace does this for
+  which sharing alone does not prevent. An oracle over a predicate that asks
+  the FILESYSTEM a question must skip on what the volume RESOLVES, not on what
+  it stores: case-insensitive APFS is case-preserving, so a stored-verbatim
+  check passes and `Lstat` finds `.Git` anyway. If you publish a nested module from here — the workspace does this for
   `flow/store` and `pluto/cmd/pluto` — declare it there and decide, explicitly,
   whether the guard should reach into it.
 - No `replace` directives to local filesystem paths, and no vendoring. A
@@ -56,8 +59,10 @@ Route a new rule by asking what it is about.
    filesystem path rule lives here. Anything about the module a directive
    NAMES belongs in 2, not here.
 4. **What the walk covers at all** — `scanNestedModules` and
-   `nestedModuleAllowlist`. A declared nested module buys an extra scan rooted
-   at it; it never suspends the boundary.
+   `nestedModuleAllowlist`. A declared nested module buys the WHOLE guard
+   rooted at it, recursively — the import scan and the nested-module walk — so
+   declaring one never suspends the mechanism that would have reported what is
+   inside it. Every floor the outer guard applies applies there too.
 5. **What any walk can see** — the exported predicates in `internal/modfiles`.
    Every predicate deciding what a walk skips belongs there and needs a fuzz
    ORACLE in the consumer, not a sample table: a table is defeated by choosing a

@@ -811,6 +811,76 @@ func TestNestedModuleScanCoversADeclaredModule(t *testing.T) {
 		}
 	})
 
+	// B: the extension has to buy BOTH halves of the guard, not one level of
+	// one half. A nested module inside a declared one was neither reported nor
+	// scanned, because scanImports walks with modfiles.Files, which stops at a
+	// boundary — so declaring a module DISABLED, for that path, the very
+	// mechanism that reports this situation at the top level.
+	t.Run("a nested module inside a declared one is reported", func(t *testing.T) {
+		t.Parallel()
+		deep := t.TempDir()
+		writeFixture(t, deep, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, deep, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, deep, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		writeFixture(t, deep, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+		writeFixture(t, deep, "tools/checkout/inner/go.mod", "module example.com/inner\n")
+		writeFixture(t, deep, "tools/checkout/inner/bad.go", "package inner\n\nimport _ \"github.com/looprig/factory\"\n")
+
+		scan, err := scanNestedModules(deep, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if !slices.Equal(scan.undeclared, []string{"tools/checkout/inner"}) {
+			t.Errorf("undeclared = %q, want [tools/checkout/inner]. A declared module inherits the whole guard, including the part that finds nested modules", scan.undeclared)
+		}
+	})
+
+	t.Run("a module nested two deep is scanned when both levels are declared", func(t *testing.T) {
+		t.Parallel()
+		deep := t.TempDir()
+		writeFixture(t, deep, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, deep, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, deep, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		writeFixture(t, deep, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+		writeFixture(t, deep, "tools/checkout/inner/go.mod", "module example.com/inner\n")
+		writeFixture(t, deep, "tools/checkout/inner/bad.go", "package inner\n\nimport _ \"github.com/looprig/factory\"\n")
+
+		scan, err := scanNestedModules(deep, []string{"tools/checkout", "tools/checkout/inner"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if len(scan.undeclared) != 0 {
+			t.Errorf("undeclared = %q, want none", scan.undeclared)
+		}
+		if !slices.Equal(scan.declared, []string{"tools/checkout", "tools/checkout/inner"}) {
+			t.Fatalf("declared = %q, want both levels named by their full root-relative paths", scan.declared)
+		}
+		if len(scan.violations) != 1 || !strings.Contains(scan.violations[0], "tools/checkout/inner/bad.go") ||
+			!strings.Contains(scan.violations[0], "Host is consumed by Factory") {
+			t.Errorf("violations = %q, want one naming tools/checkout/inner/bad.go and its reason", scan.violations)
+		}
+	})
+
+	// C: the arm has to floor the quantity the CALLER CONSUMES. Violations come
+	// from classified imports; flooring only the file count leaves a declared
+	// module of import-free files reporting a confident zero.
+	t.Run("a declared module whose files carry no import classifies nothing", func(t *testing.T) {
+		t.Parallel()
+		bare := t.TempDir()
+		writeFixture(t, bare, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, bare, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, bare, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		writeFixture(t, bare, "tools/checkout/ok.go", "package checkout\n")
+
+		scan, err := scanNestedModules(bare, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if len(scan.violations) != 1 || !strings.Contains(scan.violations[0], "no import") {
+			t.Fatalf("violations = %q, want one saying the extra scan classified no import", scan.violations)
+		}
+	})
+
 	t.Run("a declared module with no Go file is a vacuous scan", func(t *testing.T) {
 		t.Parallel()
 		empty := t.TempDir()
@@ -1011,12 +1081,37 @@ func FuzzIgnoredFileName(f *testing.F) {
 }
 
 // FuzzBoundaryMarkerName drives the predicate through the filesystem, because
-// that is how it decides. Names the filesystem does not store verbatim are
-// skipped rather than asserted: on a case-insensitive or normalizing volume a
-// file created as "GO.MOD" answers to "go.mod", and that is the volume's
-// behaviour, not the predicate's.
+// that is how it decides.
+//
+// The skip below is scoped to LOOKUP, and the first version scoped it to
+// STORAGE, which is the wrong half of the same sentence. It compared the name
+// the volume stored against the name written — right for a normalizing volume
+// such as HFS+, which stores "café" decomposed — and blind to the common case:
+// case-insensitive APFS, the macOS default, is case-PRESERVING, so ".Git" is
+// stored verbatim, the storage check passes, and os.Lstat(dir + "/.git") then
+// finds it anyway. The oracle states a rule over NAMES while the predicate
+// answers a question about the FILESYSTEM, and the bridge between them has to
+// check the half the predicate uses.
+//
+// The predicate is not wrong there — on a volume where git itself would open
+// ".Git", calling that directory a boundary is defensible — so the input is
+// discarded rather than asserted either way. What is discarded is exactly the
+// set of names the volume conflates with a marker, which is why the skip is
+// written as the lookup the predicate performs rather than as a list of
+// spellings.
+//
+// This also cost a false green: the failure is derived rather than seeded, so a
+// 30s run finds ".Git" sometimes and not others, and one clean run was reported
+// as evidence. A target whose failure is probabilistic has not been shown to be
+// able to fail until it has failed.
+// boundaryMarkers is the oracle's independent statement of the rule. It is a
+// list rather than an expression because the skip above has to iterate the same
+// set the assertion uses; two spellings of it would be the copy this file has
+// already paid for twice.
+var boundaryMarkers = []string{"go.mod", ".git"}
+
 func FuzzBoundaryMarkerName(f *testing.F) {
-	for _, seed := range []string{"go.mod", ".git", "go.work", "go.sum", "BUILD.bazel", "vendor.json", "x.go", "go.mod.bak", "Makefile"} {
+	for _, seed := range []string{"go.mod", ".git", "go.work", "go.sum", "BUILD.bazel", "vendor.json", "x.go", "go.mod.bak", "Makefile", "GO.MOD", ".Git", ".GIT", "Go.mod", "go.MOD"} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, name string) {
@@ -1028,15 +1123,17 @@ func FuzzBoundaryMarkerName(f *testing.F) {
 		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
 			t.Skip("filesystem refused the name")
 		}
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatalf("read fixture directory: %v", err)
-		}
-		if len(entries) != 1 || entries[0].Name() != name {
-			t.Skip("the filesystem did not store the name verbatim")
+		for _, marker := range boundaryMarkers {
+			if name == marker {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join(dir, marker)); err == nil {
+				t.Skip("this volume resolves " + strconv.Quote(name) + " to " + strconv.Quote(marker) +
+					"; that is the volume deciding, not the predicate")
+			}
 		}
 
-		want := name == "go.mod" || name == ".git"
+		want := slices.Contains(boundaryMarkers, name)
 		got, err := modfiles.IsBoundaryDirectory(dir)
 		if err != nil {
 			t.Fatalf("modfiles.IsBoundaryDirectory: %v", err)
@@ -1134,31 +1231,69 @@ type nestedScan struct {
 }
 
 // scanNestedModules finds every nested module below root and, for each one the
-// allowlist declares, runs the ordinary import scan ROOTED AT IT. Declaring a
-// nested module extends the boundary into it; it does not suspend the boundary
-// around it.
+// allowlist declares, applies the WHOLE guard rooted at it: the import scan and
+// this walk again. Declaring a nested module extends the boundary into it; it
+// does not suspend the boundary around it, and it does not buy one level.
+//
+// The recursion is the correction of a real gap. Scanning a declared module
+// with scanImports alone walks with modfiles.Files, which stops at a boundary,
+// so a module nested INSIDE a declared one was neither scanned nor reported —
+// declaring a module disabled, for that path, the very mechanism that reports
+// this situation at the top level. The realistic arrival is the one the doc
+// above cites: Host publishes a nested module per the flow/store pattern,
+// declares it, and someone later vendors a checkout inside it.
 func scanNestedModules(root string, allowlist []string) (nestedScan, error) {
+	return scanNestedModulesUnder(root, "", allowlist)
+}
+
+// scanNestedModulesUnder is scanNestedModules with the path prefix that makes
+// every reported path relative to the OUTERMOST module root, so an allowlist
+// entry is spelled the same way at every depth.
+func scanNestedModulesUnder(root, prefix string, allowlist []string) (nestedScan, error) {
 	nested, directories, err := nestedModuleDirectories(root)
 	if err != nil {
 		return nestedScan{}, err
 	}
 	scan := nestedScan{directories: directories}
 	for _, path := range nested {
-		if !slices.Contains(allowlist, path) {
-			scan.undeclared = append(scan.undeclared, path)
+		qualified := path
+		if prefix != "" {
+			qualified = prefix + "/" + path
+		}
+		if !slices.Contains(allowlist, qualified) {
+			scan.undeclared = append(scan.undeclared, qualified)
 			continue
 		}
-		scan.declared = append(scan.declared, path)
-		inner, err := scanImports(filepath.Join(root, filepath.FromSlash(path)))
+		scan.declared = append(scan.declared, qualified)
+
+		directory := filepath.Join(root, filepath.FromSlash(path))
+		inner, err := scanImports(directory)
 		if err != nil {
 			return nestedScan{}, err
 		}
+		// Both floors, because both quantities are consumed. files == 0 says
+		// the scan saw nothing; imports == 0 says it CLASSIFIED nothing, and
+		// the violations below come from classified imports — flooring only the
+		// first left a declared module of import-free files reporting a
+		// confident zero. productionFiles is deliberately not floored: a
+		// declared nested module may legitimately be test support.
 		if inner.files == 0 {
-			scan.violations = append(scan.violations, path+" is declared in nestedModuleAllowlist but holds no Go file, so the extra scan its declaration buys is vacuous")
+			scan.violations = append(scan.violations, qualified+" is declared in nestedModuleAllowlist but holds no Go file, so the extra scan its declaration buys is vacuous")
+		} else if inner.imports == 0 {
+			scan.violations = append(scan.violations, qualified+" is declared in nestedModuleAllowlist but no import was classified in it, so the extra scan its declaration buys is vacuous")
 		}
 		for _, violation := range inner.violations {
-			scan.violations = append(scan.violations, path+"/"+violation)
+			scan.violations = append(scan.violations, qualified+"/"+violation)
 		}
+
+		deeper, err := scanNestedModulesUnder(directory, qualified, allowlist)
+		if err != nil {
+			return nestedScan{}, err
+		}
+		scan.directories += deeper.directories
+		scan.declared = append(scan.declared, deeper.declared...)
+		scan.undeclared = append(scan.undeclared, deeper.undeclared...)
+		scan.violations = append(scan.violations, deeper.violations...)
 	}
 	return scan, nil
 }

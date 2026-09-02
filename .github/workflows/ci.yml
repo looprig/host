@@ -9,7 +9,16 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Both, and the second is not redundancy. A guard that asks the filesystem
+    # a question gets a different answer on case-insensitive APFS than on ext4,
+    # and this repository has already shipped one that was green on
+    # ubuntu-latest and red in under a second for every macOS contributor. The
+    # Makefile carries a paragraph about macOS's make 3.81 for the same reason.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       GOCACHE: /tmp/looprig-host-gocache
     steps:
