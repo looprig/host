@@ -267,13 +267,22 @@ func TestNewPreservesTypedCauses(t *testing.T) {
 
 	t.Run("a rule with no lower-layer cause unwraps to nil", func(t *testing.T) {
 		t.Parallel()
-		// Unwrap must not invent a cause. A rule this package decides on its
-		// own — no placement declared — has nothing underneath it, and saying
-		// otherwise would make errors.Is match by accident.
-		_, err := department.New([]department.Registration{{
-			AgentID: "reviewer",
-			Target:  stubTarget{compatibility: "runtime-a", capabilities: department.Capabilities{AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming}},
-		}})
+		// Unwrap must not invent a cause. A rule this package decides ON ITS
+		// OWN has nothing underneath it, and saying otherwise would make
+		// errors.Is match by accident.
+		//
+		// The rule chosen here is duplicate registration, and the choice
+		// matters: the CAPABILITY rules used to qualify and no longer do,
+		// because they moved into Capabilities.Validate so the registry and
+		// NewRigTarget could not disagree about them. That extraction gave them
+		// a real typed cause, *InvalidCapabilitiesError, which
+		// TestNewRigTargetSharesTheDepartmentsCapabilityRules now relies on. A
+		// rule with a genuine cause is the wrong subject for an assertion that
+		// there is none.
+		_, err := department.New([]department.Registration{
+			registration("reviewer", "runtime-a"),
+			registration("reviewer", "runtime-b"),
+		})
 		var invalid *department.InvalidDepartmentError
 		if !errors.As(err, &invalid) {
 			t.Fatalf("New error = %v, want *InvalidDepartmentError", err)

@@ -1,0 +1,291 @@
+package department
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"strings"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
+)
+
+// Rig is what Host requires of a Harness Rig: something that creates a session
+// and restores one. It is a LOCAL interface, and that is a decision worth its
+// paragraph rather than a shrug.
+//
+// Host does not import github.com/looprig/harness, for two independent reasons
+// either of which would be sufficient. First, the published harness (v0.30.2)
+// does not have H4.1's capabilities at all — no WaitIdle, no Done, no
+// ReleaseResidency — so naming it would buy an adapter over a type that cannot
+// satisfy Runtime. Second, naming a looprig module in go.mod is the same
+// decision as depending on it, and publishedLooprigVersions has no harness
+// entry; adding one is a release-ordering commitment, not an import.
+//
+// So this follows the pattern CLAUDE.md already prescribes for drain: a narrow
+// local interface plus a fake, with the concrete edge deferred until the
+// module and the capability both exist. What is narrow here is deliberate —
+// rig.Rig's real NewSession takes variadic SessionOption and returns
+// session.SessionController, and Host wants neither. Host wants a session it
+// can identify and interrogate.
+type Rig interface {
+	// NewSession launches a session for a create request.
+	NewSession(context.Context, RigCreateRequest) (RigSession, error)
+
+	// RestoreSession relaunches a session over existing durable state. The UUID
+	// is Harness's identity for it, which is not Host's; see rigRuntime.
+	RestoreSession(context.Context, uuid.UUID, RigRestoreRequest) (RigSession, error)
+}
+
+// RigSession is the minimum a launched session must offer. Everything else Host
+// needs is discovered by type assertion, because Harness's session type is wide
+// and H4.1's capabilities are added to implementations rather than required of
+// them: a session either has them or this package refuses to wrap it.
+type RigSession interface {
+	// ID is Harness's identity for the session, a UUID.
+	ID() uuid.UUID
+}
+
+// RigCreateRequest is what Host hands a Rig to launch a session. It carries
+// Host's identities and the storage and workspace context the session needs.
+type RigCreateRequest struct {
+	TenantID      sessionwire.TenantID
+	SessionID     sessionwire.SessionID
+	AgentID       sessionwire.AgentID
+	Placement     sessionwire.HostPlacement
+	WorkspaceRoot string
+	Storage       StorageContext
+}
+
+// RigRestoreRequest is RigCreateRequest for a relaunch over durable state.
+type RigRestoreRequest struct {
+	TenantID      sessionwire.TenantID
+	SessionID     sessionwire.SessionID
+	AgentID       sessionwire.AgentID
+	Placement     sessionwire.HostPlacement
+	WorkspaceRoot string
+	Storage       StorageContext
+}
+
+// NewRigTarget adapts a Rig into a LaunchTarget for one agent.
+//
+// It validates BEFORE returning a target, so an unusable target cannot reach a
+// Registration and therefore cannot reach a Department: the rejection happens
+// with nothing registered rather than with a registry holding something that
+// will fail on first use.
+func NewRigTarget(rig Rig, compatibility CompatibilityID, capabilities Capabilities) (LaunchTarget, error) {
+	if rig == nil {
+		return nil, &InvalidDepartmentError{Code: DefinitionErrorCodeNoTarget, Reason: "no rig to launch sessions with"}
+	}
+	if err := compatibility.Validate(); err != nil {
+		return nil, &InvalidDepartmentError{
+			Code:   DefinitionErrorCodeInvalidCompatibilityID,
+			Reason: "compatibility id is unusable: " + err.Error(),
+			Cause:  err,
+		}
+	}
+	if err := capabilities.Validate(); err != nil {
+		var invalid *InvalidCapabilitiesError
+		if !errors.As(err, &invalid) {
+			return nil, &InvalidDepartmentError{Reason: err.Error(), Cause: err}
+		}
+		return nil, &InvalidDepartmentError{Code: invalid.Code, Reason: invalid.Reason, Cause: err}
+	}
+	return &rigTarget{rig: rig, compatibility: compatibility, capabilities: capabilities}, nil
+}
+
+type rigTarget struct {
+	rig           Rig
+	compatibility CompatibilityID
+	capabilities  Capabilities
+}
+
+func (t *rigTarget) CompatibilityID() CompatibilityID { return t.compatibility }
+func (t *rigTarget) Capabilities() Capabilities       { return t.capabilities }
+
+func (t *rigTarget) Create(ctx context.Context, request CreateRequest) (Runtime, error) {
+	// A CONVERSION, not a field-by-field literal, and the difference is a
+	// guard rather than a style. RigCreateRequest is structurally identical to
+	// CreateRequest today, so a literal that forgot a field would compile and
+	// silently stop propagating it — which is exactly the defect J2 probes for.
+	// The conversion cannot forget one: the day someone adds a field to either
+	// type alone, this line stops compiling and the question "does the rig need
+	// this too?" gets asked instead of answered by omission.
+	session, err := t.rig.NewSession(ctx, RigCreateRequest(request))
+	if err != nil {
+		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "create", Cause: err}
+	}
+	return adaptRigSession(request.SessionID, request.AgentID, session)
+}
+
+func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtime, error) {
+	// FAIL CLOSED, and fail closed BEFORE launching. Deciding this after the
+	// rig has produced a session spends the resource the check exists to
+	// protect, so the ordering is part of the rule rather than an efficiency.
+	// The zero value of the field lands here too: a RestoreRequest nobody
+	// filled in does not match any target's compatibility id, because a target
+	// with an empty one cannot be constructed.
+	if request.CompatibilityID != t.compatibility {
+		return nil, &CompatibilityMismatchError{
+			AgentID:   request.AgentID,
+			SessionID: request.SessionID,
+			Durable:   request.CompatibilityID,
+			Target:    t.compatibility,
+		}
+	}
+	session, err := t.rig.RestoreSession(ctx, request.RigSessionID, RigRestoreRequest{
+		TenantID:      request.TenantID,
+		SessionID:     request.SessionID,
+		AgentID:       request.AgentID,
+		Placement:     request.Placement,
+		WorkspaceRoot: request.WorkspaceRoot,
+		Storage:       request.Storage,
+	})
+	if err != nil {
+		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "restore", Cause: err}
+	}
+	return adaptRigSession(request.SessionID, request.AgentID, session)
+}
+
+// adaptRigSession discovers the capabilities Host requires and refuses a
+// session short of any of them.
+//
+// It reports EVERY missing capability rather than the first, because a session
+// short of three should cost one diagnosis rather than three. The refusal
+// returns a nil Runtime: there is nothing for a caller to register, which is
+// the strongest form of "rejected before publication" this seam can offer —
+// publication is a later task's, and what this one can guarantee is that
+// nothing reaches it.
+func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentID, session RigSession) (Runtime, error) {
+	if session == nil {
+		return nil, &RigLaunchError{
+			AgentID:   agentID,
+			SessionID: sessionID,
+			Operation: "launch",
+			Cause:     errNoSession,
+		}
+	}
+
+	adapted := &rigRuntime{sessionID: sessionID, agentID: agentID, rigID: session.ID()}
+	var missing []string
+	if capability, ok := session.(IdleWaiter); ok {
+		adapted.IdleWaiter = capability
+	} else {
+		missing = append(missing, "IdleWaiter")
+	}
+	if capability, ok := session.(Liveness); ok {
+		adapted.Liveness = capability
+	} else {
+		missing = append(missing, "Liveness")
+	}
+	if capability, ok := session.(Releaser); ok {
+		adapted.Releaser = capability
+	} else {
+		missing = append(missing, "Releaser")
+	}
+	if capability, ok := session.(PublicationSubscriber); ok {
+		adapted.PublicationSubscriber = capability
+	} else {
+		missing = append(missing, "PublicationSubscriber")
+	}
+	if capability, ok := session.(CommandApplier); ok {
+		adapted.CommandApplier = capability
+	} else {
+		missing = append(missing, "CommandApplier")
+	}
+	if len(missing) > 0 {
+		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
+	}
+	return adapted, nil
+}
+
+// rigRuntime is the adapter O1.1 said would be mandatory.
+//
+// It exists because the identity types cannot be reconciled by naming: Harness
+// identifies a session with a uuid.UUID and Host identifies a runtime with the
+// sessionwire identities it exchanges with Factory, which are opaque strings
+// and not UUIDs by contract. The translation is not a cast — Host's identities
+// come from the REQUEST, and Harness's UUID is kept beside them rather than
+// parsed into one or derived from the other.
+type rigRuntime struct {
+	sessionID sessionwire.SessionID
+	agentID   sessionwire.AgentID
+	rigID     uuid.UUID
+
+	IdleWaiter
+	Liveness
+	Releaser
+	PublicationSubscriber
+	CommandApplier
+}
+
+func (r *rigRuntime) SessionID() sessionwire.SessionID { return r.sessionID }
+func (r *rigRuntime) AgentID() sessionwire.AgentID     { return r.agentID }
+
+// RigSessionID reports Harness's UUID for a runtime this package adapted, for
+// callers that must correlate with Harness's own records. It is deliberately
+// not part of Runtime: Host's contracts speak sessionwire identities.
+func RigSessionID(runtime Runtime) (uuid.UUID, bool) {
+	adapted, ok := runtime.(*rigRuntime)
+	if !ok {
+		return uuid.UUID{}, false
+	}
+	return adapted.rigID, true
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+// IncapableRuntimeError reports a launched session missing capabilities Host
+// requires. Missing names every one of them rather than the first, because a
+// session short of three capabilities should cost one round trip to find out.
+type IncapableRuntimeError struct {
+	AgentID   sessionwire.AgentID
+	SessionID sessionwire.SessionID
+	Missing   []string
+}
+
+func (e *IncapableRuntimeError) Error() string {
+	return "department: the rig session for agent " + strconv.Quote(string(e.AgentID)) +
+		" is missing capabilities Host requires: " + strings.Join(e.Missing, ", ")
+}
+
+// CompatibilityMismatchError reports a restore onto a runtime build that did
+// not write the durable state.
+type CompatibilityMismatchError struct {
+	AgentID   sessionwire.AgentID
+	SessionID sessionwire.SessionID
+	Durable   CompatibilityID
+	Target    CompatibilityID
+}
+
+func (e *CompatibilityMismatchError) Error() string {
+	return "department: session " + strconv.Quote(string(e.SessionID)) +
+		" was written by runtime " + strconv.Quote(string(e.Durable)) +
+		" and this target launches " + strconv.Quote(string(e.Target))
+}
+
+// ErrorCode returns the stable public code a client branches on. A restore onto
+// an incompatible runtime is not an invalid request: the request is well formed
+// and this Host has no runtime that can serve it.
+func (e *CompatibilityMismatchError) ErrorCode() sessionwire.ErrorCode {
+	return sessionwire.ErrorCodeRuntimeUnavailable
+}
+
+// RigLaunchError wraps a failure the Rig itself reported, preserving the cause.
+type RigLaunchError struct {
+	AgentID   sessionwire.AgentID
+	SessionID sessionwire.SessionID
+	Operation string
+	Cause     error
+}
+
+func (e *RigLaunchError) Error() string {
+	return "department: rig " + e.Operation + " for agent " + strconv.Quote(string(e.AgentID)) +
+		" failed: " + e.Cause.Error()
+}
+
+func (e *RigLaunchError) Unwrap() error { return e.Cause }
+
+var errNoSession = errors.New("the rig reported success and returned no session")

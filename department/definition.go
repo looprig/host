@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 )
 
 // CompatibilityID identifies the runtime build a target launches, so a restore
@@ -107,6 +108,49 @@ type Capabilities struct {
 	CaptureSafety CaptureSafety
 }
 
+// Validate holds every rule about a Capabilities value, in one place, so the
+// registry and the rig-target constructor cannot disagree about what a legal
+// declaration is.
+func (c Capabilities) Validate() error {
+	if c.AdmissionWeight == 0 {
+		return &InvalidCapabilitiesError{
+			Code:   DefinitionErrorCodeZeroAdmissionWeight,
+			Reason: "admission weight is zero, so this target would admit without bound",
+		}
+	}
+	if !c.SupportsPooled && !c.SupportsDedicated {
+		return &InvalidCapabilitiesError{
+			Code:   DefinitionErrorCodeNoPlacement,
+			Reason: "declares no placement, so it could never be launched",
+		}
+	}
+	// The capture-safety rule is enforced by REJECTION rather than by silently
+	// dropping the pooled claim. A silent narrowing produces exactly the same
+	// green as a correct declaration, which is how a too-wide exclusion hides;
+	// making the author write SupportsDedicated only is a visible diff.
+	//
+	// This is STRICTER THAN SPEC and the difference has consequences downstream
+	// that O5 must know about. §11.3 says such a target "is dedicated-only" — a
+	// narrowing — and §7's posture is degrade-visibly, so rejecting is a choice
+	// the spec did not make. Both behaviours exist: PoolingPermitted still
+	// narrows on a bare Capabilities. But because every construction path
+	// refuses the combination, SupportsPooled == PoolingPermitted() holds for
+	// every target inside a Department, which means THE NARROWING IS
+	// UNREACHABLE THROUGH THE REGISTRY — a placement path reading
+	// PoolingPermitted off a registered target can never observe it doing work.
+	// The other consequence is operational: a target whose tools regress from
+	// streaming to unbounded turns a Host that should have run it
+	// dedicated-only into one that refuses to start.
+	if c.SupportsPooled && !c.PoolingPermitted() {
+		return &InvalidCapabilitiesError{
+			Code: DefinitionErrorCodePooledUnsafeCapture,
+			Reason: "declares pooled support with " + string(c.CaptureSafety) +
+				" capture, which is dedicated-only until the target gains streaming capture",
+		}
+	}
+	return nil
+}
+
 // PoolingPermitted reports whether the target may share a Host.
 //
 // An unknown or unbounded materialized high-output tool makes the target
@@ -173,6 +217,18 @@ type LaunchTarget interface {
 	Restore(context.Context, RestoreRequest) (Runtime, error)
 }
 
+// StorageContext scopes every durable object a launched session writes.
+//
+// It is a struct with one field rather than a bare string because the thing
+// being passed is a CONTEXT, and the next thing it needs — a retention class, a
+// provider hint — is a field here rather than a second parameter threaded
+// through every signature between Host and the Rig.
+type StorageContext struct {
+	// Namespace is the durable prefix the session's objects live under. It is
+	// opaque to this package and is not parsed.
+	Namespace string
+}
+
 // CreateRequest is a Host-side launch request.
 //
 // It is NOT sessionwire.CreateRequest. That record is a client's durable
@@ -186,6 +242,7 @@ type CreateRequest struct {
 	AgentID       sessionwire.AgentID
 	Placement     sessionwire.HostPlacement
 	WorkspaceRoot string
+	Storage       StorageContext
 }
 
 // RestoreRequest is a Host-side relaunch request over existing durable state.
@@ -195,10 +252,20 @@ type RestoreRequest struct {
 	AgentID       sessionwire.AgentID
 	Placement     sessionwire.HostPlacement
 	WorkspaceRoot string
+	Storage       StorageContext
 
 	// CompatibilityID is the runtime build the durable state was written by. A
 	// target whose own CompatibilityID differs must refuse the restore.
 	CompatibilityID CompatibilityID
+
+	// RigSessionID is HARNESS'S identity for the session being restored, which
+	// Host recorded when it created the session and cannot derive: the two
+	// identity spaces are independent, so a restore that does not carry this
+	// has nothing to restore FROM. It is a field rather than something the
+	// adapter reconstructs, because reconstructing it would mean deriving a
+	// UUID from an opaque sessionwire string, which is the conflation this
+	// package exists to prevent.
+	RigSessionID uuid.UUID
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +424,23 @@ func (e *InvalidDepartmentError) Error() string {
 		return "department: invalid definition: " + e.Reason
 	}
 	return "department: invalid registration for agent " + strconv.Quote(string(e.AgentID)) + ": " + e.Reason
+}
+
+// InvalidCapabilitiesError reports a Capabilities value no target may declare.
+//
+// It exists so the rules have ONE site. department.New validates a registered
+// target's capabilities and NewRigTarget validates a target it is about to
+// build; a rule applied in one and not the other is not a rule, and this file
+// has spent several rounds removing exactly that shape. Code is the same
+// DefinitionErrorCode the registry reports, so the two paths are not merely
+// consistent but observably identical.
+type InvalidCapabilitiesError struct {
+	Code   DefinitionErrorCode
+	Reason string
+}
+
+func (e *InvalidCapabilitiesError) Error() string {
+	return "department: invalid capabilities: " + e.Reason
 }
 
 // InvalidCompatibilityIDError reports a runtime identity Host may not write to
