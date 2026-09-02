@@ -363,19 +363,36 @@ func TestCaptureSafetyMakesATargetDedicatedOnly(t *testing.T) {
 		{name: "unrecognised", safety: "some_future_capture_mode", wantPooled: false},
 	}
 
-	// Floored, and the count is LOAD-BEARING: the zero-value and
-	// unrecognised-value rows are the entire guarantee that the default arm
-	// refuses what it was not told is safe, and deleting either is a silent
-	// green. A mutant treating the empty string as poolable survived this table
-	// before those two rows existed.
+	// The two rows that carry the default arm's guarantee are asserted BY NAME,
+	// not by counting. A count cannot know which rows matter: deleting the
+	// zero-value row and editing 6 to 5 in the same commit passed, which is a
+	// diff nobody would look at twice. Deleting it now leaves nothing to edit
+	// except the assertion that says what was lost, which is a visibly
+	// different thing to do in review.
 	//
-	// It is a speed bump, not a guard, and measured as one: deleting the
-	// zero-value row AND editing 6 to 5 in the same commit passes. A count
-	// cannot know which rows matter. What it buys is that the deletion is no
-	// longer silent — it forces a second, deliberate edit with this sentence
-	// attached to it.
-	if len(tests) != 6 {
-		t.Fatalf("the capture-safety table has %d rows, want 6 including the zero value and an unrecognised value. Do not just change this number: the zero-value and unrecognised rows ARE the default arm's guarantee", len(tests))
+	// A weak guard is not kept beside a strong one — the row count is gone,
+	// because a weak check invites satisfying the weak check.
+	covered := map[department.CaptureSafety]bool{}
+	for _, tt := range tests {
+		covered[tt.safety] = true
+	}
+	if !covered[""] {
+		t.Fatal("no zero-value row: the default arm's guarantee that an UNFILLED Capabilities is unsafe is untested, and a mutant treating the empty string as poolable survived this table before that row existed")
+	}
+	declared := []department.CaptureSafety{
+		department.CaptureSafetyUnknown,
+		department.CaptureSafetyStreaming,
+		department.CaptureSafetyBoundedMaterialized,
+		department.CaptureSafetyUnboundedMaterialized,
+	}
+	unrecognised := false
+	for safety := range covered {
+		if safety != "" && !slices.Contains(declared, safety) {
+			unrecognised = true
+		}
+	}
+	if !unrecognised {
+		t.Fatal("no row carries a value outside the declared constants: nothing tests that the default arm refuses what it was never told is safe, which is what a future Core value or a typo would be")
 	}
 
 	for _, tt := range tests {
