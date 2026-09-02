@@ -199,9 +199,15 @@ func TestEveryEnumMemberIsAccepted(t *testing.T) {
 		})
 	}
 
-	// Floored against the enums growing without this table growing with them.
+	// This floor detects someone SHORTENING the local slices, and nothing else.
+	// It cannot detect Core adding a member, because the number it compares
+	// against is the number it is derived from — Go exposes no way to enumerate
+	// a package's constants, so no test in this module can notice a third
+	// isolation class appearing upstream. Written down rather than removed,
+	// because a reader would otherwise take it for the guard it resembles: when
+	// Core's enums change, THIS TABLE IS UPDATED BY HAND OR NOT AT ALL.
 	if len(isolation) != 2 || len(placements) != 2 {
-		t.Fatal("an enum gained a member and this table did not; every member Core accepts needs an accepted row here")
+		t.Fatal("a row was removed from this table; every member Core accepts needs an accepted row here")
 	}
 }
 
@@ -259,6 +265,100 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 		if _, err := host.New(options); err == nil {
 			t.Errorf("an empty %s was accepted", name)
 		}
+	}
+}
+
+// TestGenerousButLegalConfigurationIsAccepted is
+// TestDurationsHaveNoUndocumentedMinimum at the other end, and it exists
+// because a sweep found the same shape in every remaining field: EVERY ONE IS
+// FLOORED BELOW AND OPEN ABOVE, so an invented ceiling survives.
+//
+// Measured, each surviving on its own: a 64-byte cap on the three identifiers,
+// a 1000 cap on Capacity, a seven-day cap on WarmTTL and ReconcileInterval, and
+// an InternalEndpoint required to end in "/hostlink". Only the heartbeat and
+// claim ceilings died, and incidentally — the overflow rows feed huge values
+// and expect a margin code.
+//
+// Two of those are worth naming rather than counting.
+//
+// CAPACITY WAS PROBED LAST ROUND AND I REPORTED THE WRONG CONCLUSION. The
+// commit message for 75d26d1 records an undocumented Capacity ceiling as
+// "already covered by the large-capacity dedicated row". It is covered only up
+// to 64, the largest fixture: a ceiling of 32 dies and 1000 survives. The
+// value-equals-fixture trap produced a false all-clear inside a probe result I
+// published. Core imposes no capacity ceiling at all — it rejects only
+// dedicated placement above one — so any host-side ceiling is invention.
+//
+// INTERNALENDPOINT IS THE ENUM BUG ON THE OTHER CORE-DELEGATED FIELD.
+// TestEveryEnumMemberIsAccepted exists because refusing a value Core accepts is
+// as much a bug as accepting one it refuses; exactly one endpoint string was
+// ever accepted anywhere in this suite, and the "/hostlink" narrowing survived
+// SPECIFICALLY BECAUSE all three endpoint fixtures, valid and invalid, share
+// that suffix. The generalisation landed on the enums and stopped at the field
+// with identical structure. The second endpoint below differs in scheme, host
+// form, port and path so that nothing about the first is load-bearing.
+func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	// 256 bytes is Core's own identity bound, so this is the largest identifier
+	// that can reach the wire. See the report accompanying this commit: Host
+	// does not itself enforce that bound, which is a separate question.
+	long := sessionwire.HostID(strings.Repeat("h", sessionwire.MaxIDBytes))
+	longTenant := sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes))
+	longSession := sessionwire.SessionID(strings.Repeat("s", sessionwire.MaxIDBytes))
+
+	t.Run("pooled, generous", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t)
+		options.HostID = long
+		options.TenantID = longTenant
+		// A second, structurally different endpoint: ws rather than wss, an
+		// address literal rather than a name, an explicit port, and a path that
+		// is not "/hostlink".
+		options.InternalEndpoint = "ws://10.0.4.7:9000/link"
+		options.IsolationClass = sessionwire.HostIsolationClassCrossTenantIsolated
+		options.Capacity = 1_000_000
+		options.WarmTTL = 30 * 24 * time.Hour
+		options.ReconcileInterval = 7 * 24 * time.Hour
+		options.RegistryHeartbeat = 7 * 24 * time.Hour
+		options.RegistryExpiry = 30 * 24 * time.Hour
+		options.ClaimTTL = 7 * 24 * time.Hour
+		options.ApplyDeadline = 30 * 24 * time.Hour
+
+		built, err := host.New(options)
+		if err != nil {
+			t.Fatalf("New with a generous but legal configuration = %v. Every rule here is a floor; a ceiling above it is an undocumented rule owing its own constant and its own boundary rows", err)
+		}
+		if built.ID() != long || built.TenantID() != longTenant {
+			t.Error("a long identifier did not survive construction")
+		}
+		if built.Capacity() != 1_000_000 {
+			t.Errorf("Capacity() = %d, want 1000000", built.Capacity())
+		}
+		if built.InternalEndpoint() != "ws://10.0.4.7:9000/link" {
+			t.Errorf("InternalEndpoint() = %q", built.InternalEndpoint())
+		}
+	})
+
+	t.Run("dedicated, generous", func(t *testing.T) {
+		t.Parallel()
+		options := dedicatedOptions(t)
+		options.HostID = long
+		options.FixedSessionID = longSession
+		options.InternalEndpoint = "ws://[2001:db8::1]:9000/"
+		options.WarmTTL = 30 * 24 * time.Hour
+		if built, err := host.New(options); err != nil {
+			t.Fatalf("New with a generous dedicated configuration = %v", err)
+		} else if built.FixedSessionID() != longSession {
+			t.Error("a long FixedSessionID did not survive construction")
+		}
+	})
+
+	// The controls: the ceilings really are absent rather than merely
+	// unreached, so each accepted value above is one an invented ceiling would
+	// have refused.
+	if sessionwire.MaxIDBytes <= 64 {
+		t.Fatalf("MaxIDBytes = %d, so the long identifiers are not longer than the 64-byte ceiling that survived", sessionwire.MaxIDBytes)
 	}
 }
 
@@ -493,6 +593,16 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 		{name: "warm ttl negative", spoil: func(o *host.Options) { o.WarmTTL = -time.Second }, field: "WarmTTL", code: host.OptionErrorCodeNotPositive},
 		{name: "heartbeat zero", spoil: func(o *host.Options) { o.RegistryHeartbeat = 0 }, field: "RegistryHeartbeat", code: host.OptionErrorCodeNotPositive},
 		{name: "expiry zero", spoil: func(o *host.Options) { o.RegistryExpiry = 0 }, field: "RegistryExpiry", code: host.OptionErrorCodeNotPositive},
+		// The two DIVIDENDS, negative. This is the only input class where
+		// validateTiming's division and the product it replaced disagree, and
+		// the division is the more permissive of the two — so what makes it
+		// safe is that validateShape refuses these before validateTiming ever
+		// sees them. The table had a negative row only for WarmTTL, and zero is
+		// safe for the division, so the class was untested.
+		{name: "expiry negative", spoil: func(o *host.Options) { o.RegistryExpiry = -time.Second }, field: "RegistryExpiry", code: host.OptionErrorCodeNotPositive},
+		{name: "apply deadline negative", spoil: func(o *host.Options) { o.ApplyDeadline = -time.Second }, field: "ApplyDeadline", code: host.OptionErrorCodeNotPositive},
+		{name: "heartbeat negative", spoil: func(o *host.Options) { o.RegistryHeartbeat = -time.Second }, field: "RegistryHeartbeat", code: host.OptionErrorCodeNotPositive},
+		{name: "claim ttl negative", spoil: func(o *host.Options) { o.ClaimTTL = -time.Second }, field: "ClaimTTL", code: host.OptionErrorCodeNotPositive},
 		{name: "claim ttl zero", spoil: func(o *host.Options) { o.ClaimTTL = 0 }, field: "ClaimTTL", code: host.OptionErrorCodeNotPositive},
 		{name: "apply deadline zero", spoil: func(o *host.Options) { o.ApplyDeadline = 0 }, field: "ApplyDeadline", code: host.OptionErrorCodeNotPositive},
 		{name: "queue size zero", spoil: func(o *host.Options) { o.CommandQueueSize = 0 }, field: "CommandQueueSize", code: host.OptionErrorCodeNotPositive},

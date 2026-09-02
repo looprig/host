@@ -368,9 +368,21 @@ func (o Options) validateTiming() error {
 	// MaxInt64/MinHeartbeatsBeforeExpiry wraps negative, `expiry < negative` is
 	// false, and the configuration is ACCEPTED — a constructor whose whole job
 	// is refusing incoherent configurations, failing open on the one input
-	// class it cannot represent. Division cannot overflow, and truncation is
-	// harmless here because both sides are already known positive: expiry/N < hb
-	// is exactly expiry < N*hb for positive integers.
+	// class it cannot represent.
+	//
+	// PRECONDITION: the DIVIDEND must be non-negative. Only the dividend; the
+	// divisor's sign is irrelevant. `e/N < h` and `e < h*N` agree for every
+	// input except a negative dividend — at e=-5, h=-1, N=3 the product says
+	// refuse and the division says accept — and in every divergent case the
+	// division is the MORE PERMISSIVE form. Zero is safe.
+	//
+	// validateShape guarantees it by refusing non-positive durations, and it
+	// runs first. THE HAZARD IS NOT A REORDER: swapping the phases changes
+	// which error a caller gets, never whether they get one, because
+	// validateShape still runs and still refuses. The hazard is a NEW CALLER —
+	// this is an unexported method, and any future O2.x code in this package
+	// can call it directly, where nothing has established the precondition.
+	// Call validate, or establish it yourself.
 	if o.RegistryExpiry/MinHeartbeatsBeforeExpiry < o.RegistryHeartbeat {
 		return &InvalidOptionsError{
 			Code:  OptionErrorCodeHeartbeatMargin,
