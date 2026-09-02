@@ -38,8 +38,15 @@ type WorkspaceProvider interface {
 	EnsureWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) (string, error)
 }
 
-// Clock is the time source. It is an option rather than a call to time.Now so
-// the timing rules below can be tested without sleeping.
+// Clock is the time source.
+//
+// It is FORWARD-DECLARED for O2.x's residency, heartbeat and drain timers,
+// which is why NewTimer exists with no caller yet. An earlier version of this
+// comment justified it as making "the timing rules below" testable without
+// sleeping; those rules are pure arithmetic over the Options and never consult
+// a clock, so the justification described a task that had not landed. Requiring
+// it now is deliberate — a Host that reaches residency without a Clock would
+// have to be reconstructed — but it is a forward dependency and says so.
 type Clock interface {
 	Now() time.Time
 	NewTimer(time.Duration) *time.Timer
@@ -325,13 +332,18 @@ func (o Options) validateShape() error {
 			return &InvalidOptionsError{Code: OptionErrorCodeNotPositive, Field: duration.field, Reason: "must be a positive duration"}
 		}
 	}
+	// Each bound carries ITS OWN rationale. Sharing the loop is fine; sharing
+	// the sentence was not, and it was user-visible: ReconcileBatch reported
+	// the queue's backpressure argument, which is not why a reconciliation
+	// sweep is bounded.
 	for _, size := range []struct {
-		field string
-		value int
-		bound int
+		field  string
+		value  int
+		bound  int
+		reason string
 	}{
-		{"CommandQueueSize", o.CommandQueueSize, MaxCommandQueueSize},
-		{"ReconcileBatch", o.ReconcileBatch, MaxReconcileBatch},
+		{"CommandQueueSize", o.CommandQueueSize, MaxCommandQueueSize, "an unbounded queue turns backpressure into memory growth, so a slow consumer becomes an OOM rather than a refusal"},
+		{"ReconcileBatch", o.ReconcileBatch, MaxReconcileBatch, "a Host that has drifted far must not try to converge in one unbounded sweep, which would starve everything else it owes"},
 	} {
 		if size.value <= 0 {
 			return &InvalidOptionsError{Code: OptionErrorCodeNotPositive, Field: size.field, Reason: "must be positive"}
@@ -340,7 +352,7 @@ func (o Options) validateShape() error {
 			return &InvalidOptionsError{
 				Code:   OptionErrorCodeAboveBound,
 				Field:  size.field,
-				Reason: "must be at most " + strconv.Itoa(size.bound) + "; an unbounded one turns backpressure into memory growth",
+				Reason: "must be at most " + strconv.Itoa(size.bound) + "; " + size.reason,
 			}
 		}
 	}
@@ -352,7 +364,14 @@ func (o Options) validateShape() error {
 // and MinClaimAttemptsBeforeDeadline for why `<` is the bug rather than the
 // rule.
 func (o Options) validateTiming() error {
-	if o.RegistryExpiry < o.RegistryHeartbeat*MinHeartbeatsBeforeExpiry {
+	// DIVIDE, do not multiply. The product overflows: a heartbeat above
+	// MaxInt64/MinHeartbeatsBeforeExpiry wraps negative, `expiry < negative` is
+	// false, and the configuration is ACCEPTED — a constructor whose whole job
+	// is refusing incoherent configurations, failing open on the one input
+	// class it cannot represent. Division cannot overflow, and truncation is
+	// harmless here because both sides are already known positive: expiry/N < hb
+	// is exactly expiry < N*hb for positive integers.
+	if o.RegistryExpiry/MinHeartbeatsBeforeExpiry < o.RegistryHeartbeat {
 		return &InvalidOptionsError{
 			Code:  OptionErrorCodeHeartbeatMargin,
 			Field: "RegistryExpiry",
@@ -361,7 +380,7 @@ func (o Options) validateTiming() error {
 				"), so a missed heartbeat and its retry both fit before Factory stops seeing this Host",
 		}
 	}
-	if o.ApplyDeadline < o.ClaimTTL*MinClaimAttemptsBeforeDeadline {
+	if o.ApplyDeadline/MinClaimAttemptsBeforeDeadline < o.ClaimTTL {
 		return &InvalidOptionsError{
 			Code:  OptionErrorCodeClaimMargin,
 			Field: "ApplyDeadline",

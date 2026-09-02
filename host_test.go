@@ -3,6 +3,7 @@ package host_test
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -18,24 +19,30 @@ import (
 // Collaborator stubs
 // ---------------------------------------------------------------------------
 
-type stubSessionStore struct{}
+// Each stub carries an id, so two instances of the SAME type are distinguishable
+// by comparison. Four distinct zero-size types would already be comparable, but
+// an identity assertion that only works because the types differ is one
+// refactor away from being vacuous — and the whole point of these assertions is
+// that they survive a refactor of New.
+
+type stubSessionStore struct{ id string }
 
 func (stubSessionStore) LoadSession(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]byte, error) {
 	return nil, nil
 }
 
-type stubWorkspaces struct{}
+type stubWorkspaces struct{ id string }
 
 func (stubWorkspaces) EnsureWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) (string, error) {
 	return "", nil
 }
 
-type stubClock struct{}
+type stubClock struct{ id string }
 
 func (stubClock) Now() time.Time                       { return time.Unix(0, 0) }
 func (stubClock) NewTimer(d time.Duration) *time.Timer { return time.NewTimer(d) }
 
-type stubAuth struct{}
+type stubAuth struct{ id string }
 
 func (stubAuth) VerifyTenant(context.Context, sessionwire.TenantID, string) error { return nil }
 
@@ -85,10 +92,10 @@ func pooledOptions(t *testing.T) host.Options {
 		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        testDepartment(t),
-		SessionStore:      stubSessionStore{},
-		Workspaces:        stubWorkspaces{},
-		Clock:             stubClock{},
-		Auth:              stubAuth{},
+		SessionStore:      stubSessionStore{id: "store-a"},
+		Workspaces:        stubWorkspaces{id: "workspaces-a"},
+		Clock:             stubClock{id: "clock-a"},
+		Auth:              stubAuth{id: "auth-a"},
 		Placement:         sessionwire.HostPlacementPooled,
 		Capacity:          8,
 		WarmTTL:           97 * time.Second,
@@ -136,6 +143,174 @@ func TestNewAcceptsAValidConfiguration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEveryEnumMemberIsAccepted is the one-sided-comparison shape in ENUM form.
+//
+// The fixture only ever used TenantExclusive, so deleting
+// HostIsolationClassCrossTenantIsolated from the accept case — refusing every
+// cross-tenant-isolated Host outright — left the suite green, while deleting
+// TenantExclusive failed loudly across the file. Placement had accepted rows
+// for both members; IsolationClass had one for neither.
+//
+// It is also the mirror of the bug the rule exists to prevent. Refusing the
+// zero value turns Core's requirement into a construction-time failure instead
+// of a first-advertisement one; REFUSING A VALUE CORE ACCEPTS is the same
+// failure pointing the other way, and a maintainer transcribing Core's list
+// would ship it green.
+func TestEveryEnumMemberIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	isolation := []sessionwire.HostIsolationClass{
+		sessionwire.HostIsolationClassCrossTenantIsolated,
+		sessionwire.HostIsolationClassTenantExclusive,
+	}
+	for _, class := range isolation {
+		t.Run("isolation "+string(class), func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t)
+			options.IsolationClass = class
+			built, err := host.New(options)
+			if err != nil {
+				t.Fatalf("New with isolation class %q = %v, want acceptance: Core accepts it, so refusing it here is a Host that cannot be built for a configuration the wire permits", class, err)
+			}
+			if got := built.IsolationClass(); got != class {
+				t.Errorf("IsolationClass() = %q, want %q", got, class)
+			}
+		})
+	}
+
+	placements := []sessionwire.HostPlacement{
+		sessionwire.HostPlacementPooled,
+		sessionwire.HostPlacementDedicated,
+	}
+	for _, placement := range placements {
+		t.Run("placement "+string(placement), func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t)
+			options.Placement = placement
+			if placement == sessionwire.HostPlacementDedicated {
+				options.Capacity = 1
+				options.FixedSessionID = "session-71c"
+			}
+			if _, err := host.New(options); err != nil {
+				t.Fatalf("New with placement %q = %v, want acceptance", placement, err)
+			}
+		})
+	}
+
+	// Floored against the enums growing without this table growing with them.
+	if len(isolation) != 2 || len(placements) != 2 {
+		t.Fatal("an enum gained a member and this table did not; every member Core accepts needs an accepted row here")
+	}
+}
+
+// TestIdentifiersHaveNoUndocumentedMinimumLength is the third instance of the
+// class, and the one my own audit stopped short of.
+//
+// The rule for an identifier is NON-EMPTY. Replacing `o.HostID == ""` with
+// `len(o.HostID) < 4` left the suite green, because the boundary was pinned by
+// nothing except the fixture's own length — "host-7c1" is eight characters, so
+// a floor of nine fails 79 assertions and a floor of four fails none. The
+// reasoning in TestDurationsHaveNoUndocumentedMinimum applies verbatim: any
+// floor above non-empty is a new rule owing its own constant and its own
+// boundary rows, and Core's own identity rule bounds only the upper end.
+func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
+	t.Parallel()
+
+	t.Run("single-character pooled identifiers", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t)
+		options.HostID = "h"
+		options.TenantID = "t"
+		built, err := host.New(options)
+		if err != nil {
+			t.Fatalf("New with single-character identifiers = %v, want acceptance: the rule is non-empty", err)
+		}
+		if built.ID() != "h" || built.TenantID() != "t" {
+			t.Errorf("resolved (%q, %q), want (h, t)", built.ID(), built.TenantID())
+		}
+	})
+
+	t.Run("single-character dedicated binding", func(t *testing.T) {
+		t.Parallel()
+		options := dedicatedOptions(t)
+		options.HostID = "h"
+		options.TenantID = "t"
+		options.FixedSessionID = "s"
+		built, err := host.New(options)
+		if err != nil {
+			t.Fatalf("New with a single-character FixedSessionID = %v, want acceptance", err)
+		}
+		if built.FixedSessionID() != "s" {
+			t.Errorf("FixedSessionID() = %q, want s", built.FixedSessionID())
+		}
+	})
+
+	// The other side stays closed at that scale, so these rows do not soften
+	// the emptiness rule they are bounding.
+	for name, spoil := range map[string]func(*host.Options){
+		"HostID":   func(o *host.Options) { o.HostID = "" },
+		"TenantID": func(o *host.Options) { o.TenantID = "" },
+	} {
+		options := pooledOptions(t)
+		options.HostID, options.TenantID = "h", "t"
+		spoil(&options)
+		if _, err := host.New(options); err == nil {
+			t.Errorf("an empty %s was accepted", name)
+		}
+	}
+}
+
+// TestTimingMarginsDoNotOverflow holds that the two relationships fail CLOSED on
+// a duration large enough to overflow their product.
+//
+// Computed as a product, both failed OPEN: a ClaimTTL above MaxInt64/2 wraps
+// negative, `deadline < negative` is false, and a one-second deadline under a
+// 146-year claim was ACCEPTED. Nobody configures that, but this constructor's
+// entire job is refusing incoherent configurations and it refused in the wrong
+// direction on the one input class it could not represent.
+func TestTimingMarginsDoNotOverflow(t *testing.T) {
+	t.Parallel()
+
+	t.Run("claim", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t)
+		options.ClaimTTL = time.Duration(math.MaxInt64/host.MinClaimAttemptsBeforeDeadline) + 1
+		options.ApplyDeadline = time.Second
+		var invalid *host.InvalidOptionsError
+		if _, err := host.New(options); !errors.As(err, &invalid) {
+			t.Fatalf("New with an overflowing ClaimTTL = %v, want *InvalidOptionsError", err)
+		} else if invalid.Code != host.OptionErrorCodeClaimMargin {
+			t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeClaimMargin)
+		}
+	})
+
+	t.Run("heartbeat", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t)
+		options.RegistryHeartbeat = time.Duration(math.MaxInt64/host.MinHeartbeatsBeforeExpiry) + 1
+		options.RegistryExpiry = time.Second
+		var invalid *host.InvalidOptionsError
+		if _, err := host.New(options); !errors.As(err, &invalid) {
+			t.Fatalf("New with an overflowing RegistryHeartbeat = %v, want *InvalidOptionsError", err)
+		} else if invalid.Code != host.OptionErrorCodeHeartbeatMargin {
+			t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeHeartbeatMargin)
+		}
+	})
+
+	// The control: a large duration on the OTHER side, where no overflow
+	// occurs, is still accepted. Otherwise the two rows above would be
+	// satisfied by a constructor that refuses anything large.
+	t.Run("control: a large expiry is fine", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t)
+		options.RegistryHeartbeat = time.Hour
+		options.RegistryExpiry = 24 * time.Hour
+		if _, err := host.New(options); err != nil {
+			t.Fatalf("New with an hourly heartbeat under a daily expiry = %v, want acceptance", err)
+		}
+	})
 }
 
 // TestResolvedConfigurationReportsWhatItWasGiven is the accessor half.
@@ -209,8 +384,60 @@ func TestResolvedConfigurationReportsWhatItWasGiven(t *testing.T) {
 	if built.Department() != options.Department {
 		t.Error("Department() did not return the registry it was given")
 	}
-	if built.SessionStore() == nil || built.Workspaces() == nil || built.Clock() == nil || built.Auth() == nil {
-		t.Error("a collaborator accessor returned nil")
+
+	// IDENTITY, not nilness. The previous assertion here checked only that the
+	// four collaborators were non-nil, and substituting always-permissive
+	// replacements for SessionStore and Auth inside New left the whole suite
+	// green — while the identical substitution for Department died immediately,
+	// because Department had an identity assertion and these four did not.
+	//
+	// The Auth case is the one that matters: a Host answering VerifyTenant with
+	// something other than the verifier its caller supplied is a tenant
+	// isolation bypass, and nothing in this module would have noticed. A
+	// refactor of New that wraps, decorates or defaults a field is exactly how
+	// that arrives, and it arrives looking like tidying.
+	//
+	// This is also the general rule, and it runs opposite to the intuition that
+	// a validated field needs the stronger test: ClaimTTL() returning the wrong
+	// field dies in the margin test, because a value that feeds a comparison
+	// gets a second witness for free. A field with NO validation rule has no
+	// such witness, so its accessor is the only one there is.
+	for _, collaborator := range []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"SessionStore", built.SessionStore(), options.SessionStore},
+		{"Workspaces", built.Workspaces(), options.Workspaces},
+		{"Clock", built.Clock(), options.Clock},
+		{"Auth", built.Auth(), options.Auth},
+	} {
+		if collaborator.got == nil {
+			t.Errorf("%s() returned nil", collaborator.name)
+			continue
+		}
+		if collaborator.got != collaborator.want {
+			t.Errorf("%s() = %#v, want the instance it was constructed with, %#v", collaborator.name, collaborator.got, collaborator.want)
+		}
+	}
+}
+
+// TestCollaboratorsAreNotSubstitutedForOneAnother proves the identity assertions
+// above distinguish two instances of the SAME type, not merely two types.
+func TestCollaboratorsAreNotSubstitutedForOneAnother(t *testing.T) {
+	t.Parallel()
+
+	options := pooledOptions(t)
+	options.Auth = stubAuth{id: "auth-supplied"}
+	built, err := host.New(options)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if built.Auth() == (stubAuth{id: "auth-other"}) {
+		t.Fatal("two stubAuth values with different ids compare equal, so the identity assertions above cannot see a substitution within a type")
+	}
+	if built.Auth() != (stubAuth{id: "auth-supplied"}) {
+		t.Errorf("Auth() = %#v, want the supplied verifier", built.Auth())
 	}
 }
 
@@ -626,6 +853,44 @@ func TestDurationsHaveNoUndocumentedMinimum(t *testing.T) {
 	options.WarmTTL = 0
 	if _, err := host.New(options); err == nil {
 		t.Error("a zero WarmTTL was accepted")
+	}
+}
+
+// TestEachBoundExplainsItself holds that the two size bounds report their OWN
+// rationale.
+//
+// They share a validation loop, and for a while they shared its sentence too:
+// ReconcileBatch told the reader that "an unbounded one turns backpressure into
+// memory growth", which is the queue's argument and not the batch's. That is
+// user-visible text, and reverting it survived every other assertion in this
+// file — a stated expectation nothing checked, which is the shape this
+// repository treats as a defect in its own right.
+func TestEachBoundExplainsItself(t *testing.T) {
+	t.Parallel()
+
+	reasons := map[string]string{}
+	for field, spoil := range map[string]func(*host.Options){
+		"CommandQueueSize": func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 },
+		"ReconcileBatch":   func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch + 1 },
+	} {
+		options := pooledOptions(t)
+		spoil(&options)
+		_, err := host.New(options)
+		var invalid *host.InvalidOptionsError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("%s: New error = %v, want *InvalidOptionsError", field, err)
+		}
+		reasons[field] = invalid.Reason
+	}
+
+	if reasons["CommandQueueSize"] == reasons["ReconcileBatch"] {
+		t.Errorf("both bounds report the same reason %q; they bound different things for different reasons and a shared loop must not become a shared explanation", reasons["CommandQueueSize"])
+	}
+	if !strings.Contains(reasons["CommandQueueSize"], "backpressure") {
+		t.Errorf("the queue's reason %q does not give the queue's argument", reasons["CommandQueueSize"])
+	}
+	if !strings.Contains(reasons["ReconcileBatch"], "converge") {
+		t.Errorf("the batch's reason %q does not give the batch's argument", reasons["ReconcileBatch"])
 	}
 }
 

@@ -135,7 +135,8 @@ func (h *Host) ReconcileBatch() int { return h.reconcileBatch }
 // SessionStore returns the durable session state collaborator.
 func (h *Host) SessionStore() SessionStore { return h.sessionStore }
 
-// Workspaces returns the workspace and checkpoint collaborator.
+// Workspaces returns the workspace collaborator. It does not checkpoint; see
+// WorkspaceProvider.
 func (h *Host) Workspaces() WorkspaceProvider { return h.workspaces }
 
 // Clock returns the time source.
