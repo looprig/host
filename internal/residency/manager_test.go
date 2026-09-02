@@ -2292,3 +2292,46 @@ func TestNewManagerRefusesAnIncompleteConfiguration(t *testing.T) {
 		})
 	}
 }
+
+// TestTheSessionRecordHoldsWhatO32WillNeed is a WHITE-BOX assertion, and it is
+// here because the alternative is worse.
+//
+// sessionRecord's generation and ownership handle are written by an attach and
+// read by nobody in this task: O3.2's heartbeat and O6.1's release are what
+// consume them. A field nothing reads is a claim nothing checks — the previous
+// task lost four guards to exactly that shape — so rather than leave them
+// unprobed, or discard the handle and leave O3.2 with no way to stop what this
+// package started, the record is asserted directly.
+func TestTheSessionRecordHoldsWhatO32WillNeed(t *testing.T) {
+	f := newFixture(t)
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	f.manager.mu.Lock()
+	record, held := f.manager.sessions[f.key()]
+	f.manager.mu.Unlock()
+	if !held {
+		t.Fatal("no session record was kept for an attached residency")
+	}
+	if record.generation != residency.Generation {
+		t.Errorf("the record holds generation %d and the residency reports %d; a late caller must not be able to act on a residency that has been replaced", record.generation, residency.Generation)
+	}
+	if record.ownership == nil {
+		t.Fatal("the record holds no ownership handle, so nothing this attach started could ever be stopped")
+	}
+	started := f.ownership.startedRequests()
+	if len(started) != 1 {
+		t.Fatalf("%d ownerships were started, want 1", len(started))
+	}
+	if started[0].Generation != residency.Generation {
+		t.Errorf("ownership was begun for generation %d, want %d", started[0].Generation, residency.Generation)
+	}
+	if started[0].LeaseEpoch != residency.LeaseEpoch || started[0].Runtime != residency.Runtime {
+		t.Errorf("ownership was begun for epoch %d and a %T, want epoch %d and the residency's runtime", started[0].LeaseEpoch, started[0].Runtime, residency.LeaseEpoch)
+	}
+	if record.cancel == nil {
+		t.Error("the record holds no cancel, so the session lifetime has no owner")
+	}
+}
