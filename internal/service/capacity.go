@@ -15,8 +15,16 @@
 // holds the DATA: the rows Publish returns are in bijection with
 // Department.AgentIDs, in all three of initial publish, post-admission and
 // drain. TestPublishIsTheOnlyPublishingSurface holds the API: this package's
-// production files are enumerated, their exported functions are enumerated, and
-// exactly one of them yields an Advertisement. Both are stated as "enumerate
+// production files are enumerated, every exported top-level DECLARATION in them
+// is enumerated — function, method, type, const and var alike — and exactly one
+// of them yields an Advertisement.
+//
+// "Declaration" and not "function", because that sentence has already been
+// wider than its probe once: while the guard walked only *ast.FuncDecl, a
+// second publishing surface declared as a func-typed package VAR passed it, and
+// an embedded struct added published fields that the field whitelist could not
+// see because an embedded field carries no name. Both are closed and both are
+// re-probed; the wording is now the thing the guard actually does. Both are stated as "enumerate
 // what may appear and report everything else", because the alternative shape —
 // searching for a second catalogue — cannot establish an absence.
 //
@@ -42,6 +50,7 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -89,9 +98,24 @@ type Advertisement struct {
 	// zero on a tombstone.
 	Rank int64
 
-	// Ranked is false once graceful drain has begun, which is what un-ranking
-	// means: the record remains gettable and no longer appears in a ranked
-	// page.
+	// Ranked reports whether this record appears in a ranked page at all. It is
+	// false for a drained Host AND for a target this Host cannot place, and the
+	// second half is a DECISION beyond what §15 spells out — the spec names
+	// drain as un-ranking and does not say drain is the only thing that may.
+	//
+	// The distinction it rests on is between a row that is not a candidate NOW
+	// and one that can never be a candidate HERE. A full but accepting Host has
+	// zero available capacity and stays ranked, because the next heartbeat may
+	// find room; a target whose declared placement this Host does not offer is
+	// unplaceable for the life of the process, so ranking it only puts a row in
+	// the page Factory must then discard. Tombstone, not Ranked, is what
+	// distinguishes drain from either.
+	//
+	// It therefore coincides with Report.Accepting in every state this package
+	// can derive. They are separate fields because they are read by different
+	// parties — Accepting is record CONTENT a reader filters on, Ranked is an
+	// INDEX operation the writer performs — and the coincidence is asserted by
+	// test rather than assumed, in all three states.
 	Ranked bool
 
 	// DueAt is when a bounded due reconciler must look at this record. It is
@@ -145,6 +169,16 @@ type admission struct {
 // It holds the ONLY mutable state in this package: the admission ledger and the
 // drain flag. Everything else is read from the validated Host, so a
 // configuration value cannot drift from the one host.New accepted.
+//
+// FOR O6.1 AND O6.3, WHICH ARRIVE LATER AND ELSEWHERE. 04-host.md puts weighted
+// memory/admission limits in internal/residency and internal/lifecycle, and
+// drain in internal/lifecycle/drain.go. Those must CONSUME this ledger and this
+// flag, not keep their own. Two sources of "consumed" is an over-admission bug
+// that neither package's tests could see — each would be internally consistent
+// and the Host would admit past its capacity — and two sources of "draining" is
+// a Host that stops accepting in one place while still advertising Accepting
+// from the other. Whatever the final ownership, there must be exactly one of
+// each, and this is the one that already exists.
 type CapacityPublisher struct {
 	host       *host.Host
 	generation uint64
@@ -250,8 +284,8 @@ func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
 			Namespace:    AdvertisementNamespace,
 			RankingScope: rankingScope(agent, target.CompatibilityID(), p.host.Placement()),
 			StableKey:    stableKey(agent, target.CompatibilityID(), p.host.Placement(), p.host.ID()),
-			Rank:         int64(available),
-			Ranked:       !p.draining,
+			Rank:         rankOf(available),
+			Ranked:       accepting,
 			DueAt:        expires,
 			Tombstone:    p.draining,
 			Report:       report,
@@ -355,6 +389,28 @@ func (p *CapacityPublisher) ConsumedWeight() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.consumed
+}
+
+// rankOf converts available capacity to a rank, SATURATING rather than wrapping.
+//
+// §15 ranks by available capacity and the rank is a signed 64-bit value, while
+// capacity is unsigned and host.New puts no ceiling on it — so a bare
+// conversion wraps. Measured at Capacity = MaxUint64 before this existed: rank
+// -1, which under descending-rank paging puts the emptiest Host in the workspace
+// LAST. Core accepts the report either way, because AvailableCapacity is uint64
+// and it is only the ORDERING that breaks, so nothing downstream would have
+// reported it.
+//
+// The configuration is absurd and the failure is silent, which is the pair that
+// makes it worth a line. Saturating is right rather than merely safe: every
+// capacity at or above MaxInt64 is more room than any deployment can use, so
+// collapsing them all to "most room there is" loses no ordering anyone needs,
+// while wrapping inverts it.
+func rankOf(available uint64) int64 {
+	if available > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(available)
 }
 
 // placementSupported reports whether a target may run under this Host's

@@ -7,7 +7,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"math"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -331,7 +334,14 @@ func TestEveryPublishedFieldSurvivesDerivation(t *testing.T) {
 		{"Report.AvailableCapacity", got.Report.AvailableCapacity, uint64(4)},
 		{"Report.ObservedAt", got.Report.ObservedAt, observed},
 		{"Report.ExpiresAt", got.Report.ExpiresAt, observed.Add(options.RegistryExpiry)},
-		{"Namespace", got.Namespace, service.AdvertisementNamespace},
+		// The LITERAL, not the constant. Comparing the field to the constant is
+		// self-referential — a probe set the namespace to "x" and every
+		// assertion including the storage-name grammar check still passed — so
+		// the value itself is pinned here. It is two segments and host-scoped
+		// so that a Host's target directory cannot collide with another
+		// producer's records in the same backend.
+		{"Namespace", got.Namespace, "host/target-directory"},
+		{"AdvertisementNamespace", service.AdvertisementNamespace, "host/target-directory"},
 		{"Rank", got.Rank, int64(4)},
 		{"Ranked", got.Ranked, true},
 		{"DueAt", got.DueAt, observed.Add(options.RegistryExpiry)},
@@ -344,8 +354,15 @@ func TestEveryPublishedFieldSurvivesDerivation(t *testing.T) {
 	if got.StableKey == "" {
 		t.Error("StableKey is empty, so the record has no identity to CAS against")
 	}
-	if got.RankingScope == "" {
-		t.Error("RankingScope is empty, so the record cannot be ranked within its LaunchTarget scope")
+	// The PREFIX literal, for the reason the namespace literal is pinned: a
+	// probe set AdvertisementNamespace to "x" and every assertion passed,
+	// because they all compared the field to the constant. This is the same
+	// shape one field over, so it gets the same treatment.
+	if !strings.HasPrefix(got.RankingScope, "launchtarget/") {
+		t.Errorf("RankingScope = %q, want the two-segment form launchtarget/<digest> so a Host's ranking scopes cannot collide with another producer's in the same backend", got.RankingScope)
+	}
+	if got.RankingScope == "launchtarget/" {
+		t.Error("RankingScope is the bare prefix, so every LaunchTarget would rank in one scope")
 	}
 	if err := got.Report.Validate(); err != nil {
 		t.Errorf("published report is not a valid sessionwire record: %v", err)
@@ -670,6 +687,80 @@ func TestCrashedHostAdvertisementLapsesWithoutAFurtherPublish(t *testing.T) {
 	}
 	if !refreshed.Ranked || refreshed.Tombstone {
 		t.Error("a crash-lapsed record must not be confused with a drained one: recovery republishes a ranked, non-tombstoned record")
+	}
+}
+
+// TestRankSaturatesRatherThanWrapping holds the conversion at the top of its
+// range, where a bare int64(available) inverts the ordering it exists to
+// provide.
+//
+// Rank is signed and capacity is unsigned, and host.New puts no ceiling on
+// Capacity, so this is reachable configuration rather than a hypothetical.
+// Measured before the clamp existed: Capacity MaxUint64 gave Rank -1, which
+// under descending-rank paging puts the emptiest Host LAST. Core validates the
+// report either way, because AvailableCapacity is uint64 and only the ORDERING
+// breaks — nothing downstream would have reported it.
+//
+// Three scales with the boundary as a row in both directions: below it the
+// value passes through, at it the value passes through, above it the value
+// saturates. One scale would only test that some large number came back.
+func TestRankSaturatesRatherThanWrapping(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name     string
+		capacity uint64
+		wantRank int64
+	}{
+		{"ordinary", 8, 8},
+		{"one below the signed ceiling", math.MaxInt64 - 1, math.MaxInt64 - 1},
+		{"exactly the signed ceiling", math.MaxInt64, math.MaxInt64},
+		{"one above the signed ceiling", uint64(math.MaxInt64) + 1, math.MaxInt64},
+		{"the unsigned ceiling", math.MaxUint64, math.MaxInt64},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t, newFakeClock())
+			options.Capacity = row.capacity
+			options.Department = testDepartment(t, registration("reviewer", pooledCapabilities(1)))
+			advertisement := publish(t, newPublisher(t, options))[0]
+
+			if advertisement.Rank != row.wantRank {
+				t.Errorf("Rank = %d at capacity %d, want %d", advertisement.Rank, row.capacity, row.wantRank)
+			}
+			if advertisement.Rank < 0 {
+				t.Errorf("Rank = %d is negative, so descending-rank paging would put the emptiest Host last", advertisement.Rank)
+			}
+			// The report is unaffected: AvailableCapacity is uint64 and Core
+			// accepts the whole range, so the clamp must not narrow what a
+			// reader is told about actual capacity.
+			if advertisement.Report.AvailableCapacity != row.capacity {
+				t.Errorf("AvailableCapacity = %d at capacity %d and weight 1, want %d: the rank clamp must not narrow the observation", advertisement.Report.AvailableCapacity, row.capacity, row.capacity)
+			}
+			if err := advertisement.Report.Validate(); err != nil {
+				t.Errorf("report is not a valid sessionwire record: %v", err)
+			}
+		})
+	}
+
+	// Ordering is what the rank is FOR, so it is asserted directly rather than
+	// inferred from the rows above: a larger Host never ranks below a smaller
+	// one, including across the saturation boundary where two capacities share
+	// a rank.
+	rankAt := func(capacity uint64) int64 {
+		options := pooledOptions(t, newFakeClock())
+		options.Capacity = capacity
+		options.Department = testDepartment(t, registration("reviewer", pooledCapabilities(1)))
+		return publish(t, newPublisher(t, options))[0].Rank
+	}
+	ascending := []uint64{1, 8, math.MaxInt64 - 1, math.MaxInt64, uint64(math.MaxInt64) + 1, math.MaxUint64}
+	for i := 1; i < len(ascending); i++ {
+		if rankAt(ascending[i]) < rankAt(ascending[i-1]) {
+			t.Errorf("capacity %d ranks below capacity %d", ascending[i], ascending[i-1])
+		}
+	}
+	if rankAt(8) >= rankAt(math.MaxInt64) {
+		t.Error("a small Host does not rank below a huge one, so the ordering the rank exists to provide is gone")
 	}
 }
 
@@ -1005,6 +1096,26 @@ func TestATargetThatCannotRunHereIsAdvertisedButNotAccepting(t *testing.T) {
 				if advertisement.Report.Accepting != want {
 					t.Errorf("%q Accepting = %v, want %v under %s placement", agent, advertisement.Report.Accepting, want, row.placement)
 				}
+				// THE THIRD STATE, and the one a probe found undetermined: this
+				// Host is not draining, so a guard that read Ranked as "not
+				// draining" and one that read it as "is a candidate" agree
+				// everywhere else and disagree exactly here. An unplaceable
+				// target is unranked, because it can never become a candidate
+				// on this Host; a FULL one stays ranked, because the next
+				// heartbeat may find room, and TestAvailableCapacityTracks...
+				// holds that side.
+				if advertisement.Ranked != want {
+					t.Errorf("%q Ranked = %v, want %v: an unplaceable target must not occupy a slot in the ranked page Factory then has to discard, and a placeable one must", agent, advertisement.Ranked, want)
+				}
+				if advertisement.Tombstone {
+					t.Errorf("%q is tombstoned on a Host that is not draining, so an unplaceable target is indistinguishable from a drained one", agent)
+				}
+				if !want && advertisement.Report.AvailableCapacity != 0 {
+					t.Errorf("%q advertises %d available capacity though it cannot be placed here", agent, advertisement.Report.AvailableCapacity)
+				}
+				if !want && advertisement.Rank != 0 {
+					t.Errorf("%q has rank %d though it cannot be placed here", agent, advertisement.Rank)
+				}
 				if advertisement.Report.IsolationClass != row.isolation {
 					t.Errorf("%q IsolationClass = %q, want %q", agent, advertisement.Report.IsolationClass, row.isolation)
 				}
@@ -1213,26 +1324,48 @@ func TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents(t *testing.T) {
 }
 
 // TestPublishIsTheOnlyPublishingSurface is the API-level half of the same
-// whitelist: capacity.go's exported functions and methods are enumerated, and
-// exactly one of them yields a record.
+// whitelist: this package's production FILES are enumerated, every exported
+// top-level DECLARATION in them is enumerated — function, method, type, const
+// and var — and exactly one of them yields a record.
 //
 // It is written as "enumerate what may exist and report everything else" rather
 // than as "prove no second catalogue exists", because the second is unprovable
-// from inside a test. A new exported function added to this file fails here
-// until it is listed, and a new one that returns an Advertisement fails the
-// publishing-surface assertion whether or not it is listed.
+// from inside a test. A new exported declaration fails here until it is listed,
+// and one that yields an Advertisement fails the publishing-surface assertion
+// whether or not it is listed.
+//
+// EVERY WIDENING HERE WAS FORCED BY A PROBE, and the two it took are worth
+// naming because they are the same mistake at two levels. Scoped to one file
+// name, a second publishing surface in a NEW FILE of this package escaped.
+// Scoped to *ast.FuncDecl, a second publishing surface declared as a func-typed
+// VAR escaped. Neither was hypothetical; both were measured, and both now fail.
+// The lesson each time was that the guard named a proxy for its subject rather
+// than the subject.
 //
 // WHAT IT DOES NOT COVER: other PACKAGES, and anything a caller does to the
-// slice after Publish returns. It does cover every production file of this
-// package, but only because a probe showed it did not: a second exported
-// publishing surface in a new file survived until the file set itself became
-// part of the enumeration.
+// slice after Publish returns. Its two instruments are separately controlled by
+// TestTheStructuralGuardsSeeWhatTheyClaimTo, because arms of both are not
+// exercised by this package's real declarations.
 func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 	t.Parallel()
 
-	// The enumerated set. A function here is permitted to exist; only Publish
-	// is permitted to yield a record.
+	// The enumerated set. A DECLARATION here is permitted to exist; only Publish
+	// is permitted to yield a record. Types and constants are listed alongside
+	// functions because a probe showed why: while this walked only *ast.FuncDecl
+	// a second publishing surface declared as a func-typed package var — `var
+	// StaticCatalogue = func(*CapacityPublisher) []Advertisement { ... }`
+	// returning a row for an invented agent — was neither enumerated nor tested,
+	// and the package stayed green. The guard is over declarations now, so the
+	// declaration KIND cannot be the escape hatch.
 	permitted := map[string]bool{
+		"Advertisement":                      true,
+		"AdvertisementNamespace":             true,
+		"CapacityOptions":                    true,
+		"CapacityPublisher":                  true,
+		"AdmissionRefusedError":              true,
+		"AdmissionConflictError":             true,
+		"AdvertisementError":                 true,
+		"InvalidCapacityOptionsError":        true,
 		"NewCapacityPublisher":               true,
 		"Advertisement.Expired":              true,
 		"CapacityPublisher.Publish":          true,
@@ -1268,20 +1401,14 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 			t.Fatalf("parsing %s: %v", name, err)
 		}
 		for _, declaration := range parsed.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction || !function.Name.IsExported() {
-				continue
-			}
-			exported := function.Name.Name
-			if function.Recv != nil && len(function.Recv.List) == 1 {
-				exported = receiverTypeName(function.Recv.List[0].Type) + "." + exported
-			}
-			found = append(found, exported)
-			if !permitted[exported] {
-				t.Errorf("%s exports %s, which is not in the enumerated set: Host publishes one advertisement per LaunchTarget and nothing else", name, exported)
-			}
-			if yieldsAdvertisement(function.Type.Results) {
-				publishing = append(publishing, exported)
+			for _, exported := range exportedDeclarations(declaration) {
+				found = append(found, exported.name)
+				if !permitted[exported.name] {
+					t.Errorf("%s exports %s, which is not in the enumerated set: Host publishes one advertisement per LaunchTarget and nothing else", name, exported.name)
+				}
+				if exported.publishes {
+					publishing = append(publishing, exported.name)
+				}
 			}
 		}
 	}
@@ -1326,6 +1453,59 @@ func packageFiles(t *testing.T, includeTests bool) []string {
 	return names
 }
 
+// exportedDeclaration is one exported top-level declaration and whether it
+// yields an Advertisement.
+type exportedDeclaration struct {
+	name      string
+	publishes bool
+}
+
+// exportedDeclarations returns every exported top-level declaration a
+// declaration node introduces.
+//
+// It covers FUNCTIONS, METHODS, TYPES, CONSTANTS and VARIABLES, because the
+// declaration kind was itself an escape: a func-typed exported var is a
+// publishing surface that no walk over *ast.FuncDecl can see. A value
+// declaration publishes if its type or its value mentions Advertisement, which
+// reaches the results of a function literal assigned to it. A TYPE declaration
+// never counts as publishing — the Advertisement struct is not a surface — so
+// the check is deliberately not applied to it.
+func exportedDeclarations(declaration ast.Decl) []exportedDeclaration {
+	switch typed := declaration.(type) {
+	case *ast.FuncDecl:
+		if !typed.Name.IsExported() {
+			return nil
+		}
+		name := typed.Name.Name
+		if typed.Recv != nil && len(typed.Recv.List) == 1 {
+			name = receiverTypeName(typed.Recv.List[0].Type) + "." + name
+		}
+		return []exportedDeclaration{{name: name, publishes: mentionsAdvertisement(typed.Type.Results)}}
+	case *ast.GenDecl:
+		var exported []exportedDeclaration
+		for _, specification := range typed.Specs {
+			switch spec := specification.(type) {
+			case *ast.TypeSpec:
+				if spec.Name.IsExported() {
+					exported = append(exported, exportedDeclaration{name: spec.Name.Name})
+				}
+			case *ast.ValueSpec:
+				publishes := mentionsAdvertisement(spec.Type)
+				for _, value := range spec.Values {
+					publishes = publishes || mentionsAdvertisement(value)
+				}
+				for _, identifier := range spec.Names {
+					if identifier.IsExported() {
+						exported = append(exported, exportedDeclaration{name: identifier.Name, publishes: publishes})
+					}
+				}
+			}
+		}
+		return exported
+	}
+	return nil
+}
+
 // receiverTypeName returns the bare type name of a method receiver.
 func receiverTypeName(expression ast.Expr) string {
 	if star, isPointer := expression.(*ast.StarExpr); isPointer {
@@ -1337,20 +1517,19 @@ func receiverTypeName(expression ast.Expr) string {
 	return "?"
 }
 
-// yieldsAdvertisement reports whether a result list mentions Advertisement.
-func yieldsAdvertisement(results *ast.FieldList) bool {
-	if results == nil {
+// mentionsAdvertisement reports whether a syntax node names Advertisement
+// anywhere inside it, including in the results of a function literal.
+func mentionsAdvertisement(node ast.Node) bool {
+	if node == nil || reflect.ValueOf(node).IsNil() {
 		return false
 	}
 	mentioned := false
-	for _, result := range results.List {
-		ast.Inspect(result.Type, func(node ast.Node) bool {
-			if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && identifier.Name == "Advertisement" {
-				mentioned = true
-			}
-			return true
-		})
-	}
+	ast.Inspect(node, func(inner ast.Node) bool {
+		if identifier, isIdentifier := inner.(*ast.Ident); isIdentifier && identifier.Name == "Advertisement" {
+			mentioned = true
+		}
+		return true
+	})
 	return mentioned
 }
 
@@ -1360,10 +1539,18 @@ func yieldsAdvertisement(results *ast.FieldList) bool {
 func TestAdvertisementCarriesExactlyTheEnumeratedFields(t *testing.T) {
 	t.Parallel()
 
+	// The file set again, rather than a literal name. Today the other guard's
+	// enumeration happens to keep this package to one production file, but a
+	// guard that depends on a neighbouring guard's assertion reverts silently
+	// when that one is relaxed, and the diff would be at the other site.
+	files := packageFiles(t, false)
+	if !slices.Equal(files, []string{"capacity.go"}) {
+		t.Fatalf("this package's production files are %v, want exactly [capacity.go]", files)
+	}
 	fileSet := token.NewFileSet()
-	parsed, err := parser.ParseFile(fileSet, "capacity.go", nil, parser.SkipObjectResolution)
+	parsed, err := parser.ParseFile(fileSet, files[0], nil, parser.SkipObjectResolution)
 	if err != nil {
-		t.Fatalf("parsing capacity.go: %v", err)
+		t.Fatalf("parsing %s: %v", files[0], err)
 	}
 	got := structFieldNames(t, parsed, "Advertisement")
 	want := []string{"DueAt", "Namespace", "Rank", "Ranked", "RankingScope", "Report", "StableKey", "Tombstone"}
@@ -1393,6 +1580,18 @@ func structFieldNames(t *testing.T, file *ast.File, name string) []string {
 			}
 			found = true
 			for _, field := range structType.Fields.List {
+				// An EMBEDDED field carries no name, so collecting only
+				// field.Names skips it — and its own fields are published
+				// through the outer struct all the same. A probe embedded a
+				// struct holding a SubagentCatalogue and this guard stayed
+				// green, which is the field-whitelist bypass step 3 exists to
+				// prevent, landing on a literal subagent catalogue. Embedding
+				// is recorded under a name that cannot match the enumeration,
+				// so it fails rather than disappears.
+				if len(field.Names) == 0 {
+					names = append(names, "embedded "+types.ExprString(field.Type))
+					continue
+				}
 				for _, fieldName := range field.Names {
 					names = append(names, fieldName.Name)
 				}
@@ -1404,6 +1603,75 @@ func structFieldNames(t *testing.T, file *ast.File, name string) []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// TestTheStructuralGuardsSeeWhatTheyClaimTo is a POSITIVE CONTROL for the two
+// helpers the whitelists above are built from.
+//
+// It exists because both helpers have arms that the real subject does not
+// exercise, so removing them changes nothing and the mutation survives:
+// Advertisement embeds nothing, so structFieldNames' embedded arm never runs,
+// and no exported var of this package yields an Advertisement, so
+// exportedDeclarations' value-publishing arm never runs. A guard whose
+// detecting code is only reached by the payload it is meant to detect is a
+// guard nobody has tested — measured, not assumed: a probe deleting the
+// embedded arm passed the whole package.
+//
+// The subject here is a source snippet rather than this package, deliberately.
+// The claim being controlled is "the helper can SEE these shapes", and that is
+// answered by handing it the shapes; adding them to Advertisement itself would
+// mean publishing a field to test a test.
+//
+// WHAT IT DOES NOT COVER: it says nothing about what this package declares. The
+// two whitelists above own that, and this owns only their instruments.
+func TestTheStructuralGuardsSeeWhatTheyClaimTo(t *testing.T) {
+	t.Parallel()
+
+	const source = `package sample
+
+// StaticCatalogue is a publishing surface that is not a FuncDecl.
+var StaticCatalogue = func() []Advertisement { return nil }
+
+// PlainConstant mentions no record.
+const PlainConstant = 3
+
+// Embedding carries a field with no name of its own.
+type Embedding struct {
+	Named string
+	embeddedPart
+}
+`
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "sample.go", source, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parsing the sample: %v", err)
+	}
+
+	var sawCatalogue, sawConstant bool
+	for _, declaration := range parsed.Decls {
+		for _, exported := range exportedDeclarations(declaration) {
+			switch exported.name {
+			case "StaticCatalogue":
+				sawCatalogue = true
+				if !exported.publishes {
+					t.Error("a func-typed exported var yielding []Advertisement was not counted as a publishing surface, so a second catalogue declared as a variable would escape the enumeration")
+				}
+			case "PlainConstant":
+				sawConstant = true
+				if exported.publishes {
+					t.Error("an exported constant mentioning no record was counted as a publishing surface, so the publishing check reports everything and distinguishes nothing")
+				}
+			}
+		}
+	}
+	if !sawCatalogue || !sawConstant {
+		t.Fatalf("exportedDeclarations reported neither the var (%v) nor the const (%v); it reached nothing", sawCatalogue, sawConstant)
+	}
+
+	fields := structFieldNames(t, parsed, "Embedding")
+	if !slices.Equal(fields, []string{"Named", "embedded embeddedPart"}) {
+		t.Errorf("structFieldNames over an embedding struct = %v, want [Named \"embedded embeddedPart\"]: an embedded field carries no name, and its own fields are published through the outer struct all the same", fields)
+	}
 }
 
 // ---------------------------------------------------------------------------
