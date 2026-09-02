@@ -26,9 +26,12 @@
 // Collecting only named fields, an EMBEDDED struct added published fields
 // invisibly. Checking only a function's RESULTS, a second catalogue delivered
 // into a caller-supplied sink PARAMETER escaped, because "results" is a proxy
-// for "reaches a caller". All four are closed and all four are re-probed. Both are stated as "enumerate
-// what may appear and report everything else", because the alternative shape —
-// searching for a second catalogue — cannot establish an absence.
+// for "reaches a caller". All four are closed and all four are re-probed.
+//
+// THE DATA GUARD AND THE API GUARD ARE BOTH WHITELISTS: each enumerates what
+// may appear and reports everything else. The alternative shape — searching for
+// a second catalogue — cannot establish an absence, which is why neither is
+// written that way.
 //
 // WHAT THOSE TWO DO NOT REACH, measured rather than assumed. They are scoped to
 // this package: a second catalogue published from a DIFFERENT package is
@@ -227,6 +230,25 @@ type CapacityPublisher struct {
 // The keys are derived here too, once, because they are pure functions of
 // snapshotted values. That makes "a heartbeat refreshes the record it published"
 // structural rather than something the derivation has to keep getting right.
+//
+// TWO PROPERTIES OF OTHER PACKAGES' TYPES MAKE THIS WORK, and both are held by
+// TestTheSnapshotCopiesEverythingItsSourcesCanHold rather than only asserted
+// here, because neither package owes this one stability.
+//
+// FIRST, THE COPY IS DEEP BECAUSE department.Capabilities IS ALL VALUES — four
+// bools, a uint64 and a string-kind, with no slice, map or pointer. Had it
+// carried one reference field, snapshotting the struct would have snapshotted a
+// header pointing at memory the target still owns, and this whole fix would
+// have been cosmetic. The test fails if department adds such a field.
+//
+// SECOND, THE KEYS MAY BE DERIVED ONCE FROM Placement() AND ID() WHILE THE
+// REPORT READS THEM LIVE EACH HEARTBEAT. That is deliberately a snapshot/live
+// pair for one value, and it is inert only because host.Host is immutable in a
+// way department.LaunchTarget is not: it exposes no field and nothing but
+// accessors over unexported ones, fixed at host.New. A LaunchTarget is an
+// interface a caller implements and may answer differently every call, which is
+// the difference the two treatments turn on. Do not read the pair as licence to
+// re-read a target the same way.
 type launchable struct {
 	agent         sessionwire.AgentID
 	compatibility department.CompatibilityID

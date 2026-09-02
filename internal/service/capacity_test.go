@@ -1348,8 +1348,20 @@ func TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents(t *testing.T) {
 // The lesson each time was that the guard named a proxy for its subject rather
 // than the subject.
 //
-// WHAT IT DOES NOT COVER: other PACKAGES, and anything a caller does to the
-// slice after Publish returns. Its two instruments are separately controlled by
+// WHAT IT DOES NOT COVER: other PACKAGES; anything a caller does to the slice
+// after Publish returns; and a record reached through a LOCALLY RENAMED TYPE.
+//
+// The third is a floor rather than an oversight, and it is measured: a sink
+// parameter typed `*[]record`, where `type record = Advertisement`, passes,
+// while the identical sink typed `*[]Advertisement` fails — the difference is
+// purely the rename. This guard matches identifiers, and every syntactic
+// name-based guard has that floor. Closing it means go/types with a real
+// importer, which is a far heavier instrument for a payload that requires an
+// alias to be introduced on purpose. Unlike the four escapes above, this is not
+// a position the guard never looked at; it is indirection. Documented rather
+// than closed, deliberately.
+//
+// Its two instruments are separately controlled by
 // TestTheStructuralGuardsSeeWhatTheyClaimTo, because arms of both are not
 // exercised by this package's real declarations.
 func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
@@ -1738,10 +1750,17 @@ type Embedding struct {
 		t.Fatalf("parsing the sample: %v", err)
 	}
 
-	// Each row is a SHAPE the enumeration must classify, and the two negative
-	// rows are what stop "publishes" from being a check that reports
-	// everything: a guard that answered true for all four would be useless and
-	// would pass the two positive rows alone.
+	// Each row is a SHAPE the enumeration must classify. The negative rows make
+	// this instrument test SELF-CONTAINED — it decides both answers without
+	// depending on another test to catch a check that reports everything.
+	//
+	// They are not what stops that mutant, and an earlier version of this
+	// comment claimed they were. Measured: an always-true publishing check dies
+	// three times over — on the PlainConstant row here, and twice in
+	// TestPublishIsTheOnlyPublishingSurface, which reports every declaration in
+	// the package as publishing. No mutant kills on PlainFunction alone. The
+	// row stays because relying on redundancy elsewhere is exactly what this
+	// file refuses to do everywhere else.
 	wantPublishing := map[string]bool{
 		"StaticCatalogue": true,  // a record through a func-typed var
 		"SinkCatalogue":   true,  // a record through a caller-supplied PARAMETER
@@ -1823,12 +1842,24 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 		return target, options
 	}
 
-	// TWO weight rows, and the second is not redundant. A zero weight makes the
-	// live read PANIC, so a probe restoring the live read is killed by a crash
-	// rather than by an assertion — which this program does not count. A weight
-	// that merely differs is behaviourally distinguishable and wrong rather
-	// than fatal, so the same probe dies on a comparison. The zero row stays
-	// because it is the fault that was actually reported.
+	// TWO weight rows, and WHICH ONE IS LOAD-BEARING DEPENDS ON THE MUTANT.
+	// Both shapes were measured, because an earlier version of this comment
+	// asserted one of them as though it were the only one.
+	//
+	// A NARROW mutant re-reads only the DIVISOR and leaves `accepting` on the
+	// snapshot. The zero row then reaches the division and PANICS — a crash,
+	// which this program does not count as a kill — and the 2->4 row is the
+	// only assertion kill.
+	//
+	// A WHOLE-BINDING mutant re-reads `capabilities` itself. Now the zero row
+	// never reaches the divisor at all: department.Capabilities{} also zeroes
+	// SupportsPooled and SupportsDedicated, so placementSupported is false,
+	// `accepting` is false, and the division is skipped. It kills by assertion
+	// instead, reporting available capacity 4 -> 0.
+	//
+	// So the 2->4 row is the one that kills BOTH shapes by assertion, and the
+	// zero row is the only one that reaches the divide-by-zero that was
+	// actually reported. Neither is redundant, and neither covers the other.
 	t.Run("a different weight arriving after construction", func(t *testing.T) {
 		t.Parallel()
 		target, options := newDrifting(t)
@@ -1903,12 +1934,46 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 
 	t.Run("already broken at construction", func(t *testing.T) {
 		t.Parallel()
+		// The CAUSE is asserted, not just the refusal, and that is what makes
+		// these two rows different rules rather than one rule twice.
+		//
+		// Measured: deleting the constructor's compatibility re-check entirely
+		// left the whole package green. Every input CompatibilityID.Validate
+		// rejects, the trial Publish rejects too — department documents
+		// MaxCompatibilityIDBytes as DERIVED from the wire bound Core enforces
+		// on the same field — so the row passed through Core's refusal and
+		// would have kept passing with the check gone. It was a row named after
+		// a check it did not reach. Pinning the cause type fixes that, and what
+		// the check then earns its place for is message quality: it names the
+		// AGENT and its target where Core's path names only a wire field.
+		//
+		// The asymmetry is real and worth keeping straight: the CAPABILITIES
+		// re-check is load-bearing on its own, because Core has no opinion on
+		// AdmissionWeight and nothing downstream would reject a zero.
 		for _, row := range []struct {
-			name  string
-			spoil func(*driftingTarget)
+			name      string
+			spoil     func(*driftingTarget)
+			wantCause func(error) bool
+			causeName string
 		}{
-			{"zero admission weight", func(target *driftingTarget) { target.capabilities = department.Capabilities{} }},
-			{"empty compatibility id", func(target *driftingTarget) { target.compatibility = "" }},
+			{
+				name:      "zero admission weight",
+				spoil:     func(target *driftingTarget) { target.capabilities = department.Capabilities{} },
+				causeName: "*department.InvalidCapabilitiesError",
+				wantCause: func(err error) bool {
+					var invalid *department.InvalidCapabilitiesError
+					return errors.As(err, &invalid)
+				},
+			},
+			{
+				name:      "empty compatibility id",
+				spoil:     func(target *driftingTarget) { target.compatibility = "" },
+				causeName: "*department.InvalidCompatibilityIDError",
+				wantCause: func(err error) bool {
+					var invalid *department.InvalidCompatibilityIDError
+					return errors.As(err, &invalid)
+				},
+			},
 		} {
 			t.Run(row.name, func(t *testing.T) {
 				t.Parallel()
@@ -1928,6 +1993,9 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 				if invalid.Field != "Host" {
 					t.Errorf("refusal field = %q, want %q", invalid.Field, "Host")
 				}
+				if !row.wantCause(err) {
+					t.Errorf("refusal does not unwrap to %s: %v — so this row is passing through some LATER refusal and would stay green with the check it is named after deleted", row.causeName, err)
+				}
 			})
 		}
 		// The control one position over: the same target, unbroken, is accepted.
@@ -1939,6 +2007,115 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 			t.Errorf("the healthy target was refused too, so the refusals above prove nothing: %v", err)
 		}
 	})
+}
+
+// TestTheSnapshotCopiesEverythingItsSourcesCanHold holds the two properties of
+// OTHER packages' types that the snapshot silently depends on.
+//
+// It is a test and not a paragraph because neither package owes this one
+// stability, and a comment cannot fail when one of them changes.
+//
+// FIRST: department.Capabilities must hold no reference field. The snapshot
+// copies the struct, so a slice, map or pointer inside it would be copied as a
+// HEADER pointing at memory the LaunchTarget still owns — the target could keep
+// mutating it and the "snapshot" would follow, making the whole fix cosmetic
+// while every drift test kept passing. That failure is invisible from inside
+// this package, which is exactly why it is pinned here.
+//
+// SECOND: host.Host must expose no field. StableKey and RankingScope are
+// derived once from Placement() and ID() while Report.Placement and
+// Report.HostID are read live on every heartbeat — a snapshot/live pair for one
+// value, inert only while the Host cannot change underneath it. An exported
+// field would make it mutable by any holder and turn the pair into the same
+// class of bug the LaunchTarget snapshot exists to prevent.
+//
+// WHAT IT DOES NOT COVER: it checks the SHAPE of both types, not their
+// behaviour. A host.Host accessor that computed a different answer each call
+// would satisfy this and break the pair; nothing here would see it.
+func TestTheSnapshotCopiesEverythingItsSourcesCanHold(t *testing.T) {
+	t.Parallel()
+
+	// The CONTROL first. department.Capabilities holds no reference field today,
+	// so the classifier's rejecting arm is never reached by the real subject —
+	// and a probe widening that arm to accept slices, maps and pointers passed
+	// the whole package. A guard whose detecting code only the payload reaches
+	// is a guard nobody has tested, which is the third time that shape has
+	// turned up in this file.
+	type referenceBearing struct {
+		Fine    bool
+		Slice   []string
+		Map     map[string]int
+		Pointer *int
+	}
+	if got := referenceFields(reflect.TypeOf(referenceBearing{})); !slices.Equal(got, []string{"Map", "Pointer", "Slice"}) {
+		t.Errorf("referenceFields over a struct carrying a slice, a map and a pointer = %v, want all three named", got)
+	}
+
+	if got := referenceFields(reflect.TypeOf(department.Capabilities{})); len(got) != 0 {
+		t.Errorf("department.Capabilities carries reference field(s) %v; the publisher SNAPSHOTS this struct by copying it, so a reference field is shared with the LaunchTarget that owns it and the snapshot would follow the target's later changes — the fix would be cosmetic while every drift test kept passing",
+			got)
+	}
+
+	// Controlled the same way and for the same reason: host.Host exports
+	// nothing today, so the reporting arm is unreached by the real subject and
+	// disabling it passed the package. Measured, like the two before it.
+	type exportBearing struct {
+		Exported   int
+		AlsoPublic string
+		unexported bool
+	}
+	// The unexported field is assigned so it is a USE — staticcheck reports an
+	// untouched one — and it carries the negative half of the control: the
+	// classifier must EXCLUDE it, not merely list what it finds. Without the
+	// arity check, an implementation returning every field would pass the
+	// positive half.
+	bearing := reflect.TypeOf(exportBearing{unexported: true})
+	if bearing.NumField() != 3 {
+		t.Fatalf("the control struct has %d fields, want 3: two exported and one not", bearing.NumField())
+	}
+	if got := exportedFieldNames(bearing); !slices.Equal(got, []string{"AlsoPublic", "Exported"}) {
+		t.Errorf("exportedFieldNames over a struct with two exported fields and one unexported = %v, want exactly the two exported", got)
+	}
+
+	built := reflect.TypeOf(host.Host{})
+	if built.NumField() == 0 {
+		t.Fatal("host.Host has no fields, so this guard reached nothing")
+	}
+	if got := exportedFieldNames(built); len(got) != 0 {
+		t.Errorf("host.Host exports field(s) %v; the advertisement's keys are derived from Placement() and ID() ONCE while the report reads them every heartbeat, and that snapshot/live pair is only safe while a holder cannot change the Host underneath it",
+			got)
+	}
+}
+
+// referenceFields names every field of a struct whose kind makes a copy of the
+// struct share memory with the original, in sorted order.
+func referenceFields(structure reflect.Type) []string {
+	var shared []string
+	for i := 0; i < structure.NumField(); i++ {
+		field := structure.Field(i)
+		switch field.Type.Kind() {
+		case reflect.Bool, reflect.String,
+			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+		default:
+			shared = append(shared, field.Name)
+		}
+	}
+	slices.Sort(shared)
+	return shared
+}
+
+// exportedFieldNames names every exported field of a struct, in sorted order.
+func exportedFieldNames(structure reflect.Type) []string {
+	var exported []string
+	for i := 0; i < structure.NumField(); i++ {
+		if field := structure.Field(i); field.IsExported() {
+			exported = append(exported, field.Name)
+		}
+	}
+	slices.Sort(exported)
+	return exported
 }
 
 // TestExportedErrorsDoNotPanicWithoutACause holds the one thing every exported
