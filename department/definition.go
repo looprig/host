@@ -114,9 +114,14 @@ func (c Capabilities) PoolingPermitted() bool {
 	case CaptureSafetyStreaming, CaptureSafetyBoundedMaterialized:
 		return true
 	default:
-		// CaptureSafetyUnknown is the zero value and lands here, which is the
-		// half of this rule that matters: a Capabilities nobody filled in is
-		// dedicated-only rather than accidentally poolable.
+		// The default arm is the half of this rule that matters, and it is
+		// wider than "CaptureSafetyUnknown". The zero value of a Capabilities
+		// is CaptureSafety(""), not CaptureSafetyUnknown — the constant is a
+		// NAME for the unknown case, not the zero value of the type — so a
+		// struct nobody filled in arrives here as the empty string. Both land
+		// on the unsafe side, and so does any value a future Core or a typo
+		// introduces. Listing the safe cases and defaulting to unsafe is what
+		// makes that true; enumerating the unsafe ones would not.
 		return false
 	}
 }
@@ -131,9 +136,15 @@ func (c Capabilities) PermittedPlacements() []sessionwire.HostPlacement {
 	if c.PoolingPermitted() {
 		placements = append(placements, sessionwire.HostPlacementPooled)
 	}
-	// Sorted rather than appended in a fixed order, so the determinism is a
-	// property of the value and not of the order these two ifs happen to be
-	// written in. Reordering the ifs must not change the answer.
+	// Sorted so the determinism is a property of the VALUE rather than of the
+	// order these two ifs happen to be written in.
+	//
+	// Do not read more into this than it does today: "dedicated" sorts before
+	// "pooled", so the sort currently agrees with the written order and
+	// reordering the ifs would not change the answer. What the sort buys is
+	// that it would keep agreeing if Core renamed either constant into a
+	// different collating position, and the tests pin the VALUES rather than
+	// the positions, so such a rename is caught either way.
 	slices.Sort(placements)
 	return placements
 }
@@ -188,28 +199,55 @@ type RestoreRequest struct {
 // These are declared on HOST'S side rather than imported, because H4.1 has not
 // landed and Host is not blocked on it. Each is the narrowest interface a Host
 // caller actually needs, so a drain loop takes a Releaser and its fake
-// implements one method. When H4.1 lands, a Harness session either satisfies
-// these or the difference is a real disagreement worth seeing.
+// implements one method.
+//
+// AN ADAPTER IS MANDATORY, whatever H4.1 ends up naming. Harness's Session
+// identifies itself with core/uuid.UUID and these interfaces identify a runtime
+// with the sessionwire identities Host and Factory exchange, which are opaque
+// strings and not UUIDs by contract. No naming outcome makes a Harness session
+// satisfy Identity directly, so O1.2 writes the adapter. An earlier version of
+// this comment said a Harness session would "either satisfy these or the
+// difference is a real disagreement worth seeing"; that was already false when
+// it was written, and the whole point of stating an expectation in a comment is
+// that it can be checked.
+//
+// The three lifecycle shapes below are H4.1's, taken verbatim from the program
+// runbook rather than invented here. Declaring the same capability with a
+// different shape would turn a mechanical adapter into a semantic one, and both
+// differences would have cost something real: Done() is a broadcast a drain
+// supervisor can select on where a poll is not, and ReleaseResidency carries
+// the distinction H4.1 exists to protect — residency release is NONTERMINAL and
+// is not Shutdown, which durably appends SessionStopped. A bare Release loses
+// that at the Host boundary, which is the one place it most needs to survive.
 
-// Controller reports the identities a runtime is bound to.
-type Controller interface {
+// Identity reports the identities a runtime is bound to.
+//
+// It is NOT called Controller. It carries two getters and controls nothing;
+// Host's control path is CommandApplier, which applies an admitted command.
+// Naming a pure accessor after the thing it is adjacent to is how a type ends
+// up with a promise its methods do not keep.
+type Identity interface {
 	SessionID() sessionwire.SessionID
 	AgentID() sessionwire.AgentID
 }
 
-// IdleWaiter blocks until the runtime has no work in flight.
+// IdleWaiter blocks until the runtime has no work in flight. H4.1's shape.
 type IdleWaiter interface {
 	WaitIdle(context.Context) error
 }
 
-// Liveness reports whether the runtime is still answering.
+// Liveness reports when the runtime has stopped answering. H4.1's shape: a
+// channel closed once, which any number of drain supervisors can select on,
+// rather than a poll each of them has to run.
 type Liveness interface {
-	Alive(context.Context) error
+	Done() <-chan struct{}
 }
 
-// Releaser releases the runtime's resources. It is the drain path.
+// Releaser releases RESIDENCY, which is nonterminal: the session remains
+// resumable and no SessionStopped is appended. H4.1's shape, including the
+// name, because the name is the part that carries the distinction.
 type Releaser interface {
-	Release(context.Context) error
+	ReleaseResidency(context.Context) error
 }
 
 // PublicationSubscriber delivers committed public journal events after the
@@ -219,7 +257,8 @@ type PublicationSubscriber interface {
 	SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error)
 }
 
-// CommandApplier applies one admitted runtime command.
+// CommandApplier applies one admitted runtime command. This is Host's control
+// path into a runtime.
 type CommandApplier interface {
 	ApplyCommand(context.Context, sessionwire.CommandEnvelope) error
 }
@@ -228,7 +267,7 @@ type CommandApplier interface {
 // capabilities Host consumes. It is deliberately a composition and not one wide
 // interface: nothing here should have to fake six methods to test one.
 type Runtime interface {
-	Controller
+	Identity
 	IdleWaiter
 	Liveness
 	Releaser

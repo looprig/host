@@ -315,6 +315,22 @@ func TestImportClassification(t *testing.T) {
 // file, which contains "github.com/looprig/factory" as a string literal and
 // must nonetheless be clean, because the guard parses imports rather than
 // searching source text.
+//
+// The subject it asserts reaching is ONE FILE, and the floors are module-wide.
+// That was enough while the module was one package and is not enough now: a
+// predicate bug that skipped an entire subdirectory would leave files > 0,
+// productionFiles > 0, imports > 0 and this file present, all satisfied by the
+// root package alone, and the guard would stay green over an unscanned
+// package. department/ is in fact scanned today — checked by hand, not by
+// assertion — and a commit message in this repository claimed that as
+// "verified rather than assumed", which overstated what the tree holds.
+//
+// The fix is not an allowlist of package directories, which is the enumeration
+// this file has spent six rounds removing. It is an independent oracle: `go
+// list ./...` knows the package set without consulting modfiles' predicates, so
+// asserting every listed package directory appears in scan.scanned catches a
+// widened predicate that hides a whole package. Deliberately not done here —
+// it is O0.1's design rather than this task's, and it needs its own RED.
 func TestModuleImportsStayWithinBoundary(t *testing.T) {
 	t.Parallel()
 

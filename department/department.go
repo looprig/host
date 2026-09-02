@@ -48,6 +48,10 @@ type Department struct {
 
 // New validates every registration and returns an immutable Department.
 func New(registrations []Registration) (*Department, error) {
+	// NOT REQUIRED BY SPEC. §7 asks only for a finite mapping; rejecting the
+	// empty one is this implementation's choice and it forbids a Host
+	// configured later. Sound and cheap to reverse, recorded so the next reader
+	// does not mistake it for a contract.
 	if len(registrations) == 0 {
 		return nil, &InvalidDepartmentError{Reason: "a Department registers no launch target, so this Host can serve nothing"}
 	}
@@ -89,6 +93,9 @@ func validateRegistration(registration Registration) error {
 	}
 
 	capabilities := registration.Target.Capabilities()
+	// Also not required by spec, and also kept: a target that costs nothing
+	// against capacity admits without bound, and zero is the zero value rather
+	// than a deliberate declaration.
 	if capabilities.AdmissionWeight == 0 {
 		return &InvalidDepartmentError{
 			AgentID: registration.AgentID,
@@ -105,6 +112,21 @@ func validateRegistration(registration Registration) error {
 	// dropping the pooled claim. A silent narrowing produces exactly the same
 	// green as a correct declaration, which is how a too-wide exclusion hides;
 	// making the author write SupportsDedicated only is a visible diff.
+	//
+	// This is STRICTER THAN SPEC and the difference has consequences downstream
+	// that O1.2 and O5 must know about. §11.3 says such a target "is
+	// dedicated-only" — a narrowing — and §7's posture is degrade-visibly, so
+	// rejecting is a choice the spec did not make. Both behaviours exist:
+	// PoolingPermitted still narrows on a bare Capabilities. But because New
+	// refuses the combination, SupportsPooled == PoolingPermitted() holds for
+	// every target inside a constructed Department, which means THE NARROWING
+	// IS UNREACHABLE THROUGH THE REGISTRY — a placement path that reads
+	// PoolingPermitted off a registered target can never observe it doing
+	// work, and a test written against the registry cannot exercise it.
+	// The other consequence is operational: a target whose tools regress from
+	// streaming to unbounded turns a Host that should have run it
+	// dedicated-only into one that refuses to start. Fail-loud is defensible
+	// and deliberate; it is not what §11.3 asks for.
 	if capabilities.SupportsPooled && !capabilities.PoolingPermitted() {
 		return &InvalidDepartmentError{
 			AgentID: registration.AgentID,

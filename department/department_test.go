@@ -204,17 +204,30 @@ func TestCaptureSafetyMakesATargetDedicatedOnly(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
+		name       string
 		safety     department.CaptureSafety
 		wantPooled bool
 	}{
-		{safety: department.CaptureSafetyStreaming, wantPooled: true},
-		{safety: department.CaptureSafetyBoundedMaterialized, wantPooled: true},
-		{safety: department.CaptureSafetyUnboundedMaterialized, wantPooled: false},
-		{safety: department.CaptureSafetyUnknown, wantPooled: false},
+		// The ZERO VALUE of the field, which is CaptureSafety("") and NOT
+		// CaptureSafetyUnknown — the constant is a name for the unknown case,
+		// not the type's zero. A Capabilities nobody filled in arrives with the
+		// empty string, so this row is the forgotten-field case and it is the
+		// one the default arm exists for. Without it the guarantee is a comment:
+		// a mutant adding `case CaptureSafety(""): return true` survived the
+		// whole suite while every named-constant row still passed.
+		{name: "zero value", safety: "", wantPooled: false},
+		{name: "streaming", safety: department.CaptureSafetyStreaming, wantPooled: true},
+		{name: "bounded materialized", safety: department.CaptureSafetyBoundedMaterialized, wantPooled: true},
+		{name: "unbounded materialized", safety: department.CaptureSafetyUnboundedMaterialized, wantPooled: false},
+		{name: "unknown", safety: department.CaptureSafetyUnknown, wantPooled: false},
+		// A value from a future Core, or a typo. The default arm must refuse
+		// anything it was not told is safe; enumerating the unsafe ones would
+		// let this through.
+		{name: "unrecognised", safety: "some_future_capture_mode", wantPooled: false},
 	}
 
 	for _, tt := range tests {
-		t.Run(string(tt.safety), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			// SupportsPooled is true in EVERY row, which is the only way the
 			// capture-safety branch is reached: a row that declares
@@ -470,7 +483,8 @@ func TestAgentIDsAreSortedNotMapOrdered(t *testing.T) {
 // needing only liveness can take Liveness and a fake needs only that method.
 // It also pins that the whole set is satisfiable outside this package, which is
 // what "Host defines what it requires on Host's side" has to mean while H4.1 is
-// unlanded.
+// unlanded — and that the three lifecycle shapes are H4.1's, so a Harness
+// session differs from them only by identity type and not by shape.
 func TestRuntimeIsSatisfiedBySegregatedCapabilities(t *testing.T) {
 	t.Parallel()
 
@@ -481,10 +495,25 @@ func TestRuntimeIsSatisfiedBySegregatedCapabilities(t *testing.T) {
 		_ department.Releaser              = runtime
 		_ department.PublicationSubscriber = runtime
 		_ department.CommandApplier        = runtime
-		_ department.Controller            = runtime
+		_ department.Identity              = runtime
 	)
 	if got := runtime.SessionID(); got != "session-1" {
 		t.Errorf("SessionID() = %q, want \"session-1\"", got)
+	}
+
+	// Liveness is a BROADCAST, not a poll, and the difference is the reason
+	// H4.1 chose this shape: any number of drain supervisors select on the same
+	// channel and none of them has to ask. Exercising a receive pins that the
+	// method returns something select-able rather than merely declaring a
+	// channel type.
+	select {
+	case <-runtime.Done():
+	default:
+		t.Error("Done() did not report a stopped runtime; a Liveness a supervisor cannot select on is a poll with extra steps")
+	}
+
+	if err := runtime.ReleaseResidency(t.Context()); err != nil {
+		t.Errorf("ReleaseResidency() = %v, want nil", err)
 	}
 }
 
@@ -493,8 +522,13 @@ type fakeRuntime struct{}
 func (fakeRuntime) SessionID() sessionwire.SessionID { return "session-1" }
 func (fakeRuntime) AgentID() sessionwire.AgentID     { return "reviewer" }
 func (fakeRuntime) WaitIdle(context.Context) error   { return nil }
-func (fakeRuntime) Alive(context.Context) error      { return nil }
-func (fakeRuntime) Release(context.Context) error    { return nil }
+func (fakeRuntime) Done() <-chan struct{} {
+	stopped := make(chan struct{})
+	close(stopped)
+	return stopped
+}
+
+func (fakeRuntime) ReleaseResidency(context.Context) error { return nil }
 
 func (fakeRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
 	return nil, nil

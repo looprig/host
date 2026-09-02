@@ -7,9 +7,18 @@ drain. Factory consumes Host; Host never consumes Factory.
 `department/` holds the immutable Department: agent identity to launch target,
 fixed at construction, plus the segregated Harness session capabilities Host
 requires. Those capability interfaces are declared on HOST'S side because H4.1
-has not landed — when it does, a Harness session either satisfies them or the
-difference is a real disagreement worth seeing, and that is the point of not
-blocking on it.
+has not landed, and their lifecycle SHAPES are H4.1's, taken from the program
+runbook rather than invented: `IdleWaiter.WaitIdle`, `Liveness.Done() <-chan
+struct{}`, `Releaser.ReleaseResidency`. Declaring the same capability with a
+different shape would turn a mechanical adapter into a semantic one.
+
+**An adapter is mandatory whatever H4.1 names**, so do not write that a Harness
+session will satisfy these. It cannot under any outcome: Harness identifies a
+session with `core/uuid.UUID` and these identify a runtime with the sessionwire
+identities Host and Factory exchange, which are opaque strings and not UUIDs by
+contract. O1.2 writes the adapter. An earlier version of this paragraph
+promised a reconciliation that was already impossible when it was written,
+which is the failure this file exists to stop.
 
 ## Dependency boundary
 
