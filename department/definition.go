@@ -111,6 +111,14 @@ type Capabilities struct {
 // Validate holds every rule about a Capabilities value, in one place, so the
 // registry and the rig-target constructor cannot disagree about what a legal
 // declaration is.
+//
+// It was extracted in O1.2, which is a REFACTOR OF O1.1's code from a later
+// task. The trigger was real — NewRigTarget needed the same rules and restating
+// them would have been the two-site shape this file has spent several rounds
+// removing — but the consequence crossed a task boundary and is recorded here
+// rather than left to be discovered: the rules gained a typed cause,
+// *InvalidCapabilitiesError, and O1.1's assertion that a capability rule
+// unwraps to nil moved to duplicate registration.
 func (c Capabilities) Validate() error {
 	if c.AdmissionWeight == 0 {
 		return &InvalidCapabilitiesError{

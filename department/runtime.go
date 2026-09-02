@@ -100,9 +100,21 @@ type rigTarget struct {
 	capabilities  Capabilities
 }
 
+// CompatibilityID reports the runtime build this target launches.
+//
+// It is the value HostLink advertises as RuntimeCompatibilityID and the value
+// Restore compares a durable state's build against, and those two uses are the
+// reason it has its own assertion rather than being inferred from the mismatch
+// test: an accessor that disagrees with what Restore compares against is a Host
+// advertising a build it will then refuse to restore. A mutant returning a
+// constant here once left the whole suite green, because every test reached
+// t.compatibility through Restore instead.
 func (t *rigTarget) CompatibilityID() CompatibilityID { return t.compatibility }
-func (t *rigTarget) Capabilities() Capabilities       { return t.capabilities }
 
+// Capabilities reports what this target declared at construction.
+func (t *rigTarget) Capabilities() Capabilities { return t.capabilities }
+
+// Create launches a new session through the rig and adapts it into a Runtime.
 func (t *rigTarget) Create(ctx context.Context, request CreateRequest) (Runtime, error) {
 	// A CONVERSION, not a field-by-field literal, and the difference is a
 	// guard rather than a style. RigCreateRequest is structurally identical to
@@ -118,6 +130,8 @@ func (t *rigTarget) Create(ctx context.Context, request CreateRequest) (Runtime,
 	return adaptRigSession(request.SessionID, request.AgentID, session)
 }
 
+// Restore relaunches a session over existing durable state, refusing a state
+// written by a different runtime build before anything is launched.
 func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtime, error) {
 	// FAIL CLOSED, and fail closed BEFORE launching. Deciding this after the
 	// rig has produced a session spends the resource the check exists to
@@ -133,6 +147,18 @@ func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtim
 			Target:    t.compatibility,
 		}
 	}
+	// A field-by-field LITERAL, unlike Create, and the difference matters
+	// enough to write down. RestoreRequest carries two fields a rig has no
+	// business seeing — the compatibility id Host checks above, and Harness's
+	// own session identity, which travels as its own argument — so the two
+	// types are not structurally identical and a conversion is not available.
+	//
+	// That means the compile-time protection Create gets is ABSENT here: a
+	// field deleted from this literal compiles and silently stops propagating.
+	// The guard is therefore the test, which compares the whole received value
+	// against an independently spelled expectation rather than probing a field
+	// or two. Deleting Placement and WorkspaceRoot from this literal once left
+	// the entire suite green.
 	session, err := t.rig.RestoreSession(ctx, request.RigSessionID, RigRestoreRequest{
 		TenantID:      request.TenantID,
 		SessionID:     request.SessionID,
@@ -162,7 +188,7 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 			AgentID:   agentID,
 			SessionID: sessionID,
 			Operation: "launch",
-			Cause:     errNoSession,
+			Cause:     ErrNoRigSession,
 		}
 	}
 
@@ -225,6 +251,14 @@ func (r *rigRuntime) AgentID() sessionwire.AgentID     { return r.agentID }
 // RigSessionID reports Harness's UUID for a runtime this package adapted, for
 // callers that must correlate with Harness's own records. It is deliberately
 // not part of Runtime: Host's contracts speak sessionwire identities.
+//
+// PROVISIONAL. It is a *rigRuntime type assertion on a public API, which is an
+// escape hatch rather than a contract, and it exists today because it is the
+// only way to assert create-side identity translation from outside this
+// package. O2.2 is the task that will actually need to correlate with Harness's
+// records; when it does, decide then whether this stays an assertion-shaped
+// helper or becomes a field on something the registry holds. Do not build on it
+// before that decision.
 func RigSessionID(runtime Runtime) (uuid.UUID, bool) {
 	adapted, ok := runtime.(*rigRuntime)
 	if !ok {
@@ -288,4 +322,8 @@ func (e *RigLaunchError) Error() string {
 
 func (e *RigLaunchError) Unwrap() error { return e.Cause }
 
-var errNoSession = errors.New("the rig reported success and returned no session")
+// ErrNoRigSession is the cause of a RigLaunchError raised when a rig reports
+// success and hands back nothing. It is EXPORTED so a test — and a caller — can
+// tell that failure apart from a rig that refused, which is the difference
+// between a broken rig and a busy one.
+var ErrNoRigSession = errors.New("the rig reported success and returned no session")

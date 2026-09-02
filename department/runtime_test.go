@@ -146,8 +146,36 @@ func TestRestorePropagatesTheLaunchContextAndTheHarnessIdentity(t *testing.T) {
 	if len(restores) != 1 {
 		t.Fatalf("the rig was asked to restore %d sessions, want exactly 1", len(restores))
 	}
-	if restores[0].Storage.Namespace != "tenants/9f3/sessions/71c" || restores[0].TenantID != "tenant-9f3" {
-		t.Errorf("the rig received %+v, want the tenant and storage context of the request", restores[0])
+	// A WHOLE-VALUE oracle, spelled in literals, exactly as the create test
+	// does — and it is needed MORE here, not less. Create hands the rig a
+	// conversion, so a forgotten field stops the build; Restore hands it a
+	// field-by-field literal, because RestoreRequest carries two fields a rig
+	// never sees and the two types are therefore not convertible. Nothing but
+	// this comparison stands between a deleted line and a silently dropped
+	// field: probing Storage and TenantID alone left deleting Placement and
+	// WorkspaceRoot green, which is "propagate workspace context" gone.
+	wantRestore := department.RigRestoreRequest{
+		TenantID:      "tenant-9f3",
+		SessionID:     "session-71c",
+		AgentID:       "reviewer",
+		Placement:     sessionwire.HostPlacementDedicated,
+		WorkspaceRoot: "/srv/workspaces/71c",
+		Storage:       department.StorageContext{Namespace: "tenants/9f3/sessions/71c"},
+	}
+	if restores[0] != wantRestore {
+		t.Errorf("the rig received %+v, want %+v", restores[0], wantRestore)
+	}
+	for name, zero := range map[string]bool{
+		"TenantID":      wantRestore.TenantID == "",
+		"SessionID":     wantRestore.SessionID == "",
+		"AgentID":       wantRestore.AgentID == "",
+		"Placement":     wantRestore.Placement == "",
+		"WorkspaceRoot": wantRestore.WorkspaceRoot == "",
+		"Storage":       wantRestore.Storage == department.StorageContext{},
+	} {
+		if zero {
+			t.Errorf("fixture field %s is zero-valued; an assertion on it proves nothing", name)
+		}
 	}
 	// Harness's identity for the session must reach the rig, because a restore
 	// has nothing to restore FROM without it. A zero UUID here is the defect
@@ -457,6 +485,113 @@ func TestLaunchRejectsASessionTheRigDidNotReturn(t *testing.T) {
 	}
 	if runtime != nil {
 		t.Error("Create returned a runtime for a session that does not exist")
+	}
+
+	// The TYPE and the CAUSE, not merely that something failed. Asserting only
+	// "an error came back" is what let a real mutant live: delete the nil check
+	// AND move session.ID() below the capability discovery, and a nil session
+	// becomes IncapableRuntimeError{Missing: all five} — because a type
+	// assertion on a nil interface returns ok=false. No panic, suite green, and
+	// a diagnosis that sends the reader to look for five missing methods on a
+	// session that was never returned.
+	//
+	// This is why "removing the guard only panics" was the wrong reading here.
+	// It holds only when nothing can be moved above the dereference, and here
+	// the dereference is reorderable.
+	var launchErr *department.RigLaunchError
+	if !errors.As(err, &launchErr) {
+		t.Fatalf("Create error = %v, want *RigLaunchError", err)
+	}
+	if !errors.Is(err, department.ErrNoRigSession) {
+		t.Errorf("Create error does not unwrap to ErrNoRigSession, so it cannot be told from a rig that refused")
+	}
+	var incapable *department.IncapableRuntimeError
+	if errors.As(err, &incapable) {
+		t.Errorf("a rig that returned no session was diagnosed as an incapable one: %v", incapable)
+	}
+}
+
+// TestRigTargetExposesItsDeclaredCompatibilityAndCapabilities asserts the
+// ACCESSORS, which nothing did.
+//
+// "Expose the declared compatibility id" is a named property of this task and
+// it had no test: a mutant returning a constant from CompatibilityID left the
+// whole suite green, because every other test reached t.compatibility through
+// Restore's comparison, which is a different code path. The two uses are what
+// make the gap matter rather than merely exist — HostLink advertises this value
+// as RuntimeCompatibilityID and Restore refuses a durable state that disagrees
+// with it, so an accessor out of step with the comparison is a Host advertising
+// a build it will then refuse to restore.
+func TestRigTargetExposesItsDeclaredCompatibilityAndCapabilities(t *testing.T) {
+	t.Parallel()
+
+	declared := department.Capabilities{
+		SupportsPooled:     false,
+		SupportsDedicated:  true,
+		RequiresWorkspace:  true,
+		RequiresCheckpoint: true,
+		AdmissionWeight:    7,
+		CaptureSafety:      department.CaptureSafetyUnboundedMaterialized,
+	}
+	target, err := department.NewRigTarget(&testkit.FakeRig{}, "rig-2026-09", declared)
+	if err != nil {
+		t.Fatalf("NewRigTarget: %v", err)
+	}
+	if got := target.CompatibilityID(); got != "rig-2026-09" {
+		t.Errorf("CompatibilityID() = %q, want the declared build", got)
+	}
+	if got := target.Capabilities(); got != declared {
+		t.Errorf("Capabilities() = %+v, want %+v", got, declared)
+	}
+	// The control: a target declared with a DIFFERENT build reports that one,
+	// so the assertion above is reading the declaration and not a constant that
+	// happens to match the fixture.
+	other, err := department.NewRigTarget(&testkit.FakeRig{}, "rig-2025-01", declared)
+	if err != nil {
+		t.Fatalf("NewRigTarget: %v", err)
+	}
+	if got := other.CompatibilityID(); got != "rig-2025-01" {
+		t.Errorf("CompatibilityID() = %q, want the second target's declared build", got)
+	}
+}
+
+// TestARigTargetSurvivesRegistration is the closest this task gets to step 2's
+// "before registry publication": a real rig target — not the stub every other
+// registry test uses — goes into a Department and is read back out.
+//
+// It matters beyond coverage. O2.2's registry entry stores the compatibility id
+// READ OFF THE TARGET, so the value that reaches the registry is the accessor's
+// and not Restore's. Registering a stub proves the registry works; registering
+// this proves the thing the registry will actually hold.
+func TestARigTargetSurvivesRegistration(t *testing.T) {
+	t.Parallel()
+
+	rig := &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}
+	target := rigTarget(t, rig)
+
+	registry, err := department.New([]department.Registration{{AgentID: "reviewer", Target: target}})
+	if err != nil {
+		t.Fatalf("New with a rig target: %v", err)
+	}
+	registered, err := registry.Target("reviewer")
+	if err != nil {
+		t.Fatalf("Target(reviewer): %v", err)
+	}
+	if got := registered.CompatibilityID(); got != "rig-2026-09" {
+		t.Errorf("the registered target reports build %q, want the one it was constructed with. This is the value O2.2 stores and HostLink advertises", got)
+	}
+	if got := registered.Capabilities(); got != pooledCapabilities() {
+		t.Errorf("the registered target reports %+v, want %+v", got, pooledCapabilities())
+	}
+
+	// And it still launches once registered, so registration does not hand back
+	// something merely shaped like the target.
+	runtime, err := registered.Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatalf("Create through the registry: %v", err)
+	}
+	if runtime.SessionID() != "session-71c" {
+		t.Errorf("SessionID() = %q through the registry", runtime.SessionID())
 	}
 }
 
