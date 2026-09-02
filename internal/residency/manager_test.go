@@ -115,8 +115,11 @@ func (l *fakeLease) Release(ctx context.Context) error {
 		return errDeadContext
 	}
 	l.trace.record("lease.release")
+	if l.releaseErr != nil {
+		return l.releaseErr
+	}
 	l.released++
-	return l.releaseErr
+	return nil
 }
 
 // fakeLeases grants leases and records every grant.
@@ -131,11 +134,11 @@ type fakeLeases struct {
 	held      map[sessionwire.SessionID]bool
 	granted   []*fakeLease
 	err       error
-	// epochOverride, when non-zero, replaces the minted epoch, so a test can
-	// hand the manager an epoch Core would refuse.
-	epochOverride uint64
-	zeroEpoch     bool
-	nilLease      bool
+	zeroEpoch bool
+	nilLease  bool
+	// releaseErr is given to every lease this store grants, so a test can make
+	// the ROLLBACK itself fail.
+	releaseErr error
 }
 
 func (s *fakeLeases) AcquireSessionLease(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (Lease, error) {
@@ -158,13 +161,10 @@ func (s *fakeLeases) AcquireSessionLease(ctx context.Context, tenant sessionwire
 	s.held[session] = true
 	s.nextEpoch++
 	epoch := s.nextEpoch
-	if s.epochOverride != 0 {
-		epoch = s.epochOverride
-	}
 	if s.zeroEpoch {
 		epoch = 0
 	}
-	lease := &fakeLease{trace: s.trace, epoch: epoch, lost: make(chan struct{})}
+	lease := &fakeLease{trace: s.trace, epoch: epoch, lost: make(chan struct{}), releaseErr: s.releaseErr}
 	s.granted = append(s.granted, lease)
 	return lease, nil
 }
@@ -277,8 +277,11 @@ func (w *fakeWorkspaces) ReleaseWorkspace(ctx context.Context, _ sessionwire.Ten
 		return errDeadContext
 	}
 	w.trace.record("workspace.release")
+	if w.releaseErr != nil {
+		return w.releaseErr
+	}
 	w.released++
-	return w.releaseErr
+	return nil
 }
 
 func (w *fakeWorkspaces) counts() (ensured, released int) {
@@ -291,10 +294,11 @@ func (w *fakeWorkspaces) counts() (ensured, released int) {
 type fakeLocations struct {
 	trace *trace
 
-	mu         sync.Mutex
-	published  []sessionwire.HostLinkRegistryObservation
-	tombstoned []uint64
-	publishErr error
+	mu           sync.Mutex
+	published    []sessionwire.HostLinkRegistryObservation
+	tombstoned   []uint64
+	publishErr   error
+	tombstoneErr error
 	// failAfter, when positive, lets that many publishes succeed and refuses
 	// the rest, so a test can fail the RESIDENT publish of step 9 while the
 	// ATTACHING publish of step 7 succeeded.
@@ -324,6 +328,9 @@ func (l *fakeLocations) TombstoneResidency(ctx context.Context, _ sessionwire.Te
 		return errDeadContext
 	}
 	l.trace.record("location.tombstone")
+	if l.tombstoneErr != nil {
+		return l.tombstoneErr
+	}
 	l.tombstoned = append(l.tombstoned, epoch)
 	return nil
 }
@@ -361,6 +368,7 @@ func (l *fakeLocations) tombstones() []uint64 {
 // fakeOwnershipHandle is one started ownership.
 type fakeOwnershipHandle struct {
 	trace   *trace
+	stopErr error
 	mu      sync.Mutex
 	stopped int
 }
@@ -373,6 +381,9 @@ func (h *fakeOwnershipHandle) Stop(ctx context.Context) error {
 		return errDeadContext
 	}
 	h.trace.record("ownership.stop")
+	if h.stopErr != nil {
+		return h.stopErr
+	}
 	h.stopped++
 	return nil
 }
@@ -388,6 +399,14 @@ type fakeOwnership struct {
 	contexts []context.Context
 	handles  []*fakeOwnershipHandle
 	err      error
+	stopErr  error
+	// nilHandle makes BeginOwnership report success and return nothing.
+	nilHandle bool
+	// inWindow runs while the attach is between step 6 and step 9: the
+	// registry entry exists and the session is not attached yet. It is the only
+	// seam that reaches that window, and no other collaborator is called inside
+	// it.
+	inWindow func()
 }
 
 func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipRequest) (OwnershipHandle, error) {
@@ -398,12 +417,25 @@ func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipReq
 		return nil, errDeadContext
 	}
 	o.trace.record("ownership.begin")
+	hook := o.inWindow
+	o.inWindow = nil
+	if hook != nil {
+		// Released before the hook runs: the hook re-enters the Manager, and
+		// holding a fake's lock across that would be a deadlock this fake
+		// invented rather than a property of the subject.
+		o.mu.Unlock()
+		hook()
+		o.mu.Lock()
+	}
 	if o.err != nil {
 		return nil, o.err
 	}
+	if o.nilHandle {
+		return nil, nil
+	}
 	o.started = append(o.started, request)
 	o.contexts = append(o.contexts, ctx)
-	handle := &fakeOwnershipHandle{trace: o.trace}
+	handle := &fakeOwnershipHandle{trace: o.trace, stopErr: o.stopErr}
 	o.handles = append(o.handles, handle)
 	return handle, nil
 }
@@ -511,8 +543,11 @@ func (r *fakeRuntime) ReleaseResidency(ctx context.Context) error {
 		return errDeadContext
 	}
 	r.trace.record("runtime.release")
+	if r.releaseErr != nil {
+		return r.releaseErr
+	}
 	r.released++
-	return r.releaseErr
+	return nil
 }
 
 // Shutdown is the TERMINAL teardown and must never be reached from here.
@@ -562,6 +597,8 @@ type fakeTarget struct {
 	bornDone bool
 	// nilRuntime, when true, reports success and returns nothing.
 	nilRuntime bool
+	// releaseErr is given to every runtime this target produces.
+	releaseErr error
 
 	creates  []department.CreateRequest
 	restores []department.RestoreRequest
@@ -598,7 +635,7 @@ func (t *fakeTarget) newRuntime(session sessionwire.SessionID, agent sessionwire
 	if t.boundSessionID != "" {
 		session = t.boundSessionID
 	}
-	runtime := &fakeRuntime{trace: t.trace, sessionID: session, agentID: agent, done: make(chan struct{})}
+	runtime := &fakeRuntime{trace: t.trace, sessionID: session, agentID: agent, done: make(chan struct{}), releaseErr: t.releaseErr}
 	if t.bornDone {
 		close(runtime.done)
 	}
@@ -1528,6 +1565,13 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			forbidden: []string{"location.publish:resident"},
 		},
 		{
+			name:      "8 ownership reports success and returns no handle",
+			mode:      ModeCreate,
+			configure: func(f *fixture) { f.ownership.nilHandle = true },
+			wantStep:  StepOwnership,
+			forbidden: []string{"location.publish:resident"},
+		},
+		{
 			name: "9 the resident projection is refused",
 			mode: ModeCreate,
 			configure: func(f *fixture) {
@@ -2333,5 +2377,408 @@ func TestTheSessionRecordHoldsWhatO32WillNeed(t *testing.T) {
 	}
 	if record.cancel == nil {
 		t.Error("the record holds no cancel, so the session lifetime has no owner")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The 6-to-9 window
+// ---------------------------------------------------------------------------
+
+// TestNothingIsReportableAsAttachedInsideTheInstallWindow is the deterministic
+// half of the guard over a live escape.
+//
+// registry.Insert marks an entry resident and accepting at step 6, and the
+// attach can still fail at 7, 8 or 9 and take it away again. A fast path gated
+// on the REGISTRY therefore returned success, carrying the winner's runtime, to
+// a caller arriving inside that window — and when the winner then rolled back,
+// that caller was left holding a Runtime whose ReleaseResidency had already
+// been called and whose lease was gone. The erroring call took nothing; the
+// SUCCEEDING one held a corpse.
+//
+// WHAT THIS SUBTEST COVERS AND WHAT IT DOES NOT: it pins the PREDICATE — inside
+// the window the registry says resident and attachedResidency says not
+// attached, so the two are observably different things. It does not pin the
+// CALL SITE; TestAttachReadsResidencyOnlyThroughTheAttachedPredicate does that,
+// structurally, because no seam can drive a second Attach into this window
+// without either a coin flip or a deadlock in the fixed code.
+func TestNothingIsReportableAsAttachedInsideTheInstallWindow(t *testing.T) {
+	f := newFixture(t, func(f *fixture) {
+		f.ownership.err = errors.New("injected")
+	})
+	var (
+		registrySaysResident  bool
+		predicateSaysAttached bool
+		sessionContextLive    bool
+	)
+	f.ownership.inWindow = func() {
+		_, registrySaysResident = f.registry.Get(f.key())
+		_, predicateSaysAttached = f.manager.attachedResidency(f.key())
+		_, sessionContextLive = f.manager.SessionContext(f.key())
+	}
+
+	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err == nil {
+		t.Fatal("the injected ownership failure was not reported")
+	}
+	if !registrySaysResident {
+		t.Fatal("the registry did not hold the entry inside the window, so this test never reached its subject")
+	}
+	if predicateSaysAttached {
+		t.Error("the predicate the fast path uses reported ATTACHED inside the install window; a caller taking that path would be handed a runtime this attach is about to release")
+	}
+	if sessionContextLive {
+		t.Error("a session context was reportable inside the install window")
+	}
+	f.assertNothingHeld(t)
+}
+
+// TestAttachReadsResidencyOnlyThroughTheAttachedPredicate is the CALL-SITE half,
+// and it is structural because the behavioural form cannot be made
+// deterministic: a second Attach driven into the window either races (a coin
+// flip, which is not a guard) or, once the fix is in, correctly blocks on the
+// slot for that key — and a fixture that waits for it deadlocks the passing
+// case.
+//
+// So the rule is stated over the code: Attach reads residency through
+// attachedResidency and reaches the registry through nothing else.
+func TestAttachReadsResidencyOnlyThroughTheAttachedPredicate(t *testing.T) {
+	files := parseProductionFiles(t)
+	examined := 0
+	for name, file := range files {
+		for _, declaration := range file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != "Attach" {
+				continue
+			}
+			examined++
+			for _, reached := range registryFieldSelections(function) {
+				t.Errorf("%s: Attach reads m.registry.%s directly; a registry entry exists from step 6 and may still be withdrawn, so residency must be read through attachedResidency", name, reached)
+			}
+		}
+	}
+	if examined != 1 {
+		t.Fatalf("%d functions named Attach were examined, want exactly 1; this guard is vacuous otherwise", examined)
+	}
+
+	// The detector, on a source that breaks the rule, and a control one
+	// position over that must stay clean.
+	for _, probe := range []struct {
+		name   string
+		source string
+		want   int
+	}{
+		{
+			name:   "a direct registry read in Attach",
+			source: "package p\ntype M struct{ registry any }\nfunc (m *M) Attach() { m.registry.Get(1) }\n",
+			want:   1,
+		},
+		{
+			name:   "control: the same read in a different method",
+			source: "package p\ntype M struct{ registry any }\nfunc (m *M) attachedResidency() { m.registry.Get(1) }\nfunc (m *M) Attach() { m.attachedResidency() }\n",
+			want:   0,
+		},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", probe.source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%s: parsing the probe: %v", probe.name, err)
+		}
+		found := 0
+		for _, declaration := range parsed.Decls {
+			if function, ok := declaration.(*ast.FuncDecl); ok && function.Name.Name == "Attach" {
+				found += len(registryFieldSelections(function))
+			}
+		}
+		if found != probe.want {
+			t.Errorf("%s: the detector reported %d direct registry reads, want %d", probe.name, found, probe.want)
+		}
+	}
+}
+
+// registryFieldSelections returns the methods called on the receiver's registry
+// field inside one function.
+func registryFieldSelections(function *ast.FuncDecl) []string {
+	var reached []string
+	ast.Inspect(function, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		method, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		field, isField := method.X.(*ast.SelectorExpr)
+		if !isField || field.Sel.Name != "registry" {
+			return true
+		}
+		if receiver, isIdent := field.X.(*ast.Ident); isIdent && receiver.Name == "m" {
+			reached = append(reached, method.Sel.Name)
+		}
+		return true
+	})
+	return reached
+}
+
+// TestNoSuccessfulAttachEverReportsAReleasedRuntime is the end-to-end form of
+// the same property, and it is the universal invariant rather than a race the
+// test has to win: EVERY attach that returns nil must report a live runtime
+// with running ownership, whichever branch it took.
+//
+// It drives a second Attach into the install window through the ownership hook
+// while the winner is failing at step 9. Reaching the window is probabilistic —
+// see the structural guard above for why it cannot be otherwise — but the
+// assertion is not conditional on reaching it, so the test is meaningful on
+// every run and strictly more likely to fire under -race -count=20.
+func TestNoSuccessfulAttachEverReportsAReleasedRuntime(t *testing.T) {
+	f := newFixture(t, func(f *fixture) {
+		f.locations.publishErr = errors.New("injected")
+		f.locations.failAfter = 1
+	})
+
+	type outcome struct {
+		residency Residency
+		err       error
+	}
+	second := make(chan outcome, 1)
+	f.ownership.inWindow = func() {
+		go func() {
+			residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+			second <- outcome{residency, err}
+		}()
+	}
+
+	_, winnerErr := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if winnerErr == nil {
+		t.Fatal("the winner's injected step 9 failure was not reported")
+	}
+	result := <-second
+
+	if result.err != nil {
+		// A refusal is a perfectly good outcome here; there is nothing to check.
+		return
+	}
+	if result.residency.Runtime == nil {
+		t.Fatal("a successful attach reported no runtime")
+	}
+	for _, runtime := range f.target.producedRuntimes() {
+		if department.Runtime(runtime) != result.residency.Runtime {
+			continue
+		}
+		if released, _ := runtime.counts(); released != 0 {
+			t.Errorf("a successful attach reported a runtime whose ReleaseResidency has been called %d time(s): the caller was handed a corpse", released)
+		}
+	}
+	if _, live := f.manager.SessionContext(result.residency.Key); !live {
+		t.Error("a successful attach left no session context, so it did not reach step 9")
+	}
+	if running := f.ownership.runningCount(); running == 0 {
+		t.Error("a successful attach reported a residency with no ownership running")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The warm path is validated like the cold one
+// ---------------------------------------------------------------------------
+
+// TestAResidentSessionIsValidatedLikeAColdOne is the THIRD direction of the
+// idempotency rule, and the one that had no row.
+//
+// The first two are "the same request returns the same residency" and "a
+// different agent is refused". The third is every OTHER rule step 1 holds: a
+// caller naming an unknown mode, no actor, or a runtime build this Host does
+// not launch was refused cold and ACCEPTED WARM, because the fast path ran
+// before validation and checked only the agent.
+func TestAResidentSessionIsValidatedLikeAColdOne(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		mutate   func(*Request)
+		wantCode sessionwire.HostLinkErrorCode
+	}{
+		{name: "an unknown mode", mutate: func(r *Request) { r.Mode = "resume" }},
+		{name: "no actor", mutate: func(r *Request) { r.Principal.ActorID = "" }},
+		{name: "a principal acting for another tenant", mutate: func(r *Request) { r.Principal.TenantID = "tenant-other" }},
+		{name: "a build this Host does not launch", mutate: func(r *Request) { r.CompatibilityID = "rig-1999-nonsense" }, wantCode: sessionwire.HostLinkErrorRuntimeMismatch},
+		{name: "an agent this Department does not register", mutate: func(r *Request) { r.AgentID = "reviewer" }, wantCode: sessionwire.HostLinkErrorRuntimeUnavailable},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newFixture(t)
+			first, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+			if err != nil {
+				t.Fatalf("the cold attach failed: %v", err)
+			}
+			before := f.trace.recorded()
+
+			// The CONTROL: the same request unmutated is still accepted warm,
+			// so each row below fails for the field it changes.
+			if again, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err != nil || again.Generation != first.Generation {
+				t.Fatalf("the unmutated warm attach reported (%+v, %v), want the resident residency", again, err)
+			}
+
+			request := f.request(ModeCreate)
+			row.mutate(&request)
+			_, err = f.manager.Attach(context.Background(), request)
+			if err == nil {
+				t.Fatal("the invalid request was accepted against a resident session")
+			}
+			var attach *AttachError
+			if !errors.As(err, &attach) {
+				t.Fatalf("error is %T, want *AttachError", err)
+			}
+			if attach.Step != StepValidate {
+				t.Errorf("the refusal names step %q, want %q", attach.Step, StepValidate)
+			}
+			if attach.Code != row.wantCode {
+				t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, row.wantCode)
+			}
+			requireSteps(t, f.trace.recorded(), before)
+			if entry, held := f.registry.Get(f.key()); !held || entry.Generation != first.Generation {
+				t.Error("the refused warm attach disturbed the resident session")
+			}
+		})
+	}
+}
+
+// TestAResidentSessionIsRefusedForARuntimeBuildItIsNotRunning holds that the
+// comparison is against the RESIDENT entry rather than against the current
+// target, which is the only comparison that means anything once a target has
+// been upgraded under a live session.
+func TestAResidentSessionIsRefusedForARuntimeBuildItIsNotRunning(t *testing.T) {
+	const upgraded department.CompatibilityID = "rig-2027-06-upgraded"
+	f := newFixture(t)
+	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err != nil {
+		t.Fatalf("the cold attach failed: %v", err)
+	}
+	// The target is upgraded under the resident session. Its runtime is still
+	// the old build, and the registry recorded that.
+	f.target.driftFromNow(upgraded)
+	f.target.driftAfter = 0
+	f.target.compatibility = upgraded
+
+	request := f.request(ModeCreate)
+	request.CompatibilityID = upgraded
+	_, err := f.manager.Attach(context.Background(), request)
+	if err == nil {
+		t.Fatal("a request placed on the upgraded build was accepted onto a runtime built by the old one")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
+		t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A rollback that cannot release says so
+// ---------------------------------------------------------------------------
+
+// TestARollbackThatCannotReleaseNamesWhatIsStillHeld closes the case the
+// package's own guarantee was silent about.
+//
+// "An Attach that returns an error took nothing that is still held" is false
+// when a compensation itself fails, and until this test the failure was
+// swallowed: a refused TombstoneResidency leaves a LIVE ROUTE while the attach
+// reports failure, so Factory keeps sending work to a Host that owns nothing,
+// and nothing anywhere records why. Every knob exercised here existed on the
+// fakes and was set by no test, which is what made the gap invisible.
+func TestARollbackThatCannotReleaseNamesWhatIsStillHeld(t *testing.T) {
+	stuck := errors.New("the store is unreachable")
+	f := newFixture(t, func(f *fixture) {
+		f.locations.publishErr = errors.New("injected")
+		f.locations.failAfter = 1
+		f.locations.tombstoneErr = stuck
+		f.ownership.stopErr = stuck
+		f.workspaces.releaseErr = stuck
+		f.leases.releaseErr = stuck
+		f.target.releaseErr = stuck
+	})
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the injected step 9 failure was not reported")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if attach.Step != StepAttached {
+		t.Errorf("the failure names step %q, want %q", attach.Step, StepAttached)
+	}
+	for _, want := range []string{"residency tombstone", "ownership", "runtime residency", "workspace", "session lease"} {
+		found := false
+		for _, unreleased := range attach.Unreleased {
+			if strings.HasPrefix(unreleased, want+": ") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the failure does not name %q among what it could not release: %v", want, attach.Unreleased)
+		}
+	}
+	if !strings.Contains(err.Error(), "could not release") {
+		t.Errorf("the error text says nothing about what is still held: %q", err.Error())
+	}
+
+	// EVERY compensation was attempted, not just the ones before the first
+	// failure. Abandoning the rest would turn one leaked resource into five.
+	for _, attempted := range []string{"location.tombstone", "ownership.stop", "runtime.release", "workspace.release", "lease.release"} {
+		if f.trace.indexOf(attempted) < 0 {
+			t.Errorf("the rollback never attempted %q; a compensation that fails must not abandon the ones after it", attempted)
+		}
+	}
+	// And the registry entry, whose removal cannot fail, is gone regardless.
+	if _, held := f.registry.Get(f.key()); held {
+		t.Error("the local registry still holds a residency after a failed attach")
+	}
+}
+
+// TestAStaleSessionRecordIsNotReportableAsAttached closes the generation half
+// of the fast-path predicate, which nothing else reached.
+//
+// A SYNTHETIC FIXTURE IS REQUIRED because the subject already satisfies the
+// rule on every path this Manager takes: while the key slot is held no attach
+// of that key can replace the entry, so a record and its entry never disagree.
+// The fixture builds the disagreement directly — the residency is replaced
+// under the same key by another writer to the shared registry, leaving this
+// Manager's record naming a generation that is gone — and a predicate ignoring
+// the generation then reports ATTACHED for a residency this Manager does not
+// own, handing a caller a runtime it never launched and would never release.
+func TestAStaleSessionRecordIsNotReportableAsAttached(t *testing.T) {
+	f := newFixture(t)
+	first, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if !f.registry.inner.RemoveByGeneration(f.key(), first.Generation) {
+		t.Fatal("the seeded residency could not be removed")
+	}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	replacement, installed := f.registry.inner.Insert(f.key(), registry.Admission{
+		AgentID: testAgent, Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
+	})
+	if !installed || replacement.Generation == first.Generation {
+		t.Fatalf("the replacement was not installed under a new generation (installed=%t, generation=%d)", installed, replacement.Generation)
+	}
+	launchesBefore := len(f.target.producedRuntimes())
+
+	second, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("second Attach: %v", err)
+	}
+
+	if second.Generation != replacement.Generation {
+		t.Errorf("the attach reported generation %d, want the residency that actually exists, %d", second.Generation, replacement.Generation)
+	}
+	// THE DISCRIMINATOR. Reporting the replacement is right either way; what
+	// separates a stale record honoured from a stale record ignored is whether
+	// the fast path was taken. A predicate that ignored the generation returns
+	// straight from the record and launches nothing; the correct one falls
+	// through to the slot, launches, loses the registry race and releases.
+	launched := f.target.producedRuntimes()
+	if len(launched) != launchesBefore+1 {
+		t.Fatalf("%d runtimes were launched by the second attach, want 1: a stale record was reported as attached without the key slot ever being taken", len(launched)-launchesBefore)
+	}
+	if released, shutdowns := launched[len(launched)-1].counts(); released != 1 || shutdowns != 0 {
+		t.Errorf("the losing runtime was released %d times and shut down %d times, want exactly one nonterminal release", released, shutdowns)
 	}
 }

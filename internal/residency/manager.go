@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -142,6 +143,16 @@ type Workspaces interface {
 	// durable state.
 	ReleaseWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) error
 }
+
+// FOR O6.1, AND IT IS THE DEFECT CLASS internal/service ALREADY NAMED. host.New
+// validates a host.WorkspaceProvider that this manager CANNOT USE, because it
+// has no ReleaseWorkspace. So a Host today can be constructed with one workspace
+// provider and its residency manager wired to another, and nothing checks that
+// they are the same thing — two sources of "the workspace", exactly as two
+// sources of "consumed" would be two admission ledgers. The composition root
+// must either widen host.WorkspaceProvider to carry the release half, or hand
+// this manager the very value host.New validated. Do not resolve it by leaving
+// both.
 
 // Locations writes the epoch-fenced durable Host registry projection of §15.
 type Locations interface {
@@ -359,6 +370,13 @@ type AttachError struct {
 	Key    registry.Key
 	Reason string
 	Cause  error
+
+	// Unreleased names every compensation that itself failed, so a caller can
+	// tell "the attach failed and took nothing" from "the attach failed and
+	// something is still held". The second is an operator's problem — a live
+	// route with no owner, a lease nobody will renew — and it must not be
+	// indistinguishable from the first.
+	Unreleased []string
 }
 
 func (e *AttachError) Error() string {
@@ -366,6 +384,9 @@ func (e *AttachError) Error() string {
 		" failed at " + string(e.Step) + ": " + e.Reason
 	if e.Cause != nil {
 		message += ": " + e.Cause.Error()
+	}
+	if len(e.Unreleased) > 0 {
+		message += " (and the rollback could not release " + strings.Join(e.Unreleased, "; ") + ")"
 	}
 	return message
 }
@@ -543,17 +564,43 @@ func (m *Manager) Close() {
 // below is called on the SESSION context, derived from this Manager's root, and
 // every rollback on the root itself.
 //
-// The consequence is stated because it is a real cost: a caller cannot cancel
-// an attach. What bounds one is the collaborators' own deadlines, and if that
-// stops being enough the answer is a bound owned by this package, not a return
-// to the request's lifetime.
+// TWO COSTS, and they COMPOUND, which is why they are written together rather
+// than one each in their own place. A caller cannot cancel an attach; and
+// attaches of one key are serialized, so one hung Create or Restore parks every
+// later attacher for that key on the slot with no timeout and no way for any of
+// them to abandon. The bound is the collaborators' own deadlines, and that
+// bound now covers the QUEUE and not just the one call. If it stops being
+// enough the answer is a deadline owned by this package — a bound on the whole
+// sequence, applied to the session context — and not a return to the request's
+// lifetime, which would reintroduce the failure the paragraph above describes.
 func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency, error) {
 	key := registry.Key{TenantID: request.TenantID, SessionID: request.SessionID}
 
-	// The FAST idempotency path, taken without serializing on the key: a
-	// session that is already resident costs one map read.
-	if existing, held := m.registry.Get(key); held {
-		return existingResidency(existing, key, request.AgentID)
+	// STEP 1 RUNS FIRST, INCLUDING ON THE WARM PATH. An earlier version put the
+	// idempotency check ahead of validation, so a request naming an unknown
+	// mode, no actor, or a runtime build this Host does not launch was REFUSED
+	// COLD AND ACCEPTED WARM. Step 1 says validate the AgentID AND the runtime
+	// compatibility; checking only the agent on the resident path is half of a
+	// rule. Validation reaches no collaborator, so running it first still
+	// leaves "a refused request took nothing" true.
+	target, err := m.validate(key, request)
+	if err != nil {
+		return Residency{}, err
+	}
+
+	// THE FAST IDEMPOTENCY PATH IS GATED ON THE SESSION RECORD, which exists
+	// only from step 9. Gating it on the REGISTRY was a live escape: Insert
+	// marks an entry resident and accepting at step 6, so a concurrent Attach
+	// arriving in the 6-to-9 window bypassed the serialization entirely and
+	// returned success carrying the winner's runtime — which the winner then
+	// released when its own step 7, 8 or 9 failed. The erroring call took
+	// nothing and the SUCCEEDING one was left holding a corpse: a Runtime whose
+	// ReleaseResidency had already been called and whose lease was gone.
+	//
+	// The record is written last, under the same mutex, so it reports attached
+	// only for a residency that reached step 9.
+	if existing, attached := m.attachedResidency(key); attached {
+		return existingResidency(existing, key, request)
 	}
 
 	// ONE ATTACH PER KEY AT A TIME. Without this, N concurrent cold attaches
@@ -563,13 +610,37 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 	// "concurrent cold restore" into one launch and N-1 idempotent hits.
 	//
 	// The RE-READ after the slot is held is what makes that true; without it
-	// every waiter proceeds to launch its own runtime in turn.
+	// every waiter proceeds to launch its own runtime in turn. It uses the same
+	// predicate as the fast path, so a residency that is merely half-installed
+	// is never reported to anyone.
 	release := m.acquireKey(key)
 	defer release()
-	if existing, held := m.registry.Get(key); held {
-		return existingResidency(existing, key, request.AgentID)
+	if existing, attached := m.attachedResidency(key); attached {
+		return existingResidency(existing, key, request)
 	}
-	return m.attach(key, request)
+	return m.attach(key, request, target)
+}
+
+// attachedResidency reports the residency of a session this Manager has
+// ATTACHED — one that reached step 9 — and nothing else.
+//
+// It is deliberately narrower than "the registry holds an entry". A registry
+// entry exists from step 6, and between 6 and 9 the attach that installed it
+// may still fail and take it away again; an entry installed by anything other
+// than this Manager has no session record here at all and is left to the
+// registry-loser branch, which knows how to give back what it took.
+func (m *Manager) attachedResidency(key registry.Key) (registry.Entry, bool) {
+	m.mu.Lock()
+	record, known := m.sessions[key]
+	m.mu.Unlock()
+	if !known {
+		return registry.Entry{}, false
+	}
+	entry, resident := m.registry.Get(key)
+	if !resident || entry.Generation != record.generation {
+		return registry.Entry{}, false
+	}
+	return entry, true
 }
 
 // acquireKey serializes attaches of one session and returns the release. A
@@ -595,14 +666,28 @@ func (m *Manager) acquireKey(key registry.Key) func() {
 }
 
 // existingResidency reports a residency that already exists, refusing a caller
-// that named a different agent for it.
-func existingResidency(entry registry.Entry, key registry.Key, agent sessionwire.AgentID) (Residency, error) {
-	if entry.AgentID != agent {
+// whose request does not describe it.
+//
+// BOTH HALVES OF STEP 1'S IDENTITY RULE ARE CHECKED HERE, against the RESIDENT
+// entry rather than against the current launch target: a target upgraded under
+// a resident session still holds a runtime built by the old one, so the build
+// the caller was placed on must be compared with the build actually running.
+// The tenant needs no check because it is half of the key.
+func existingResidency(entry registry.Entry, key registry.Key, request Request) (Residency, error) {
+	if entry.AgentID != request.AgentID {
 		return Residency{}, &AttachError{
 			Step:   StepValidate,
 			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
 			Key:    key,
-			Reason: "the session is resident as agent " + strconv.Quote(string(entry.AgentID)) + " and cannot also be attached as " + strconv.Quote(string(agent)),
+			Reason: "the session is resident as agent " + strconv.Quote(string(entry.AgentID)) + " and cannot also be attached as " + strconv.Quote(string(request.AgentID)),
+		}
+	}
+	if request.CompatibilityID != "" && request.CompatibilityID != entry.CompatibilityID {
+		return Residency{}, &AttachError{
+			Step:   StepValidate,
+			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
+			Key:    key,
+			Reason: "the session is resident on runtime " + strconv.Quote(string(entry.CompatibilityID)) + " and the request was placed on " + strconv.Quote(string(request.CompatibilityID)),
 		}
 	}
 	return Residency{
@@ -628,9 +713,17 @@ func existingResidency(entry registry.Entry, key registry.Key, agent sessionwire
 // admit past its capacity, with neither package's tests able to see it. A
 // failed attach with no winner releases both; a registry loser releases only
 // what is its own.
+//
+// THE PRECONDITION, stated because it is not enforced here: leaving a shared
+// resource to the winner is right only if the winner CHARGED it. Every path
+// through this package admits before it inserts, so it holds today; a residency
+// installed into the registry by code that did not call Admit would strand the
+// loser's charge instead. If a second writer to this registry ever appears,
+// that is the assumption to revisit.
 type compensation struct {
 	shared bool
-	run    func(context.Context)
+	name   string
+	run    func(context.Context) error
 }
 
 // unwinder holds the compensations of one in-flight attach, released in
@@ -638,35 +731,51 @@ type compensation struct {
 type unwinder struct{ actions []compensation }
 
 // own records a compensation for a resource belonging to this attempt alone.
-func (u *unwinder) own(run func(context.Context)) {
-	u.actions = append(u.actions, compensation{run: run})
+func (u *unwinder) own(name string, run func(context.Context) error) {
+	u.actions = append(u.actions, compensation{name: name, run: run})
 }
 
 // shared records a compensation for a resource keyed by the session, which a
 // registry loser must leave to the winner.
-func (u *unwinder) shared(run func(context.Context)) {
-	u.actions = append(u.actions, compensation{shared: true, run: run})
+func (u *unwinder) shared(name string, run func(context.Context) error) {
+	u.actions = append(u.actions, compensation{shared: true, name: name, run: run})
 }
 
-// unwind releases what was taken, most recent first.
-func (u *unwinder) unwind(ctx context.Context, includeShared bool) {
+// unwind releases what was taken, most recent first, and NAMES WHAT IT COULD
+// NOT GIVE BACK.
+//
+// A compensation can itself fail, and the failure is not cosmetic: a
+// tombstone write that is refused leaves a LIVE ROUTE while the attach
+// reports failure, so Factory keeps sending work to a Host that owns nothing.
+// Swallowing that made the package's own guarantee — "an Attach that returns an
+// error took nothing that is still held" — unfalsifiable in exactly the case
+// where it is false. Every failure is named on the returned AttachError.
+//
+// It CONTINUES past a failure rather than stopping. The compensations are
+// independent, and abandoning the rest because one failed would turn one leaked
+// resource into five.
+func (u *unwinder) unwind(ctx context.Context, includeShared bool) []string {
+	var unreleased []string
 	for i := len(u.actions) - 1; i >= 0; i-- {
 		if u.actions[i].shared && !includeShared {
 			continue
 		}
-		u.actions[i].run(ctx)
+		if err := u.actions[i].run(ctx); err != nil {
+			unreleased = append(unreleased, u.actions[i].name+": "+err.Error())
+		}
 	}
+	return unreleased
 }
 
 // attach is the nine-step sequence. It is one function on purpose: the ORDER is
 // the contract, and a sequence split across methods is a sequence a reader has
 // to reassemble before they can check it.
-func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
+func (m *Manager) attach(key registry.Key, request Request, target snapshotTarget) (Residency, error) {
 	// -- 1. AgentID, runtime compatibility, and Host admission ---------------
-	target, err := m.validate(key, request)
-	if err != nil {
-		return Residency{}, err
-	}
+	//
+	// The identity and compatibility half ran in Attach, so that the WARM path
+	// is validated by the same code. What is left of step 1 is admission, which
+	// must not be charged for a request that was going to be refused anyway.
 	capabilities := target.capabilities
 
 	if err := m.admissions.Admit(key, request.AgentID); err != nil {
@@ -679,18 +788,18 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 		}
 	}
 	unwound := &unwinder{}
-	unwound.shared(func(context.Context) { m.admissions.Release(key) })
+	unwound.shared("admission", func(context.Context) error { m.admissions.Release(key); return nil })
 
 	// The ONE explicit root session context, and the only place one is made.
 	sessionCtx, cancelSession := m.newSessionContext(request.Principal)
-	unwound.own(func(context.Context) { cancelSession() })
+	unwound.own("session context", func(context.Context) error { cancelSession(); return nil })
 
 	fail := func(step Step, code sessionwire.HostLinkErrorCode, reason string, cause error) (Residency, error) {
 		// The rollback runs on the MANAGER ROOT: not on the request, which may
 		// already be cancelled, and not on the session context, which this
 		// very rollback is cancelling.
-		unwound.unwind(m.root, true)
-		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause}
+		unreleased := unwound.unwind(m.root, true)
+		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased}
 	}
 
 	// -- 2. the SessionStore lease and its new epoch -------------------------
@@ -709,7 +818,7 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 	case lease == nil:
 		return fail(StepLease, "", "the lease store reported success and granted nothing", nil)
 	}
-	unwound.own(func(ctx context.Context) { _ = lease.Release(ctx) })
+	unwound.own("session lease", lease.Release)
 
 	epoch := lease.Epoch()
 	if epoch == 0 {
@@ -758,8 +867,8 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 		if err != nil {
 			return fail(StepHydrate, "", "the session workspace could not be materialized", err)
 		}
-		unwound.shared(func(ctx context.Context) {
-			_ = m.workspaces.ReleaseWorkspace(ctx, key.TenantID, key.SessionID)
+		unwound.shared("workspace", func(ctx context.Context) error {
+			return m.workspaces.ReleaseWorkspace(ctx, key.TenantID, key.SessionID)
 		})
 	}
 
@@ -792,7 +901,7 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 	case runtime == nil:
 		return fail(StepHydrate, "", "the launch target reported success and produced no runtime", nil)
 	}
-	unwound.own(func(ctx context.Context) { _ = runtime.ReleaseResidency(ctx) })
+	unwound.own("runtime residency", runtime.ReleaseResidency)
 
 	// -- 5. the required runtime capabilities --------------------------------
 	//
@@ -828,19 +937,22 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 		// workspace to the winner. Leaving the runtime live is the bug this
 		// branch exists to fix.
 		unwound.unwind(m.root, false)
-		return existingResidency(entry, key, request.AgentID)
+		return existingResidency(entry, key, request)
 	}
-	unwound.own(func(context.Context) { m.registry.RemoveByGeneration(key, entry.Generation) })
+	unwound.own("registry entry", func(context.Context) error {
+		m.registry.RemoveByGeneration(key, entry.Generation)
+		return nil
+	})
 
 	// -- 7. the epoch-fenced durable residency projection --------------------
 	observation := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyAttaching, false)
 	if err := m.locations.PublishResidency(sessionCtx, observation); err != nil {
 		return fail(StepPublish, "", "the durable residency projection could not be written", err)
 	}
-	unwound.own(func(ctx context.Context) {
+	unwound.own("residency tombstone", func(ctx context.Context) error {
 		// §10.1: the route is removed by an EXPIRED epoch-fenced tombstone,
 		// never by erasing the fencing high-water mark.
-		_ = m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, epoch)
+		return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, epoch)
 	})
 
 	// -- 8. inbox, event and heartbeat ownership -----------------------------
@@ -852,12 +964,17 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 		Generation:      entry.Generation,
 		Runtime:         runtime,
 	})
-	if err != nil {
+	switch {
+	case err != nil:
 		return fail(StepOwnership, "", "inbox, event and heartbeat ownership could not be started", err)
+	case handle == nil:
+		// The SAME RULE the lease and the runtime get, applied in the third
+		// place it belongs. An accepted nil handle attaches the session with
+		// nothing O3.2 can stop and nothing O6.1 can release, which is a leak
+		// reported as a success.
+		return fail(StepOwnership, "", "ownership reported success and returned no handle, so nothing it started could ever be stopped", nil)
 	}
-	if handle != nil {
-		unwound.own(func(ctx context.Context) { _ = handle.Stop(ctx) })
-	}
+	unwound.own("ownership", handle.Stop)
 
 	// -- 9. only then, attached ----------------------------------------------
 	//
@@ -866,6 +983,16 @@ func (m *Manager) attach(key registry.Key, request Request) (Residency, error) {
 	// advertise an accepting route before its inbox ownership existed;
 	// publishing only `attaching` would leave every session attaching until
 	// O3.2's first heartbeat, which Factory does not route to at all.
+	//
+	// WHAT `attaching` IS AND IS NOT VISIBLE FOR, so a later reader does not
+	// "fix" it: the projection is written at step 7, which is AFTER hydration,
+	// so `attaching` is externally observable only across the short 7-to-9
+	// window and never during the slow part of an attach. §9.1's prose sketch
+	// orders "Host registers observed location" before construction, but the
+	// task's sequence governs and is the safer one — a crash during hydration
+	// leaves no observation at all, which projects `cold`, which is correct.
+	// Moving the first publish earlier would advertise a route for a session
+	// that may never exist.
 	resident := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyResident, true)
 	if err := m.locations.PublishResidency(sessionCtx, resident); err != nil {
 		return fail(StepAttached, "", "the resident residency projection could not be written", err)
