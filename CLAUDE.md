@@ -51,7 +51,12 @@ merged — the independence is worth more than the tidiness, and each has its ow
 failure mode. It has already misfired twice for want of an index: the reason map
 was consumed by one guard and discarded by the other, and the file-level
 structural predicate was left behind when the two directory ones were shared.
-Route a new rule by asking what it is about.
+Route a new rule by asking what it is about. **Every mechanism has exactly one
+site, and a new rule is added at that site — if a mechanism does not have one,
+that is the bug.** Six rounds of review found six escapes and every one of them
+was the same thing: a rule listed in one place and not in the adjacent place
+that inherits from it. Enumerate CONSUMERS if you must enumerate something;
+never enumerate the rules, because the rules are the side that grows.
 
 1. **One import path, in one file** — `importVerdict`. Layering bans, the
    Centrifuge path scope. Return a reason; the message is consumed.
@@ -61,6 +66,13 @@ Route a new rule by asking what it is about.
 3. **The shape of a go.mod directive** — `replaceViolations`. The local
    filesystem path rule lives here. Anything about the module a directive
    NAMES belongs in 2, not here.
+   2 and 3 are RUN from one place, `goModViolations`, which both the root guard
+   and the nested extension point call. A new go.mod rule goes in there and
+   both inherit it; adding it to either caller instead leaves the other silent,
+   which is what a probe demonstrated with a seventh rule over the `exclude`
+   directive before the two lists were merged.
+   `TestGoModRulesHaveOneSite` holds the shape: a consumer calls
+   `goModViolations` and no other `…Violations` function.
 4. **What the walk covers at all** — `scanNestedModules` and
    `nestedModuleAllowlist`. A declared nested module buys the WHOLE guard: the
    import scan (mechanism 1), that module's own `go.mod` through both
@@ -78,6 +90,9 @@ Route a new rule by asking what it is about.
    classification TIME and not at report time; that is what stops a path-scoped
    rule re-anchoring, and any path-scoped rule added to `importVerdict`
    inherits it by construction.
+   Every mechanism now has one site: 1 through `scanImports`'s REQUIRED prefix
+   parameter, 2 and 3 through `goModViolations`, 4 through the recursion, 5
+   through the exported predicates and their oracles.
    The floors are deliberately NOT uniform: `files` and `imports` are floored
    because violations are derived from them, `productionFiles` is not, because
    a declared nested module may legitimately be test support and flooring it

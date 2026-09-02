@@ -166,6 +166,24 @@ func replaceViolations(parsed *modfile.File) []string {
 	return violations
 }
 
+// goModViolations is EVERY rule that applies to a parsed go.mod, in one place.
+//
+// It exists because "two callers that must each remember to list the same
+// mechanisms" is the shape this file has produced five escapes with, and it
+// had quietly grown a sixth: the root guard listed replaceViolations and
+// requireViolations, and the nested extension point listed the same two,
+// separately, in the other order. Adding a SEVENTH go.mod rule — an
+// excludeViolations over the exclude directive, say, whose target
+// looprigDependencyViolation already classifies verbatim — and wiring it into
+// the root guard alone would have left every declared nested module without
+// it, silently, with make check green.
+//
+// So: a new go.mod rule is added HERE, and both callers inherit it. Adding one
+// to a caller instead is the bug, and TestGoModRulesHaveOneSite says so.
+func goModViolations(parsed *modfile.File) []string {
+	return append(replaceViolations(parsed), requireViolations(parsed)...)
+}
+
 // requireViolations reports every looprig requirement Host may not name: a
 // forbidden module at any version, a module with no release Host is allowed to
 // depend on, and a version other than the published one. Pseudo-versions fail
@@ -495,12 +513,9 @@ func TestGoModHasNoLocalReplaceAndNamesOnlyPublishedVersions(t *testing.T) {
 		t.Fatalf("go.mod module = %+v, want github.com/looprig/host; the guard is reading the wrong file", parsed.Module)
 	}
 	if len(parsed.Require) == 0 {
-		t.Fatal("go.mod requires nothing, so both go.mod assertions below would be vacuous")
+		t.Fatal("go.mod requires nothing, so the go.mod rules below would be vacuous")
 	}
-	for _, violation := range replaceViolations(parsed) {
-		t.Error(violation)
-	}
-	for _, violation := range requireViolations(parsed) {
+	for _, violation := range goModViolations(parsed) {
 		t.Error(violation)
 	}
 }
@@ -1111,6 +1126,75 @@ func TestDeclaredNestedModuleInheritsTheWholeGuard(t *testing.T) {
 	})
 }
 
+// goModRuleConsumers names the two functions that run the go.mod rules over a
+// parsed file: the root guard and the nested extension point. It enumerates
+// CONSUMERS, deliberately, and not rules — the consumers are fixed at two
+// because there are two go.mod files a run can see, while the rules are the
+// thing that grows, and enumerating the growing side is what this file has
+// spent six rounds paying for.
+var goModRuleConsumers = []string{
+	"TestGoModHasNoLocalReplaceAndNamesOnlyPublishedVersions",
+	"nestedGoModViolations",
+}
+
+// TestGoModRulesHaveOneSite is what makes "a new go.mod rule is added in one
+// place" a checkable claim rather than a note in CLAUDE.md.
+//
+// Extracting goModViolations makes the two consumers agree TODAY. It does not
+// stop the next maintainer adding an excludeViolations to one of them directly,
+// which is precisely the edit that produced this round's finding — the root
+// guard and the nested arm each listed the same two rules, separately, and a
+// seventh wired into the root alone left every declared nested module without
+// it. So the shape is asserted: a consumer calls goModViolations and no other
+// rule function.
+//
+// The hook is the …Violations naming convention this file already follows
+// throughout. A rule named checkExcludes would escape; the convention is worth
+// more as a guard than the guard would be worth as an enumeration.
+func TestGoModRulesHaveOneSite(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := parser.ParseFile(token.NewFileSet(), "import_boundary_test.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse import_boundary_test.go: %v", err)
+	}
+
+	found := map[string]bool{}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || !slices.Contains(goModRuleConsumers, function.Name.Name) {
+			continue
+		}
+		found[function.Name.Name] = true
+
+		calls := map[string]bool{}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if callee, ok := call.Fun.(*ast.Ident); ok && strings.HasSuffix(callee.Name, "Violations") {
+				calls[callee.Name] = true
+			}
+			return true
+		})
+
+		if !calls["goModViolations"] {
+			t.Errorf("%s does not call goModViolations, so the single site is not the site it uses", function.Name.Name)
+		}
+		for callee := range calls {
+			if callee != "goModViolations" {
+				t.Errorf("%s calls %s directly. Every go.mod rule goes through goModViolations, so that both this consumer and the other one inherit a new rule from one edit; listing a rule here is how the other consumer silently misses it", function.Name.Name, callee)
+			}
+		}
+	}
+	for _, consumer := range goModRuleConsumers {
+		if !found[consumer] {
+			t.Errorf("goModRuleConsumers names %q, which is not a function in this file. Correct it or remove it; a stale entry asserts nothing", consumer)
+		}
+	}
+}
+
 // TestDocCommentsNameTheirOwnDeclaration is a structural check for a mechanism
 // that has now produced three defects in this repository by itself: a comment
 // written for one declaration attaches to the declaration that happens to sit
@@ -1203,6 +1287,11 @@ func TestDocCommentsNameTheirOwnDeclaration(t *testing.T) {
 		if slices.Contains(doc.names, doc.word) {
 			continue
 		}
+		// documentedNames is keyed by BARE name across every package in the
+		// module, so a name defined in two packages and documented in only one
+		// suppresses a real finding in the other. That is a false NEGATIVE and
+		// never a false positive, which is the right way round for a check
+		// whose value depends on never firing on prose.
 		if documentedNames[doc.word] {
 			// A comment that DISCUSSES another declaration is ordinary and
 			// frequent in this file — "forbiddenLooprigModules is a map of
@@ -1705,9 +1794,11 @@ func scanNestedModulesUnder(root, prefix string, allowlist []string) (nestedScan
 	return scan, nil
 }
 
-// nestedGoModViolations applies mechanisms 2 and 3 — the looprig-dependency
-// rule and the go.mod-directive-shape rule — to a declared nested module's own
-// go.mod, and reports whether there was one to read.
+// nestedGoModViolations runs the go.mod rules over a declared nested module's
+// own go.mod and reports whether there was one to read. Its job is FINDING and
+// PARSING that file and qualifying what comes back; which rules apply is
+// goModViolations' job, and listing them here again would be the second site
+// this whole round exists to remove.
 //
 // A declared BOUNDARY is not always a module: a vendored git checkout carries
 // .git and no go.mod, and having nothing to read is not a violation. A go.mod
@@ -1726,7 +1817,7 @@ func nestedGoModViolations(directory, qualified string) ([]string, bool, error) 
 		return nil, false, err
 	}
 	var violations []string
-	for _, violation := range append(requireViolations(parsed), replaceViolations(parsed)...) {
+	for _, violation := range goModViolations(parsed) {
 		violations = append(violations, qualified+"/"+violation)
 	}
 	return violations, true, nil
