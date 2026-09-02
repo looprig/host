@@ -101,6 +101,13 @@ type SessionState struct {
 	// Namespace is the tenant- and session-scoped object prefix every launched
 	// runtime writes under. It is read from the store rather than derived here
 	// because the layout is SessionStore's, not Host's.
+	//
+	// IT IS REQUIRED WHETHER OR NOT THE SESSION EXISTS. The prefix is a
+	// property of the identities, not of the durable state, so a store that
+	// answers Exists=false must still answer with the namespace that session's
+	// objects will live under. An empty one is refused before the launch: a
+	// runtime handed the empty prefix scopes every object it writes to nothing,
+	// and it does so having reported success.
 	Namespace string
 
 	// CompatibilityID is the runtime build that wrote the durable state. A
@@ -556,7 +563,9 @@ func (m *Manager) SessionContext(key registry.Key) (context.Context, bool) {
 // that writes no tombstone and releases no lease, which is worse than doing
 // none of it: the durable projection would outlive the process that wrote it
 // and Factory would route to a Host that had stopped listening. Close is for
-// process shutdown after that protocol has run, or for a test.
+// process shutdown after that protocol has run, or for a test. An attach in
+// flight when it arrives still rolls back completely: see the rollback context
+// in attach, which Close deliberately cannot cancel.
 //
 // FOR O3.2/O6.1, WITH O3.1's REACHABILITY STATED: m.sessions is never pruned by
 // this package, because nothing here ends a residency. If a record is ever
@@ -589,6 +598,14 @@ func (m *Manager) Close() {
 // enough the answer is a deadline owned by this package — a bound on the whole
 // sequence, applied to the session context — and not a return to the request's
 // lifetime, which would reintroduce the failure the paragraph above describes.
+//
+// THE SLOT ALSO BARGES: acquireKey deletes the map entry before closing the
+// channel it woke everyone on, so a fresh arrival can take the slot ahead of a
+// waiter that has been parked longer. There is no correctness consequence —
+// every waiter re-reads the residency and either finds it or attaches — but
+// there is no fairness bound either, so a hot key under sustained arrivals can
+// starve one waiter indefinitely. A queue would fix it and is not worth its
+// complexity until an attach is slow enough for the starvation to be visible.
 func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency, error) {
 	key := registry.Key{TenantID: request.TenantID, SessionID: request.SessionID}
 
@@ -599,8 +616,7 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 	// compatibility; checking only the agent on the resident path is half of a
 	// rule. Validation reaches no collaborator, so running it first still
 	// leaves "a refused request took nothing" true.
-	target, err := m.validate(key, request)
-	if err != nil {
+	if err := m.validateRequest(key, request); err != nil {
 		return Residency{}, err
 	}
 
@@ -633,6 +649,14 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 	defer release()
 	if existing, attached := m.attachedResidency(key); attached {
 		return existingResidency(existing, key, request)
+	}
+
+	// THE SNAPSHOT IS TAKEN HERE, inside the slot, and nowhere else. See
+	// resolveTarget: taken before the wait, a parked attach launches on answers
+	// the target gave before it parked.
+	target, err := m.resolveTarget(key, request)
+	if err != nil {
+		return Residency{}, err
 	}
 	return m.attach(key, request, target)
 }
@@ -761,6 +785,19 @@ func (u *unwinder) shared(name string, run func(context.Context) error) {
 	u.actions = append(u.actions, compensation{shared: true, name: name, run: run})
 }
 
+// sharedHeld names the shared compensations this attach recorded and did not
+// run, for a caller that must be told they are still held. It is the loser's
+// half of the same honesty unwind provides for a failure.
+func (u *unwinder) sharedHeld() []string {
+	var held []string
+	for _, action := range u.actions {
+		if action.shared {
+			held = append(held, action.name+": held by the resident session and not this call's to release")
+		}
+	}
+	return held
+}
+
 // unwind releases what was taken, most recent first, and NAMES WHAT IT COULD
 // NOT GIVE BACK.
 //
@@ -818,17 +855,40 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		}
 	}
 	unwound := &unwinder{}
-	unwound.shared("admission", func(context.Context) error { m.admissions.Release(key); return nil })
+	unwound.shared("admission", func(context.Context) error {
+		// The bool is CONSUMED. This attach charged the ledger, so a release
+		// reporting that nothing was charged means something else credited it
+		// back first — which is the double-credit that lets a Host admit past
+		// its capacity, and it must not be discarded on the one path that would
+		// have noticed.
+		if !m.admissions.Release(key) {
+			return errors.New("the ledger reports this session was not charged, so something else credited it back first")
+		}
+		return nil
+	})
 
 	// The ONE explicit root session context, and the only place one is made.
 	sessionCtx, cancelSession := m.newSessionContext(request.Principal)
 	unwound.own("session context", func(context.Context) error { cancelSession(); return nil })
 
+	// THE ROLLBACK CONTEXT IS NOT THE MANAGER ROOT, and the reason is §8.3's,
+	// one level up. Compensations ran on m.root, which Close cancels — so a
+	// Close arriving during an in-flight attach disabled the entire rollback
+	// and left a live §15 route with no owner and a lease nobody would renew.
+	// That is the same "a rollback on a dead context releases nothing" failure
+	// the request context is kept out of the sequence to avoid. A release must
+	// happen whether or not this process is shutting down, so the rollback runs
+	// on a context nothing here can cancel. It is not the request's either,
+	// which may already be done.
+	//
+	// It carries NO principal and no deadline. It is not a session: nothing
+	// downstream of it works on the tenant's behalf, it only gives back what
+	// was taken, and installing an identity on a context with no lifetime owner
+	// would be the opposite of what the whitelist is for.
+	rollbackCtx := context.Background()
+
 	fail := func(step Step, code sessionwire.HostLinkErrorCode, reason string, cause error) (Residency, error) {
-		// The rollback runs on the MANAGER ROOT: not on the request, which may
-		// already be cancelled, and not on the session context, which this
-		// very rollback is cancelling.
-		unreleased := unwound.unwind(m.root, true)
+		unreleased := unwound.unwind(rollbackCtx, true)
 		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased}
 	}
 
@@ -874,18 +934,33 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	if err != nil {
 		return fail(StepHydrate, "", "the durable session state could not be read", err)
 	}
+	// THE NAMESPACE IS REQUIRED IN BOTH MODES, and a genuinely cold create is
+	// the case that made this necessary rather than pedantic. A create has no
+	// durable state, so a store answering Exists=false also answered
+	// Namespace="" — and the runtime was launched with the EMPTY PREFIX every
+	// one of that session's durable objects is scoped by. It succeeded, which
+	// is the worst available outcome. The namespace is a property of the
+	// IDENTITIES and not of the state, which is why SessionState.Namespace is
+	// documented as required whether or not the session exists; enforcing it
+	// here is what makes that documentation a rule.
+	if state.Namespace == "" {
+		return fail(StepHydrate, "", "the durable store returned no object namespace for this session, and a runtime launched under the empty prefix would scope every object it writes to nothing", nil)
+	}
+	// THE BUILD CHECK IS NOT RESTORE-ONLY. It was, and a create over durable
+	// state written by a different runtime proceeded and then published the new
+	// build as the route for that session. Whether a create should meet
+	// existing state at all is Factory's idempotency question — §16 binds the
+	// create identity in SessionStore — but if it does, the build must still
+	// agree. A session with state and no recorded build lands here too, and
+	// fails closed.
+	if state.Exists && state.CompatibilityID != target.compatibility {
+		return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeMismatch,
+			"the durable state was written by runtime "+strconv.Quote(string(state.CompatibilityID))+" and this Host launches "+strconv.Quote(string(target.compatibility)), nil)
+	}
 	if request.Mode == ModeRestore {
 		switch {
 		case !state.Exists:
 			return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeUnavailable, "the session has no durable state to restore from", nil)
-		case state.CompatibilityID != target.compatibility:
-			// Fail closed BEFORE the launch, for O1.2's reason: deciding this
-			// after the target has produced a session spends the resource the
-			// check exists to protect. The target checks it again against the
-			// value it is handed; this check is against the DURABLE state,
-			// which is a different source.
-			return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeMismatch,
-				"the durable state was written by runtime "+strconv.Quote(string(state.CompatibilityID))+" and this Host launches "+strconv.Quote(string(target.compatibility)), nil)
 		case capabilities.RequiresCheckpoint && !state.HasCheckpoint:
 			return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeUnavailable, "the target requires a checkpoint and the session has none", nil)
 		}
@@ -966,7 +1041,34 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// elsewhere and remains resumable — and leaves the shared admission and
 		// workspace to the winner. Leaving the runtime live is the bug this
 		// branch exists to fix.
-		if unreleased := unwound.unwind(m.root, false); len(unreleased) > 0 {
+		unreleased := unwound.unwind(rollbackCtx, false)
+		residency, mismatch := existingResidency(entry, key, request)
+		if mismatch != nil {
+			// THE THIRD EXIT, and it is a FAILING one. The residency that won
+			// is not the one this request describes, so there is nothing to
+			// report as an idempotent success — and the shared admission charge
+			// and workspace have already been skipped, deliberately, because
+			// this Manager may be the winner's charger and crediting them back
+			// would uncharge a resident session. So they are genuinely STILL
+			// HELD and this call cannot safely give them back. Returning
+			// existingResidency's error as-is named step "validate", carried no
+			// Unreleased, and left an admission charge and a materialized
+			// workspace behind in silence.
+			var refusal *AttachError
+			code := sessionwire.HostLinkErrorCode("")
+			if errors.As(mismatch, &refusal) {
+				code = refusal.Code
+			}
+			return Residency{}, &AttachError{
+				Step:       StepInstall,
+				Code:       code,
+				Key:        key,
+				Reason:     "the session is resident under an attach this request does not describe",
+				Cause:      mismatch,
+				Unreleased: append(unreleased, unwound.sharedHeld()...),
+			}
+		}
+		if len(unreleased) > 0 {
 			// LOSING IS NOT A FAILURE; LEAKING IS. A loser whose own
 			// ReleaseResidency or lease release failed holds a live runtime and
 			// a lease nobody will renew, and reporting the residency with a nil
@@ -980,10 +1082,15 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 				Unreleased: unreleased,
 			}
 		}
-		return existingResidency(entry, key, request)
+		return residency, nil
 	}
 	unwound.own("registry entry", func(context.Context) error {
-		m.registry.RemoveByGeneration(key, entry.Generation)
+		// Consumed for the same reason: false means the generation this attach
+		// installed is no longer the one held, so the residency was replaced
+		// under it and this rollback removed nothing.
+		if !m.registry.RemoveByGeneration(key, entry.Generation) {
+			return errors.New("the residency was replaced under this generation, so nothing was removed")
+		}
 		return nil
 	})
 
@@ -1070,12 +1177,22 @@ type snapshotTarget struct {
 	capabilities  department.Capabilities
 }
 
-// validate holds step 1: every rule that must hold before this Host takes
-// anything at all. It reaches no collaborator, which is what makes the claim
-// that a refusal took nothing observable rather than asserted.
-func (m *Manager) validate(key registry.Key, request Request) (snapshotTarget, error) {
-	refuse := func(code sessionwire.HostLinkErrorCode, reason string, cause error) (snapshotTarget, error) {
-		return snapshotTarget{}, &AttachError{Step: StepValidate, Code: code, Key: key, Reason: reason, Cause: cause}
+// validateRequest holds the half of step 1 that is about the REQUEST: the
+// identities, the placement binding, the mode and the principal. It reaches no
+// collaborator, which is what makes the claim that a refusal took nothing
+// observable rather than asserted.
+//
+// IT RUNS AHEAD OF THE WARM FAST PATH, so a resident session is validated by
+// the same rules as a cold one. An earlier version put the idempotency check
+// first and a request naming an unknown mode, no actor, or an agent this
+// Department does not register was refused cold and accepted warm.
+//
+// It looks the agent up and DISCARDS the target. That lookup is the cost of
+// keeping the unknown-agent rule on both paths, and it is a map read; what it
+// must not do is snapshot, for the reason resolveTarget states.
+func (m *Manager) validateRequest(key registry.Key, request Request) error {
+	refuse := func(code sessionwire.HostLinkErrorCode, reason string, cause error) error {
+		return &AttachError{Step: StepValidate, Code: code, Key: key, Reason: reason, Cause: cause}
 	}
 	if request.TenantID != m.host.TenantID() {
 		return refuse("", "this Host serves tenant "+strconv.Quote(string(m.host.TenantID()))+" and the request names "+strconv.Quote(string(request.TenantID)), nil)
@@ -1097,6 +1214,32 @@ func (m *Manager) validate(key registry.Key, request Request) (snapshotTarget, e
 	}
 	if err := request.Principal.validate(request.TenantID); err != nil {
 		return refuse("", err.Error(), err)
+	}
+	if _, err := m.host.Department().Target(request.AgentID); err != nil {
+		return refuse(sessionwire.HostLinkErrorRuntimeUnavailable, "this Host's Department registers no launch target for that agent", err)
+	}
+	return nil
+}
+
+// resolveTarget takes the snapshot, and it is called ONLY WITH THE KEY SLOT
+// HELD. That is the whole of its contract and it is not an optimisation.
+//
+// The snapshot drives the compatibility comparison, the workspace and
+// checkpoint requirements, the launch, the registry entry and both §15
+// projections. Taken before the slot, an attach that then PARKS behind another
+// one uses answers the target gave before it waited — so a target that grew a
+// RequiresWorkspace in the meantime got a runtime launched with an empty
+// workspace root and no workspace compensation recorded, and a target that
+// changed build published a route for a build the Host is not running. That
+// second sentence is snapshotTarget's own stated reason for existing,
+// reintroduced by taking the snapshot on the wrong side of the lock.
+//
+// The fix is NOT a second validate after the slot: two reads of a drifting
+// target is the exact defect the snapshot type exists to prevent, and it breaks
+// the guard that says so. One read, inside the slot.
+func (m *Manager) resolveTarget(key registry.Key, request Request) (snapshotTarget, error) {
+	refuse := func(code sessionwire.HostLinkErrorCode, reason string, cause error) (snapshotTarget, error) {
+		return snapshotTarget{}, &AttachError{Step: StepValidate, Code: code, Key: key, Reason: reason, Cause: cause}
 	}
 	target, err := m.host.Department().Target(request.AgentID)
 	if err != nil {

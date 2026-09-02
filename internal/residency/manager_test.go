@@ -299,10 +299,13 @@ type fakeLocations struct {
 	tombstoned   []uint64
 	publishErr   error
 	tombstoneErr error
-	// failAfter, when positive, lets that many publishes succeed and refuses
-	// the rest, so a test can fail the RESIDENT publish of step 9 while the
-	// ATTACHING publish of step 7 succeeded.
-	failAfter int
+	// failOnCall, when positive, refuses exactly that publish and no other,
+	// counted from one. It names ONE call rather than "everything after the
+	// nth" because a test that needs the winner's resident publish to fail
+	// usually needs a LATER attach to succeed, and a fake that fails forever
+	// after the first refusal cannot express the difference.
+	failOnCall int
+	calls      int
 }
 
 func (l *fakeLocations) PublishResidency(ctx context.Context, observation sessionwire.HostLinkRegistryObservation) error {
@@ -313,7 +316,8 @@ func (l *fakeLocations) PublishResidency(ctx context.Context, observation sessio
 		return errDeadContext
 	}
 	l.trace.record("location.publish:" + string(observation.Residency))
-	if l.publishErr != nil && (l.failAfter == 0 || len(l.published) >= l.failAfter) {
+	l.calls++
+	if l.publishErr != nil && (l.failOnCall == 0 || l.calls == l.failOnCall) {
 		return l.publishErr
 	}
 	l.published = append(l.published, observation)
@@ -477,9 +481,10 @@ type tracingAdmissions struct {
 	trace *trace
 	inner Admissions
 
-	mu       sync.Mutex
-	admits   int
-	releases int
+	mu            sync.Mutex
+	admits        int
+	releases      int
+	refuseRelease bool
 }
 
 func (a *tracingAdmissions) Admit(key registry.Key, agent sessionwire.AgentID) error {
@@ -493,8 +498,15 @@ func (a *tracingAdmissions) Admit(key registry.Key, agent sessionwire.AgentID) e
 func (a *tracingAdmissions) Release(key registry.Key) bool {
 	a.mu.Lock()
 	a.releases++
+	refuse := a.refuseRelease
 	a.mu.Unlock()
 	a.trace.record("admission.release")
+	if refuse {
+		// The ledger reporting "this session was not charged". It is the shape
+		// a double credit takes, and the only way to reach the branch that
+		// consumes the bool.
+		return false
+	}
 	return a.inner.Release(key)
 }
 
@@ -629,7 +641,22 @@ func (t *fakeTarget) driftFromNow(to department.CompatibilityID) {
 	t.driftTo = to
 }
 
-func (t *fakeTarget) Capabilities() department.Capabilities { return t.capabilities }
+func (t *fakeTarget) Capabilities() department.Capabilities {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.capabilities
+}
+
+// redeclare changes what the target answers from now on. It is how a test
+// models the thing a LaunchTarget is entitled to do and a snapshot exists to
+// survive: answer differently on the next call.
+func (t *fakeTarget) redeclare(compatibility department.CompatibilityID, capabilities department.Capabilities) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.compatibility = compatibility
+	t.driftAfter = 0
+	t.capabilities = capabilities
+}
 
 func (t *fakeTarget) newRuntime(session sessionwire.SessionID, agent sessionwire.AgentID) *fakeRuntime {
 	if t.boundSessionID != "" {
@@ -925,6 +952,15 @@ func (f *fixture) key() registry.Key {
 
 func (f *fixture) request(mode Mode) Request { return f.requestFor(testSession, mode) }
 
+// requestWithoutBuild omits the placed-on build, for the tests in which the
+// target's build changes underneath the attach and pinning it in the request
+// would refuse the very case being measured.
+func (f *fixture) requestWithoutBuild(mode Mode) Request {
+	request := f.requestFor(testSession, mode)
+	request.CompatibilityID = ""
+	return request
+}
+
 func (f *fixture) requestFor(session sessionwire.SessionID, mode Mode) Request {
 	return Request{
 		TenantID:        testTenant,
@@ -975,6 +1011,15 @@ func (f *fixture) assertNothingHeld(t *testing.T) {
 	ensured, released := f.workspaces.counts()
 	if ensured != released {
 		t.Errorf("%d workspace(s) were materialized and %d released after a failed attach; the local materialization must not survive", ensured, released)
+	}
+	// THE EIGHTH RESOURCE, and the one that had no guard: deleting the session
+	// context's compensation passed the whole suite, leaking a context.WithCancel
+	// child on the manager root for the process lifetime and leaving the
+	// released runtime with a live context.
+	for i, ctx := range f.target.launchContexts() {
+		if ctx.Err() == nil {
+			t.Errorf("the context runtime %d was launched on is still live after a failed attach; a released runtime keeps a live context and the cancel leaks on the manager root", i)
+		}
 	}
 	if dead := f.trace.count("lease.release-on-dead-context") + f.trace.count("workspace.release-on-dead-context") + f.trace.count("runtime.release-on-dead-context") + f.trace.count("location.tombstone-on-dead-context") + f.trace.count("ownership.stop-on-dead-context"); dead != 0 {
 		t.Errorf("%d rollback call(s) were made on a context that was already done; a rollback that runs on the request context releases nothing once the caller has gone", dead)
@@ -1514,6 +1559,23 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			forbidden: []string{"workspace.ensure", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
+			name:      "4 the durable store returns no object namespace",
+			mode:      ModeCreate,
+			configure: func(f *fixture) { f.durable.state = SessionState{Exists: false} },
+			wantStep:  StepHydrate,
+			forbidden: []string{"workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
+			name: "4 create over durable state written by a different build",
+			mode: ModeCreate,
+			configure: func(f *fixture) {
+				f.durable.state = SessionState{Exists: true, Namespace: testNamespace, CompatibilityID: "rig-2026-04-z9"}
+			},
+			wantStep:  StepHydrate,
+			wantCode:  sessionwire.HostLinkErrorRuntimeMismatch,
+			forbidden: []string{"workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
 			name:      "4 workspace cannot be materialized",
 			mode:      ModeCreate,
 			configure: func(f *fixture) { f.workspaces.ensureErr = sentinel },
@@ -1576,7 +1638,7 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			mode: ModeCreate,
 			configure: func(f *fixture) {
 				f.locations.publishErr = sentinel
-				f.locations.failAfter = 1
+				f.locations.failOnCall = 2
 			},
 			wantStep:  StepAttached,
 			forbidden: nil,
@@ -1786,11 +1848,16 @@ func TestPrincipalCarriesOnlyStringShapedFields(t *testing.T) {
 // enclosing function, which is the structural spelling of "a session is never
 // derived from a request".
 //
+// R2 FOLLOWS ONE LEVEL OF LOCAL ALIASING — `c := ctx` then
+// `context.WithValue(c, …)` — because that is the likeliest maintainer edit of
+// the shapes that defeat a bare identifier comparison, and it escaped until it
+// was measured.
+//
 // WHAT IT DOES NOT COVER: a request context stored in a struct field and read
-// back, and a helper that takes its parent as an `any`. Both would defeat R2,
-// and neither is refused here; what closes them today is that Principal cannot
-// carry a context (see TestPrincipalCarriesOnlyStringShapedFields) and that
-// R1 leaves only three constructors to reach.
+// back, and a helper that takes its parent as an `any`. Neither is refused
+// here; what closes them today is that Principal cannot carry a context (see
+// TestPrincipalCarriesOnlyStringShapedFields) and that R1 leaves only three
+// constructors to reach.
 func contextViolations(file *ast.File) []string {
 	permitted := map[string]bool{"Background": true, "WithCancel": true, "WithValue": true}
 	var violations []string
@@ -1811,6 +1878,22 @@ func contextViolations(file *ast.File) []string {
 				}
 			}
 		}
+		// One level of local aliasing: any local assigned FROM a request
+		// parameter is itself a request context for the purposes of R2.
+		ast.Inspect(function, func(node ast.Node) bool {
+			assignment, isAssignment := node.(*ast.AssignStmt)
+			if !isAssignment || len(assignment.Lhs) != len(assignment.Rhs) {
+				return true
+			}
+			for i, right := range assignment.Rhs {
+				source, sourceIsIdent := right.(*ast.Ident)
+				target, targetIsIdent := assignment.Lhs[i].(*ast.Ident)
+				if sourceIsIdent && targetIsIdent && requestParams[source.Name] {
+					requestParams[target.Name] = true
+				}
+			}
+			return true
+		})
 		ast.Inspect(function, func(node ast.Node) bool {
 			call, isCall := node.(*ast.CallExpr)
 			if !isCall {
@@ -1908,6 +1991,11 @@ func TestProductionCodeNeverDerivesASessionFromARequestContext(t *testing.T) {
 		{
 			name:   "a value installed on a request context",
 			source: "package p\nimport \"context\"\ntype k struct{}\nfunc f(ctx context.Context) context.Context { return context.WithValue(ctx, k{}, 1) }\n",
+			want:   1,
+		},
+		{
+			name:   "a value installed on a local alias of a request context",
+			source: "package p\nimport \"context\"\ntype k struct{}\nfunc f(ctx context.Context) context.Context { c := ctx; return context.WithValue(c, k{}, 1) }\n",
 			want:   1,
 		},
 		{
@@ -2536,7 +2624,7 @@ func registryFieldSelections(function *ast.FuncDecl) []string {
 func TestNoSuccessfulAttachEverReportsAReleasedRuntime(t *testing.T) {
 	f := newFixture(t, func(f *fixture) {
 		f.locations.publishErr = errors.New("injected")
-		f.locations.failAfter = 1
+		f.locations.failOnCall = 2
 	})
 
 	type outcome struct {
@@ -2714,7 +2802,7 @@ func TestARollbackThatCannotReleaseNamesWhatIsStillHeld(t *testing.T) {
 	stuck := errors.New("the store is unreachable")
 	f := newFixture(t, func(f *fixture) {
 		f.locations.publishErr = errors.New("injected")
-		f.locations.failAfter = 1
+		f.locations.failOnCall = 2
 		f.locations.tombstoneErr = stuck
 		f.ownership.stopErr = stuck
 		f.workspaces.releaseErr = stuck
@@ -2842,7 +2930,7 @@ func TestASecondAttachCannotReturnFromInsideTheInstallWindow(t *testing.T) {
 		// The winner fails at step 9, so a residency reported from inside the
 		// window would be one that is about to be withdrawn.
 		f.locations.publishErr = errors.New("injected")
-		f.locations.failAfter = 1
+		f.locations.failOnCall = 2
 	})
 
 	parked := make(chan struct{}, 1)
@@ -2953,5 +3041,278 @@ func TestALosingAttachThatCannotReleaseIsNotReportedAsSuccess(t *testing.T) {
 	}
 	if residency, err := g.manager.Attach(context.Background(), g.request(ModeCreate)); err != nil || residency.Attached {
 		t.Fatalf("a loser whose releases succeeded reported (attached=%t, %v), want an idempotent success", residency.Attached, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot is taken inside the slot
+// ---------------------------------------------------------------------------
+
+// TestAParkedAttachLaunchesOnTheTargetAsItIsWhenItRuns is B1, and it needs a
+// fixture nobody had written: a target that changes its answers while an attach
+// is parked behind another one.
+//
+// A snapshot taken BEFORE the slot is a snapshot of answers the target gave
+// before this attach waited. It drives the compatibility comparison, the
+// workspace and checkpoint requirements, the launch, the registry entry and
+// both §15 projections — so a target that grew a RequiresWorkspace in the
+// meantime got a runtime launched with an EMPTY WORKSPACE ROOT and no workspace
+// compensation recorded, and a target that changed build published a route for
+// a build the Host is not running. The second is snapshotTarget's own stated
+// reason for existing, defeated by taking the snapshot on the wrong side of the
+// lock.
+//
+// The winner is made to fail at step 9 so the parked attach runs COLD when it
+// wakes; if the winner succeeded the parked call would take the warm path and
+// launch nothing, which is a different rule.
+func TestAParkedAttachLaunchesOnTheTargetAsItIsWhenItRuns(t *testing.T) {
+	const upgraded department.CompatibilityID = "rig-2027-11-v2"
+	f := newFixture(t, func(f *fixture) {
+		f.locations.publishErr = errors.New("injected")
+		f.locations.failOnCall = 2
+		// The target starts declaring that it needs NO workspace, so a stale
+		// snapshot launches without one.
+		f.target.capabilities.RequiresWorkspace = false
+	})
+	// Both builds must be restorable, so the durable state is created rather
+	// than restored and the build comparison does not mask the subject.
+	f.durable.state = SessionState{Exists: false, Namespace: testNamespace}
+
+	parked := make(chan struct{}, 1)
+	f.manager.mu.Lock()
+	f.manager.parked = func() {
+		select {
+		case parked <- struct{}{}:
+		default:
+		}
+	}
+	f.manager.mu.Unlock()
+
+	type outcome struct {
+		residency Residency
+		err       error
+	}
+	returned := make(chan outcome, 1)
+	f.ownership.inWindow = func() {
+		go func() {
+			residency, err := f.manager.Attach(context.Background(), f.requestWithoutBuild(ModeCreate))
+			returned <- outcome{residency, err}
+		}()
+		<-parked
+		// The parked attach has not read the target yet. Everything it is about
+		// to decide must come from these answers, not the ones the winner saw.
+		f.target.redeclare(upgraded, department.Capabilities{
+			SupportsPooled:    true,
+			SupportsDedicated: true,
+			RequiresWorkspace: true,
+			AdmissionWeight:   testWeight,
+			CaptureSafety:     department.CaptureSafetyStreaming,
+		})
+	}
+
+	if _, err := f.manager.Attach(context.Background(), f.requestWithoutBuild(ModeCreate)); err == nil {
+		t.Fatal("the winner's injected step 9 failure was not reported")
+	}
+	second := <-returned
+	if second.err != nil {
+		t.Fatalf("the parked attach failed: %v", second.err)
+	}
+
+	launched := f.target.createRequests()
+	if len(launched) != 2 {
+		t.Fatalf("%d launches, want the winner's and the parked attach's", len(launched))
+	}
+	parkedLaunch := launched[1]
+	if parkedLaunch.WorkspaceRoot != testWorkspaceRoot {
+		t.Errorf("the parked attach launched with workspace root %q, though the target it launched declares RequiresWorkspace; a stale snapshot both skips the materialization and records no compensation for it", parkedLaunch.WorkspaceRoot)
+	}
+	if second.residency.CompatibilityID != upgraded {
+		t.Errorf("the residency reports build %q while the target launches %q", second.residency.CompatibilityID, upgraded)
+	}
+	entry, held := f.registry.Get(f.key())
+	if !held || entry.CompatibilityID != upgraded {
+		t.Errorf("the registry recorded build %q, want %q", entry.CompatibilityID, upgraded)
+	}
+	for i, observation := range f.locations.live() {
+		if department.CompatibilityID(observation.RuntimeCompatibilityID) != upgraded {
+			t.Errorf("live projection %d advertises build %q while the Host runs %q: a route for a build it is not running", i, observation.RuntimeCompatibilityID, upgraded)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hydration fails closed
+// ---------------------------------------------------------------------------
+
+// TestAColdCreateIsLaunchedWithItsDurableNamespace is B2. Every fixture seeded
+// Exists:true with a namespace even for create rows, so the genuinely cold
+// case — the ONLY case a create is — was never exercised.
+func TestAColdCreateIsLaunchedWithItsDurableNamespace(t *testing.T) {
+	f := newFixture(t)
+	f.durable.state = SessionState{Exists: false, Namespace: testNamespace}
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("a genuinely cold create was refused: %v", err)
+	}
+	if !residency.Attached {
+		t.Error("the cold create reports Attached false")
+	}
+	launched := f.target.createRequests()
+	if len(launched) != 1 {
+		t.Fatalf("%d launches, want 1", len(launched))
+	}
+	if launched[0].Storage.Namespace != testNamespace {
+		t.Errorf("the runtime was launched with object namespace %q, want %q; the empty prefix scopes every object the session writes to nothing", launched[0].Storage.Namespace, testNamespace)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The loser's third exit
+// ---------------------------------------------------------------------------
+
+// TestALoserWhoseRivalIsADifferentSessionNamesWhatIsStillHeld is B3.
+//
+// The loser has THREE exits, not two. Besides "released cleanly, report the
+// residency" and "could not release, report that", there is "the residency that
+// won is not the one this request describes" — and on that exit the shared
+// admission and workspace have already been skipped and are genuinely still
+// held. Returning existingResidency's refusal unchanged named step "validate"
+// for a failure at step 6, carried no Unreleased, and left an admission charge
+// and a materialized workspace behind in silence: the package's own headline
+// guarantee, falsified.
+//
+// Unwinding with shared=true is NOT the remedy. This Manager may be the
+// winner's charger — service.Admit is idempotent per (key, agent) — so
+// crediting the charge back would uncharge the resident session.
+func TestALoserWhoseRivalIsADifferentSessionNamesWhatIsStillHeld(t *testing.T) {
+	f := newFixture(t)
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: "reviewer", done: make(chan struct{})}
+	f.registry.beforeInsert = func() {
+		f.registry.inner.Insert(f.key(), registry.Admission{
+			AgentID: "reviewer", Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
+		})
+	}
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("losing to a residency this request does not describe was reported as a success")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if attach.Step != StepInstall {
+		t.Errorf("the failure names step %q, want %q; it happened at the registry install, not during validation", attach.Step, StepInstall)
+	}
+	if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
+		t.Errorf("the failure carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
+	}
+	for _, want := range []string{"admission", "workspace"} {
+		found := false
+		for _, held := range attach.Unreleased {
+			if strings.HasPrefix(held, want+": ") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the failure does not name %q among what is still held: %v", want, attach.Unreleased)
+		}
+	}
+	// And they ARE still held, which is why they must be named rather than
+	// released: the resident session is charged for them.
+	if consumed := f.publisher.ConsumedWeight(); consumed != testWeight {
+		t.Errorf("the ledger charges %d, want the resident session's %d still charged", consumed, testWeight)
+	}
+	if ensured, released := f.workspaces.counts(); ensured != 1 || released != 0 {
+		t.Errorf("%d workspaces materialized and %d released; that root is the resident runtime's", ensured, released)
+	}
+	// The loser's OWN resources are gone, as on every other loser exit.
+	if held := f.leases.heldCount(); held != 0 {
+		t.Errorf("the loser still holds %d lease grant(s)", held)
+	}
+	for i, runtime := range f.target.producedRuntimes() {
+		if released, shutdowns := runtime.counts(); released != 1 || shutdowns != 0 {
+			t.Errorf("runtime %d was released %d times and shut down %d times, want one nonterminal release", i, released, shutdowns)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown does not disable the rollback
+// ---------------------------------------------------------------------------
+
+// TestClosingTheManagerDuringAnAttachStillRollsItBack is N2.
+//
+// Compensations used to run on the manager root, which Close cancels, so a
+// Close arriving mid-attach released nothing and left a live §15 route with no
+// owner and a lease nobody would renew. That is §8.3's failure one level up:
+// the request context is kept out of the sequence precisely so a rollback
+// cannot be disabled by something else ending, and the manager's own lifetime
+// is something else ending.
+func TestClosingTheManagerDuringAnAttachStillRollsItBack(t *testing.T) {
+	f := newFixture(t, func(f *fixture) { f.ownership.err = errors.New("injected") })
+	f.ownership.inWindow = func() { f.manager.Close() }
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the injected ownership failure was not reported")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if len(attach.Unreleased) != 0 {
+		t.Errorf("closing the manager mid-attach left %v unreleased; the rollback must not depend on this process still running", attach.Unreleased)
+	}
+	f.assertNothingHeld(t)
+}
+
+// TestACompensationThatReportsItDidNothingIsNamed covers the two rungs whose
+// result is a bool rather than an error.
+//
+// A ledger release reporting "this session was not charged" means something
+// else credited it back first, which is the double credit that lets a Host
+// admit past its capacity; a registry removal reporting the same means the
+// residency was replaced under this attach's generation. Both were discarded.
+// Neither is reachable through the ordinary fakes, so the ledger's answer is
+// forced.
+func TestACompensationThatReportsItDidNothingIsNamed(t *testing.T) {
+	f := newFixture(t, func(f *fixture) {
+		f.ownership.err = errors.New("injected")
+		f.afterBuild = func(f *fixture) { f.admissions.refuseRelease = true }
+	})
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the injected ownership failure was not reported")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	named := false
+	for _, unreleased := range attach.Unreleased {
+		if strings.HasPrefix(unreleased, "admission: ") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("a ledger release reporting that nothing was charged was not named: %v", attach.Unreleased)
+	}
+	// The CONTROL: with a ledger that credits normally, the same failure names
+	// nothing. Without this row the assertion above would pass for a manager
+	// that named the admission unconditionally.
+	g := newFixture(t, func(g *fixture) { g.ownership.err = errors.New("injected") })
+	_, err = g.manager.Attach(context.Background(), g.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the control's injected ownership failure was not reported")
+	}
+	var control *AttachError
+	if !errors.As(err, &control) {
+		t.Fatalf("control error is %T, want *AttachError", err)
+	}
+	if len(control.Unreleased) != 0 {
+		t.Errorf("a clean rollback named %v as unreleased", control.Unreleased)
 	}
 }
