@@ -11,9 +11,11 @@ drain. Factory consumes Host; Host never consumes Factory.
 - Never import `github.com/looprig/factory`, `wui`, `tui`, or a product or
   integration repository (`carbon`, `client`, `kosa`, `policy53`, `capstan`,
   `tests`) from anywhere in this module, tests included.
-- Centrifuge is allowed only under `internal/realtime/hostlink/`. A second
-  package under `internal/realtime/` does not inherit that exemption. Widening
-  it means editing `centrifugeExemptDir`, which is a visible diff.
+- Centrifuge is allowed only under `internal/realtime/hostlink/` **of this
+  module root**. A second package under `internal/realtime/` does not inherit
+  that exemption, and neither does a directory of that name inside a declared
+  nested module — the guard classifies on the outermost-root-relative path.
+  Widening it means editing `centrifugeExemptDir`, which is a visible diff.
 - Name only published looprig versions, listed in `publishedLooprigVersions`.
   Adding a module there is the same decision as depending on it, and the
   version must exist on that module's remote first. A forbidden module is
@@ -32,9 +34,10 @@ drain. Factory consumes Host; Host never consumes Factory.
   which sharing alone does not prevent. An oracle over a predicate that asks
   the FILESYSTEM a question must skip on what the volume RESOLVES, not on what
   it stores: case-insensitive APFS is case-preserving, so a stored-verbatim
-  check passes and `Lstat` finds `.Git` anyway. If you publish a nested module from here — the workspace does this for
-  `flow/store` and `pluto/cmd/pluto` — declare it there and decide, explicitly,
-  whether the guard should reach into it.
+  check passes and `Lstat` finds `.Git` anyway. If you publish a nested module
+  from here — the workspace does this for `flow/store` and `pluto/cmd/pluto` —
+  declare it in `nestedModuleAllowlist`. Declaring is not a suspension: it
+  turns the guard ON for that directory, in full. See mechanism 4 below.
 - No `replace` directives to local filesystem paths, and no vendoring. A
   `GOWORK=off` failure means a dependency release is still owed upstream; it is
   not a reason to add a `replace`.
@@ -59,10 +62,28 @@ Route a new rule by asking what it is about.
    filesystem path rule lives here. Anything about the module a directive
    NAMES belongs in 2, not here.
 4. **What the walk covers at all** — `scanNestedModules` and
-   `nestedModuleAllowlist`. A declared nested module buys the WHOLE guard
-   rooted at it, recursively — the import scan and the nested-module walk — so
-   declaring one never suspends the mechanism that would have reported what is
-   inside it. Every floor the outer guard applies applies there too.
+   `nestedModuleAllowlist`. A declared nested module buys the WHOLE guard: the
+   import scan (mechanism 1), that module's own `go.mod` through both
+   dependency mechanisms (2 and 3), and this walk again, recursively. Declaring
+   one never suspends the mechanism that would have reported what is inside it.
+   **A mechanism added to this file must be applied HERE, in the same edit.**
+   Five review rounds found five escapes and all five had one shape: extend one
+   mechanism into the nested scan, leave the others behind. The recursion that
+   closed round 4 inherited mechanism 1's PATH SCOPE but re-anchored it — a
+   declared module got its own Centrifuge exemption, widenable by creating a
+   directory — and did not inherit 2 or 3 at all, so a declared module could
+   `require` Factory indirectly and `replace` Core with `../../../core` while
+   `make check` stayed green.
+   Paths are classified relative to the OUTERMOST module root (`qualify`), at
+   classification TIME and not at report time; that is what stops a path-scoped
+   rule re-anchoring, and any path-scoped rule added to `importVerdict`
+   inherits it by construction.
+   The floors are deliberately NOT uniform: `files` and `imports` are floored
+   because violations are derived from them, `productionFiles` is not, because
+   a declared nested module may legitimately be test support and flooring it
+   would force a false violation. That asymmetry is asserted, not assumed — see
+   the "only test files" subtest. Do not apply "floor what the caller consumes"
+   mechanically here.
 5. **What any walk can see** — the exported predicates in `internal/modfiles`.
    Every predicate deciding what a walk skips belongs there and needs a fuzz
    ORACLE in the consumer, not a sample table: a table is defeated by choosing a
@@ -73,6 +94,17 @@ Route a new rule by asking what it is about.
 An exclusion added to make a guard pass must itself be tested. A too-wide
 exclusion produces exactly the same green as a correct one; that has been a live
 defect here twice.
+
+A doc comment must be separated from an unrelated declaration below it by a
+blank line. `gofmt`, `go vet` and `staticcheck` all pass an attached one, and
+this repository has lost a doc comment to that exact slip three times, so
+`TestDocCommentsNameTheirOwnDeclaration` parses every module-owned file and
+fails when a declaration has NO doc comment of its own while a line opening
+with its name sits inside someone else's. The rule is over that symptom rather
+than over Go's naming convention: a comment that merely discusses another,
+documented declaration is ordinary and is left alone, and stating it this way
+catches both orderings of the merge — the first version of the check saw only
+the one where the stolen doc came first.
 
 ## Code and security
 

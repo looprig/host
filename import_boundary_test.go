@@ -2,6 +2,7 @@ package host_test
 
 import (
 	"errors"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -90,7 +91,7 @@ func importVerdict(fileRelative, importPath string) (bool, string) {
 		if underCentrifugeExemption(fileRelative) {
 			return true, ""
 		}
-		return false, "Centrifuge is permitted only under " + centrifugeExemptDir + "/, and this file is outside it"
+		return false, "Centrifuge is permitted only under " + centrifugeExemptDir + "/ at the host module root, and this file is outside it"
 	}
 	return true, ""
 }
@@ -111,7 +112,9 @@ func isCentrifugal(segments []string) bool {
 }
 
 // underCentrifugeExemption reports whether fileRelative lies inside the single
-// exempt directory.
+// exempt directory. fileRelative is relative to the OUTERMOST module root, which
+// is what makes the exemption a property of one directory in this repository
+// rather than of a directory NAME: see qualify.
 //
 // The scope is DERIVED from centrifugeExemptDir and compared segment by
 // segment, which answers the question this exemption exists to survive: what
@@ -297,7 +300,7 @@ func TestImportClassification(t *testing.T) {
 func TestModuleImportsStayWithinBoundary(t *testing.T) {
 	t.Parallel()
 
-	scan, err := scanImports(".")
+	scan, err := scanImports(".", "")
 	if err != nil {
 		t.Fatalf("scan module imports: %v", err)
 	}
@@ -333,7 +336,7 @@ func TestImportScanReportsForbiddenImportsInAFixtureTree(t *testing.T) {
 	writeFixture(t, root, "nested/go.mod", "module example.com/nested\n")
 	writeFixture(t, root, "nested/x.go", "package nested\n\nimport _ \"github.com/looprig/factory\"\n")
 
-	scan, err := scanImports(root)
+	scan, err := scanImports(root, "")
 	if err != nil {
 		t.Fatalf("scan fixture imports: %v", err)
 	}
@@ -403,7 +406,7 @@ func TestImportScanCanReportZero(t *testing.T) {
 	writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
 	writeFixture(t, root, "testdata/ignored.go", "package ignored\n")
 
-	scan, err := scanImports(root)
+	scan, err := scanImports(root, "")
 	if err != nil {
 		t.Fatalf("scan empty fixture: %v", err)
 	}
@@ -423,7 +426,7 @@ func TestImportScanRejectsGoSymlink(t *testing.T) {
 		t.Fatalf("create Go file symlink: %v", err)
 	}
 
-	_, err := scanImports(root)
+	_, err := scanImports(root, "")
 	var symlinkErr *modfiles.SymlinkError
 	if !errors.As(err, &symlinkErr) {
 		t.Fatalf("scanImports() error = %v, want *modfiles.SymlinkError", err)
@@ -805,7 +808,7 @@ func TestNestedModuleScanCoversADeclaredModule(t *testing.T) {
 		if !slices.Equal(scan.declared, []string{"internal/httpapi"}) {
 			t.Fatalf("declared = %q, want [internal/httpapi]. The allowlist entry format must be exactly what nestedModuleDirectories reports", scan.declared)
 		}
-		if len(scan.violations) != 1 || !strings.Contains(scan.violations[0], "internal/httpapi/api.go") ||
+		if len(scan.violations) != 1 || !strings.HasPrefix(scan.violations[0], "internal/httpapi/api.go imports ") ||
 			!strings.Contains(scan.violations[0], "Host is consumed by Factory") {
 			t.Errorf("violations = %q, want one naming internal/httpapi/api.go and its reason", scan.violations)
 		}
@@ -855,7 +858,7 @@ func TestNestedModuleScanCoversADeclaredModule(t *testing.T) {
 		if !slices.Equal(scan.declared, []string{"tools/checkout", "tools/checkout/inner"}) {
 			t.Fatalf("declared = %q, want both levels named by their full root-relative paths", scan.declared)
 		}
-		if len(scan.violations) != 1 || !strings.Contains(scan.violations[0], "tools/checkout/inner/bad.go") ||
+		if len(scan.violations) != 1 || !strings.HasPrefix(scan.violations[0], "tools/checkout/inner/bad.go imports ") ||
 			!strings.Contains(scan.violations[0], "Host is consumed by Factory") {
 			t.Errorf("violations = %q, want one naming tools/checkout/inner/bad.go and its reason", scan.violations)
 		}
@@ -896,6 +899,347 @@ func TestNestedModuleScanCoversADeclaredModule(t *testing.T) {
 			t.Fatalf("violations = %q, want one saying the extra scan found no Go file", scan.violations)
 		}
 	})
+}
+
+// TestDeclaredNestedModuleInheritsTheWholeGuard is the terminating assertion of
+// a sequence: five rounds of "extend mechanism X into the nested scan", each of
+// which left the OTHER mechanisms behind. The extension point applies the whole
+// guard now, and the subtests below are one per mechanism rather than one per
+// bug, so the next mechanism added has a slot it visibly does not fill.
+func TestDeclaredNestedModuleInheritsTheWholeGuard(t *testing.T) {
+	t.Parallel()
+
+	// Mechanism 1, the part that is PATH-SCOPED. Classification used to happen
+	// on a path relative to the NESTED root, because qualification was applied
+	// at report time and not at classification time, so every path-scoped rule
+	// silently re-anchored. Declaring tools/checkout granted it its own
+	// Centrifuge exemption, and the exemption whose whole point is that it can
+	// only be widened by editing one constant was widened by CREATING A
+	// DIRECTORY.
+	t.Run("a path-scoped rule stays anchored to the outermost module root", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		// The outer module's own exemption still holds.
+		writeFixture(t, root, centrifugeExemptDir+"/server.go", "package hostlink\n\nimport _ \"github.com/centrifugal/centrifuge\"\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		// The escape: a directory inside the nested module spelled exactly like
+		// the exempt one.
+		writeFixture(t, root, "tools/checkout/"+centrifugeExemptDir+"/x.go", "package hostlink\n\nimport _ \"github.com/centrifugal/centrifuge\"\n")
+		// The control, one position over, proving the payload is catchable.
+		writeFixture(t, root, "tools/checkout/other/y.go", "package other\n\nimport _ \"github.com/centrifugal/centrifuge\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		// HasPrefix, not Contains: a violation qualified TWICE — once at
+		// classification and again at report time — still CONTAINS the right
+		// path, and a Contains assertion cannot see the difference.
+		for _, want := range []string{
+			"tools/checkout/" + centrifugeExemptDir + "/x.go imports ",
+			"tools/checkout/other/y.go imports ",
+		} {
+			if !slices.ContainsFunc(scan.violations, func(v string) bool { return strings.HasPrefix(v, want) }) {
+				t.Errorf("violations = %q, want one naming %s. Declaring a nested module must not grant it its own copy of a path-scoped exemption", scan.violations, want)
+			}
+		}
+		if len(scan.violations) != 2 {
+			t.Errorf("violations = %q, want exactly 2", scan.violations)
+		}
+		// The message has to say WHOSE directory it means, because it now names
+		// a file in a different module than the directory it cites.
+		for _, violation := range scan.violations {
+			if !strings.Contains(violation, "host module root") {
+				t.Errorf("violation %q does not say which module's %s is meant", violation, centrifugeExemptDir)
+			}
+		}
+	})
+
+	// The exemption still works where it is granted: the outer module root.
+	t.Run("the outermost module keeps its own exemption", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, centrifugeExemptDir+"/server.go", "package hostlink\n\nimport _ \"github.com/centrifugal/centrifuge\"\n")
+
+		scan, err := scanImports(root, "")
+		if err != nil {
+			t.Fatalf("scanImports: %v", err)
+		}
+		if len(scan.violations) != 0 {
+			t.Fatalf("violations = %q, want none", scan.violations)
+		}
+	})
+
+	// Mechanisms 2 and 3. The declared module's OWN go.mod was never parsed, so
+	// neither the looprig-dependency rule nor the local-path rule applied to
+	// it. Both payloads are proven catchable in the root go.mod by
+	// TestRequireViolations and TestReplaceViolations; the escape is position,
+	// not payload. This matters more than it reads: requireViolations' own
+	// comment calls itself "the only guard standing" for a forbidden module
+	// arriving indirectly, because the import guard is silent by construction
+	// there.
+	t.Run("the declared module's own go.mod goes through both dependency mechanisms", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n\ngo 1.26.6\n\nrequire github.com/looprig/factory v0.1.0 // indirect\n\nreplace github.com/looprig/core => ../../../core\n")
+		writeFixture(t, root, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if scan.goModFiles != 1 {
+			t.Fatalf("goModFiles = %d, want 1; the dependency mechanisms never saw a go.mod, so their zero is vacuous", scan.goModFiles)
+		}
+		for _, want := range []string{
+			"Host is consumed by Factory and must not depend on it",
+			"local filesystem path",
+		} {
+			if !slices.ContainsFunc(scan.violations, func(v string) bool { return strings.Contains(v, want) }) {
+				t.Errorf("violations = %q, want one saying %q", scan.violations, want)
+			}
+		}
+		for _, violation := range scan.violations {
+			if !strings.HasPrefix(violation, "tools/checkout/go.mod ") {
+				t.Errorf("violation %q does not name which module's go.mod is at fault", violation)
+			}
+		}
+		if len(scan.violations) != 2 {
+			t.Errorf("violations = %q, want exactly 2", scan.violations)
+		}
+	})
+
+	// The control for the pair above: a clean nested go.mod is silent, so the
+	// two violations are the directives and not the parsing.
+	t.Run("a clean nested go.mod reports nothing", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.7.0\n")
+		writeFixture(t, root, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if len(scan.violations) != 0 {
+			t.Fatalf("violations = %q, want none", scan.violations)
+		}
+		if scan.goModFiles != 1 {
+			t.Fatalf("goModFiles = %d, want 1", scan.goModFiles)
+		}
+	})
+
+	// A declared boundary is not always a MODULE: a vendored git checkout is a
+	// boundary with a .git and no go.mod. The dependency mechanisms have
+	// nothing to read and must not invent a violation.
+	t.Run("a declared repository with no go.mod is not a dependency violation", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/.git/HEAD", "ref: refs/heads/main\n")
+		writeFixture(t, root, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if len(scan.violations) != 0 {
+			t.Fatalf("violations = %q, want none", scan.violations)
+		}
+		if scan.goModFiles != 0 {
+			t.Fatalf("goModFiles = %d, want 0", scan.goModFiles)
+		}
+	})
+
+	// The cross product, which is the shape every escape in this file has had:
+	// a mechanism applied at one depth and not the next. The recursion carries
+	// the qualified prefix into BOTH the import scan and the go.mod check, so a
+	// module two levels down is checked by everything.
+	t.Run("a go.mod two levels deep goes through the dependency mechanisms", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		writeFixture(t, root, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/inner/go.mod", "module example.com/inner\n\ngo 1.26.6\n\nrequire github.com/looprig/wui v1.2.3\n")
+		writeFixture(t, root, "tools/checkout/inner/ok.go", "package inner\n\nimport _ \"context\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout", "tools/checkout/inner"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if scan.goModFiles != 2 {
+			t.Errorf("goModFiles = %d, want 2; the recursion did not carry the go.mod check down", scan.goModFiles)
+		}
+		if len(scan.violations) != 1 ||
+			!strings.HasPrefix(scan.violations[0], "tools/checkout/inner/go.mod ") ||
+			!strings.Contains(scan.violations[0], "Host serves no web UI bundle") {
+			t.Fatalf("violations = %q, want one naming tools/checkout/inner/go.mod and its reason", scan.violations)
+		}
+	})
+
+	// Mechanism 4 flooring. productionFiles is deliberately NOT floored here,
+	// and that asymmetry with the root scan was reasoning in a comment with no
+	// test under it. A declared module that is genuinely test support is a
+	// legitimate shape; flooring it would force a false violation, and a later
+	// reviewer applying "floor what the caller consumes" mechanically would add
+	// the floor and break it. This subtest is the evidence.
+	t.Run("a declared module holding only test files is not a vacuous scan", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n")
+		writeFixture(t, root, "tools/checkout/helper_test.go", "package checkout_test\n\nimport _ \"testing\"\n")
+
+		scan, err := scanNestedModules(root, []string{"tools/checkout"})
+		if err != nil {
+			t.Fatalf("scanNestedModules: %v", err)
+		}
+		if len(scan.violations) != 0 {
+			t.Fatalf("violations = %q, want none: a declared nested module may legitimately be test support", scan.violations)
+		}
+	})
+}
+
+// TestDocCommentsNameTheirOwnDeclaration is a structural check for a mechanism
+// that has now produced three defects in this repository by itself: a comment
+// written for one declaration attaches to the declaration that happens to sit
+// under it, because a blank line was missing. gofmt, go vet and staticcheck all
+// pass it, and the result is a documented thing with someone else's
+// documentation and an undocumented thing beside it. Round 3 lost
+// moduleRelative's doc to nestedModuleDirectories; round 5 lost
+// FuzzBoundaryMarkerName's to boundaryMarkers. Three by one mechanism is a
+// missing check, not a slip.
+//
+// The rule is stated over the SYMPTOM rather than over Go's naming convention,
+// because the convention alone gives both false negatives and false positives.
+// A line inside a doc comment that opens with the name of a declaration in this
+// module is a violation only when that declaration has no doc comment of its
+// own. That is exactly what a missing blank line produces, in either ordering —
+// the merged comment can name the attached declaration first and bury the other
+// one further down, which the first version of this check did not see — while a
+// comment that merely DISCUSSES a documented declaration, common and correct in
+// this file, is left alone.
+func TestDocCommentsNameTheirOwnDeclaration(t *testing.T) {
+	t.Parallel()
+
+	files, err := modfiles.Files(".")
+	if err != nil {
+		t.Fatalf("enumerate module files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no Go files were enumerated; this check would be vacuous")
+	}
+
+	// documented is one LINE of one declaration's doc comment, not one comment.
+	// Checking only the first line catches the comment written for the
+	// declaration below and left attached to the one above, but not the mirror
+	// image — two doc comments merged into one group, whose first line names
+	// the declaration it is attached to correctly while a second declaration's
+	// documentation is buried inside it and that declaration has none. Both
+	// have occurred here; the mirror survived the first version of this check.
+	type documented struct {
+		file  string
+		names []string
+		word  string
+	}
+	var (
+		declarationNames = map[string]bool{}
+		documentedNames  = map[string]bool{}
+		docs             []documented
+	)
+	for _, file := range files {
+		relative, err := moduleRelative(".", file)
+		if err != nil {
+			t.Fatalf("relativize %s: %v", file, err)
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", relative, err)
+		}
+		for _, declaration := range parsed.Decls {
+			names, doc := declaredNames(declaration)
+			for _, name := range names {
+				declarationNames[name] = true
+				if doc != nil {
+					documentedNames[name] = true
+				}
+			}
+			if doc == nil || len(names) == 0 {
+				continue
+			}
+			for _, line := range doc.List {
+				fields := strings.Fields(line.Text)
+				if len(fields) < 3 || fields[0] != "//" {
+					continue
+				}
+				docs = append(docs, documented{file: relative, names: names, word: fields[1]})
+			}
+		}
+	}
+	if len(docs) == 0 {
+		t.Fatal("no documented declaration was found; this check would be vacuous")
+	}
+
+	checked := 0
+	for _, doc := range docs {
+		if !declarationNames[doc.word] {
+			// The line opens with prose rather than a name. Go's convention is
+			// not universally followed in this repository and enforcing it is
+			// not this test's business; attachment is.
+			continue
+		}
+		checked++
+		if slices.Contains(doc.names, doc.word) {
+			continue
+		}
+		if documentedNames[doc.word] {
+			// A comment that DISCUSSES another declaration is ordinary and
+			// frequent in this file — "forbiddenLooprigModules is a map of
+			// reasons" appears in importVerdict's doc and belongs there. What
+			// is not ordinary is a declaration with no documentation of its own
+			// whose name opens a line inside someone else's, which is exactly
+			// what a missing blank line produces, in both orderings.
+			continue
+		}
+		t.Errorf("%s: %s has no doc comment of its own, and a line opening with its name is attached to %q instead. Separate the two comments with a blank line so each documents its own declaration", doc.file, doc.word, strings.Join(doc.names, ", "))
+	}
+	if checked == 0 {
+		t.Fatal("no doc comment line opened with a declaration name, so nothing was checked and this guard is vacuous")
+	}
+}
+
+// declaredNames returns every name a declaration binds, and its doc comment.
+func declaredNames(declaration ast.Decl) ([]string, *ast.CommentGroup) {
+	switch declaration := declaration.(type) {
+	case *ast.FuncDecl:
+		return []string{declaration.Name.Name}, declaration.Doc
+	case *ast.GenDecl:
+		var names []string
+		for _, spec := range declaration.Specs {
+			switch spec := spec.(type) {
+			case *ast.TypeSpec:
+				names = append(names, spec.Name.Name)
+			case *ast.ValueSpec:
+				for _, name := range spec.Names {
+					names = append(names, name.Name)
+				}
+			}
+		}
+		return names, declaration.Doc
+	default:
+		return nil, nil
+	}
 }
 
 // The three Example tables below are named for what they are. They document
@@ -992,7 +1336,7 @@ func TestNestedModuleDetection(t *testing.T) {
 		writeFixture(t, root, "internal/plain/plain.go", "package plain\n")
 
 		// The premise: the import guard really is blind to both of them.
-		scan, err := scanImports(root)
+		scan, err := scanImports(root, "")
 		if err != nil {
 			t.Fatalf("scanImports: %v", err)
 		}
@@ -1080,6 +1424,12 @@ func FuzzIgnoredFileName(f *testing.F) {
 	})
 }
 
+// boundaryMarkers is the oracle's independent statement of the rule. It is a
+// list rather than an expression because FuzzBoundaryMarkerName's skip has to
+// iterate the same set its assertion uses; two spellings of it would be the
+// copy this file has already paid for twice.
+var boundaryMarkers = []string{"go.mod", ".git"}
+
 // FuzzBoundaryMarkerName drives the predicate through the filesystem, because
 // that is how it decides.
 //
@@ -1103,13 +1453,8 @@ func FuzzIgnoredFileName(f *testing.F) {
 // This also cost a false green: the failure is derived rather than seeded, so a
 // 30s run finds ".Git" sometimes and not others, and one clean run was reported
 // as evidence. A target whose failure is probabilistic has not been shown to be
-// able to fail until it has failed.
-// boundaryMarkers is the oracle's independent statement of the rule. It is a
-// list rather than an expression because the skip above has to iterate the same
-// set the assertion uses; two spellings of it would be the copy this file has
-// already paid for twice.
-var boundaryMarkers = []string{"go.mod", ".git"}
-
+// able to fail until it has failed. See TestDocCommentsNameTheirOwnDeclaration
+// for why this comment is separated from the var above by a blank line.
 func FuzzBoundaryMarkerName(f *testing.F) {
 	for _, seed := range []string{"go.mod", ".git", "go.work", "go.sum", "BUILD.bazel", "vendor.json", "x.go", "go.mod.bak", "Makefile", "GO.MOD", ".Git", ".GIT", "Go.mod", "go.MOD"} {
 		f.Add(seed)
@@ -1182,11 +1527,36 @@ type importScan struct {
 	violations      []string
 }
 
-// scanImports enumerates the Go files this module owns, parses their import
-// declarations, and classifies each one. It parses; it never searches source
-// text. A ban expressed as a substring search has twice been defeated in this
-// program by whitespace and by an equivalent spelling.
-func scanImports(root string) (importScan, error) {
+// qualify turns a path relative to root into one relative to the OUTERMOST
+// module root. It is the whole of the fix for a defect that had five rounds to
+// hide in: qualification used to happen at REPORT time, so a scan rooted at a
+// declared nested module classified every file by its nested-module-relative
+// path and every path-scoped rule silently re-anchored. Declaring
+// tools/checkout granted it its own Centrifuge exemption, and an exemption that
+// could only be widened by editing one constant was widened by CREATING A
+// DIRECTORY named internal/realtime/hostlink inside it.
+//
+// Anything path-scoped added to importVerdict inherits this by construction,
+// which is the point: the previous four fixes each extended one mechanism into
+// the nested scan and left the others behind, and extension is precisely the
+// operation that does that.
+func qualify(prefix, relative string) string {
+	if prefix == "" {
+		return relative
+	}
+	return prefix + "/" + relative
+}
+
+// scanImports enumerates the Go files owned by the module at root, parses their
+// import declarations, and classifies each one by its path relative to the
+// OUTERMOST module root — prefix, which is "" for that root itself. It parses;
+// it never searches source text. A ban expressed as a substring search has
+// twice been defeated in this program by whitespace and by an equivalent
+// spelling.
+//
+// prefix is a required parameter rather than a second entry point, so a caller
+// scanning a nested root cannot forget it.
+func scanImports(root, prefix string) (importScan, error) {
 	var scan importScan
 	files, err := modfiles.Files(root)
 	if err != nil {
@@ -1197,6 +1567,7 @@ func scanImports(root string) (importScan, error) {
 		if err != nil {
 			return importScan{}, err
 		}
+		relative = qualify(prefix, relative)
 		scan.files++
 		if !strings.HasSuffix(relative, "_test.go") {
 			scan.productionFiles++
@@ -1225,15 +1596,28 @@ func scanImports(root string) (importScan, error) {
 // declared ones.
 type nestedScan struct {
 	directories int
-	declared    []string
-	undeclared  []string
-	violations  []string
+	// goModFiles counts the declared modules whose own go.mod was parsed, so a
+	// caller can tell "no dependency violation" from "no go.mod was read".
+	goModFiles int
+	declared   []string
+	undeclared []string
+	violations []string
 }
 
 // scanNestedModules finds every nested module below root and, for each one the
-// allowlist declares, applies the WHOLE guard rooted at it: the import scan and
-// this walk again. Declaring a nested module extends the boundary into it; it
-// does not suspend the boundary around it, and it does not buy one level.
+// allowlist declares, applies the WHOLE guard to it: mechanism 1 with paths
+// still anchored to the OUTERMOST root, mechanisms 2 and 3 over that module's
+// own go.mod, and this walk again. Declaring a nested module extends the
+// boundary into it; it does not suspend the boundary around it, and it does not
+// buy one level or one mechanism.
+//
+// Read the last sentence as a rule about FUTURE mechanisms, because the history
+// of this function is five rounds of one mechanism at a time. Every fix was
+// "extend mechanism X to the nested scan", and extension is exactly the
+// operation that leaves the other mechanisms behind: the recursion added to
+// close round 4 inherited mechanism 1's PATH SCOPE (re-anchored, so a declared
+// module got its own Centrifuge exemption) and did not inherit 2 or 3 at all. A
+// sixth mechanism must be applied HERE, not enumerated as the sixth escape.
 //
 // The recursion is the correction of a real gap. Scanning a declared module
 // with scanImports alone walks with modfiles.Files, which stops at a boundary,
@@ -1256,10 +1640,7 @@ func scanNestedModulesUnder(root, prefix string, allowlist []string) (nestedScan
 	}
 	scan := nestedScan{directories: directories}
 	for _, path := range nested {
-		qualified := path
-		if prefix != "" {
-			qualified = prefix + "/" + path
-		}
+		qualified := qualify(prefix, path)
 		if !slices.Contains(allowlist, qualified) {
 			scan.undeclared = append(scan.undeclared, qualified)
 			continue
@@ -1267,7 +1648,26 @@ func scanNestedModulesUnder(root, prefix string, allowlist []string) (nestedScan
 		scan.declared = append(scan.declared, qualified)
 
 		directory := filepath.Join(root, filepath.FromSlash(path))
-		inner, err := scanImports(directory)
+
+		// Mechanisms 2 and 3: the declared module's OWN go.mod. Neither ran
+		// here for five rounds, and requireViolations' comment calls itself
+		// "the only guard standing" for a forbidden module arriving
+		// INDIRECTLY, because the import guard is silent by construction
+		// there. For a declared nested module the only guard standing was not
+		// standing: `require github.com/looprig/factory v0.1.0 // indirect`
+		// and `replace github.com/looprig/core => ../../../core` both passed,
+		// while the identical strings are caught in the root go.mod.
+		modViolations, parsedMod, err := nestedGoModViolations(directory, qualified)
+		if err != nil {
+			return nestedScan{}, err
+		}
+		if parsedMod {
+			scan.goModFiles++
+		}
+		scan.violations = append(scan.violations, modViolations...)
+
+		// Mechanism 1, classified on paths relative to the OUTERMOST root.
+		inner, err := scanImports(directory, qualified)
 		if err != nil {
 			return nestedScan{}, err
 		}
@@ -1275,27 +1675,61 @@ func scanNestedModulesUnder(root, prefix string, allowlist []string) (nestedScan
 		// the scan saw nothing; imports == 0 says it CLASSIFIED nothing, and
 		// the violations below come from classified imports — flooring only the
 		// first left a declared module of import-free files reporting a
-		// confident zero. productionFiles is deliberately not floored: a
-		// declared nested module may legitimately be test support.
+		// confident zero. productionFiles is deliberately NOT floored: a
+		// declared nested module may legitimately be test support, and
+		// flooring it would force a false violation on a legitimate shape. That
+		// asymmetry with the root scan is asserted rather than merely reasoned
+		// about — see the "only test files" subtest of
+		// TestDeclaredNestedModuleInheritsTheWholeGuard — because otherwise the
+		// next reviewer applying "floor what the caller consumes" uniformly
+		// adds the floor and breaks it, with nothing red to say so.
 		if inner.files == 0 {
 			scan.violations = append(scan.violations, qualified+" is declared in nestedModuleAllowlist but holds no Go file, so the extra scan its declaration buys is vacuous")
 		} else if inner.imports == 0 {
 			scan.violations = append(scan.violations, qualified+" is declared in nestedModuleAllowlist but no import was classified in it, so the extra scan its declaration buys is vacuous")
 		}
-		for _, violation := range inner.violations {
-			scan.violations = append(scan.violations, qualified+"/"+violation)
-		}
+		// No re-prefixing: inner.violations already name outermost-relative
+		// paths, because qualification happens at classification time now.
+		scan.violations = append(scan.violations, inner.violations...)
 
 		deeper, err := scanNestedModulesUnder(directory, qualified, allowlist)
 		if err != nil {
 			return nestedScan{}, err
 		}
 		scan.directories += deeper.directories
+		scan.goModFiles += deeper.goModFiles
 		scan.declared = append(scan.declared, deeper.declared...)
 		scan.undeclared = append(scan.undeclared, deeper.undeclared...)
 		scan.violations = append(scan.violations, deeper.violations...)
 	}
 	return scan, nil
+}
+
+// nestedGoModViolations applies mechanisms 2 and 3 — the looprig-dependency
+// rule and the go.mod-directive-shape rule — to a declared nested module's own
+// go.mod, and reports whether there was one to read.
+//
+// A declared BOUNDARY is not always a module: a vendored git checkout carries
+// .git and no go.mod, and having nothing to read is not a violation. A go.mod
+// that exists and does not parse is, because it is this module's tree.
+func nestedGoModViolations(directory, qualified string) ([]string, bool, error) {
+	name := qualified + "/go.mod"
+	source, err := os.ReadFile(filepath.Join(directory, "go.mod")) //nolint:gosec // a walked module-owned path
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	parsed, err := modfile.Parse(name, source, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	var violations []string
+	for _, violation := range append(requireViolations(parsed), replaceViolations(parsed)...) {
+		violations = append(violations, qualified+"/"+violation)
+	}
+	return violations, true, nil
 }
 
 // nestedModuleDirectories returns the module-root-relative paths of every
