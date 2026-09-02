@@ -788,6 +788,16 @@ func (u *unwinder) shared(name string, run func(context.Context) error) {
 // sharedHeld names the shared compensations this attach recorded and did not
 // run, for a caller that must be told they are still held. It is the loser's
 // half of the same honesty unwind provides for a failure.
+//
+// THE WORDING IS ONE DEGREE MORE CONFIDENT THAN THE SITUATION, and the report
+// is honest where the sentence is not. "Not this call's to release" is exactly
+// right when the winner charged the ledger, which is every path through this
+// package. It is WRONG in the case a second registry writer makes reachable:
+// a rival installed by code that never went through the ledger leaves the
+// charge genuinely this call's, and skipping it strands the charge rather than
+// handing it over. Naming it is still the right report — something is held and
+// somebody must know — but a reader should not take the phrase as a claim about
+// who owns it.
 func (u *unwinder) sharedHeld() []string {
 	var held []string
 	for _, action := range u.actions {
@@ -1237,6 +1247,16 @@ func (m *Manager) validateRequest(key registry.Key, request Request) error {
 // The fix is NOT a second validate after the slot: two reads of a drifting
 // target is the exact defect the snapshot type exists to prevent, and it breaks
 // the guard that says so. One read, inside the slot.
+//
+// THE WINDOW IT DOES NOT CLOSE, because one read cannot: a target that
+// redeclares between this snapshot and the launch is still launched on the
+// snapshot. That window is IRREDUCIBLE under a one-read snapshot and what moved
+// the slot changed is what it CONTAINS — no wait for another attach remains
+// inside it, because AcquireSessionLease reports ErrLeaseHeld rather than
+// waiting. The residual lands on the CREATE path: a restore reaches
+// rigTarget.Restore, which compares the id it is handed against the target's
+// own and fails closed, so a build that drifted mid-hydration is caught there.
+// A create has no equivalent comparison and would launch on the stale id.
 func (m *Manager) resolveTarget(key registry.Key, request Request) (snapshotTarget, error) {
 	refuse := func(code sessionwire.HostLinkErrorCode, reason string, cause error) (snapshotTarget, error) {
 		return snapshotTarget{}, &AttachError{Step: StepValidate, Code: code, Key: key, Reason: reason, Cause: cause}

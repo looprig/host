@@ -300,7 +300,12 @@ type fakeLocations struct {
 	publishErr   error
 	tombstoneErr error
 	// failOnCall, when positive, refuses exactly that publish and no other,
-	// counted from one. It names ONE call rather than "everything after the
+	// counted from one. THE COUNT IS PER FIXTURE, NOT PER ATTACH: it spans every
+	// session, which is fine for a single-key test and a trap for a
+	// multi-session one, where the Nth publish is not the Nth publish of the
+	// attach under test.
+	//
+	// It names ONE call rather than "everything after the
 	// nth" because a test that needs the winner's resident publish to fail
 	// usually needs a LATER attach to succeed, and a fake that fails forever
 	// after the first refusal cannot express the difference.
