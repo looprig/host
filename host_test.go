@@ -519,6 +519,138 @@ func TestTheMarginsAreDerivedFromTheirConstants(t *testing.T) {
 	}
 }
 
+// TestSizeBoundsAcceptExactlyTheirConstant is the boundary-in-both-directions
+// treatment the size bounds did not get.
+//
+// The timing margins got it rigorously and the sizes got nothing, which is the
+// same "which branch does this test actually enter" failure in a new dress: the
+// discipline was real but scoped to where I was looking. The only bound row was
+// MaxCommandQueueSize+1, and that value exceeds EITHER constant — so swapping
+// CommandQueueSize's bound for MaxReconcileBatch left the suite green with the
+// queue limit 16x tighter than the exported constant that documents it. A
+// caller who reads MaxCommandQueueSize and configures exactly that would have
+// been refused by a Host whose tests all passed.
+//
+// The accepted-at-the-bound row is what closes it, and it only works because
+// the two constants DIFFER; that is asserted rather than assumed.
+func TestSizeBoundsAcceptExactlyTheirConstant(t *testing.T) {
+	t.Parallel()
+
+	if host.MaxCommandQueueSize == host.MaxReconcileBatch {
+		t.Fatal("the two size bounds are equal, so swapping one for the other in validateShape would be undetectable by any value. Keep them distinct or this test cannot do its job")
+	}
+
+	tests := []struct {
+		name     string
+		apply    func(*host.Options)
+		accepted bool
+	}{
+		{name: "queue at exactly its bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize }, accepted: true},
+		{name: "queue one over its bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 }},
+		{name: "queue at one", apply: func(o *host.Options) { o.CommandQueueSize = 1 }, accepted: true},
+		// The cross rows: each size set to the OTHER bound's constant. The
+		// queue accepts it because the queue's bound is larger; the batch
+		// refuses it for the same reason. A swapped bound inverts both.
+		{name: "queue at the batch bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxReconcileBatch }, accepted: true},
+		{name: "batch at exactly its bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch }, accepted: true},
+		{name: "batch one over its bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch + 1 }},
+		{name: "batch at one", apply: func(o *host.Options) { o.ReconcileBatch = 1 }, accepted: true},
+		{name: "batch at the queue bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxCommandQueueSize }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t)
+			tt.apply(&options)
+			built, err := host.New(options)
+			if tt.accepted {
+				if err != nil {
+					t.Fatalf("New = %v, want acceptance. A caller who reads the exported constant and configures exactly it must be accepted, or the constant is not the bound", err)
+				}
+				return
+			}
+			if built != nil {
+				t.Error("New returned a Host alongside its error")
+			}
+			var invalid *host.InvalidOptionsError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
+			}
+			if invalid.Code != host.OptionErrorCodeAboveBound {
+				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeAboveBound)
+			}
+		})
+	}
+}
+
+// TestDurationsHaveNoUndOCUMENTEDMinimum is the second instance of the survivor
+// class, found by auditing the rest of the file rather than by being told.
+//
+// The rule for a duration is POSITIVE, and nothing more. Every fixture in this
+// file is on a scale of seconds, so imposing an undocumented one-second floor —
+// `duration.value < time.Second` in place of `<= 0` — left the whole suite
+// green. That is the same defect as the size bounds: a rejection row proves the
+// upper side, and with no accepted row at the smallest legal value the lower
+// side is whatever the implementation happens to say.
+//
+// A nanosecond heartbeat is operationally absurd, and accepting it is still the
+// right answer here: this constructor validates COHERENCE, not operational
+// sanity, and a minimum would be a new rule owing its own exported constant and
+// its own boundary rows, exactly as the two margins do. If one is ever wanted,
+// add it that way rather than by tightening this comparison.
+func TestDurationsHaveNoUndocumentedMinimum(t *testing.T) {
+	t.Parallel()
+
+	options := pooledOptions(t)
+	options.WarmTTL = 1
+	options.ReconcileInterval = 1
+	options.RegistryHeartbeat = 1
+	options.RegistryExpiry = host.MinHeartbeatsBeforeExpiry
+	options.ClaimTTL = 1
+	options.ApplyDeadline = host.MinClaimAttemptsBeforeDeadline
+
+	built, err := host.New(options)
+	if err != nil {
+		t.Fatalf("New with nanosecond-scale durations = %v, want acceptance: the rule is positive, and any floor above that is an undocumented rule", err)
+	}
+	if got := built.WarmTTL(); got != 1 {
+		t.Errorf("WarmTTL() = %v, want 1ns", got)
+	}
+	if got := built.RegistryHeartbeat(); got != 1 {
+		t.Errorf("RegistryHeartbeat() = %v, want 1ns", got)
+	}
+
+	// The other side stays closed: zero is still refused at that scale, so this
+	// row does not soften the positivity rule it is bounding.
+	options.WarmTTL = 0
+	if _, err := host.New(options); err == nil {
+		t.Error("a zero WarmTTL was accepted")
+	}
+}
+
+// TestResolvedSizesSurviveAtTheBound pins that a value accepted at the bound is
+// also REPORTED at the bound, since acceptance and the accessor are two code
+// paths and this lane has already shipped a divergence between exactly that
+// pair once.
+func TestResolvedSizesSurviveAtTheBound(t *testing.T) {
+	t.Parallel()
+
+	options := pooledOptions(t)
+	options.CommandQueueSize = host.MaxCommandQueueSize
+	options.ReconcileBatch = host.MaxReconcileBatch
+	built, err := host.New(options)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := built.CommandQueueSize(); got != host.MaxCommandQueueSize {
+		t.Errorf("CommandQueueSize() = %d, want %d", got, host.MaxCommandQueueSize)
+	}
+	if got := built.ReconcileBatch(); got != host.MaxReconcileBatch {
+		t.Errorf("ReconcileBatch() = %d, want %d", got, host.MaxReconcileBatch)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Placement is a cross-field rule
 // ---------------------------------------------------------------------------

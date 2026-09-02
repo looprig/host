@@ -26,7 +26,13 @@ type SessionStore interface {
 	LoadSession(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]byte, error)
 }
 
-// WorkspaceProvider materializes and checkpoints session workspaces.
+// WorkspaceProvider materializes session workspaces.
+//
+// It does NOT checkpoint them. An earlier version of this comment said it did,
+// which is the doc-versus-reality drift host/CLAUDE.md exists to stop and the
+// third time this lane has shipped a comment promising more than the code
+// holds. Checkpointing arrives with O4.x/O6.x and will be its own method or its
+// own interface; until then this says only what EnsureWorkspace does.
 type WorkspaceProvider interface {
 	// EnsureWorkspace makes a workspace available and returns its root.
 	EnsureWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) (string, error)
@@ -67,7 +73,27 @@ const MinHeartbeatsBeforeExpiry = 3
 // lifetime fits inside the deadline, the first lapse spends the entire budget
 // and the command misses its deadline with no attempt left; two means a lapsed
 // claim still has a whole attempt in front of it.
+//
+// THIS IS STRICTER THAN THE RUNBOOK, and the difference is not derived from
+// anything written down. 04-host.md says "claim TTL below apply deadline" —
+// merely below — and reserves the words "safely below" for the heartbeat rule
+// alone. That asymmetry is deliberate on the runbook's part, so this constant
+// is an engineering choice and not a reading of the spec: it will REFUSE
+// DEPLOYMENTS THE RUNBOOK PERMITS, such as a 30s claim under a 45s deadline.
+//
+// The failure model it is chosen against: at 1.5x, a claim that lapses at the
+// end of its life leaves half an attempt before the deadline, so the retry is
+// guaranteed to be cut off and the command fails having consumed two Hosts. At
+// 2x the retry has a full attempt. If a deployment needs the looser rule the
+// runbook allows, change THIS CONSTANT — do not weaken validateTiming, which is
+// what makes the boundary testable.
 const MinClaimAttemptsBeforeDeadline = 2
+
+// The two size bounds below are DELIBERATELY DIFFERENT VALUES, and a test
+// asserts that they differ. They bound different things for different reasons,
+// and if they ever coincided, swapping one for the other in validateShape would
+// become undetectable — which is exactly the mutation that survived this file's
+// first version, because the only bound row exceeded either constant.
 
 // MaxCommandQueueSize bounds the command queue. A queue is bounded because an
 // unbounded one converts backpressure into memory growth and turns a slow
@@ -258,13 +284,18 @@ func (o Options) validateShape() error {
 	switch o.IsolationClass {
 	case sessionwire.HostIsolationClassCrossTenantIsolated, sessionwire.HostIsolationClassTenantExclusive:
 	default:
-		// The zero value lands here, which is the point: an unset isolation
-		// class is not a default, it is an unanswered question about whether
-		// this Host may hold another tenant's session.
+		// The zero value lands here, and this is REQUIRED rather than a
+		// judgement about defaults. Core's validateHostIsolationClass
+		// (sessionwire/v1/hostlink.go) accepts only these two constants and
+		// returns invalid_field for anything else including the empty string;
+		// HostLinkCapacityReport.Validate calls it, and decodeHostIsolationClass
+		// requires the wire member outright. A Host that defaulted this field
+		// could not publish a capacity report, so refusing it here turns a
+		// failure at first advertisement into a failure at construction.
 		return &InvalidOptionsError{
 			Code:   OptionErrorCodeUnknownEnum,
 			Field:  "IsolationClass",
-			Reason: "must be " + string(sessionwire.HostIsolationClassCrossTenantIsolated) + " or " + string(sessionwire.HostIsolationClassTenantExclusive) + "; there is no default, because the unset value is a question about cross-tenant placement rather than an answer",
+			Reason: "must be " + string(sessionwire.HostIsolationClassCrossTenantIsolated) + " or " + string(sessionwire.HostIsolationClassTenantExclusive) + "; Core rejects any other value on the capacity report, so a Host without one could never advertise",
 		}
 	}
 	switch o.Placement {

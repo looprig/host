@@ -6,8 +6,11 @@
 // dependency boundary that states this is enforced by import_boundary_test.go
 // rather than by convention.
 //
-// This package currently carries a placeholder Host. The Department it serves
-// — the immutable set of launch targets, and the segregated runtime
-// capabilities Host consumes — lives in the department subpackage; residency,
-// command consumption and HostLink follow.
+// A Host is constructed from validated Options and holds a resolved,
+// immutable configuration: identity and tenant, the HostLink address it
+// advertises, its Department, its collaborators, and the placement, capacity
+// and timing bounds it runs under. The Department it serves — the immutable set
+// of launch targets, and the segregated runtime capabilities Host consumes —
+// lives in the department subpackage. Residency, command consumption, HostLink
+// and drain follow.
 package host
