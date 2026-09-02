@@ -106,6 +106,14 @@ never enumerate the rules, because the rules are the side that grows.
    over this tree simultaneously — including `make fmt-check`, which pipes the
    same enumerator into gofmt.
 
+Mechanisms 1-5 are about the MODULE. `import_boundary_test.go` also carries
+meta-guards, which are about the SHAPE OF THE GUARD and have no numbered slot:
+`TestGoModRulesHaveOneSite` holds "every mechanism has one site" and
+`TestDocCommentsNameTheirOwnDeclaration` holds "a doc comment documents the
+declaration it is attached to". A third one goes here, not in the numbered
+list — and it must state its own limits in its doc comment, because a
+meta-guard that overstates its reach is the defect it exists to catch.
+
 An exclusion added to make a guard pass must itself be tested. A too-wide
 exclusion produces exactly the same green as a correct one; that has been a live
 defect here twice.

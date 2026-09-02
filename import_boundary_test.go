@@ -1148,9 +1148,38 @@ var goModRuleConsumers = []string{
 // it. So the shape is asserted: a consumer calls goModViolations and no other
 // rule function.
 //
-// The hook is the …Violations naming convention this file already follows
-// throughout. A rule named checkExcludes would escape; the convention is worth
-// more as a guard than the guard would be worth as an enumeration.
+// Its limits, largest first, because a guard that discloses its second-largest
+// limit and not its largest is prose asserting more than the code holds — which
+// is this repository's most persistent defect and the thing six rounds were
+// spent on.
+//
+//   - A rule written INLINE in a consumer — a for over parsed.Exclude calling
+//     looprigDependencyViolation, three lines, no function at all — escapes
+//     entirely, and that is a likelier edit than writing a whole rule function.
+//     Measured: with those three lines in nestedGoModViolations, the same
+//     go.mod yields [] from the root consumer's path and a violation from the
+//     nested one, with this test PASSING. Widening the hook to catch
+//     parsed.<Field> access inside a consumer is not the answer: the root guard
+//     legitimately reads parsed.Module and parsed.Require for its own vacuity
+//     floors, so it would false-positive, and enumerating modfile's fields
+//     reintroduces exactly the enumeration this test exists to avoid.
+//   - A rule function named off-convention — checkExcludes rather than
+//     excludeViolations — escapes the …Violations hook. Smaller, because it
+//     takes deliberate deviation from a convention the file follows throughout.
+//   - The check is FILE-SCOPED: it parses import_boundary_test.go alone, while
+//     TestDocCommentsNameTheirOwnDeclaration twelve lines below enumerates the
+//     whole module. The consequence is not only narrowness — a CORRECT consumer
+//     in a sibling file cannot be listed at all, because the staleness arm
+//     below would report it as naming no function in this file. Latent while
+//     the guard is one file; fix the scope before it is two.
+//   - The consumer list is policed for STALENESS, not for OMISSION. An entry
+//     naming nothing fails; a third consumer nobody listed is simply not
+//     checked. Half-policed, and accepted: the alternative is deciding
+//     structurally what counts as a consumer, which is the enumeration problem
+//     again one level up.
+//
+// What it does hold is the shape that actually failed here: a rule function
+// that exists and is called from a consumer instead of from goModViolations.
 func TestGoModRulesHaveOneSite(t *testing.T) {
 	t.Parallel()
 
