@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"maps"
 	"math"
 	"os"
 	"reflect"
@@ -1292,20 +1293,25 @@ func TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents(t *testing.T) {
 	publisher := newPublisher(t, options)
 
 	registered := options.Department.AgentIDs()
+	// Each phase takes the SUBTEST's *testing.T. t.Fatalf calls FailNow, which
+	// must run on the goroutine of the test it belongs to; closing over the
+	// parent t and failing inside t.Run is undefined, and it was reachable
+	// exactly when Admit failed — the moment a confusing outcome costs most.
 	for _, phase := range []struct {
 		name string
-		act  func()
+		act  func(*testing.T)
 	}{
-		{"initial publish", func() {}},
-		{"after admission", func() {
+		{"initial publish", func(*testing.T) {}},
+		{"after admission", func(t *testing.T) {
+			t.Helper()
 			if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "planner"); err != nil {
 				t.Fatalf("Admit: %v", err)
 			}
 		}},
-		{"after drain", publisher.BeginDrain},
+		{"after drain", func(*testing.T) { publisher.BeginDrain() }},
 	} {
 		t.Run(phase.name, func(t *testing.T) {
-			phase.act()
+			phase.act(t)
 			var published []sessionwire.AgentID
 			for _, advertisement := range publish(t, publisher) {
 				published = append(published, advertisement.Report.AgentID)
@@ -1480,7 +1486,14 @@ func exportedDeclarations(declaration ast.Decl) []exportedDeclaration {
 		if typed.Recv != nil && len(typed.Recv.List) == 1 {
 			name = receiverTypeName(typed.Recv.List[0].Type) + "." + name
 		}
-		return []exportedDeclaration{{name: name, publishes: mentionsAdvertisement(typed.Type.Results)}}
+		// typed.Type, not typed.Type.Results. A record reaches a caller through
+		// a PARAMETER just as well as through a return — a second catalogue
+		// appended to a caller-supplied sink keeps a whitelisted name AND a
+		// whitelisted result type, and a probe confirmed it passed the whole
+		// package. The receiver is deliberately outside this: FuncType covers
+		// parameters and results only, so Advertisement's own methods are not
+		// counted as surfaces for having an Advertisement receiver.
+		return []exportedDeclaration{{name: name, publishes: mentionsAdvertisement(typed.Type)}}
 	case *ast.GenDecl:
 		var exported []exportedDeclaration
 		for _, specification := range typed.Specs {
@@ -1507,6 +1520,11 @@ func exportedDeclarations(declaration ast.Decl) []exportedDeclaration {
 }
 
 // receiverTypeName returns the bare type name of a method receiver.
+//
+// It falls back to the printed expression rather than to a placeholder, because
+// a placeholder would collapse every unrecognised receiver onto one name and
+// the enumeration compares names. No permitted declaration in this package has
+// a receiver that reaches the fallback; a generic one would.
 func receiverTypeName(expression ast.Expr) string {
 	if star, isPointer := expression.(*ast.StarExpr); isPointer {
 		expression = star.X
@@ -1514,7 +1532,7 @@ func receiverTypeName(expression ast.Expr) string {
 	if identifier, isIdentifier := expression.(*ast.Ident); isIdentifier {
 		return identifier.Name
 	}
-	return "?"
+	return types.ExprString(expression)
 }
 
 // mentionsAdvertisement reports whether a syntax node names Advertisement
@@ -1533,10 +1551,19 @@ func mentionsAdvertisement(node ast.Node) bool {
 	return mentioned
 }
 
-// TestAdvertisementCarriesExactlyTheEnumeratedFields is the same whitelist over
-// the record's shape. A field added to what Host publishes fails here until it
-// is enumerated, which is the visible diff a silent addition would not be.
-func TestAdvertisementCarriesExactlyTheEnumeratedFields(t *testing.T) {
+// TestEveryExportedStructCarriesExactlyTheEnumeratedFields is the same
+// whitelist over the shapes this package exports. A field added to any of them
+// fails here until it is enumerated, which is the visible diff a silent
+// addition would not be.
+//
+// EVERY exported struct, not just Advertisement, and that widening was forced
+// like the others: an []Advertisement field added to CapacityOptions passed
+// while the identical field on Advertisement failed. CapacityOptions is input
+// and a static catalogue there would be inert, which is exactly why it is the
+// defensible-looking face of a class whose other face — a caller-supplied sink
+// PARAMETER — is a live output path. Both are the same mistake, so both are
+// closed by the same change of shape rather than one being written up.
+func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 	t.Parallel()
 
 	// The file set again, rather than a literal name. Today the other guard's
@@ -1552,11 +1579,69 @@ func TestAdvertisementCarriesExactlyTheEnumeratedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsing %s: %v", files[0], err)
 	}
-	got := structFieldNames(t, parsed, "Advertisement")
-	want := []string{"DueAt", "Namespace", "Rank", "Ranked", "RankingScope", "Report", "StableKey", "Tombstone"}
-	if !slices.Equal(got, want) {
-		t.Errorf("Advertisement fields = %v, want exactly %v", got, want)
+	want := map[string][]string{
+		"Advertisement":               {"DueAt", "Namespace", "Rank", "Ranked", "RankingScope", "Report", "StableKey", "Tombstone"},
+		"CapacityOptions":             {"Host", "HostGeneration"},
+		"CapacityPublisher":           nil,
+		"AdmissionRefusedError":       {"AgentID", "Cause", "Code", "Reason"},
+		"AdmissionConflictError":      {"Admitted", "Key", "Requested"},
+		"AdvertisementError":          {"AgentID", "Cause", "Reason"},
+		"InvalidCapacityOptionsError": {"Cause", "Field", "Reason"},
 	}
+
+	structs := exportedStructNames(t, parsed)
+	if !slices.Equal(structs, slices.Sorted(maps.Keys(want))) {
+		t.Errorf("this package's exported structs are %v, want exactly %v", structs, slices.Sorted(maps.Keys(want)))
+	}
+	for _, name := range structs {
+		enumerated, listed := want[name]
+		if !listed {
+			continue
+		}
+		if name == "CapacityPublisher" {
+			// Its fields are all unexported, so structFieldNames reports them
+			// and the enumeration would have to track private state. What
+			// matters about this one is that it exports NOTHING, which is a
+			// stronger statement and the one asserted.
+			for _, field := range structFieldNames(t, parsed, name) {
+				if field != "" && field[0] >= 'A' && field[0] <= 'Z' {
+					t.Errorf("CapacityPublisher exports field %s; its state is not part of what this package publishes", field)
+				}
+			}
+			continue
+		}
+		if got := structFieldNames(t, parsed, name); !slices.Equal(got, enumerated) {
+			t.Errorf("%s fields = %v, want exactly %v", name, got, enumerated)
+		}
+	}
+}
+
+// exportedStructNames returns every exported struct type declared in a file, in
+// sorted order. It is what lets the field whitelist name its subject as "the
+// shapes this package exports" rather than one type somebody remembered.
+func exportedStructNames(t *testing.T, file *ast.File) []string {
+	t.Helper()
+	var names []string
+	for _, declaration := range file.Decls {
+		general, isGeneral := declaration.(*ast.GenDecl)
+		if !isGeneral || general.Tok != token.TYPE {
+			continue
+		}
+		for _, specification := range general.Specs {
+			typeSpec, isType := specification.(*ast.TypeSpec)
+			if !isType || !typeSpec.Name.IsExported() {
+				continue
+			}
+			if _, isStruct := typeSpec.Type.(*ast.StructType); isStruct {
+				names = append(names, typeSpec.Name.Name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("no exported struct type was found, so this guard reached nothing")
+	}
+	slices.Sort(names)
+	return names
 }
 
 // structFieldNames returns the sorted field names of a named struct type.
@@ -1632,6 +1717,12 @@ func TestTheStructuralGuardsSeeWhatTheyClaimTo(t *testing.T) {
 // StaticCatalogue is a publishing surface that is not a FuncDecl.
 var StaticCatalogue = func() []Advertisement { return nil }
 
+// SinkCatalogue delivers records through a PARAMETER, keeping a plain result.
+func SinkCatalogue(sink *[]Advertisement) bool { return false }
+
+// PlainFunction names no record in either position.
+func PlainFunction(n int) bool { return false }
+
 // PlainConstant mentions no record.
 const PlainConstant = 3
 
@@ -1647,31 +1738,377 @@ type Embedding struct {
 		t.Fatalf("parsing the sample: %v", err)
 	}
 
-	var sawCatalogue, sawConstant bool
+	// Each row is a SHAPE the enumeration must classify, and the two negative
+	// rows are what stop "publishes" from being a check that reports
+	// everything: a guard that answered true for all four would be useless and
+	// would pass the two positive rows alone.
+	wantPublishing := map[string]bool{
+		"StaticCatalogue": true,  // a record through a func-typed var
+		"SinkCatalogue":   true,  // a record through a caller-supplied PARAMETER
+		"PlainFunction":   false, // no record in either position
+		"PlainConstant":   false, // no record at all
+	}
+	seen := map[string]bool{}
 	for _, declaration := range parsed.Decls {
 		for _, exported := range exportedDeclarations(declaration) {
-			switch exported.name {
-			case "StaticCatalogue":
-				sawCatalogue = true
-				if !exported.publishes {
-					t.Error("a func-typed exported var yielding []Advertisement was not counted as a publishing surface, so a second catalogue declared as a variable would escape the enumeration")
-				}
-			case "PlainConstant":
-				sawConstant = true
-				if exported.publishes {
-					t.Error("an exported constant mentioning no record was counted as a publishing surface, so the publishing check reports everything and distinguishes nothing")
-				}
+			want, interesting := wantPublishing[exported.name]
+			if !interesting {
+				continue
+			}
+			seen[exported.name] = true
+			if exported.publishes != want {
+				t.Errorf("exportedDeclarations classified %s as publishes=%v, want %v", exported.name, exported.publishes, want)
 			}
 		}
 	}
-	if !sawCatalogue || !sawConstant {
-		t.Fatalf("exportedDeclarations reported neither the var (%v) nor the const (%v); it reached nothing", sawCatalogue, sawConstant)
+	for name := range wantPublishing {
+		if !seen[name] {
+			t.Errorf("exportedDeclarations never reported %s, so its row proves nothing", name)
+		}
+	}
+
+	if got := exportedStructNames(t, parsed); !slices.Equal(got, []string{"Embedding"}) {
+		t.Errorf("exportedStructNames = %v, want [Embedding]: the field whitelist enumerates the structs it finds, so a struct it cannot find is a shape nobody enumerated", got)
 	}
 
 	fields := structFieldNames(t, parsed, "Embedding")
 	if !slices.Equal(fields, []string{"Named", "embedded embeddedPart"}) {
 		t.Errorf("structFieldNames over an embedding struct = %v, want [Named \"embedded embeddedPart\"]: an embedded field carries no name, and its own fields are published through the outer struct all the same", fields)
 	}
+}
+
+// driftingTarget is a LaunchTarget whose answers change after registration.
+//
+// It is not a contrived fixture. department's own type documentation says a
+// Department "does not and cannot copy the TARGETS, which are interface values
+// a caller may still hold and whose implementations may carry state", so this
+// is the behaviour the accepted design permits, and department.New validates
+// only the answers it was given at registration.
+type driftingTarget struct {
+	compatibility department.CompatibilityID
+	capabilities  department.Capabilities
+}
+
+func (t *driftingTarget) CompatibilityID() department.CompatibilityID { return t.compatibility }
+func (t *driftingTarget) Capabilities() department.Capabilities       { return t.capabilities }
+
+func (*driftingTarget) Create(context.Context, department.CreateRequest) (department.Runtime, error) {
+	return nil, errors.New("drifting target launches nothing")
+}
+
+func (*driftingTarget) Restore(context.Context, department.RestoreRequest) (department.Runtime, error) {
+	return nil, errors.New("drifting target launches nothing")
+}
+
+// TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath holds the snapshot.
+//
+// The fault it pins was a PANIC, not a wrong value: a target reporting admission
+// weight 1 at registration and 0 afterwards divided by zero inside Publish, on
+// the heartbeat, in a file where every other fault is a typed refusal. The
+// compatibility id is the same shape with a quieter consequence — it is an input
+// to StableKey, so a drifting one would start writing to a different record and
+// orphan the live advertisement until it expired, reporting nothing.
+//
+// Both directions are here: a target already broken AT construction is refused,
+// and a target that breaks AFTERWARDS is survived on the snapshotted values.
+func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
+	t.Parallel()
+
+	newDrifting := func(t *testing.T) (*driftingTarget, host.Options) {
+		t.Helper()
+		target := &driftingTarget{compatibility: "rig-drift-2026-09", capabilities: pooledCapabilities(2)}
+		options := pooledOptions(t, newFakeClock())
+		options.Capacity = 8
+		options.Department = testDepartment(t, department.Registration{AgentID: "reviewer", Target: target})
+		return target, options
+	}
+
+	// TWO weight rows, and the second is not redundant. A zero weight makes the
+	// live read PANIC, so a probe restoring the live read is killed by a crash
+	// rather than by an assertion — which this program does not count. A weight
+	// that merely differs is behaviourally distinguishable and wrong rather
+	// than fatal, so the same probe dies on a comparison. The zero row stays
+	// because it is the fault that was actually reported.
+	t.Run("a different weight arriving after construction", func(t *testing.T) {
+		t.Parallel()
+		target, options := newDrifting(t)
+		publisher := newPublisher(t, options)
+		before := publish(t, publisher)[0]
+
+		// 8/2 = 4 before, 8/4 = 2 if re-read. Neither is zero, so nothing
+		// crashes and the difference is a value a test can compare.
+		target.capabilities = pooledCapabilities(4)
+
+		after := publish(t, publisher)[0]
+		if after.Report.AvailableCapacity != 4 || before.Report.AvailableCapacity != 4 {
+			t.Errorf("AvailableCapacity was %d and is %d; both must be 4, the snapshotted weight-2 answer at capacity 8", before.Report.AvailableCapacity, after.Report.AvailableCapacity)
+		}
+		if after.Rank != before.Rank {
+			t.Errorf("Rank moved from %d to %d because a target changed its mind", before.Rank, after.Rank)
+		}
+		if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+			t.Fatalf("Admit: %v", err)
+		}
+		if got := publisher.ConsumedWeight(); got != 2 {
+			t.Errorf("ConsumedWeight = %d, want the snapshotted weight 2: admission must charge what the Host was validated against", got)
+		}
+	})
+
+	t.Run("a zero weight arriving after construction", func(t *testing.T) {
+		t.Parallel()
+		target, options := newDrifting(t)
+		publisher := newPublisher(t, options)
+		before := publish(t, publisher)[0]
+
+		target.capabilities = department.Capabilities{}
+
+		// Would panic with integer divide by zero if the weight were re-read.
+		after := publish(t, publisher)[0]
+		if after.Report.AvailableCapacity != before.Report.AvailableCapacity {
+			t.Errorf("AvailableCapacity moved from %d to %d because a target changed its mind; the snapshot is what the Host was validated against", before.Report.AvailableCapacity, after.Report.AvailableCapacity)
+		}
+		if got := before.Report.AvailableCapacity; got != 4 {
+			t.Errorf("AvailableCapacity = %d at capacity 8 and weight 2, want 4: the fixture must exercise a weight above one or a divisor fault is invisible", got)
+		}
+		// Admission charges the snapshotted weight too, and a zero weight there
+		// would admit without bound — which is the rule Capabilities.Validate
+		// exists to enforce and could no longer see.
+		if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+			t.Fatalf("Admit: %v", err)
+		}
+		if got := publisher.ConsumedWeight(); got != 2 {
+			t.Errorf("ConsumedWeight = %d, want the snapshotted weight 2", got)
+		}
+	})
+
+	t.Run("a compatibility id arriving after construction", func(t *testing.T) {
+		t.Parallel()
+		target, options := newDrifting(t)
+		publisher := newPublisher(t, options)
+		before := publish(t, publisher)[0]
+
+		target.compatibility = "rig-drift-2026-12"
+
+		after := publish(t, publisher)[0]
+		if after.StableKey != before.StableKey {
+			t.Errorf("the heartbeat's stable key moved from %q to %q, so it would insert a new record and leave the live advertisement to expire unrefreshed", before.StableKey, after.StableKey)
+		}
+		if after.RankingScope != before.RankingScope {
+			t.Errorf("the heartbeat's ranking scope moved from %q to %q", before.RankingScope, after.RankingScope)
+		}
+		if after.Report.RuntimeCompatibilityID != before.Report.RuntimeCompatibilityID {
+			t.Errorf("RuntimeCompatibilityID moved from %q to %q without the key moving, so the record would advertise a build its own key does not describe", before.Report.RuntimeCompatibilityID, after.Report.RuntimeCompatibilityID)
+		}
+	})
+
+	t.Run("already broken at construction", func(t *testing.T) {
+		t.Parallel()
+		for _, row := range []struct {
+			name  string
+			spoil func(*driftingTarget)
+		}{
+			{"zero admission weight", func(target *driftingTarget) { target.capabilities = department.Capabilities{} }},
+			{"empty compatibility id", func(target *driftingTarget) { target.compatibility = "" }},
+		} {
+			t.Run(row.name, func(t *testing.T) {
+				t.Parallel()
+				target, options := newDrifting(t)
+				// Registration succeeded on the healthy answers; the target
+				// changes them before the publisher snapshots. This is the case
+				// department.New has already been past and cannot revisit.
+				row.spoil(target)
+				_, err := service.NewCapacityPublisher(service.CapacityOptions{
+					Host:           newHost(t, options),
+					HostGeneration: testHostGeneration,
+				})
+				var invalid *service.InvalidCapacityOptionsError
+				if !errors.As(err, &invalid) {
+					t.Fatalf("NewCapacityPublisher = %v (%T), want *service.InvalidCapacityOptionsError: a snapshot nobody validated is the panic in a different place", err, err)
+				}
+				if invalid.Field != "Host" {
+					t.Errorf("refusal field = %q, want %q", invalid.Field, "Host")
+				}
+			})
+		}
+		// The control one position over: the same target, unbroken, is accepted.
+		_, options := newDrifting(t)
+		if _, err := service.NewCapacityPublisher(service.CapacityOptions{
+			Host:           newHost(t, options),
+			HostGeneration: testHostGeneration,
+		}); err != nil {
+			t.Errorf("the healthy target was refused too, so the refusals above prove nothing: %v", err)
+		}
+	})
+}
+
+// TestExportedErrorsDoNotPanicWithoutACause holds the one thing every exported
+// error type owes a caller that did not build it the way this file does.
+//
+// Error() is what a log line calls, so a nil dereference there crashes at the
+// moment something has already gone wrong — the worst place to crash. Every
+// exported type is a row rather than the one that was found wanting, because
+// the guard is only worth having if it is over the shape and not the instance.
+func TestExportedErrorsDoNotPanicWithoutACause(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name string
+		err  error
+	}{
+		{"AdvertisementError", &service.AdvertisementError{AgentID: "reviewer", Reason: "unpublishable"}},
+		{"AdmissionRefusedError", &service.AdmissionRefusedError{AgentID: "reviewer", Reason: "refused"}},
+		{"AdmissionConflictError", &service.AdmissionConflictError{Admitted: "a", Requested: "b"}},
+		{"InvalidCapacityOptionsError", &service.InvalidCapacityOptionsError{Field: "Host", Reason: "unset"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			// RECOVERED, so the failure is an assertion naming the type rather
+			// than a panic that fails the whole package and says only which
+			// goroutine died. The defect being guarded IS a panic, so without
+			// this the only possible kill is a crash.
+			message, panicked := errorText(row.err)
+			if panicked != nil {
+				t.Fatalf("Error() panicked with %v; a nil cause must not crash the log line that reports the failure", panicked)
+			}
+			if message == "" {
+				t.Error("Error() returned nothing, so a log line would say nothing")
+			}
+			if !strings.Contains(message, "host/service") {
+				t.Errorf("Error() = %q, want it to name the package it came from", message)
+			}
+			if unwrapped := errors.Unwrap(row.err); unwrapped != nil {
+				t.Errorf("errors.Unwrap = %v on an error built with no cause, want nil", unwrapped)
+			}
+		})
+	}
+}
+
+// errorText calls Error() and reports any panic instead of propagating it.
+func errorText(err error) (message string, panicked any) {
+	defer func() { panicked = recover() }()
+	return err.Error(), nil
+}
+
+// TestNoInjectedCallHappensUnderTheLock holds the reentrancy hazard
+// structurally, because the only behavioural symptom is a DEADLOCK.
+//
+// sync.Mutex is not reentrant. Every collaborator this package reaches through
+// the Host — Clock, Department, LaunchTarget — is caller-supplied code, and a
+// Clock whose Now called back into Draining, ConsumedWeight, Admit or Release
+// would hang the Host rather than misbehave visibly. A test that provoked it
+// would be killed by a hang, which this program does not count as a kill and
+// which in CI reports a timeout rather than a cause; a structural guard fails
+// with a file and a line.
+//
+// The rule is narrow and exact: no method call reached through p.host may
+// appear lexically inside a region where p.mu is held. A deferred unlock makes
+// the region run to the end of the function, which is the shape every method
+// here uses.
+//
+// WHAT IT DOES NOT COVER: a call reached through a HELPER invoked under the
+// lock, and any deadlock not involving p.mu. It is a guard over one lexical
+// pattern and does not prove the package deadlock-free.
+func TestNoInjectedCallHappensUnderTheLock(t *testing.T) {
+	t.Parallel()
+
+	files := packageFiles(t, false)
+	regions := 0
+	for _, name := range files {
+		fileSet := token.NewFileSet()
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, declaration := range parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			from, to, held := lockedRegion(function)
+			if !held {
+				continue
+			}
+			regions++
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall || call.Pos() < from || call.Pos() > to {
+					return true
+				}
+				if reachesHost(call.Fun) {
+					t.Errorf("%s: %s calls through p.host at %s, inside the region where p.mu is held; sync.Mutex is not reentrant, so a collaborator that called back into this publisher would deadlock the Host",
+						name, function.Name.Name, fileSet.Position(call.Pos()))
+				}
+				return true
+			})
+		}
+	}
+	if regions == 0 {
+		t.Fatal("no locked region was found, so this guard reached nothing")
+	}
+	// Every mutating and reading entry point takes the lock. Fewer regions than
+	// that would mean the guard is inspecting a subset and passing on the rest.
+	if regions < 6 {
+		t.Errorf("found %d locked regions, want at least 6 — Publish, Admit, Release, BeginDrain, Draining and ConsumedWeight all take p.mu", regions)
+	}
+}
+
+// lockedRegion returns the byte range of a function in which p.mu is held.
+//
+// A deferred unlock runs the region to the end of the function; an explicit one
+// ends it at that call. Only the first lock in a function is considered, which
+// is all this package has and is stated rather than assumed.
+func lockedRegion(function *ast.FuncDecl) (from, to token.Pos, held bool) {
+	deferred := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.DeferStmt:
+			if isMutexCall(typed.Call, "Unlock") {
+				deferred = true
+			}
+			return false
+		case *ast.CallExpr:
+			if isMutexCall(typed, "Lock") && !held {
+				from, held = typed.Pos(), true
+			}
+			if isMutexCall(typed, "Unlock") && held && to == token.NoPos {
+				to = typed.Pos()
+			}
+		}
+		return true
+	})
+	if !held {
+		return token.NoPos, token.NoPos, false
+	}
+	if deferred || to == token.NoPos {
+		to = function.Body.End()
+	}
+	return from, to, true
+}
+
+// isMutexCall reports whether a call is p.mu.<name>().
+func isMutexCall(call *ast.CallExpr, name string) bool {
+	selector, isSelector := call.Fun.(*ast.SelectorExpr)
+	if !isSelector || selector.Sel.Name != name {
+		return false
+	}
+	inner, isInner := selector.X.(*ast.SelectorExpr)
+	return isInner && inner.Sel.Name == "mu"
+}
+
+// reachesHost reports whether an expression selects through p.host.
+func reachesHost(expression ast.Expr) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		selector, isSelector := node.(*ast.SelectorExpr)
+		if !isSelector || selector.Sel.Name != "host" {
+			return true
+		}
+		if identifier, isIdentifier := selector.X.(*ast.Ident); isIdentifier && identifier.Name == "p" {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // ---------------------------------------------------------------------------
@@ -1817,6 +2254,14 @@ func TestNewCapacityPublisherRefusesWhatItCannotPublish(t *testing.T) {
 		if validation.Field != "host_generation" {
 			t.Errorf("Core objected to field %q, want %q", validation.Field, "host_generation")
 		}
+		// The OPTION named, not just Core's wire field. This was hard-coded to
+		// HostGeneration for both causes the constructor documents, so the
+		// Clock refusal below sent an operator to a knob that was already
+		// correct. Two rows, because one cannot tell a derived answer from a
+		// constant that happens to match.
+		if invalid.Field != "HostGeneration" {
+			t.Errorf("refusal field = %q, want %q", invalid.Field, "HostGeneration")
+		}
 		if _, err := service.NewCapacityPublisher(service.CapacityOptions{Host: built, HostGeneration: 1}); err != nil {
 			t.Errorf("generation 1 was refused too, so the assertion above proves nothing: %v", err)
 		}
@@ -1839,6 +2284,9 @@ func TestNewCapacityPublisherRefusesWhatItCannotPublish(t *testing.T) {
 		var validation *sessionwire.RequestValidationError
 		if !errors.As(err, &validation) || validation.Field != "observed_at" {
 			t.Errorf("Core's objection = %v, want an observed_at validation error", err)
+		}
+		if invalid.Field != "Host" {
+			t.Errorf("refusal field = %q, want %q: the instant comes from the Host's Clock, and naming HostGeneration here sends the operator to a knob that is already correct", invalid.Field, "Host")
 		}
 		// The control: the same Clock one instant later is accepted.
 		options.Clock = frozenClock{at: time.Unix(1, 0)}

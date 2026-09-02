@@ -8,23 +8,25 @@
 // WHAT THIS PACKAGE DOES NOT DO, because §15 says Factory must not find it
 // here: it publishes NO SECOND CATALOGUE and COPIES NO RIG SUBAGENT ENTRY.
 //
-// Both halves are ONE property and are held by one pair of whitelists, because
-// a copied Rig subagent entry and an invented static row are the same thing
-// seen from the two sides — a published row whose agent this Department does
-// not register. TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents
-// holds the DATA: the rows Publish returns are in bijection with
-// Department.AgentIDs, in all three of initial publish, post-admission and
-// drain. TestPublishIsTheOnlyPublishingSurface holds the API: this package's
-// production files are enumerated, every exported top-level DECLARATION in them
-// is enumerated — function, method, type, const and var alike — and exactly one
-// of them yields an Advertisement.
+// Those two halves are ONE property, because a copied Rig subagent entry and an
+// invented static row are the same thing seen from two sides: a published row
+// whose agent this Department does not register. One pair of whitelists holds
+// it. TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents holds the
+// DATA — the rows Publish returns are in bijection with Department.AgentIDs, in
+// all three of initial publish, post-admission and drain.
+// TestPublishIsTheOnlyPublishingSurface holds the API: this package's production
+// files are enumerated, every exported top-level DECLARATION in them is
+// enumerated, every exported STRUCT's fields are enumerated, and exactly one
+// declaration lets an Advertisement reach a caller.
 //
-// "Declaration" and not "function", because that sentence has already been
-// wider than its probe once: while the guard walked only *ast.FuncDecl, a
-// second publishing surface declared as a func-typed package VAR passed it, and
-// an embedded struct added published fields that the field whitelist could not
-// see because an embedded field carries no name. Both are closed and both are
-// re-probed; the wording is now the thing the guard actually does. Both are stated as "enumerate
+// EACH OF THOSE WORDS REPLACED A NARROWER ONE THAT A PROBE DEFEATED, and the
+// four failures were one mistake: the guard named a proxy for its subject.
+// Scoped to one file name, a second publishing surface in a new FILE escaped.
+// Walking only *ast.FuncDecl, one declared as a func-typed VAR escaped.
+// Collecting only named fields, an EMBEDDED struct added published fields
+// invisibly. Checking only a function's RESULTS, a second catalogue delivered
+// into a caller-supplied sink PARAMETER escaped, because "results" is a proxy
+// for "reaches a caller". All four are closed and all four are re-probed. Both are stated as "enumerate
 // what may appear and report everything else", because the alternative shape —
 // searching for a second catalogue — cannot establish an absence.
 //
@@ -50,6 +52,7 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -167,8 +170,15 @@ type admission struct {
 // CapacityPublisher derives the Department's target advertisements.
 //
 // It holds the ONLY mutable state in this package: the admission ledger and the
-// drain flag. Everything else is read from the validated Host, so a
-// configuration value cannot drift from the one host.New accepted.
+// drain flag. Everything else is either read from the immutable Host or taken
+// from the target snapshot below, so no value it derives from can drift from
+// the one that was validated.
+//
+// THAT SENTENCE WAS FALSE WHEN IT WAS FIRST WRITTEN, which is why it now names
+// the snapshot. Capabilities() and CompatibilityID() were re-read on every
+// heartbeat, and they are caller code free to answer differently each time; the
+// claim covered only the Host and read as though it covered everything. See
+// launchable for the panic that cost.
 //
 // FOR O6.1 AND O6.3, WHICH ARRIVE LATER AND ELSEWHERE. 04-host.md puts weighted
 // memory/admission limits in internal/residency and internal/lifecycle, and
@@ -183,38 +193,143 @@ type CapacityPublisher struct {
 	host       *host.Host
 	generation uint64
 
+	// targets is the SNAPSHOT the whole package derives from, taken and
+	// validated once. See launchable for why it is a snapshot and not a live
+	// read, and byAgent for why both shapes are kept.
+	targets []launchable
+	byAgent map[sessionwire.AgentID]launchable
+
 	mu       sync.Mutex
 	admitted map[registry.Key]admission
 	consumed uint64
 	draining bool
 }
 
+// launchable is one LaunchTarget's description, SNAPSHOTTED AND VALIDATED at
+// construction rather than re-read on every heartbeat.
+//
+// THE SNAPSHOT IS THE POINT, and it is not an optimisation. department.New
+// validates a target's capabilities ONCE, at registration, and department's own
+// type documentation says why that is all it can do: a Department "does not and
+// cannot copy the TARGETS, which are interface values a caller may still hold
+// and whose implementations may carry state". So Capabilities() is arbitrary
+// caller code returning an arbitrary answer each time it is called, and the
+// validated answer and the live one are not the same thing.
+//
+// Reading it live cost a PANIC on the periodic path: a target returning weight
+// 1 at registration and 0 afterwards divided by zero inside Publish, on the
+// heartbeat, in a file where every other fault is a typed refusal. Measured,
+// not argued. The compatibility id is snapshotted for the same reason and a
+// worse consequence — it is an input to StableKey, so a drifting one would
+// silently start writing to a DIFFERENT record and orphan the live
+// advertisement until it expired, with no error anywhere.
+//
+// The keys are derived here too, once, because they are pure functions of
+// snapshotted values. That makes "a heartbeat refreshes the record it published"
+// structural rather than something the derivation has to keep getting right.
+type launchable struct {
+	agent         sessionwire.AgentID
+	compatibility department.CompatibilityID
+	capabilities  department.Capabilities
+	stableKey     string
+	rankingScope  string
+}
+
 // NewCapacityPublisher validates options and returns a publisher.
 //
-// It derives the whole publication once and refuses if any record would be one
-// Core rejects. That is not belt-and-braces: HostGeneration is a required
-// non-zero wire field that host.Options does not carry, and Clock is an
-// injected interface that may return an instant Core refuses, so a publisher
-// can be constructed that could never publish anything. Failing here hands the
+// It SNAPSHOTS every LaunchTarget's description, validates it, and then derives
+// the whole publication once, refusing if any record would be one Core rejects.
+//
+// The snapshot is what makes everything after this total: see launchable. The
+// trial derivation is separate and is not belt-and-braces — HostGeneration is a
+// required non-zero wire field that host.Options does not carry, and Clock is an
+// injected interface that may return an instant Core refuses, so a publisher can
+// be constructed that could never publish anything. Failing here hands the
 // operator the configuration; failing at the first heartbeat hands them a Host
 // that started and then went silent.
 func NewCapacityPublisher(options CapacityOptions) (*CapacityPublisher, error) {
 	if options.Host == nil {
 		return nil, &InvalidCapacityOptionsError{Field: "Host", Reason: "must be set; there is nothing to advertise without one"}
 	}
+	agents := options.Host.Department().AgentIDs()
 	publisher := &CapacityPublisher{
 		host:       options.Host,
 		generation: options.HostGeneration,
+		targets:    make([]launchable, 0, len(agents)),
+		byAgent:    make(map[sessionwire.AgentID]launchable, len(agents)),
 		admitted:   map[registry.Key]admission{},
+	}
+	for _, agent := range agents {
+		target, err := options.Host.Department().Target(agent)
+		if err != nil {
+			// Unreachable: AgentIDs lists the map Target reads and a Department
+			// is immutable in its MAPPING, which is the half that is immutable.
+			// Reported rather than ignored because the alternative is a
+			// publisher that silently advertises fewer targets than the Host
+			// serves.
+			return nil, &InvalidCapacityOptionsError{
+				Field:  "Host",
+				Reason: "the Department lists agent " + strconv.Quote(string(agent)) + " and cannot resolve it",
+				Cause:  err,
+			}
+		}
+		snapshot := launchable{
+			agent:         agent,
+			compatibility: target.CompatibilityID(),
+			capabilities:  target.Capabilities(),
+		}
+		// Re-validated HERE, against the values actually captured. department.New
+		// validated what the target returned at REGISTRATION; this validates
+		// what it returned just now, which is the pair of answers that can
+		// differ. Without it a target already misbehaving at construction would
+		// have its zero weight snapshotted and divided by on the first
+		// heartbeat, which is the panic this snapshot exists to remove.
+		if err := snapshot.compatibility.Validate(); err != nil {
+			return nil, &InvalidCapacityOptionsError{
+				Field:  "Host",
+				Reason: "the launch target for agent " + strconv.Quote(string(agent)) + " reports an unusable compatibility id",
+				Cause:  err,
+			}
+		}
+		if err := snapshot.capabilities.Validate(); err != nil {
+			return nil, &InvalidCapacityOptionsError{
+				Field:  "Host",
+				Reason: "the launch target for agent " + strconv.Quote(string(agent)) + " reports capabilities it could not have been registered with",
+				Cause:  err,
+			}
+		}
+		snapshot.stableKey = stableKey(agent, snapshot.compatibility, options.Host.Placement(), options.Host.ID())
+		snapshot.rankingScope = rankingScope(agent, snapshot.compatibility, options.Host.Placement())
+		publisher.targets = append(publisher.targets, snapshot)
+		// byAgent holds the SAME values as targets. The slice is the publication
+		// order and the map is Admit's lookup; deriving either from the other
+		// per call would be the same answer at the cost of making the order or
+		// the lookup a property of the caller rather than of the value.
+		publisher.byAgent[agent] = snapshot
 	}
 	if _, err := publisher.Publish(); err != nil {
 		return nil, &InvalidCapacityOptionsError{
-			Field:  "HostGeneration",
+			Field:  optionFieldFor(err),
 			Reason: "this Host could not derive a publishable advertisement: " + err.Error(),
 			Cause:  err,
 		}
 	}
 	return publisher, nil
+}
+
+// optionFieldFor names the OPTION responsible for a wire field Core refused.
+//
+// It exists because the constructor previously hard-coded "HostGeneration" for
+// both causes its own documentation names, so a Clock returning an instant Core
+// refuses sent the operator to a knob that was already correct. The mapping is
+// explicit and defaults to the Host, because the Clock, the endpoint, the
+// isolation class and the identities all reach the wire through it.
+func optionFieldFor(err error) string {
+	var validation *sessionwire.RequestValidationError
+	if errors.As(err, &validation) && validation.Field == "host_generation" {
+		return "HostGeneration"
+	}
+	return "Host"
 }
 
 // Publish derives the current advertisement for every Department LaunchTarget.
@@ -234,24 +349,29 @@ func NewCapacityPublisher(options CapacityOptions) (*CapacityPublisher, error) {
 // once, so no input this package accepts produces a partial publication to
 // begin with.
 func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	// NO INJECTED CALL HAPPENS UNDER THE LOCK, here or anywhere in this file.
+	// sync.Mutex is not reentrant, so a Clock, a LaunchTarget or any other
+	// caller-supplied implementation that called back into Draining,
+	// ConsumedWeight, Admit or Release would deadlock the Host rather than
+	// misbehave visibly. Nothing does that today; the fixtures in this
+	// package's tests are enough to show these are arbitrary caller code.
 	observed := p.host.Clock().Now()
-	expires := observed.Add(p.host.RegistryExpiry())
-	agents := p.host.Department().AgentIDs()
-	advertisements := make([]Advertisement, 0, len(agents))
 
-	for _, agent := range agents {
-		target, err := p.host.Department().Target(agent)
-		if err != nil {
-			// Unreachable: AgentIDs lists the map Target reads, and a
-			// Department is immutable. Reported rather than ignored because the
-			// alternative is publishing a record with a zero compatibility id.
-			return nil, &AdvertisementError{AgentID: agent, Reason: "the Department lists an agent it cannot resolve", Cause: err}
-		}
-		capabilities := target.Capabilities()
-		accepting := !p.draining && placementSupported(capabilities, p.host.Placement())
+	// One coherent read of the mutable state, then derive outside the lock.
+	// Every row still comes from the SAME consumed and draining values, so a
+	// publication cannot be internally inconsistent with the ledger — which is
+	// the property that mattered about holding the lock, and it is preserved by
+	// copying rather than by holding.
+	p.mu.Lock()
+	consumed, draining := p.consumed, p.draining
+	p.mu.Unlock()
+
+	expires := observed.Add(p.host.RegistryExpiry())
+	advertisements := make([]Advertisement, 0, len(p.targets))
+
+	for _, target := range p.targets {
+		agent, capabilities := target.agent, target.capabilities
+		accepting := !draining && placementSupported(capabilities, p.host.Placement())
 
 		// Available capacity is how many MORE of THIS target fit, which is why
 		// the admission weight divides rather than subtracts: a Host with three
@@ -260,7 +380,10 @@ func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
 		// whatever the arithmetic says.
 		var available uint64
 		if accepting {
-			available = (p.host.Capacity() - p.consumed) / capabilities.AdmissionWeight
+			// The divisor cannot be zero: capabilities is the SNAPSHOT, and
+			// NewCapacityPublisher refused any snapshot whose weight was zero.
+			// Reading it live is what panicked here.
+			available = (p.host.Capacity() - consumed) / capabilities.AdmissionWeight
 		}
 
 		report := sessionwire.HostLinkCapacityReport{
@@ -268,7 +391,7 @@ func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
 			HostID:                 p.host.ID(),
 			HostGeneration:         p.generation,
 			AgentID:                agent,
-			RuntimeCompatibilityID: string(target.CompatibilityID()),
+			RuntimeCompatibilityID: string(target.compatibility),
 			Placement:              p.host.Placement(),
 			InternalEndpoint:       p.host.InternalEndpoint(),
 			IsolationClass:         p.host.IsolationClass(),
@@ -282,12 +405,12 @@ func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
 		}
 		advertisements = append(advertisements, Advertisement{
 			Namespace:    AdvertisementNamespace,
-			RankingScope: rankingScope(agent, target.CompatibilityID(), p.host.Placement()),
-			StableKey:    stableKey(agent, target.CompatibilityID(), p.host.Placement(), p.host.ID()),
+			RankingScope: target.rankingScope,
+			StableKey:    target.stableKey,
 			Rank:         rankOf(available),
 			Ranked:       accepting,
 			DueAt:        expires,
-			Tombstone:    p.draining,
+			Tombstone:    draining,
 			Report:       report,
 		})
 	}
@@ -301,6 +424,14 @@ func (p *CapacityPublisher) Publish() ([]Advertisement, error) {
 // same key under a DIFFERENT agent is refused instead, because the ledger would
 // then hold a weight attributable to neither.
 func (p *CapacityPublisher) Admit(key registry.Key, agent sessionwire.AgentID) error {
+	// Read through the Host BEFORE taking the lock, for the reason Publish
+	// does. These particular accessors are pure reads of an immutable value and
+	// could not deadlock — but TestNoInjectedCallHappensUnderTheLock does not
+	// distinguish them from the injected collaborators p.host also reaches, and
+	// that bluntness is deliberate: telling "safe accessor" from "caller code"
+	// at each site is a judgement, and a judgement is what drifts.
+	placement, capacity := p.host.Placement(), p.host.Capacity()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -317,30 +448,30 @@ func (p *CapacityPublisher) Admit(key registry.Key, agent sessionwire.AgentID) e
 			Reason:  "this Host is draining and has stopped admitting new sessions",
 		}
 	}
-	target, err := p.host.Department().Target(agent)
-	if err != nil {
+	target, registered := p.byAgent[agent]
+	if !registered {
 		return &AdmissionRefusedError{
 			Code:    sessionwire.HostLinkErrorRuntimeUnavailable,
 			AgentID: agent,
 			Reason:  "this Host's Department registers no launch target for that agent",
-			Cause:   err,
+			Cause:   &department.UnknownAgentError{AgentID: agent},
 		}
 	}
-	capabilities := target.Capabilities()
-	if !placementSupported(capabilities, p.host.Placement()) {
+	capabilities := target.capabilities
+	if !placementSupported(capabilities, placement) {
 		return &AdmissionRefusedError{
 			Code:    sessionwire.HostLinkErrorRuntimeMismatch,
 			AgentID: agent,
-			Reason:  "the target does not support " + string(p.host.Placement()) + " placement, which is the only placement this Host offers",
+			Reason:  "the target does not support " + string(placement) + " placement, which is the only placement this Host offers",
 		}
 	}
-	if capabilities.AdmissionWeight > p.host.Capacity()-p.consumed {
+	if capabilities.AdmissionWeight > capacity-p.consumed {
 		return &AdmissionRefusedError{
 			Code:    sessionwire.HostLinkErrorNoCapacity,
 			AgentID: agent,
 			Reason: "admission weight " + strconv.FormatUint(capabilities.AdmissionWeight, 10) +
-				" exceeds the " + strconv.FormatUint(p.host.Capacity()-p.consumed, 10) + " remaining of capacity " +
-				strconv.FormatUint(p.host.Capacity(), 10),
+				" exceeds the " + strconv.FormatUint(capacity-p.consumed, 10) + " remaining of capacity " +
+				strconv.FormatUint(capacity, 10),
 		}
 	}
 	p.admitted[key] = admission{agent: agent, weight: capabilities.AdmissionWeight}
@@ -358,12 +489,12 @@ func (p *CapacityPublisher) Release(key registry.Key) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	held, admitted := p.admitted[key]
+	entry, admitted := p.admitted[key]
 	if !admitted {
 		return false
 	}
 	delete(p.admitted, key)
-	p.consumed -= held.weight
+	p.consumed -= entry.weight
 	return true
 }
 
@@ -472,8 +603,7 @@ func digest(parts ...string) string {
 		hash.Write([]byte(strconv.Itoa(len(part)) + ":"))
 		hash.Write([]byte(part))
 	}
-	sum := hash.Sum(nil)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // ---------------------------------------------------------------------------
@@ -529,8 +659,17 @@ type AdvertisementError struct {
 }
 
 // Error describes the underivable advertisement.
+//
+// The cause is optional in the TEXT even though every construction site in this
+// file supplies one, because the type is exported: a caller building one
+// without a cause would otherwise crash inside the logging call, which is the
+// worst place to crash. The other three error types here already guard this.
 func (e *AdvertisementError) Error() string {
-	return "host/service: advertisement for " + strconv.Quote(string(e.AgentID)) + ": " + e.Reason + ": " + e.Cause.Error()
+	message := "host/service: advertisement for " + strconv.Quote(string(e.AgentID)) + ": " + e.Reason
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
 }
 
 // Unwrap returns the typed error a lower layer produced, so a caller reaches
