@@ -290,19 +290,31 @@ func (o Options) validateShape() error {
 	}
 	// DELEGATED to Core, not restated. HostID.Validate, TenantID.Validate and
 	// SessionID.Validate are exported and each calls Core's validateID, so this
-	// enforces Core's rule BY CALLING IT: empty, over MaxIDBytes, and invalid
-	// UTF-8, in Core's own order, and it cannot drift if Core changes them.
+	// enforces Core's rule BY CALLING IT and cannot drift if Core changes it.
+	//
+	// TWO of validateID's three arms are reachable here: over MaxIDBytes and
+	// invalid UTF-8. The EMPTY arm is delegated but SHADOWED, because
+	// validatePresence runs first and reports OptionErrorCodeMissing — which is
+	// the better error, and deliberately so. Core's generic "empty" would tell
+	// an operator less than "HostID must be set", and for FixedSessionID the
+	// shadowing code is DedicatedRequiresFixedSession, which names the actual
+	// rule. An earlier version of this comment claimed all three arms in Core's
+	// own order; the layering is right and the sentence was not.
 	//
 	// O1.2's CompatibilityID.Validate had to hand-restate those three arms
 	// because Core exports no named type for that field, and a copy has nothing
 	// keeping it honest — that restatement needs a drift test and has one.
 	// Here there is a type to delegate to, so there is no copy to keep honest.
 	//
-	// This is the IsolationClass ruling applied to the identifiers. Core calls
-	// validateHostLinkHost from three sites in hostlink.go, so a 300-byte
-	// HostID constructed fine and failed at FIRST ADVERTISEMENT on every path
-	// that advertises. Enforcing it here turns that into a failure at New,
-	// where the operator is still holding the configuration.
+	// This is the IsolationClass ruling applied to the identifiers, and the
+	// consequence is worse than "fails at first advertisement". Core calls
+	// validateHostLinkHost from SIX sites in hostlink.go — HostLinkBindRequest,
+	// HostLinkUnbindRequest, HostLinkCapacityReport, HostLinkRegistryObservation,
+	// HostLinkDrainRequest and HostLinkDrainObservation — so an over-long HostID
+	// produced a Host that could neither ADVERTISE nor DRAIN. It could not shut
+	// down cleanly, which is the state you least want to discover in production.
+	// Enforcing it here turns that into a failure at New, where the operator is
+	// still holding the configuration.
 	for _, identity := range []struct {
 		field    string
 		validate func() error

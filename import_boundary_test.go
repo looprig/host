@@ -1259,6 +1259,16 @@ func TestGoModRulesHaveOneSite(t *testing.T) {
 // described only the first repair, so four correct findings read as false
 // positives. It names both repairs now.
 //
+// ONE LIMIT WORTH KNOWING, and it arrived without a firing: a MISSPELLED
+// self-reference is invisible here. The check only inspects a line whose first
+// word is a known declaration name, so a doc comment opening
+// "TestDurationsHaveNoUndOCUMENTEDMinimum" against the real
+// TestDurationsHaveNoUndocumentedMinimum is classified as prose and skipped.
+// That is the correct trade — matching near-misses would need a distance
+// heuristic and would fire on ordinary words — but it means this guard cannot
+// be relied on to catch a test's own name being mistyped in its own comment.
+// It happened once in this module and a reader found it, not this test.
+//
 // The rule is stated over the SYMPTOM rather than over Go's naming convention,
 // because the convention alone gives both false negatives and false positives.
 // A line inside a doc comment that opens with the name of a declaration in this

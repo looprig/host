@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,9 +68,16 @@ func (stubTarget) Restore(context.Context, department.RestoreRequest) (departmen
 	return nil, errors.New("stub")
 }
 
-func testDepartment(t *testing.T) *department.Department {
+func testDepartment(t *testing.T, agents ...sessionwire.AgentID) *department.Department {
 	t.Helper()
-	registry, err := department.New([]department.Registration{{AgentID: "reviewer", Target: stubTarget{}}})
+	if len(agents) == 0 {
+		agents = []sessionwire.AgentID{"reviewer"}
+	}
+	registrations := make([]department.Registration, 0, len(agents))
+	for _, agent := range agents {
+		registrations = append(registrations, department.Registration{AgentID: agent, Target: stubTarget{}})
+	}
+	registry, err := department.New(registrations)
 	if err != nil {
 		t.Fatalf("department.New: %v", err)
 	}
@@ -273,10 +281,10 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 // fields at MaxIDBytes and rejects invalid UTF-8 besides.
 //
 // It is the IsolationClass ruling on three more fields. Core calls
-// validateHostLinkHost from three sites in hostlink.go, so a 300-byte HostID
-// constructed fine and failed at FIRST ADVERTISEMENT on every path that
-// advertises — the failure arriving at the moment Factory needs the Host, in a
-// process that no longer has the operator's attention.
+// validateHostLinkHost from SIX sites in hostlink.go — bind, unbind, capacity
+// report, registry observation, and BOTH DRAIN PATHS — so an over-long HostID
+// produced a Host that could neither advertise nor drain. Not merely "fails at
+// first advertisement": it cannot shut down cleanly either.
 //
 // The rule is DELEGATED rather than restated: options.go calls Core's own
 // exported Validate on each identity, so there is no copy to drift. That is why
@@ -391,6 +399,48 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 	})
 }
 
+// TestDepartmentCardinalityIsNotConstrained is the same survivor shape one field
+// over, and the one my ceiling sweep missed.
+//
+// That sweep covered every SCALAR option and stopped at the only reference-typed
+// required dependency. Every Department in this file was one registration of one
+// agent, so adding `if o.Department.Len() != 1` to validatePresence left the
+// whole suite green — a Host that silently refused every multi-agent Department,
+// with nothing to notice.
+//
+// It matters for what is next rather than for what is here: O2.2 and O2.3 derive
+// one advertisement per LaunchTarget, so a cardinality assumption baked in at
+// New would stay invisible until a two-agent Department met a real deployment.
+// There is no such rule and there should not be one; this row is what says so.
+func TestDepartmentCardinalityIsNotConstrained(t *testing.T) {
+	t.Parallel()
+
+	for _, agents := range [][]sessionwire.AgentID{
+		{"reviewer"},
+		{"reviewer", "planner"},
+		{"reviewer", "planner", "summariser", "critic"},
+	} {
+		t.Run(strconv.Itoa(len(agents))+" agents", func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t)
+			options.Department = testDepartment(t, agents...)
+			built, err := host.New(options)
+			if err != nil {
+				t.Fatalf("New with a %d-agent Department = %v, want acceptance: Host constrains the Department's CONTENTS nowhere and its SIZE nowhere either", len(agents), err)
+			}
+			if got := built.Department().Len(); got != len(agents) {
+				t.Errorf("Department().Len() = %d, want %d", got, len(agents))
+			}
+			// The registry survives construction intact, not merely by count.
+			for _, agent := range agents {
+				if _, err := built.Department().Target(agent); err != nil {
+					t.Errorf("Target(%q) after construction: %v", agent, err)
+				}
+			}
+		})
+	}
+}
+
 // TestGenerousButLegalConfigurationIsAccepted is
 // TestDurationsHaveNoUndocumentedMinimum at the other end, and it exists
 // because a sweep found the same shape in every remaining field: EVERY ONE IS
@@ -424,8 +474,12 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 	t.Parallel()
 
 	// 256 bytes is Core's own identity bound, so this is the largest identifier
-	// that can reach the wire. See the report accompanying this commit: Host
-	// does not itself enforce that bound, which is a separate question.
+	// that can reach the wire — and since Host now delegates to Core's
+	// validators, it is also the largest Host will construct with. This row is
+	// therefore the ACCEPTED SIDE of that bound, not merely a generous value.
+	// (An earlier version of this comment called Host's non-enforcement "a
+	// separate question"; it was answered two commits later and the comment was
+	// left contradicting the code below it.)
 	long := sessionwire.HostID(strings.Repeat("h", sessionwire.MaxIDBytes))
 	longTenant := sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes))
 	longSession := sessionwire.SessionID(strings.Repeat("s", sessionwire.MaxIDBytes))
@@ -767,8 +821,24 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 }
 
 // TestEveryRuleIsReachableThroughTheExportedConstructor holds that a caller can
-// discriminate every refusal, which is the property O1.1 shipped without: an
-// exported error type no consumer could match is a type that does not exist.
+// discriminate the refusals BELOW, which is the property O1.1 shipped without:
+// an exported error type no consumer could match is a type that does not exist.
+//
+// READ THE NAME NARROWLY. Ten rules are covered and FOUR ARE DELIBERATELY
+// EXCLUDED: the three identity delegations (HostID, TenantID, FixedSessionID)
+// and, with them, the endpoint rule they would collide with. All four report
+// OptionErrorCodeInvalid, so adding a spoiler for any of them would fail the
+// distinctness assertion — and the correct response then is NOT to relax the
+// assertion but to split the code.
+//
+// The exclusion is safe today because those four are discriminated by two
+// routes this test does not use: the Field, and a typed cause of a different
+// type — Core's *RequestValidationError for the endpoint against its
+// *IDValidationError for the identities, both asserted in
+// TestInvalidEndpointCarriesCoresTypedCause and
+// TestIdentifiersEnforceCoresIdentityRule. Written down because a reader takes
+// "every rule" at face value, believes a property that is not held, and
+// discovers the collision by weakening the wrong thing.
 func TestEveryRuleIsReachableThroughTheExportedConstructor(t *testing.T) {
 	t.Parallel()
 
@@ -1044,7 +1114,7 @@ func TestSizeBoundsAcceptExactlyTheirConstant(t *testing.T) {
 	}
 }
 
-// TestDurationsHaveNoUndOCUMENTEDMinimum is the second instance of the survivor
+// TestDurationsHaveNoUndocumentedMinimum is the second instance of the survivor
 // class, found by auditing the rest of the file rather than by being told.
 //
 // The rule for a duration is POSITIVE, and nothing more. Every fixture in this
