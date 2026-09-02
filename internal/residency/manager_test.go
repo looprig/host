@@ -745,9 +745,23 @@ type spyRegistry struct {
 	trace        *trace
 	mu           sync.Mutex
 	beforeInsert func()
+	// afterGet runs once, after the next read. It is the seam that puts a
+	// heartbeat between reading the registry and writing the record, which is
+	// the only place a lease can be lost mid-beat.
+	afterGet func()
 }
 
-func (s *spyRegistry) Get(key registry.Key) (registry.Entry, bool) { return s.inner.Get(key) }
+func (s *spyRegistry) Get(key registry.Key) (registry.Entry, bool) {
+	entry, held := s.inner.Get(key)
+	s.mu.Lock()
+	hook := s.afterGet
+	s.afterGet = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return entry, held
+}
 
 func (s *spyRegistry) Insert(key registry.Key, admission registry.Admission) (registry.Entry, bool) {
 	s.mu.Lock()
@@ -761,10 +775,30 @@ func (s *spyRegistry) Insert(key registry.Key, admission registry.Admission) (re
 	return s.inner.Insert(key, admission)
 }
 
+// MarkReleasing and BeginTeardown are recorded but Get is NOT, deliberately:
+// Get is on the attach hot path and recording it would put an entry in every
+// manager test's expected sequence for a read that decides nothing.
+func (s *spyRegistry) MarkReleasing(key registry.Key, generation uint64) (registry.Entry, bool) {
+	s.trace.record("registry.releasing")
+	return s.inner.MarkReleasing(key, generation)
+}
+
+func (s *spyRegistry) BeginTeardown(key registry.Key, generation uint64) (registry.Entry, bool) {
+	s.trace.record("registry.teardown")
+	return s.inner.BeginTeardown(key, generation)
+}
+
 func (s *spyRegistry) RemoveByGeneration(key registry.Key, generation uint64) bool {
 	s.trace.record("registry.remove")
 	return s.inner.RemoveByGeneration(key, generation)
 }
+
+// The spy satisfies both seams, so the heartbeat tests drive the same registry
+// the manager tests do.
+var (
+	_ LocalRegistry     = (*spyRegistry)(nil)
+	_ HeartbeatRegistry = (*spyRegistry)(nil)
+)
 
 // ---------------------------------------------------------------------------
 // Host fixture

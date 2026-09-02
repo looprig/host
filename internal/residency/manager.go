@@ -188,6 +188,12 @@ type OwnershipRequest struct {
 	LeaseEpoch      uint64
 	Generation      uint64
 	Runtime         department.Runtime
+
+	// Lease is the GRANT ITSELF and not just its epoch, because the heartbeat
+	// that runs under this ownership must watch Lost(). O3.1 disclosed that
+	// nothing consulted it; a heartbeat handed only an epoch number would go on
+	// publishing an accepting route under a lease this Host no longer holds.
+	Lease Lease
 }
 
 // Ownership begins the durable inbox consumption, event fan-out and heartbeat
@@ -1123,6 +1129,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		LeaseEpoch:      epoch,
 		Generation:      entry.Generation,
 		Runtime:         runtime,
+		Lease:           lease,
 	})
 	switch {
 	case err != nil:
