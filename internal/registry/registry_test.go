@@ -6,9 +6,12 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -148,6 +151,25 @@ func TestTwoTenantsMayShareASessionID(t *testing.T) {
 	}
 }
 
+// productionFiles lists the package's non-test Go sources, so a guard over the
+// package cannot be escaped by adding a second file.
+func productionFiles(dir string) ([]string, error) {
+	listing, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var sources []string
+	for _, item := range listing {
+		name := item.Name()
+		if item.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		sources = append(sources, filepath.Join(dir, name))
+	}
+	slices.Sort(sources)
+	return sources, nil
+}
+
 // TestEveryFieldIsCarried asserts the WHOLE entry, because asserting a couple
 // of fields is the same defect as asserting a struct's shape.
 //
@@ -239,76 +261,99 @@ func TestEveryFieldIsCarried(t *testing.T) {
 // condition WAS caught, and the hoisted assignment was not. A stated limit is
 // read as the boundary of what is known, so getting it backwards was worse than
 // saying nothing.
+//
+// IT PARSES THE WHOLE PACKAGE, not registry.go. A file-scoped rule ends the
+// first time this package gets a second file: an epoch.go holding
+// `func epochRejected(e *Entry) bool { return e.LeaseEpoch == 999 }`, called
+// from registry.go, passed. That is not an awkward edit, it is the next
+// ordinary one — and it was inconsistent with the return-type guard in the same
+// commit, which moved from file-scoped parsing to package-scoped reflection for
+// exactly this reason.
 func TestRegistryNeverGatesOnTheLeaseEpoch(t *testing.T) {
 	t.Parallel()
 
 	fileSet := token.NewFileSet()
-	parsed, err := parser.ParseFile(fileSet, "registry.go", nil, parser.ParseComments)
+	sources, err := productionFiles(".")
 	if err != nil {
-		t.Fatalf("parse registry.go: %v", err)
+		t.Fatalf("enumerate package files: %v", err)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no production file was found; this guard would be vacuous")
+	}
+	files := make([]*ast.File, 0, len(sources))
+	for _, source := range sources {
+		parsed, err := parser.ParseFile(fileSet, source, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source, err)
+		}
+		files = append(files, parsed)
 	}
 
 	// Pass one: every position where naming the field is legitimate.
 	permitted := map[token.Pos]bool{}
-	ast.Inspect(parsed, func(node ast.Node) bool {
-		switch node := node.(type) {
-		case *ast.StructType:
-			for _, field := range node.Fields.List {
-				for _, name := range field.Names {
-					if name.Name == "LeaseEpoch" {
-						permitted[name.Pos()] = true
+	for _, parsed := range files {
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.StructType:
+				for _, field := range node.Fields.List {
+					for _, name := range field.Names {
+						if name.Name == "LeaseEpoch" {
+							permitted[name.Pos()] = true
+						}
 					}
 				}
-			}
-		case *ast.KeyValueExpr:
-			key, ok := node.Key.(*ast.Ident)
-			if !ok || key.Name != "LeaseEpoch" {
-				return true
-			}
-			// The key and the whole carried value: `LeaseEpoch: x.LeaseEpoch`.
-			ast.Inspect(node, func(inner ast.Node) bool {
-				switch inner := inner.(type) {
-				case *ast.Ident:
-					permitted[inner.Pos()] = true
-				case *ast.SelectorExpr:
-					permitted[inner.Sel.Pos()] = true
+			case *ast.KeyValueExpr:
+				key, ok := node.Key.(*ast.Ident)
+				if !ok || key.Name != "LeaseEpoch" {
+					return true
 				}
-				return true
-			})
-		}
-		return true
-	})
+				// The key and the whole carried value: `LeaseEpoch: x.LeaseEpoch`.
+				ast.Inspect(node, func(inner ast.Node) bool {
+					switch inner := inner.(type) {
+					case *ast.Ident:
+						permitted[inner.Pos()] = true
+					case *ast.SelectorExpr:
+						permitted[inner.Sel.Pos()] = true
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
 
 	// Pass two: every occurrence must be one of them.
 	occurrences := 0
-	ast.Inspect(parsed, func(node ast.Node) bool {
-		var pos token.Pos
-		switch node := node.(type) {
-		case *ast.SelectorExpr:
-			if node.Sel.Name != "LeaseEpoch" {
+	for _, parsed := range files {
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			var pos token.Pos
+			switch node := node.(type) {
+			case *ast.SelectorExpr:
+				if node.Sel.Name != "LeaseEpoch" {
+					return true
+				}
+				pos = node.Sel.Pos()
+			case *ast.Ident:
+				if node.Name != "LeaseEpoch" {
+					return true
+				}
+				pos = node.Pos()
+			default:
 				return true
 			}
-			pos = node.Sel.Pos()
-		case *ast.Ident:
-			if node.Name != "LeaseEpoch" {
-				return true
+			occurrences++
+			if !permitted[pos] {
+				t.Errorf("%s names LeaseEpoch outside a declaration or a carry. The registry may CARRY a lease epoch so a caller can compare it, and may never decide anything from one: a caller that trusted this index would be getting an authorization answer from a cache", fileSet.Position(pos))
 			}
-			pos = node.Pos()
-		default:
 			return true
-		}
-		occurrences++
-		if !permitted[pos] {
-			t.Errorf("registry.go names LeaseEpoch at %s outside a declaration or a carry. The registry may CARRY a lease epoch so a caller can compare it, and may never decide anything from one: a caller that trusted this index would be getting an authorization answer from a cache", fileSet.Position(pos))
-		}
-		return true
-	})
+		})
+	}
 
 	// Floored twice: the field must be seen at all, and at least one position
 	// must have been whitelisted. Either being zero means a rename has made
 	// this guard vacuous while it still passes.
 	if occurrences == 0 {
-		t.Fatal("registry.go never mentions LeaseEpoch; this guard is asserting nothing. If the field was renamed, rename it here too")
+		t.Fatal("the package never mentions LeaseEpoch; this guard is asserting nothing. If the field was renamed, rename it here too")
 	}
 	if len(permitted) == 0 {
 		t.Fatal("no legitimate LeaseEpoch position was recognised; the whitelist matched nothing and every occurrence would be reported")
@@ -786,44 +831,68 @@ func TestSnapshotIsACopy(t *testing.T) {
 	}
 }
 
-// TestNoExportedMethodHandsOutInternalState is step 3 as a structural rule
-// rather than a sentence: "return leases and handles through narrow callbacks
-// or snapshots; do not expose the mutable map."
+// permittedSignatureTypes is the FINITE set of types an exported Registry
+// method may mention, in either position.
 //
-// IT CHECKS THE RESOLVED TYPE, NOT THE SPELLING, and that distinction is the
-// whole fix. The first version walked the AST and matched the top-level type
-// EXPRESSION, so two ordinary spellings walked through it: `[]*Entry` is an
-// ArrayType whose element nobody looked at, and `type View map[Key]*Entry` with
-// a method returning View is a bare Ident — the live map handed out under a
-// name, clean under vet and staticcheck. Adding cases for those two would have
-// re-opened on the third spelling. Reflection answers what the type IS, so
-// there is no spelling to miss.
+// It is a whitelist because the previous version was a blacklist, and a
+// blacklist of the ways a leak can be spelled is unbounded. Four spellings
+// walked through it, none exotic:
 //
-// The ban is Map, Chan and Pointer, reached through containers and through the
-// EXPORTED fields of any struct. Exportedness is the principled line rather
-// than the package: a caller outside this package cannot reach an unexported
-// field at all, so an unexported field cannot leak state TO A CALLER, and
-// walking one produces the false positive department's field walk learned about
-// — time.Time carries an unexported *Location, so every timestamp would be
-// reported. Foreign structs are therefore walked too, which is what catches a
-// map handed out inside somebody else's wrapper type.
+//   - All() func(func(Key, *Entry) bool) — a range-over-func iterator yielding
+//     live rows, which is the most likely way this package actually grows and a
+//     WORSE leak than returning a slice, because it holds the mutex open across
+//     caller code. Kind Func fell to the default arm.
+//   - Each(fn func(*Entry)) — live rows through a PARAMETER. The guard walked
+//     results only, so the one construct step 3 explicitly blesses, a callback,
+//     was the one position it never looked at.
+//   - Debug() any — Kind Interface, default arm.
+//   - View() Live, where Live has an unexported map field and an exported
+//     accessor returning it.
 //
-// Interfaces are deliberately NOT banned. Entry.Target and Entry.Runtime are
-// the handles step 3 says to return; copying an interface value is not a
-// defence, it is a different runtime. The rule is about the INDEX, not about
-// what the index carries.
-func TestNoExportedMethodHandsOutInternalState(t *testing.T) {
+// "Reflection answers what the type IS, so there is no spelling to miss" was
+// false as written. Reflection removed the SPELLING axis and left the POSITION
+// axis and the KIND axis untouched. Enumerating the legitimate set removes all
+// three at once — which is the rule I wrote for the epoch guard in the same
+// commit and did not apply here.
+//
+// Adding a legitimate callback means adding its exact type to this list. That
+// is the point: a reviewer then sees whether it takes Entry or *Entry.
+func permittedSignatureTypes() map[reflect.Type]bool {
+	return map[reflect.Type]bool{
+		reflect.TypeFor[registry.Entry]():     true,
+		reflect.TypeFor[[]registry.Entry]():   true,
+		reflect.TypeFor[[]registry.Key]():     true,
+		reflect.TypeFor[registry.Key]():       true,
+		reflect.TypeFor[registry.Admission](): true,
+		reflect.TypeFor[uint64]():             true,
+		reflect.TypeFor[bool]():               true,
+		reflect.TypeFor[int]():                true,
+		reflect.TypeFor[time.Time]():          true,
+	}
+}
+
+// TestExportedMethodsMentionOnlyPermittedTypes is step 3 as a rule over the
+// whole signature: "return leases and handles through narrow callbacks or
+// snapshots; do not expose the mutable map."
+func TestExportedMethodsMentionOnlyPermittedTypes(t *testing.T) {
 	t.Parallel()
 
+	permitted := permittedSignatureTypes()
 	registryType := reflect.TypeFor[*registry.Registry]()
 
 	checked := 0
 	for i := range registryType.NumMethod() {
 		method := registryType.Method(i)
 		checked++
+		// Parameter 0 is the receiver on a method obtained from the type.
+		for p := 1; p < method.Type.NumIn(); p++ {
+			if !permitted[method.Type.In(p)] {
+				t.Errorf("Registry.%s takes %s, which is not in the permitted set. A live row reaches a caller through a parameter as easily as through a return — a callback is the construct step 3 blesses and the one a results-only rule never inspects", method.Name, method.Type.In(p))
+			}
+		}
 		for r := range method.Type.NumOut() {
-			for _, complaint := range exposesInternalState(method.Type.Out(r), method.Name, map[reflect.Type]bool{}) {
-				t.Error(complaint)
+			if !permitted[method.Type.Out(r)] {
+				t.Errorf("Registry.%s returns %s, which is not in the permitted set. Add it here deliberately if it is legitimate, so a reviewer sees whether it carries Entry or *Entry", method.Name, method.Type.Out(r))
 			}
 		}
 	}
@@ -831,9 +900,8 @@ func TestNoExportedMethodHandsOutInternalState(t *testing.T) {
 		t.Fatal("no exported Registry method was inspected; this guard is asserting nothing")
 	}
 
-	// The guard must be able to SEE the shapes it bans, or it would pass for
-	// want of understanding rather than for want of a defect. Each of these is
-	// a spelling that defeated the previous version.
+	// The guard must REPORT every shape that defeated its predecessor, or it
+	// would pass for want of understanding rather than for want of a defect.
 	for _, banned := range []struct {
 		name string
 		typ  reflect.Type
@@ -843,39 +911,93 @@ func TestNoExportedMethodHandsOutInternalState(t *testing.T) {
 		{"chan Entry", reflect.TypeFor[chan registry.Entry]()},
 		{"*Entry", reflect.TypeFor[*registry.Entry]()},
 		{"named map type", reflect.TypeFor[namedView]()},
-		{"struct wrapping a map", reflect.TypeFor[wrappedView]()},
+		{"struct with an accessor to the live map", reflect.TypeFor[accessorView]()},
+		{"range-over-func iterator", reflect.TypeFor[func(func(registry.Key, *registry.Entry) bool)]()},
+		{"callback taking a live row", reflect.TypeFor[func(*registry.Entry)]()},
+		{"any", reflect.TypeFor[any]()},
 	} {
-		if complaints := exposesInternalState(banned.typ, "probe", map[reflect.Type]bool{}); len(complaints) == 0 {
-			t.Errorf("the guard does not recognise %s as exposing internal state; it would pass a method returning one", banned.name)
+		if permitted[banned.typ] {
+			t.Errorf("the permitted set contains %s; that is a leak spelled as a permission", banned.name)
 		}
 	}
-	// And it must NOT flag what the registry legitimately returns, or it would
-	// be satisfied by banning everything.
-	for _, allowed := range []struct {
-		name string
-		typ  reflect.Type
-	}{
-		{"Entry", reflect.TypeFor[registry.Entry]()},
-		{"[]Entry", reflect.TypeFor[[]registry.Entry]()},
-		{"[]Key", reflect.TypeFor[[]registry.Key]()},
-		{"bool", reflect.TypeFor[bool]()},
-		{"time.Time", reflect.TypeFor[time.Time]()},
+	// And it must permit what the registry legitimately uses, or it would be
+	// satisfied by permitting nothing.
+	for _, allowed := range []reflect.Type{
+		reflect.TypeFor[registry.Entry](),
+		reflect.TypeFor[[]registry.Entry](),
+		reflect.TypeFor[[]registry.Key](),
+		reflect.TypeFor[bool](),
 	} {
-		if complaints := exposesInternalState(allowed.typ, "probe", map[reflect.Type]bool{}); len(complaints) != 0 {
-			t.Errorf("the guard flags %s, which the registry legitimately returns: %v", allowed.name, complaints)
+		if !permitted[allowed] {
+			t.Errorf("the permitted set omits %s, which the registry legitimately uses", allowed)
 		}
 	}
 }
 
-// namedView and wrappedView are the two spellings that defeated the syntactic
-// version of the guard above, kept so the guard is tested against them.
+// namedView and accessorView are two of the spellings that defeated the
+// blacklist, kept so the whitelist is tested against them.
 type namedView map[registry.Key]*registry.Entry
+
+type accessorView struct {
+	rows map[registry.Key]*registry.Entry
+}
+
+// Rows hands out the live map through a method rather than a field.
+func (v accessorView) Rows() map[registry.Key]*registry.Entry { return v.rows }
+
+// TestPermittedTypesDoNotThemselvesExposeState is the second half, and it is
+// needed because the whitelist above permits Entry BY NAME: if Entry later
+// gained a map field, every method returning one would still pass.
+//
+// SCOPE LIMIT, stated as a limit rather than as a principle. This walks
+// EXPORTED FIELDS. An unexported field is unreachable BY NAME from outside the
+// package, which is why walking it would only reproduce time.Time's unexported
+// *Location as a false positive — but it is NOT unreachable in general, because
+// any exported method of the type can return it, and the author of such a leak
+// is also the author of the accessor. A leak behind an accessor method on a
+// permitted type is therefore OUT OF SCOPE here; the whitelist above is what
+// stops such a type reaching a signature at all.
+func TestPermittedTypesDoNotThemselvesExposeState(t *testing.T) {
+	t.Parallel()
+
+	for typ := range permittedSignatureTypes() {
+		for _, complaint := range exposesInternalState(typ, typ.String(), map[reflect.Type]bool{}) {
+			t.Error(complaint)
+		}
+	}
+
+	// Bidirectional, as before: the walk must see the shapes it bans and must
+	// not flag the shapes the registry uses.
+	for _, banned := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"map[Key]*Entry", reflect.TypeFor[map[registry.Key]*registry.Entry]()},
+		{"[]*Entry", reflect.TypeFor[[]*registry.Entry]()},
+		{"chan Entry", reflect.TypeFor[chan registry.Entry]()},
+		{"struct with an exported map field", reflect.TypeFor[wrappedView]()},
+	} {
+		if complaints := exposesInternalState(banned.typ, "probe", map[reflect.Type]bool{}); len(complaints) == 0 {
+			t.Errorf("the walk does not recognise %s as exposing internal state", banned.name)
+		}
+	}
+	for _, allowed := range []reflect.Type{
+		reflect.TypeFor[registry.Entry](),
+		reflect.TypeFor[[]registry.Entry](),
+		reflect.TypeFor[time.Time](),
+	} {
+		if complaints := exposesInternalState(allowed, "probe", map[reflect.Type]bool{}); len(complaints) != 0 {
+			t.Errorf("the walk flags %s, which the registry legitimately carries: %v", allowed, complaints)
+		}
+	}
+}
 
 type wrappedView struct {
 	Rows map[registry.Key]*registry.Entry
 }
 
-// exposesInternalState reports every way typ hands out mutable shared state.
+// exposesInternalState reports every way typ hands out mutable shared state
+// through its EXPORTED surface. See the scope limit above.
 func exposesInternalState(typ reflect.Type, method string, seen map[reflect.Type]bool) []string {
 	if seen[typ] {
 		return nil
@@ -884,20 +1006,17 @@ func exposesInternalState(typ reflect.Type, method string, seen map[reflect.Type
 
 	switch typ.Kind() {
 	case reflect.Map:
-		return []string{method + " returns " + typ.String() + ", a map. A caller handed the live index can write to it; return a snapshot or take a callback"}
+		return []string{method + " exposes " + typ.String() + ", a map. A caller handed the live index can write to it"}
 	case reflect.Chan:
-		return []string{method + " returns " + typ.String() + ", a channel, which is another way to hand out mutable shared state"}
+		return []string{method + " exposes " + typ.String() + ", a channel, which is another way to hand out mutable shared state"}
 	case reflect.Pointer:
-		return []string{method + " returns " + typ.String() + ", a pointer that aliases a registry row; return a copy"}
+		return []string{method + " exposes " + typ.String() + ", a pointer that aliases a registry row; carry a copy"}
 	case reflect.Slice, reflect.Array:
 		return exposesInternalState(typ.Elem(), method, seen)
 	case reflect.Struct:
 		var complaints []string
 		for i := range typ.NumField() {
 			field := typ.Field(i)
-			// Only an EXPORTED field can hand anything to a caller outside the
-			// declaring package, and only exported fields avoid time.Time's
-			// unexported *Location.
 			if !field.IsExported() {
 				continue
 			}
@@ -909,7 +1028,7 @@ func exposesInternalState(typ reflect.Type, method string, seen map[reflect.Type
 	}
 }
 
-// TestSnapshotIsDeterministicallyOrdered pins// TestSnapshotIsDeterministicallyOrdered pins that callers see a stable
+// TestSnapshotIsDeterministicallyOrdered pins that callers see a stable
 // sequence rather than map iteration order, with enough entries that agreement
 // by luck is not the explanation.
 func TestSnapshotIsDeterministicallyOrdered(t *testing.T) {
