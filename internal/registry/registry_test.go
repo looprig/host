@@ -269,6 +269,22 @@ func TestEveryFieldIsCarried(t *testing.T) {
 // ordinary one — and it was inconsistent with the return-type guard in the same
 // commit, which moved from file-scoped parsing to package-scoped reflection for
 // exactly this reason.
+//
+// WHAT IT DOES NOT SEE, stated no wider than the probes that demonstrate it.
+// The rule is over syntactic occurrences of the identifier in this package's
+// production files, so two things are outside it. A WHOLE-STRUCT COMPARISON of
+// a type containing the field is not seen — build an Entry in a whitelisted
+// carry position and then compare it with `candidate != *existing`, and the
+// outcome depends on the lease epoch while the identifier appears only where
+// the whitelist blesses it. And a decision made in a DIFFERENT PACKAGE, from a
+// value this one handed out, is outside it by construction; that half is the
+// caller-side rule the package comment says explicitly is not enforced here.
+//
+// Both are more awkward than the hoisted assignment that defeated the previous
+// version, and neither is impossible. This is the third time this disclosure
+// has been written and the second time it was too wide: the failure mode is not
+// a claim with no probe — each of these had one — it is a claim BROADER than
+// the probe that demonstrates it.
 func TestRegistryNeverGatesOnTheLeaseEpoch(t *testing.T) {
 	t.Parallel()
 
@@ -966,6 +982,24 @@ func TestPermittedTypesDoNotThemselvesExposeState(t *testing.T) {
 		}
 	}
 
+	// THE REGISTRY'S OWN EXPORTED SURFACE. A method is not the only way out: an
+	// exported FIELD on Registry aliasing r.entries, assigned in New, is never
+	// inspected by a rule over signatures, and that shape survived all three
+	// versions of this guard. Registry has no exported fields today, so this
+	// loop reports nothing until someone adds one — which is the point, and why
+	// it is not floored on a count that would have to be zero. The walk it uses
+	// is exercised against positive cases below instead.
+	registryStruct := reflect.TypeFor[registry.Registry]()
+	for i := range registryStruct.NumField() {
+		field := registryStruct.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		for _, complaint := range exposesInternalState(field.Type, "Registry."+field.Name, map[reflect.Type]bool{}) {
+			t.Error(complaint)
+		}
+	}
+
 	// Bidirectional, as before: the walk must see the shapes it bans and must
 	// not flag the shapes the registry uses.
 	for _, banned := range []struct {
@@ -995,6 +1029,14 @@ func TestPermittedTypesDoNotThemselvesExposeState(t *testing.T) {
 type wrappedView struct {
 	Rows map[registry.Key]*registry.Entry
 }
+
+// A package-level FUNCTION taking a *Registry and returning the live map —
+// `func Entries(r *Registry) map[Key]*Entry` — is out of scope for every guard
+// here, and deliberately so. Nothing inspects package-level functions, and this
+// package sits under internal/, so such a function is reachable only from this
+// module and only by whoever wrote it. Recorded as an edge rather than closed:
+// enumerating every package-level function's signature costs more than it buys
+// behind that boundary. If this package ever leaves internal/, close it.
 
 // exposesInternalState reports every way typ hands out mutable shared state
 // through its EXPORTED surface. See the scope limit above.
