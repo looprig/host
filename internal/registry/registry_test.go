@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"reflect"
 	"slices"
 	"strconv"
 	"sync"
@@ -147,75 +148,171 @@ func TestTwoTenantsMayShareASessionID(t *testing.T) {
 	}
 }
 
+// TestEveryFieldIsCarried asserts the WHOLE entry, because asserting a couple
+// of fields is the same defect as asserting a struct's shape.
+//
+// Only Runtime and LeaseEpoch round-tripped under assertion before this;
+// deleting AgentID, Target and CompatibilityID from Insert's literal left the
+// suite green. Three of the ten required fields were carried by nothing but
+// hope — in the file whose own commit message disparages asserting a struct's
+// shape rather than its behaviour.
+func TestEveryFieldIsCarried(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	index := registry.New(clock)
+	key := registry.Key{TenantID: "tenant-9f3", SessionID: "session-71c"}
+	admitted := admission("a")
+
+	got, won := index.Insert(key, admitted)
+	if !won {
+		t.Fatal("Insert did not establish the residency")
+	}
+	if got.Generation == 0 {
+		t.Error("Generation is zero; the registry assigns it")
+	}
+
+	want := registry.Entry{
+		Key:             key,
+		AgentID:         admitted.AgentID,
+		Target:          admitted.Target,
+		CompatibilityID: admitted.CompatibilityID,
+		Runtime:         admitted.Runtime,
+		LeaseEpoch:      admitted.LeaseEpoch,
+		Generation:      got.Generation,
+		State:           registry.StateResident,
+		Accepting:       true,
+		LastActivity:    clock.Now(),
+		TeardownOwned:   false,
+	}
+	if got != want {
+		t.Errorf("Insert returned %+v, want %+v", got, want)
+	}
+	if held, _ := index.Get(key); held != want {
+		t.Errorf("Get returned %+v, want %+v", held, want)
+	}
+
+	// The fixture-default control: a field whose expected value is the zero
+	// value proves nothing, so every carried field must be non-zero here.
+	for name, zero := range map[string]bool{
+		"AgentID":         want.AgentID == "",
+		"Target":          want.Target == nil,
+		"CompatibilityID": want.CompatibilityID == "",
+		"Runtime":         want.Runtime == nil,
+		"LeaseEpoch":      want.LeaseEpoch == 0,
+		"TenantID":        want.Key.TenantID == "",
+		"SessionID":       want.Key.SessionID == "",
+		"LastActivity":    want.LastActivity.IsZero(),
+	} {
+		if zero {
+			t.Errorf("fixture field %s is zero-valued; an assertion on it proves nothing", name)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Step 2, as an assertion rather than a sentence
 // ---------------------------------------------------------------------------
 
-// TestRegistryNeverGatesOnTheLeaseEpoch holds the claim the package comment
-// makes: the registry is an OPTIMIZATION ONLY, and every mutating caller
-// validates the durable lease epoch separately.
+// TestRegistryNeverGatesOnTheLeaseEpoch holds the negative half of the claim
+// the package comment makes: this index never DECIDES anything from a lease
+// epoch.
 //
-// That sentence is exactly the shape this repository treats as a defect when
-// nothing checks it — a claim in prose a future reader will quote. What it
-// means concretely is that the registry may CARRY a lease epoch so a caller can
-// compare it, and may never BRANCH on one: the moment it does, a caller that
-// trusted the index has been handed an authorization answer by a cache.
+// The rule is a WHITELIST OF POSITIONS, not a blacklist of branch shapes, and
+// that is the correction of a real defect. The first version flagged
+// BinaryExpr, IfStmt.Cond and SwitchStmt.Tag — which caught
+// `if epochRejected(entry.LeaseEpoch)`, and was defeated by the most ordinary
+// refactor in Go:
 //
-// The structural half is the load-bearing one, because the behavioural half
-// below can only show that today's code does not gate; it cannot stop tomorrow's
-// from starting to.
+//	rejected := epochRejected(entry.LeaseEpoch)
+//	if rejected { ... }
+//
+// An assignment is none of those three, so the guard was a speed bump wearing a
+// rule's name. Enumerating the shapes a decision can take is unbounded;
+// enumerating the places the field may legitimately APPEAR is not. It may be
+// declared, and it may be carried across in a composite literal. Any third
+// reference is reported without this test needing to understand what it
+// computes.
+//
+// I previously disclosed the opposite limit — that a helper taking the field
+// would escape — and that was wrong in both directions: a helper call inside a
+// condition WAS caught, and the hoisted assignment was not. A stated limit is
+// read as the boundary of what is known, so getting it backwards was worse than
+// saying nothing.
 func TestRegistryNeverGatesOnTheLeaseEpoch(t *testing.T) {
 	t.Parallel()
 
-	parsed, err := parser.ParseFile(token.NewFileSet(), "registry.go", nil, parser.ParseComments)
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "registry.go", nil, parser.ParseComments)
 	if err != nil {
 		t.Fatalf("parse registry.go: %v", err)
 	}
 
-	mentions := 0
+	// Pass one: every position where naming the field is legitimate.
+	permitted := map[token.Pos]bool{}
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		switch node := node.(type) {
-		case *ast.BinaryExpr:
-			for _, operand := range []ast.Expr{node.X, node.Y} {
-				if namesLeaseEpoch(operand) {
-					t.Errorf("registry.go compares LeaseEpoch (%s). The registry may carry a lease epoch and may never branch on one: a caller that trusted this index would be getting an authorization answer from a cache", node.Op)
+		case *ast.StructType:
+			for _, field := range node.Fields.List {
+				for _, name := range field.Names {
+					if name.Name == "LeaseEpoch" {
+						permitted[name.Pos()] = true
+					}
 				}
 			}
-		case *ast.SwitchStmt:
-			if node.Tag != nil && namesLeaseEpoch(node.Tag) {
-				t.Error("registry.go switches on LeaseEpoch")
+		case *ast.KeyValueExpr:
+			key, ok := node.Key.(*ast.Ident)
+			if !ok || key.Name != "LeaseEpoch" {
+				return true
 			}
-		case *ast.IfStmt:
-			if node.Cond != nil && namesLeaseEpoch(node.Cond) {
-				t.Error("registry.go branches on LeaseEpoch")
-			}
-		case *ast.SelectorExpr:
-			if node.Sel.Name == "LeaseEpoch" {
-				mentions++
-			}
+			// The key and the whole carried value: `LeaseEpoch: x.LeaseEpoch`.
+			ast.Inspect(node, func(inner ast.Node) bool {
+				switch inner := inner.(type) {
+				case *ast.Ident:
+					permitted[inner.Pos()] = true
+				case *ast.SelectorExpr:
+					permitted[inner.Sel.Pos()] = true
+				}
+				return true
+			})
 		}
 		return true
 	})
 
-	// Floored: the walk must have SEEN the field, or a rename would make this
-	// guard silently vacuous while still passing.
-	if mentions == 0 {
+	// Pass two: every occurrence must be one of them.
+	occurrences := 0
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		var pos token.Pos
+		switch node := node.(type) {
+		case *ast.SelectorExpr:
+			if node.Sel.Name != "LeaseEpoch" {
+				return true
+			}
+			pos = node.Sel.Pos()
+		case *ast.Ident:
+			if node.Name != "LeaseEpoch" {
+				return true
+			}
+			pos = node.Pos()
+		default:
+			return true
+		}
+		occurrences++
+		if !permitted[pos] {
+			t.Errorf("registry.go names LeaseEpoch at %s outside a declaration or a carry. The registry may CARRY a lease epoch so a caller can compare it, and may never decide anything from one: a caller that trusted this index would be getting an authorization answer from a cache", fileSet.Position(pos))
+		}
+		return true
+	})
+
+	// Floored twice: the field must be seen at all, and at least one position
+	// must have been whitelisted. Either being zero means a rename has made
+	// this guard vacuous while it still passes.
+	if occurrences == 0 {
 		t.Fatal("registry.go never mentions LeaseEpoch; this guard is asserting nothing. If the field was renamed, rename it here too")
 	}
-}
-
-func namesLeaseEpoch(expr ast.Expr) bool {
-	found := false
-	ast.Inspect(expr, func(node ast.Node) bool {
-		if selector, ok := node.(*ast.SelectorExpr); ok && selector.Sel.Name == "LeaseEpoch" {
-			found = true
-		}
-		if ident, ok := node.(*ast.Ident); ok && ident.Name == "LeaseEpoch" {
-			found = true
-		}
-		return true
-	})
-	return found
+	if len(permitted) == 0 {
+		t.Fatal("no legitimate LeaseEpoch position was recognised; the whitelist matched nothing and every occurrence would be reported")
+	}
 }
 
 // TestAStaleLeaseEpochChangesNothing is the behavioural half: an entry whose
@@ -382,6 +479,48 @@ func TestBeginTeardownHasExactlyOneOwner(t *testing.T) {
 	}
 }
 
+// TestTeardownOwnershipSurvivesAStateChange is what makes ownership a recorded
+// fact rather than an inference from the state.
+//
+// The doc claims BeginTeardown must not read ownership off StateDraining
+// because state is re-enterable and ownership is once-only — and nothing
+// constructed the sequence that shows it. Replacing `if entry.TeardownOwned`
+// with `if entry.State == StateDraining` passed everything, one MarkReleasing
+// call away from a second caller being handed an ownership it does not have.
+//
+// The property is not about that particular ordering being sensible. It is that
+// ownership must survive ANY subsequent state change, because a fact recorded
+// once cannot be recovered from a field that keeps moving.
+func TestTeardownOwnershipSurvivesAStateChange(t *testing.T) {
+	t.Parallel()
+
+	index := registry.New(newClock())
+	key := registry.Key{TenantID: "tenant-9f3", SessionID: "session-71c"}
+	entry, _ := index.Insert(key, admission("a"))
+
+	if _, owned := index.BeginTeardown(key, entry.Generation); !owned {
+		t.Fatal("the first caller did not win teardown")
+	}
+
+	// Any subsequent state change. The registry does not order these, and it
+	// must not lose the ownership fact when one moves the state away from
+	// draining.
+	released, ok := index.MarkReleasing(key, entry.Generation)
+	if !ok {
+		t.Fatal("MarkReleasing failed after teardown began")
+	}
+	if released.State != registry.StateReleasing {
+		t.Fatalf("State = %q, want %q: this test needs the state to have moved", released.State, registry.StateReleasing)
+	}
+	if !released.TeardownOwned {
+		t.Error("TeardownOwned was cleared by a state change; ownership is once-only and must not be recoverable from the state")
+	}
+
+	if _, owned := index.BeginTeardown(key, entry.Generation); owned {
+		t.Error("a second caller was handed teardown ownership after the state moved away from draining. Ownership is a fact, not an inference")
+	}
+}
+
 // atomicCounter is a mutex counter, so the race detector has something real to
 // check rather than a plain int.
 type atomicCounter struct {
@@ -445,6 +584,24 @@ func TestGenerationSeparatesSuccessiveResidencies(t *testing.T) {
 		t.Error("a stale generation touched the replacement residency")
 	}
 
+	// A FABRICATED FUTURE generation must be refused too, and the check must be
+	// an inequality rather than a comparison. `entry.Generation > generation`
+	// in place of `!=` passes every row above — the tests only ever present a
+	// LOWER generation — while accepting any number a caller invents.
+	future := second.Generation + 1000
+	if index.RemoveByGeneration(key, future) {
+		t.Error("a fabricated future generation removed the residency")
+	}
+	if _, ok := index.MarkReleasing(key, future); ok {
+		t.Error("a fabricated future generation marked the residency releasing")
+	}
+	if _, ok := index.BeginTeardown(key, future); ok {
+		t.Error("a fabricated future generation claimed teardown")
+	}
+	if index.Touch(key, future) {
+		t.Error("a fabricated future generation touched the residency")
+	}
+
 	// The control: the CURRENT generation still works, so the rejections above
 	// are about staleness rather than about everything being refused.
 	if _, ok := index.MarkReleasing(key, second.Generation); !ok {
@@ -499,6 +656,7 @@ func TestRemoveStaleLeavesResidentSessionsAlone(t *testing.T) {
 	index := registry.New(clock)
 	resident := registry.Key{TenantID: "tenant-9f3", SessionID: "session-resident"}
 	releasing := registry.Key{TenantID: "tenant-9f3", SessionID: "session-releasing"}
+	draining := registry.Key{TenantID: "tenant-9f3", SessionID: "session-draining"}
 	fresh := registry.Key{TenantID: "tenant-9f3", SessionID: "session-fresh"}
 
 	residentEntry, _ := index.Insert(resident, admission("resident"))
@@ -506,12 +664,19 @@ func TestRemoveStaleLeavesResidentSessionsAlone(t *testing.T) {
 	if _, ok := index.MarkReleasing(releasing, releasingEntry.Generation); !ok {
 		t.Fatal("MarkReleasing failed")
 	}
+	drainingEntry, _ := index.Insert(draining, admission("draining"))
+	if _, ok := index.BeginTeardown(draining, drainingEntry.Generation); !ok {
+		t.Fatal("BeginTeardown failed")
+	}
 
 	clock.advance(time.Hour)
 	index.Insert(fresh, admission("fresh"))
 	cutoff := clock.Now().Add(-time.Minute)
 
 	removed := index.RemoveStale(cutoff)
+	if !slices.Contains(removed, draining) {
+		t.Errorf("RemoveStale removed %v, want the stale DRAINING residency too. Testing one non-resident state leaves the other's sweep unheld: `State != StateReleasing` in place of `State == StateResident` passes with only a releasing row", removed)
+	}
 	if !slices.Contains(removed, releasing) {
 		t.Errorf("RemoveStale removed %v, want the stale releasing residency", removed)
 	}
@@ -525,6 +690,31 @@ func TestRemoveStaleLeavesResidentSessionsAlone(t *testing.T) {
 		t.Error("the resident session was removed")
 	}
 	_ = residentEntry
+}
+
+// TestRemoveStaleTreatsTheCutoffAsExclusive pins the tie-break, which nothing
+// did: an entry last active EXACTLY at the cutoff is not stale.
+//
+// The boundary is arbitrary in the sense that either answer could have been
+// chosen, and load-bearing in the sense that a caller passing clock.Now() as
+// the cutoff must not sweep a residency touched in the same instant. Unpinned,
+// `Before` could become `!After` and nothing would notice.
+func TestRemoveStaleTreatsTheCutoffAsExclusive(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	index := registry.New(clock)
+	key := registry.Key{TenantID: "tenant-9f3", SessionID: "session-71c"}
+	entry, _ := index.Insert(key, admission("a"))
+	index.MarkReleasing(key, entry.Generation)
+	at := clock.Now()
+
+	if removed := index.RemoveStale(at); len(removed) != 0 {
+		t.Errorf("RemoveStale(lastActivity) removed %v; an entry active exactly at the cutoff is not yet stale", removed)
+	}
+	if removed := index.RemoveStale(at.Add(time.Nanosecond)); !slices.Contains(removed, key) {
+		t.Errorf("RemoveStale(lastActivity+1ns) removed %v, want the residency", removed)
+	}
 }
 
 // TestTouchDefersStaleness pins that activity is what staleness measures.
@@ -600,71 +790,126 @@ func TestSnapshotIsACopy(t *testing.T) {
 // rather than a sentence: "return leases and handles through narrow callbacks
 // or snapshots; do not expose the mutable map."
 //
-// TestSnapshotIsACopy closes REPLACEMENT — Snapshot returning the live rows
-// dies there. It does not close ADDITION, and a probe confirmed it: bolting an
-// Entries() method returning map[Key]*Entry onto the Registry passes every
-// behavioural test in this file, because no test calls a method that does not
-// exist yet. That is the same addition-shaped residual O2.1 left open on its
-// delegation guard, and here it is cheap to close.
+// IT CHECKS THE RESOLVED TYPE, NOT THE SPELLING, and that distinction is the
+// whole fix. The first version walked the AST and matched the top-level type
+// EXPRESSION, so two ordinary spellings walked through it: `[]*Entry` is an
+// ArrayType whose element nobody looked at, and `type View map[Key]*Entry` with
+// a method returning View is a bare Ident — the live map handed out under a
+// name, clean under vet and staticcheck. Adding cases for those two would have
+// re-opened on the third spelling. Reflection answers what the type IS, so
+// there is no spelling to miss.
 //
-// The rule is over RETURN TYPES, which is where the leak can only be: an
-// exported method may not return a map, a channel, or a pointer into the
-// registry's own rows. Copies and narrow values are what remain.
+// The ban is Map, Chan and Pointer, reached through containers and through the
+// EXPORTED fields of any struct. Exportedness is the principled line rather
+// than the package: a caller outside this package cannot reach an unexported
+// field at all, so an unexported field cannot leak state TO A CALLER, and
+// walking one produces the false positive department's field walk learned about
+// — time.Time carries an unexported *Location, so every timestamp would be
+// reported. Foreign structs are therefore walked too, which is what catches a
+// map handed out inside somebody else's wrapper type.
+//
+// Interfaces are deliberately NOT banned. Entry.Target and Entry.Runtime are
+// the handles step 3 says to return; copying an interface value is not a
+// defence, it is a different runtime. The rule is about the INDEX, not about
+// what the index carries.
 func TestNoExportedMethodHandsOutInternalState(t *testing.T) {
 	t.Parallel()
 
-	parsed, err := parser.ParseFile(token.NewFileSet(), "registry.go", nil, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("parse registry.go: %v", err)
-	}
+	registryType := reflect.TypeFor[*registry.Registry]()
 
 	checked := 0
-	for _, declaration := range parsed.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Recv == nil || !function.Name.IsExported() {
-			continue
-		}
-		if !receiverIsRegistry(function.Recv) {
-			continue
-		}
+	for i := range registryType.NumMethod() {
+		method := registryType.Method(i)
 		checked++
-		if function.Type.Results == nil {
-			continue
-		}
-		for _, result := range function.Type.Results.List {
-			switch result.Type.(type) {
-			case *ast.MapType:
-				t.Errorf("Registry.%s returns a map. A caller handed the live index can write to it; return a snapshot or take a callback", function.Name.Name)
-			case *ast.ChanType:
-				t.Errorf("Registry.%s returns a channel, which is another way to hand out mutable shared state", function.Name.Name)
-			case *ast.StarExpr:
-				t.Errorf("Registry.%s returns a pointer, which aliases a registry row; return a copy", function.Name.Name)
+		for r := range method.Type.NumOut() {
+			for _, complaint := range exposesInternalState(method.Type.Out(r), method.Name, map[reflect.Type]bool{}) {
+				t.Error(complaint)
 			}
 		}
 	}
-
-	// Floored: with no methods found the loop above asserts nothing, which is
-	// how this guard would go quiet after a receiver rename.
 	if checked == 0 {
 		t.Fatal("no exported Registry method was inspected; this guard is asserting nothing")
 	}
+
+	// The guard must be able to SEE the shapes it bans, or it would pass for
+	// want of understanding rather than for want of a defect. Each of these is
+	// a spelling that defeated the previous version.
+	for _, banned := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"map[Key]*Entry", reflect.TypeFor[map[registry.Key]*registry.Entry]()},
+		{"[]*Entry", reflect.TypeFor[[]*registry.Entry]()},
+		{"chan Entry", reflect.TypeFor[chan registry.Entry]()},
+		{"*Entry", reflect.TypeFor[*registry.Entry]()},
+		{"named map type", reflect.TypeFor[namedView]()},
+		{"struct wrapping a map", reflect.TypeFor[wrappedView]()},
+	} {
+		if complaints := exposesInternalState(banned.typ, "probe", map[reflect.Type]bool{}); len(complaints) == 0 {
+			t.Errorf("the guard does not recognise %s as exposing internal state; it would pass a method returning one", banned.name)
+		}
+	}
+	// And it must NOT flag what the registry legitimately returns, or it would
+	// be satisfied by banning everything.
+	for _, allowed := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"Entry", reflect.TypeFor[registry.Entry]()},
+		{"[]Entry", reflect.TypeFor[[]registry.Entry]()},
+		{"[]Key", reflect.TypeFor[[]registry.Key]()},
+		{"bool", reflect.TypeFor[bool]()},
+		{"time.Time", reflect.TypeFor[time.Time]()},
+	} {
+		if complaints := exposesInternalState(allowed.typ, "probe", map[reflect.Type]bool{}); len(complaints) != 0 {
+			t.Errorf("the guard flags %s, which the registry legitimately returns: %v", allowed.name, complaints)
+		}
+	}
 }
 
-func receiverIsRegistry(fields *ast.FieldList) bool {
-	if len(fields.List) != 1 {
-		return false
-	}
-	switch receiver := fields.List[0].Type.(type) {
-	case *ast.StarExpr:
-		ident, ok := receiver.X.(*ast.Ident)
-		return ok && ident.Name == "Registry"
-	case *ast.Ident:
-		return receiver.Name == "Registry"
-	}
-	return false
+// namedView and wrappedView are the two spellings that defeated the syntactic
+// version of the guard above, kept so the guard is tested against them.
+type namedView map[registry.Key]*registry.Entry
+
+type wrappedView struct {
+	Rows map[registry.Key]*registry.Entry
 }
 
-// TestSnapshotIsDeterministicallyOrdered pins that callers see a stable
+// exposesInternalState reports every way typ hands out mutable shared state.
+func exposesInternalState(typ reflect.Type, method string, seen map[reflect.Type]bool) []string {
+	if seen[typ] {
+		return nil
+	}
+	seen[typ] = true
+
+	switch typ.Kind() {
+	case reflect.Map:
+		return []string{method + " returns " + typ.String() + ", a map. A caller handed the live index can write to it; return a snapshot or take a callback"}
+	case reflect.Chan:
+		return []string{method + " returns " + typ.String() + ", a channel, which is another way to hand out mutable shared state"}
+	case reflect.Pointer:
+		return []string{method + " returns " + typ.String() + ", a pointer that aliases a registry row; return a copy"}
+	case reflect.Slice, reflect.Array:
+		return exposesInternalState(typ.Elem(), method, seen)
+	case reflect.Struct:
+		var complaints []string
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			// Only an EXPORTED field can hand anything to a caller outside the
+			// declaring package, and only exported fields avoid time.Time's
+			// unexported *Location.
+			if !field.IsExported() {
+				continue
+			}
+			complaints = append(complaints, exposesInternalState(field.Type, method, seen)...)
+		}
+		return complaints
+	default:
+		return nil
+	}
+}
+
+// TestSnapshotIsDeterministicallyOrdered pins// TestSnapshotIsDeterministicallyOrdered pins that callers see a stable
 // sequence rather than map iteration order, with enough entries that agreement
 // by luck is not the explanation.
 func TestSnapshotIsDeterministicallyOrdered(t *testing.T) {

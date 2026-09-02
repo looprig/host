@@ -1,17 +1,24 @@
 // Package registry indexes the sessions a Host currently holds resident.
 //
-// IT IS AN OPTIMIZATION AND NOTHING MORE. Every mutating caller separately
-// validates the durable lease epoch before acting; this index exists so a Host
-// need not read durable state to answer "do I hold this session", and a wrong
-// or stale answer must never be load-bearing for correctness. That is not a
-// stylistic preference — it is what makes a lost, duplicated or reordered
-// registry update survivable, and TestRegistryNeverGatesOnTheLeaseEpoch holds
-// it structurally rather than leaving it as a sentence in this comment.
+// IT IS AN OPTIMIZATION AND NOTHING MORE. This index exists so a Host need not
+// read durable state to answer "do I hold this session", and a wrong or stale
+// answer must waste a request at worst. Concretely: a stale entry may cost a
+// caller a round trip, and may never let a stale Host advance the journal, a
+// mutable projection, a continuation or checkpoint pointer, or a command claim.
+// Nothing this package decides is durable, which is what makes a lost,
+// duplicated or reordered registry update survivable.
 //
-// The consequence for anyone extending this package: the registry may READ and
-// STORE a lease epoch so a caller can compare it, and may never BRANCH on one.
-// The moment it does, a caller that trusted the index has been given an
-// authorization answer by a cache.
+// THE RULE THIS PACKAGE ENFORCES, and it is only half the sentence: the
+// registry may READ and STORE a lease epoch so a caller can compare it, and may
+// never DECIDE anything from one. TestRegistryNeverGatesOnTheLeaseEpoch holds
+// that structurally, by whitelisting the positions the field may appear in
+// rather than by guessing at the shapes a decision can take.
+//
+// THE OTHER HALF IS NOT ENFORCED HERE AND CANNOT BE. "Every mutating caller
+// separately validates the durable lease epoch" is a rule about CALLERS; this
+// package has none yet, and its API gives a caller nothing to validate against.
+// Whoever writes the first caller owns that half, and should not read the guard
+// below as having covered it.
 package registry
 
 import (
