@@ -288,6 +288,37 @@ func (o Options) validateShape() error {
 			Cause:  err,
 		}
 	}
+	// DELEGATED to Core, not restated. HostID.Validate, TenantID.Validate and
+	// SessionID.Validate are exported and each calls Core's validateID, so this
+	// enforces Core's rule BY CALLING IT: empty, over MaxIDBytes, and invalid
+	// UTF-8, in Core's own order, and it cannot drift if Core changes them.
+	//
+	// O1.2's CompatibilityID.Validate had to hand-restate those three arms
+	// because Core exports no named type for that field, and a copy has nothing
+	// keeping it honest — that restatement needs a drift test and has one.
+	// Here there is a type to delegate to, so there is no copy to keep honest.
+	//
+	// This is the IsolationClass ruling applied to the identifiers. Core calls
+	// validateHostLinkHost from three sites in hostlink.go, so a 300-byte
+	// HostID constructed fine and failed at FIRST ADVERTISEMENT on every path
+	// that advertises. Enforcing it here turns that into a failure at New,
+	// where the operator is still holding the configuration.
+	for _, identity := range []struct {
+		field    string
+		validate func() error
+	}{
+		{"HostID", o.HostID.Validate},
+		{"TenantID", o.TenantID.Validate},
+	} {
+		if err := identity.validate(); err != nil {
+			return &InvalidOptionsError{
+				Code:   OptionErrorCodeInvalid,
+				Field:  identity.field,
+				Reason: "is not a permitted sessionwire identity: " + err.Error(),
+				Cause:  err,
+			}
+		}
+	}
 	switch o.IsolationClass {
 	case sessionwire.HostIsolationClassCrossTenantIsolated, sessionwire.HostIsolationClassTenantExclusive:
 	default:
@@ -415,6 +446,18 @@ func (o Options) validatePlacement() error {
 				Code:   OptionErrorCodeDedicatedFixed,
 				Field:  "FixedSessionID",
 				Reason: "dedicated placement is a binding to one session and must name it",
+			}
+		}
+		// FixedSessionID is a SessionID and takes the same rule, delegated the
+		// same way. It is checked here rather than in validateShape because
+		// only the dedicated branch requires it to be present at all; the
+		// pooled branch requires the opposite.
+		if err := o.FixedSessionID.Validate(); err != nil {
+			return &InvalidOptionsError{
+				Code:   OptionErrorCodeInvalid,
+				Field:  "FixedSessionID",
+				Reason: "is not a permitted sessionwire identity: " + err.Error(),
+				Cause:  err,
 			}
 		}
 		if o.Capacity != 1 {

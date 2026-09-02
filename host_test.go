@@ -268,6 +268,129 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 	}
 }
 
+// TestIdentifiersEnforceCoresIdentityRule closes the divergence the ceiling
+// sweep turned up: Host checked only non-empty while Core bounds these three
+// fields at MaxIDBytes and rejects invalid UTF-8 besides.
+//
+// It is the IsolationClass ruling on three more fields. Core calls
+// validateHostLinkHost from three sites in hostlink.go, so a 300-byte HostID
+// constructed fine and failed at FIRST ADVERTISEMENT on every path that
+// advertises — the failure arriving at the moment Factory needs the Host, in a
+// process that no longer has the operator's attention.
+//
+// The rule is DELEGATED rather than restated: options.go calls Core's own
+// exported Validate on each identity, so there is no copy to drift. That is why
+// these rows assert Core's CODES rather than a message — a caller must be able
+// to tell too_long from invalid_utf8, which is the whole reason Core documents
+// IDValidationError.Code as stable.
+func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
+	t.Parallel()
+
+	overLong := strings.Repeat("x", sessionwire.MaxIDBytes+1)
+	badUTF8 := "host-\xff\xfe"
+
+	tests := []struct {
+		name  string
+		spoil func(*host.Options)
+		field string
+		code  sessionwire.IDValidationCode
+	}{
+		{name: "host id too long", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(overLong) }, field: "HostID", code: sessionwire.IDValidationCodeTooLong},
+		{name: "host id invalid utf8", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(badUTF8) }, field: "HostID", code: sessionwire.IDValidationCodeInvalidUTF8},
+		{name: "tenant id too long", spoil: func(o *host.Options) { o.TenantID = sessionwire.TenantID(overLong) }, field: "TenantID", code: sessionwire.IDValidationCodeTooLong},
+		{name: "tenant id invalid utf8", spoil: func(o *host.Options) { o.TenantID = sessionwire.TenantID(badUTF8) }, field: "TenantID", code: sessionwire.IDValidationCodeInvalidUTF8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			options := pooledOptions(t)
+			tt.spoil(&options)
+			built, err := host.New(options)
+			if built != nil {
+				t.Error("New returned a Host alongside its error")
+			}
+
+			var invalid *host.InvalidOptionsError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
+			}
+			if invalid.Field != tt.field {
+				t.Errorf("Field = %q, want %q", invalid.Field, tt.field)
+			}
+			if invalid.Code != host.OptionErrorCodeInvalid {
+				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeInvalid)
+			}
+
+			// The TYPED CAUSE, reachable through the exported constructor. An
+			// error carrying Core's sentence but not Core's type forces a
+			// caller to substring-match text Core is free to reword, which is
+			// exactly what the stable Code exists to prevent.
+			var validation *sessionwire.IDValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("errors.As did not reach *sessionwire.IDValidationError from New's error")
+			}
+			if validation.Code != tt.code {
+				t.Errorf("IDValidationError.Code = %q, want %q", validation.Code, tt.code)
+			}
+		})
+	}
+
+	// FixedSessionID takes the same rule in the dedicated branch, where it is
+	// the one placement that requires it to be present at all.
+	for _, tt := range []struct {
+		name  string
+		value sessionwire.SessionID
+		code  sessionwire.IDValidationCode
+	}{
+		{name: "fixed session id too long", value: sessionwire.SessionID(overLong), code: sessionwire.IDValidationCodeTooLong},
+		{name: "fixed session id invalid utf8", value: sessionwire.SessionID("session-\xff"), code: sessionwire.IDValidationCodeInvalidUTF8},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			options := dedicatedOptions(t)
+			options.FixedSessionID = tt.value
+			_, err := host.New(options)
+			var invalid *host.InvalidOptionsError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
+			}
+			if invalid.Field != "FixedSessionID" {
+				t.Errorf("Field = %q, want FixedSessionID", invalid.Field)
+			}
+			var validation *sessionwire.IDValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("errors.As did not reach *sessionwire.IDValidationError")
+			}
+			if validation.Code != tt.code {
+				t.Errorf("IDValidationError.Code = %q, want %q", validation.Code, tt.code)
+			}
+		})
+	}
+
+	// The OTHER DIRECTION, which is the lesson of this round: exactly
+	// MaxIDBytes must be ACCEPTED. Without it the rule is one-sided again and a
+	// bound one byte too tight would pass. TestGenerousButLegalConfigurationIsAccepted
+	// carries the same values and now pins this boundary rather than merely
+	// being generous; this row states the intent locally so deleting that test
+	// does not silently remove the accepted side.
+	t.Run("exactly MaxIDBytes is accepted", func(t *testing.T) {
+		t.Parallel()
+		atLimit := strings.Repeat("x", sessionwire.MaxIDBytes)
+		options := dedicatedOptions(t)
+		options.HostID = sessionwire.HostID(atLimit)
+		options.TenantID = sessionwire.TenantID(atLimit)
+		options.FixedSessionID = sessionwire.SessionID(atLimit)
+		built, err := host.New(options)
+		if err != nil {
+			t.Fatalf("New with identifiers of exactly MaxIDBytes = %v, want acceptance: Core accepts them, so refusing them here is a Host that cannot be built for a configuration the wire permits", err)
+		}
+		if len(built.ID()) != sessionwire.MaxIDBytes {
+			t.Errorf("ID() has %d bytes, want %d", len(built.ID()), sessionwire.MaxIDBytes)
+		}
+	})
+}
+
 // TestGenerousButLegalConfigurationIsAccepted is
 // TestDurationsHaveNoUndocumentedMinimum at the other end, and it exists
 // because a sweep found the same shape in every remaining field: EVERY ONE IS
