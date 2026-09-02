@@ -473,7 +473,7 @@ func TestIdentityRulesAreDelegatedNotRestated(t *testing.T) {
 
 	for _, identity := range []string{"HostID", "TenantID", "FixedSessionID"} {
 		if !delegated[identity] {
-			t.Errorf("options.go never calls Validate on o.%s. Core's rule must be ASKED FOR, not recomputed: a faithful restatement passes every behavioural test in this file and diverges silently the next time Core moves", identity)
+			t.Errorf("options.go never calls Validate on o.%s. Core's rule must be ASKED FOR: a faithful restatement passes every behavioural test in this file and diverges silently the next time Core moves. Note this guard closes REPLACEMENT, not ADDITION — a redundant check alongside the call names none of the banned symbols and passes", identity)
 		}
 	}
 	for _, name := range borrowed {
@@ -697,6 +697,15 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		// — Len() > 4 and Len() > 8 both survived, because the cardinality test
 		// stops at four agents. It is the fixture-pinned ceiling I diagnosed
 		// and fixed for the scalars, recurring one level up.
+		//
+		// THIS ROW MITIGATES; IT DOES NOT CLOSE. The identifier rows above ARE
+		// closed, because MaxIDBytes is a real upstream bound and the fixture
+		// sits exactly on it — no ceiling can hide above a value Core itself
+		// refuses to exceed. Department size and Capacity have NO upstream
+		// bound, so any finite fixture leaves a higher ceiling invisible: this
+		// dies at 32 and survives at 100. Sixty-four and one million are
+		// arguments from implausibility, not proofs, and a later reader should
+		// not take them for the same kind of assurance.
 		crowd := make([]sessionwire.AgentID, 0, 64)
 		for i := range 64 {
 			crowd = append(crowd, sessionwire.AgentID("agent-"+strconv.Itoa(i)))
