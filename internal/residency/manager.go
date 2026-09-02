@@ -481,6 +481,14 @@ type Manager struct {
 
 	// attaching serializes attaches of one key. See Manager.acquireKey.
 	attaching map[registry.Key]chan struct{}
+
+	// parked, when set, is called immediately before an attach parks on a busy
+	// key slot. It exists so that PARKING IS OBSERVABLE, which is what turns
+	// "a second attach must not return from inside the install window" from a
+	// race into a decidable question: exactly one of parked-or-returned
+	// happens, so a select between the two is deterministic. It is unexported
+	// and set only from inside this package, always under mu.
+	parked func()
 }
 
 // NewManager validates options and returns a Manager.
@@ -549,6 +557,14 @@ func (m *Manager) SessionContext(key registry.Key) (context.Context, bool) {
 // none of it: the durable projection would outlive the process that wrote it
 // and Factory would route to a Host that had stopped listening. Close is for
 // process shutdown after that protocol has run, or for a test.
+//
+// FOR O3.2/O6.1, WITH O3.1's REACHABILITY STATED: m.sessions is never pruned by
+// this package, because nothing here ends a residency. If a record is ever
+// orphaned — its registry entry replaced under the same key by another writer,
+// which needs a second writer to that registry and so cannot happen in O3.1 —
+// the record stays forever holding a live session context and an ownership
+// handle, and every later attach for that key launches a runtime and discards
+// it. Release owns the pruning, under the same mutex that writes the record.
 func (m *Manager) Close() {
 	m.cancelRoot()
 }
@@ -649,7 +665,11 @@ func (m *Manager) acquireKey(key registry.Key) func() {
 	for {
 		m.mu.Lock()
 		if waiting, busy := m.attaching[key]; busy {
+			parked := m.parked
 			m.mu.Unlock()
+			if parked != nil {
+				parked()
+			}
 			<-waiting
 			continue
 		}
@@ -773,9 +793,19 @@ func (u *unwinder) unwind(ctx context.Context, includeShared bool) []string {
 func (m *Manager) attach(key registry.Key, request Request, target snapshotTarget) (Residency, error) {
 	// -- 1. AgentID, runtime compatibility, and Host admission ---------------
 	//
-	// The identity and compatibility half ran in Attach, so that the WARM path
-	// is validated by the same code. What is left of step 1 is admission, which
-	// must not be charged for a request that was going to be refused anyway.
+	// The identity half ran in Attach, so that the WARM path is validated by
+	// the same code. What is left of step 1 is the COLD-path compatibility
+	// comparison — see Manager.validate for why it is not shared — and
+	// admission, which must not be charged for a request that was going to be
+	// refused anyway.
+	if request.CompatibilityID != "" && request.CompatibilityID != target.compatibility {
+		return Residency{}, &AttachError{
+			Step:   StepValidate,
+			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
+			Key:    key,
+			Reason: "the session was placed on runtime " + strconv.Quote(string(request.CompatibilityID)) + " and this Host launches " + strconv.Quote(string(target.compatibility)),
+		}
+	}
 	capabilities := target.capabilities
 
 	if err := m.admissions.Admit(key, request.AgentID); err != nil {
@@ -936,7 +966,20 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// elsewhere and remains resumable — and leaves the shared admission and
 		// workspace to the winner. Leaving the runtime live is the bug this
 		// branch exists to fix.
-		unwound.unwind(m.root, false)
+		if unreleased := unwound.unwind(m.root, false); len(unreleased) > 0 {
+			// LOSING IS NOT A FAILURE; LEAKING IS. A loser whose own
+			// ReleaseResidency or lease release failed holds a live runtime and
+			// a lease nobody will renew, and reporting the residency with a nil
+			// error would tell the caller the attach was fine and tell the
+			// operator nothing at all. This is the rule fail() applies, applied
+			// on the path beside it.
+			return Residency{}, &AttachError{
+				Step:       StepInstall,
+				Key:        key,
+				Reason:     "the session is resident under another attach and this one could not release what it took",
+				Unreleased: unreleased,
+			}
+		}
 		return existingResidency(entry, key, request)
 	}
 	unwound.own("registry entry", func(context.Context) error {
@@ -1069,10 +1112,17 @@ func (m *Manager) validate(key registry.Key, request Request) (snapshotTarget, e
 	if err := snapshot.capabilities.Validate(); err != nil {
 		return refuse(sessionwire.HostLinkErrorRuntimeUnavailable, "the launch target reports capabilities it could not have been registered with", err)
 	}
-	if request.CompatibilityID != "" && request.CompatibilityID != snapshot.compatibility {
-		return refuse(sessionwire.HostLinkErrorRuntimeMismatch,
-			"the session was placed on runtime "+strconv.Quote(string(request.CompatibilityID))+" and this Host launches "+strconv.Quote(string(snapshot.compatibility)), nil)
-	}
+	// THE REQUEST'S OWN COMPATIBILITY IS NOT COMPARED HERE, and the reason is a
+	// regression this comparison caused when it was. Against a RESIDENT session
+	// there are two builds in play — the one the current target launches and
+	// the one the resident runtime was actually built by — and after an upgrade
+	// they differ. Comparing against the CURRENT target on the warm path
+	// refused the RESIDENT value, so between the two checks every non-empty
+	// CompatibilityID was refused and the only correct placement was the one
+	// that could not be expressed. The comparison a warm caller needs is
+	// against the entry, and existingResidency owns it; this one belongs to the
+	// cold path, where the target about to be launched is the only build there
+	// is, and attach makes it before taking anything.
 	return snapshot, nil
 }
 
