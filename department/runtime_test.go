@@ -3,6 +3,7 @@ package department_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -100,24 +101,7 @@ func TestCreatePropagatesTheLaunchContextToTheRig(t *testing.T) {
 	if got != want {
 		t.Errorf("the rig received %+v, want %+v", got, want)
 	}
-	// The fixture-default control. If any asserted field equalled its zero
-	// value, the assertion above would pass against an adapter that propagates
-	// nothing, which is how three probes were lost in a sibling lane this week.
-	if want == (department.RigCreateRequest{}) {
-		t.Fatal("the launch request is entirely zero-valued, so the assertion above cannot distinguish propagation from silence")
-	}
-	for name, zero := range map[string]bool{
-		"TenantID":      want.TenantID == "",
-		"SessionID":     want.SessionID == "",
-		"AgentID":       want.AgentID == "",
-		"Placement":     want.Placement == "",
-		"WorkspaceRoot": want.WorkspaceRoot == "",
-		"Storage":       want.Storage == department.StorageContext{},
-	} {
-		if zero {
-			t.Errorf("fixture field %s is zero-valued; an assertion on it proves nothing", name)
-		}
-	}
+	assertEveryFieldPropagated(t, got)
 }
 
 func TestRestorePropagatesTheLaunchContextAndTheHarnessIdentity(t *testing.T) {
@@ -165,18 +149,7 @@ func TestRestorePropagatesTheLaunchContextAndTheHarnessIdentity(t *testing.T) {
 	if restores[0] != wantRestore {
 		t.Errorf("the rig received %+v, want %+v", restores[0], wantRestore)
 	}
-	for name, zero := range map[string]bool{
-		"TenantID":      wantRestore.TenantID == "",
-		"SessionID":     wantRestore.SessionID == "",
-		"AgentID":       wantRestore.AgentID == "",
-		"Placement":     wantRestore.Placement == "",
-		"WorkspaceRoot": wantRestore.WorkspaceRoot == "",
-		"Storage":       wantRestore.Storage == department.StorageContext{},
-	} {
-		if zero {
-			t.Errorf("fixture field %s is zero-valued; an assertion on it proves nothing", name)
-		}
-	}
+	assertEveryFieldPropagated(t, restores[0])
 	// Harness's identity for the session must reach the rig, because a restore
 	// has nothing to restore FROM without it. A zero UUID here is the defect
 	// this assertion exists for: the adapter passed uuid.UUID{} and every other
@@ -211,6 +184,60 @@ func TestAdaptedRuntimeCarriesHostIdentitiesNotHarnessOnes(t *testing.T) {
 	}
 	if got := string(runtime.SessionID()); got == rigSessionUUID.String() {
 		t.Error("SessionID() returned Harness's UUID; the two identity spaces are not the same one spelled differently")
+	}
+}
+
+// assertEveryFieldPropagated requires every field of the value the rig received
+// to be non-zero, walking nested structs.
+//
+// It exists because a whole-value comparison covers every field BY VALUE and
+// nothing about the struct's SHAPE, and the difference is the edit that
+// actually happens. Add a field to both RigRestoreRequest and RestoreRequest
+// and forget to wire it into the adapter's literal: got and want both sit at
+// the zero value, they agree, and the comparison passes while the field is
+// silently dropped. A hand-enumerated list of "is this fixture field non-zero"
+// checks goes stale in the very same edit by the very same mechanism — it is
+// the struct's field list written a second time, and the second copy is the one
+// nobody updates. This walks the type instead, so it fails the day the struct
+// GROWS rather than the day a value changes.
+//
+// It applies to Create as well as Restore, because the hole is shared. Create's
+// conversion protects against DIVERGENT growth — a field added to one type
+// alone stops the build — and not against COORDINATED growth, where the field
+// is added to both and propagated by neither. Only this catches that.
+//
+// The cost is a real constraint on fixtures: every field must be given a
+// non-zero value, which for a future bool means true. That is defensible rather
+// than merely tolerable — a bool only ever exercised as false is not exercised
+// — but it is a constraint, and whoever hits it should know it was chosen.
+func assertEveryFieldPropagated(t *testing.T, received any) {
+	t.Helper()
+	value := reflect.ValueOf(received)
+	if value.Kind() != reflect.Struct {
+		t.Fatalf("assertEveryFieldPropagated needs a struct, got %s", value.Kind())
+	}
+	if value.NumField() == 0 {
+		t.Fatalf("%s has no fields, so this assertion would be vacuous", value.Type())
+	}
+	assertFieldsNonZero(t, value, value.Type().Name())
+}
+
+func assertFieldsNonZero(t *testing.T, value reflect.Value, path string) {
+	t.Helper()
+	for i := range value.NumField() {
+		field := value.Field(i)
+		name := path + "." + value.Type().Field(i).Name
+		if field.Kind() == reflect.Struct {
+			if field.NumField() == 0 {
+				t.Errorf("%s is an empty struct; it can never be non-zero and this walk cannot check it", name)
+				continue
+			}
+			assertFieldsNonZero(t, field, name)
+			continue
+		}
+		if field.IsZero() {
+			t.Errorf("%s is the zero value in what the rig received. Either the adapter does not propagate it or the fixture does not set it — for this assertion those are one defect, because a field nobody wired is invisible to a whole-value comparison: want and got agree at zero", name)
+		}
 	}
 }
 
@@ -543,15 +570,46 @@ func TestRigTargetExposesItsDeclaredCompatibilityAndCapabilities(t *testing.T) {
 	if got := target.Capabilities(); got != declared {
 		t.Errorf("Capabilities() = %+v, want %+v", got, declared)
 	}
-	// The control: a target declared with a DIFFERENT build reports that one,
-	// so the assertion above is reading the declaration and not a constant that
-	// happens to match the fixture.
-	other, err := department.NewRigTarget(&testkit.FakeRig{}, "rig-2025-01", declared)
+	// The control, and it is LOCAL on purpose. A second target declared with a
+	// different build AND different capabilities: no hardcoded return can
+	// satisfy two distinct declarations, so this kills the exploit form of the
+	// mutation — the one that returns exactly the constant the first assertion
+	// expects — without depending on any other test.
+	//
+	// Both halves were measured, and the two accessors were not in the same
+	// state. CompatibilityID's control was already local. Capabilities' was
+	// CROSS-TEST: this test asserted `declared` and
+	// TestARigTargetSurvivesRegistration asserted pooledCapabilities(), which
+	// is a real guard but one that deleting the other test would silently
+	// weaken with nothing turning red. It is local now.
+	//
+	// The dependency also ran the other way, which is the sharper half. Running
+	// TestARigTargetSurvivesRegistration ALONE against CompatibilityID
+	// hardcoded to "rig-2026-09" PASSES, because that is the value it expects:
+	// a test with one expected value cannot catch a constant equal to it. That
+	// test kills the naive mutant ("rig-0000-00") on its own and the exploit
+	// mutant not at all, so the second target below is what actually closes the
+	// class.
+	otherCapabilities := department.Capabilities{
+		SupportsPooled:     true,
+		SupportsDedicated:  false,
+		RequiresWorkspace:  false,
+		RequiresCheckpoint: false,
+		AdmissionWeight:    1,
+		CaptureSafety:      department.CaptureSafetyStreaming,
+	}
+	if otherCapabilities == declared {
+		t.Fatal("the two capability fixtures are equal, so neither is a control for the other")
+	}
+	other, err := department.NewRigTarget(&testkit.FakeRig{}, "rig-2025-01", otherCapabilities)
 	if err != nil {
 		t.Fatalf("NewRigTarget: %v", err)
 	}
 	if got := other.CompatibilityID(); got != "rig-2025-01" {
 		t.Errorf("CompatibilityID() = %q, want the second target's declared build", got)
+	}
+	if got := other.Capabilities(); got != otherCapabilities {
+		t.Errorf("Capabilities() = %+v, want the second target's declaration %+v", got, otherCapabilities)
 	}
 }
 
