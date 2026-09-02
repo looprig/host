@@ -3,10 +3,14 @@ package host_test
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,27 +30,32 @@ import (
 // refactor away from being vacuous — and the whole point of these assertions is
 // that they survive a refactor of New.
 
+// stubSessionStore is an inert SessionStore that records nothing.
 type stubSessionStore struct{ id string }
 
 func (stubSessionStore) LoadSession(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]byte, error) {
 	return nil, nil
 }
 
+// stubWorkspaces is an inert WorkspaceProvider.
 type stubWorkspaces struct{ id string }
 
 func (stubWorkspaces) EnsureWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) (string, error) {
 	return "", nil
 }
 
+// stubClock is a fixed time source.
 type stubClock struct{ id string }
 
 func (stubClock) Now() time.Time                       { return time.Unix(0, 0) }
 func (stubClock) NewTimer(d time.Duration) *time.Timer { return time.NewTimer(d) }
 
+// stubAuth is a verifier that accepts everything.
 type stubAuth struct{ id string }
 
 func (stubAuth) VerifyTenant(context.Context, sessionwire.TenantID, string) error { return nil }
 
+// stubTarget is a launch target that launches nothing.
 type stubTarget struct{}
 
 func (stubTarget) CompatibilityID() department.CompatibilityID { return "rig-2026-09" }
@@ -399,6 +408,201 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 	})
 }
 
+// TestIdentityRulesAreDelegatedNotRestated pins the MECHANISM, because the
+// mechanism is what the comment claims.
+//
+// options.go asserts, at length, that it "enforces Core's rule BY CALLING IT
+// and cannot drift if Core changes it". The calling is the entire argument, and
+// it was unpinned: a hand restatement that is FAITHFUL — all three arms, the
+// bound derived from sessionwire.MaxIDBytes, utf8.ValidString, returning Core's
+// own *IDValidationError with Core's own codes — passes every behavioural test
+// in this file. Q4 died only because the restatement I wrote was wrong.
+//
+// The live exposure is therefore one step earlier than "Core drifts". It is that
+// the delegation quietly STOPS BEING a delegation: a maintainer inlining the
+// check during a refactor, or deleting what reads as needless indirection,
+// produces a copy that is green today and diverges the next time Core moves —
+// surfacing as a Host that can neither advertise nor drain, which is the exact
+// failure this delegation exists to prevent.
+//
+// One commit ago I added TestEachBoundExplainsItself because a stated
+// expectation nothing checked is the shape this repository treats as a defect
+// in its own right. A twenty-five line comment asserting delegation, with no
+// assertion that delegation happens, is that shape.
+//
+// So: options.go must CALL Validate on each identity, and must not name Core's
+// internals directly. Detection is by exclusion rather than by recognising a
+// good restatement, because there is no way to tell a faithful copy from a
+// delegation by looking at what it computes — only by looking at whether it
+// delegates.
+func TestIdentityRulesAreDelegatedNotRestated(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := parser.ParseFile(token.NewFileSet(), "options.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse options.go: %v", err)
+	}
+
+	delegated := map[string]bool{}
+	var borrowed []string
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		// o.<Identity>.Validate, whether called or taken as a method value.
+		if selector.Sel.Name == "Validate" {
+			if field, ok := selector.X.(*ast.SelectorExpr); ok {
+				delegated[field.Sel.Name] = true
+			}
+		}
+		// sessionwire.MaxIDBytes, utf8.ValidString, IDValidationCode*: naming
+		// any of these in production code means the rule is being recomputed
+		// here rather than asked for.
+		if pkg, ok := selector.X.(*ast.Ident); ok {
+			switch {
+			case pkg.Name == "utf8":
+				borrowed = append(borrowed, "utf8."+selector.Sel.Name)
+			case selector.Sel.Name == "MaxIDBytes",
+				strings.HasPrefix(selector.Sel.Name, "IDValidationCode"):
+				borrowed = append(borrowed, pkg.Name+"."+selector.Sel.Name)
+			}
+		}
+		return true
+	})
+
+	for _, identity := range []string{"HostID", "TenantID", "FixedSessionID"} {
+		if !delegated[identity] {
+			t.Errorf("options.go never calls Validate on o.%s. Core's rule must be ASKED FOR, not recomputed: a faithful restatement passes every behavioural test in this file and diverges silently the next time Core moves", identity)
+		}
+	}
+	for _, name := range borrowed {
+		t.Errorf("options.go names %s directly. That is Core's rule being recomputed here; call the identity's own Validate instead", name)
+	}
+
+	// Floored: if the walk found no delegation at all the loop above would have
+	// reported three failures, but a walk that visited nothing would report
+	// them for the wrong reason.
+	if len(parsed.Decls) == 0 {
+		t.Fatal("options.go parsed to no declarations; this guard would be vacuous")
+	}
+}
+
+// TestNoCollaboratorIsInvokedAtConstruction converts a property I verified once
+// by hand into one the suite holds.
+//
+// Nothing calls a collaborator during New today, and the four ordinary stubs
+// cannot show that: an invented LoadSession or VerifyTenant call SURVIVES,
+// because stubSessionStore returns (nil, nil) and stubAuth returns nil. Two
+// other invented calls die, but only by accident of what their stubs return —
+// and a kill that depends on a fixture's return value is the same false
+// all-clear that produced the Capacity mistake, one layer down.
+//
+// Auth is the one that matters. A New that acquires a VerifyTenant call becomes
+// network- and order-dependent, and a Host that fails to construct because an
+// auth service is briefly unreachable is a different component from the one
+// documented here.
+//
+// The stubs RECORD rather than panic. A panicking stub kills these mutants too,
+// but by crashing, and this repository does not count a crash as a kill by
+// assertion — the recorded flag gives the same detection with a failure that
+// names the method and survives -race cleanly.
+func TestNoCollaboratorIsInvokedAtConstruction(t *testing.T) {
+	t.Parallel()
+
+	invoked := &invocationLog{}
+	options := pooledOptions(t)
+	options.SessionStore = recordingStore{log: invoked}
+	options.Workspaces = recordingWorkspaces{log: invoked}
+	options.Clock = recordingClock{log: invoked}
+	options.Auth = recordingAuth{log: invoked}
+
+	built, err := host.New(options)
+	if err != nil {
+		t.Fatalf("New = %v; construction must not depend on a collaborator", err)
+	}
+	if called := invoked.calls(); len(called) != 0 {
+		t.Errorf("host.New invoked %v. Construction must be pure: a New that calls Auth or SessionStore becomes network- and order-dependent, and a Host that cannot be built while a dependency is briefly unreachable is a different component from the one documented", called)
+	}
+
+	// The collaborators are STORED, not discarded — otherwise this would pass
+	// against a New that dropped them on the floor and called nothing.
+	if built.Auth() != options.Auth || built.SessionStore() != options.SessionStore {
+		t.Error("a collaborator did not survive construction")
+	}
+
+	// And the log itself works, so "no calls" is a measurement rather than a
+	// stub that records nothing.
+	if err := built.Auth().VerifyTenant(t.Context(), "tenant-9f3", ""); err != nil {
+		t.Fatalf("VerifyTenant: %v", err)
+	}
+	if called := invoked.calls(); !slices.Contains(called, "Auth.VerifyTenant") {
+		t.Errorf("the invocation log recorded %v after a deliberate call; it cannot detect what it does not record", called)
+	}
+}
+
+// invocationLog records which collaborator methods were called.
+type invocationLog struct {
+	mu    sync.Mutex
+	names []string
+}
+
+// record notes one invocation.
+func (l *invocationLog) record(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.names = append(l.names, name)
+}
+
+// calls returns every recorded invocation, in order.
+func (l *invocationLog) calls() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.names...)
+}
+
+// recordingStore is a SessionStore that notes every call.
+type recordingStore struct{ log *invocationLog }
+
+// LoadSession records the call and succeeds.
+func (s recordingStore) LoadSession(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]byte, error) {
+	s.log.record("SessionStore.LoadSession")
+	return nil, nil
+}
+
+// recordingWorkspaces is a WorkspaceProvider that notes every call.
+type recordingWorkspaces struct{ log *invocationLog }
+
+// EnsureWorkspace records the call and succeeds.
+func (w recordingWorkspaces) EnsureWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) (string, error) {
+	w.log.record("Workspaces.EnsureWorkspace")
+	return "/tmp/workspace", nil
+}
+
+// recordingClock is a Clock that notes every call.
+type recordingClock struct{ log *invocationLog }
+
+// Now records the call and returns a fixed instant.
+func (c recordingClock) Now() time.Time {
+	c.log.record("Clock.Now")
+	return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+}
+
+// NewTimer records the call and returns a real timer.
+func (c recordingClock) NewTimer(d time.Duration) *time.Timer {
+	c.log.record("Clock.NewTimer")
+	return time.NewTimer(d)
+}
+
+// recordingAuth is an AuthVerifier that notes every call.
+type recordingAuth struct{ log *invocationLog }
+
+// VerifyTenant records the call and succeeds.
+func (a recordingAuth) VerifyTenant(context.Context, sessionwire.TenantID, string) error {
+	a.log.record("Auth.VerifyTenant")
+	return nil
+}
+
 // TestDepartmentCardinalityIsNotConstrained is the same survivor shape one field
 // over, and the one my ceiling sweep missed.
 //
@@ -487,6 +691,17 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 	t.Run("pooled, generous", func(t *testing.T) {
 		t.Parallel()
 		options := pooledOptions(t)
+		// GENEROUS IN THE DEPARTMENT TOO. Without this the row is generous in
+		// every field except the one reference-typed dependency it carries, and
+		// an invented Department ceiling above the largest fixture is invisible
+		// — Len() > 4 and Len() > 8 both survived, because the cardinality test
+		// stops at four agents. It is the fixture-pinned ceiling I diagnosed
+		// and fixed for the scalars, recurring one level up.
+		crowd := make([]sessionwire.AgentID, 0, 64)
+		for i := range 64 {
+			crowd = append(crowd, sessionwire.AgentID("agent-"+strconv.Itoa(i)))
+		}
+		options.Department = testDepartment(t, crowd...)
 		options.HostID = long
 		options.TenantID = longTenant
 		// A second, structurally different endpoint: ws rather than wss, an
@@ -514,6 +729,9 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		}
 		if built.InternalEndpoint() != "ws://10.0.4.7:9000/link" {
 			t.Errorf("InternalEndpoint() = %q", built.InternalEndpoint())
+		}
+		if got := built.Department().Len(); got != len(crowd) {
+			t.Errorf("Department().Len() = %d, want %d", got, len(crowd))
 		}
 	})
 

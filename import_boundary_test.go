@@ -1264,10 +1264,20 @@ func TestGoModRulesHaveOneSite(t *testing.T) {
 // word is a known declaration name, so a doc comment opening
 // "TestDurationsHaveNoUndOCUMENTEDMinimum" against the real
 // TestDurationsHaveNoUndocumentedMinimum is classified as prose and skipped.
-// That is the correct trade — matching near-misses would need a distance
-// heuristic and would fire on ordinary words — but it means this guard cannot
-// be relied on to catch a test's own name being mistyped in its own comment.
-// It happened once in this module and a reader found it, not this test.
+// The stated reason for not fixing it matters, because a wrong one makes the
+// problem look harder than it is. It is NOT that near-miss matching needs a
+// distance heuristic that would fire on ordinary words: the edit distance from
+// TestDurationsHaveNoUndocumentedMinimum to any English word is enormous. The
+// real false-positive risk is SHORT declaration names — Now, New, ID, Host,
+// Clock all sit within a couple of edits of ordinary prose — which sinks the
+// naive version and nothing more.
+//
+// A cheaper rule needs no distance metric at all: flag a CamelCase token at the
+// start of a doc-comment line, over some length, matching no declaration in the
+// package. Detection by exclusion rather than by proximity, and prose contains
+// no long CamelCase tokens. Not built, because it guards a comment typo that a
+// reader caught — but it is available, and the next person should know the
+// obstacle is short names rather than the idea.
 //
 // The rule is stated over the SYMPTOM rather than over Go's naming convention,
 // because the convention alone gives both false negatives and false positives.
