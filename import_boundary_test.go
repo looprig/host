@@ -4,6 +4,7 @@ import (
 	"errors"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -134,14 +135,31 @@ func replaceViolations(parsed *modfile.File) []string {
 }
 
 // requireViolations reports every looprig requirement Host may not name: a
-// module with no release Host is allowed to depend on, and a version other than
-// the published one. Pseudo-versions fail as a consequence rather than as a
-// pattern — no pseudo-version is in publishedLooprigVersions.
+// forbidden module at any version, a module with no release Host is allowed to
+// depend on, and a version other than the published one. Pseudo-versions fail
+// as a consequence rather than as a pattern — no pseudo-version is in
+// publishedLooprigVersions.
+//
+// The forbidden check comes FIRST, and its position is the point rather than a
+// detail. Consulting only publishedLooprigVersions would reject Factory for
+// being ABSENT from it, which is an accident: Factory ships in this same
+// program, and extending that map to "every published looprig module" is the
+// natural next edit to it. A forbidden module also arrives INDIRECTLY, pulled
+// into go.mod by a released dependency with no import anywhere in this
+// repository — so the import guard is silent by construction and this is the
+// only guard standing. The failure mode of getting this wrong is a green
+// `make check` over a Host that depends on Factory.
+// See TestForbiddenModulesAreRejectedEvenWhenPublished.
 func requireViolations(parsed *modfile.File) []string {
 	var violations []string
 	for _, requirement := range parsed.Require {
 		module, ok := looprigModule(strings.Split(requirement.Mod.Path, "/"))
 		if !ok {
+			continue
+		}
+		if reason, forbidden := forbiddenLooprigModules[module]; forbidden {
+			violations = append(violations, "go.mod requires "+requirement.Mod.Path+
+				" at "+requirement.Mod.Version+"; "+reason)
 			continue
 		}
 		published, ok := publishedLooprigVersions[module]
@@ -437,17 +455,62 @@ func TestReplaceViolations(t *testing.T) {
 func TestRequireViolations(t *testing.T) {
 	t.Parallel()
 
+	// Each row asserts the REASON, not just the count. A count-only assertion
+	// let a mutant through the whole suite here once: the message degraded to
+	// "not the published version \"\"" for an unreleased module, which sends a
+	// maintainer hunting version skew that does not exist. A kill whose message
+	// does not say what broke is a kill that gets mis-triaged later.
 	tests := []struct {
 		name   string
 		source string
-		want   int
+		want   []string
 	}{
-		{name: "published pins", source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/sessionstore v0.1.0\n\tgithub.com/looprig/storage v0.6.0\n)\n", want: 0},
-		{name: "non-looprig dependency is unconstrained", source: "module m\n\ngo 1.26.6\n\nrequire golang.org/x/mod v0.40.0\n", want: 0},
-		{name: "unreleased module", source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/harness v0.30.2\n", want: 1},
-		{name: "pseudo-version", source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/sessionstore v0.0.0-20260901060329-a34464c893e6\n", want: 1},
-		{name: "unpublished version of a released module", source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.8.0\n", want: 1},
-		{name: "factory", source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/factory v0.1.0\n", want: 1},
+		{
+			name:   "published pins",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/sessionstore v0.1.0\n\tgithub.com/looprig/storage v0.6.0\n)\n",
+		},
+		{
+			name:   "non-looprig dependency is unconstrained",
+			source: "module m\n\ngo 1.26.6\n\nrequire golang.org/x/mod v0.40.0\n",
+		},
+		{
+			name:   "unreleased module",
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/harness v0.30.2\n",
+			want:   []string{`requires github.com/looprig/harness at v0.30.2; Host has no released version of that module to name`},
+		},
+		{
+			name:   "pseudo-version",
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/sessionstore v0.0.0-20260901060329-a34464c893e6\n",
+			want:   []string{`requires github.com/looprig/sessionstore at v0.0.0-20260901060329-a34464c893e6, which is not the published version v0.1.0`},
+		},
+		{
+			name:   "unpublished version of a released module",
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.8.0\n",
+			want:   []string{`requires github.com/looprig/core at v0.8.0, which is not the published version v0.7.0`},
+		},
+		{
+			// A forbidden module must be rejected FOR BEING FORBIDDEN. Today it
+			// is also unreleased, and a rejection that rests on that is an
+			// accident of absence: Factory ships in this same program.
+			name:   "factory",
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/factory v0.1.0\n",
+			want:   []string{`requires github.com/looprig/factory at v0.1.0; Host is consumed by Factory and must not depend on it`},
+		},
+		{
+			// The realistic arrival is INDIRECT, through a released looprig
+			// dependency, where there is no import for the import guard to see.
+			name:   "forbidden module arriving indirectly",
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/wui v0.1.1 // indirect\n",
+			want:   []string{`requires github.com/looprig/wui at v0.1.1; Host serves no web UI bundle`},
+		},
+		{
+			name:   "several at once, in file order",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/factory v0.1.0\n\tgithub.com/looprig/harness v0.30.2\n)\n",
+			want: []string{
+				`github.com/looprig/factory at v0.1.0; Host is consumed by Factory`,
+				`github.com/looprig/harness at v0.30.2; Host has no released version`,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -457,11 +520,164 @@ func TestRequireViolations(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse fixture go.mod: %v", err)
 			}
-			if got := requireViolations(parsed); len(got) != tt.want {
-				t.Errorf("requireViolations() = %q (%d), want %d", got, len(got), tt.want)
+			got := requireViolations(parsed)
+			if len(got) != len(tt.want) {
+				t.Fatalf("requireViolations() = %q (%d), want %d", got, len(got), len(tt.want))
+			}
+			for i, want := range tt.want {
+				if !strings.Contains(got[i], want) {
+					t.Errorf("requireViolations()[%d] = %q, want it to say %q", i, got[i], want)
+				}
 			}
 		})
 	}
+}
+
+// TestForbiddenModulesAreRejectedEvenWhenPublished pins the ORDER of the two
+// rules in requireViolations, which is the whole of finding 1.
+//
+// The ban on Factory must not rest on Factory being absent from
+// publishedLooprigVersions, because Factory ships in this same program and
+// "make the version map list every published looprig module" is the natural
+// next edit to that map. If the ban were an accident of absence, that edit
+// would silently let Host depend on Factory — and an INDIRECT requirement has
+// no import for the import guard to catch, so the go.mod guard is the only one
+// standing.
+//
+// It is not parallel: it substitutes the package-level map, and every reader of
+// that map is a parallel test that is paused for the duration of a sequential
+// one.
+func TestForbiddenModulesAreRejectedEvenWhenPublished(t *testing.T) {
+	original := publishedLooprigVersions
+	t.Cleanup(func() { publishedLooprigVersions = original })
+
+	extended := make(map[string]string, len(original)+len(forbiddenLooprigModules))
+	for module, version := range original {
+		extended[module] = version
+	}
+	for module := range forbiddenLooprigModules {
+		extended[module] = "v1.0.0"
+	}
+	publishedLooprigVersions = extended
+
+	for module, reason := range forbiddenLooprigModules {
+		source := "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/" + module + " v1.0.0\n"
+		parsed, err := modfile.Parse("go.mod", []byte(source), nil)
+		if err != nil {
+			t.Fatalf("parse fixture go.mod: %v", err)
+		}
+		got := requireViolations(parsed)
+		if len(got) != 1 {
+			t.Errorf("requireViolations() for a published %s = %q, want exactly one violation", module, got)
+			continue
+		}
+		if !strings.Contains(got[0], reason) {
+			t.Errorf("requireViolations() for %s = %q, want it to say %q", module, got[0], reason)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Nested modules
+// ---------------------------------------------------------------------------
+
+// nestedModuleAllowlist names every directory under this module that is
+// deliberately its own module or repository, relative to the module root and
+// slash-separated. It is EMPTY, and adding to it is a decision, not an
+// accident.
+var nestedModuleAllowlist []string
+
+// TestModuleContainsNoUndeclaredNestedModule closes the one hole the file
+// enumerator has by construction.
+//
+// modfiles.Files skips any directory holding go.mod or .git, which is correct —
+// a nested repository is not this module's content — but the consequence is
+// that the boundary is a property of the MODULE rather than of the TREE, and
+// silently so. A nested module beside a file importing Factory is not scanned,
+// and the guard reports a clean walk. This was driven in the sibling Factory
+// scaffold and it survives there.
+//
+// Exploitability is low: a nested module is not in `go build ./...`, and the
+// parent cannot reach it without a require plus a replace, which
+// replaceViolations already bans. What this assertion buys is that the day
+// someone legitimately publishes a nested module from inside this repository —
+// which is the established workspace pattern, see flow/store and
+// pluto/cmd/pluto — they are stopped and made to decide whether the boundary
+// should reach into it, instead of silently acquiring an unguarded subtree.
+func TestModuleContainsNoUndeclaredNestedModule(t *testing.T) {
+	t.Parallel()
+
+	nested, directories, err := nestedModuleDirectories(".")
+	if err != nil {
+		t.Fatalf("walk for nested modules: %v", err)
+	}
+	if directories == 0 {
+		t.Fatal("no directory was visited; this assertion would be vacuous")
+	}
+	for _, path := range nested {
+		if slices.Contains(nestedModuleAllowlist, path) {
+			continue
+		}
+		t.Errorf("%s is a nested module or repository, so nothing inside it is covered by the import guard. Either remove it, or add it to nestedModuleAllowlist and extend the guard to reach into it deliberately", path)
+	}
+}
+
+func TestNestedModuleDetection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("finds a nested module and a nested repository", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "host.go", "package host\n")
+		writeFixture(t, root, "internal/httpapi/go.mod", "module github.com/looprig/host/internal/httpapi\n")
+		writeFixture(t, root, "internal/httpapi/api.go", "package httpapi\n\nimport _ \"github.com/looprig/factory\"\n")
+		writeFixture(t, root, "tools/checkout/.git/HEAD", "ref: refs/heads/main\n")
+		writeFixture(t, root, "internal/plain/plain.go", "package plain\n")
+
+		// The premise: the import guard really is blind to both of them.
+		scan, err := scanImports(root)
+		if err != nil {
+			t.Fatalf("scanImports: %v", err)
+		}
+		if len(scan.violations) != 0 {
+			t.Fatalf("violations = %q; this fixture exists because the import scan does NOT see inside a nested module", scan.violations)
+		}
+
+		nested, directories, err := nestedModuleDirectories(root)
+		if err != nil {
+			t.Fatalf("nestedModuleDirectories: %v", err)
+		}
+		if directories == 0 {
+			t.Fatal("visited no directories")
+		}
+		want := []string{"internal/httpapi", "tools/checkout"}
+		if !slices.Equal(nested, want) {
+			t.Errorf("nested = %q, want %q", nested, want)
+		}
+	})
+
+	t.Run("reports none for an ordinary tree", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
+		writeFixture(t, root, "internal/plain/plain.go", "package plain\n")
+		// Structural and excluded directories are not nested modules, and a
+		// go.mod under testdata is fixture data.
+		writeFixture(t, root, "testdata/fixture/go.mod", "module example.com/fixture\n")
+		writeFixture(t, root, ".worktrees/branch/go.mod", "module example.com/worktree\n")
+
+		nested, directories, err := nestedModuleDirectories(root)
+		if err != nil {
+			t.Fatalf("nestedModuleDirectories: %v", err)
+		}
+		if directories == 0 {
+			t.Fatal("visited no directories, so the empty result below means nothing")
+		}
+		if len(nested) != 0 {
+			t.Errorf("nested = %q, want none", nested)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +764,60 @@ func scanImports(root string) (importScan, error) {
 // moduleRelative returns path as a slash-separated path relative to root. It
 // resolves root first: modfiles.Files returns absolute paths and the live guard
 // passes ".", so comparing the two unresolved yields an error, not a decision.
+// nestedModuleDirectories returns the module-root-relative paths of every
+// nested module or repository below root, and the number of directories
+// visited so the caller can tell "none" from "walked nothing".
+//
+// It applies the same exclusions modfiles does — vendor, testdata, and dot- or
+// underscore-prefixed names — because a directory the Go tool never builds is
+// not a nested module of this one, and because the module root's own .git and
+// .worktrees are structural rather than content. A directory is a boundary if
+// it holds go.mod or .git, which is modfiles' own rule, restated here against
+// the same markers so the two cannot disagree about what a boundary is.
+func nestedModuleDirectories(root string) ([]string, int, error) {
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, 0, err
+	}
+	var nested []string
+	directories := 0
+	err = filepath.WalkDir(absoluteRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() || path == absoluteRoot {
+			return nil
+		}
+		name := entry.Name()
+		if name == "vendor" || name == "testdata" || name[0] == '.' || name[0] == '_' {
+			return filepath.SkipDir
+		}
+		directories++
+		for _, marker := range []string{"go.mod", ".git"} {
+			_, statErr := os.Lstat(filepath.Join(path, marker))
+			switch {
+			case statErr == nil:
+				relative, relErr := filepath.Rel(absoluteRoot, path)
+				if relErr != nil {
+					return relErr
+				}
+				nested = append(nested, filepath.ToSlash(relative))
+				return filepath.SkipDir
+			case os.IsNotExist(statErr):
+				continue
+			default:
+				return statErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	slices.Sort(nested)
+	return nested, directories, nil
+}
+
 func moduleRelative(root, path string) (string, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {

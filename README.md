@@ -10,6 +10,10 @@ terminal UI, and no product repository. That boundary is enforced by
 declarations of every Go file the module owns rather than searching source
 text, and fails loudly if it walked nothing.
 
+A nested module or repository under `host/` would fall outside that walk by
+construction, so `nestedModuleAllowlist` is empty and a separate assertion fails
+on any undeclared one: a silent hole is converted into a deliberate exemption.
+
 Centrifuge is permitted in exactly one directory,
 `internal/realtime/hostlink/`, and the scope is derived from a single constant
 and compared segment by segment, so a sibling package under

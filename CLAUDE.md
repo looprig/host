@@ -16,7 +16,19 @@ drain. Factory consumes Host; Host never consumes Factory.
   it means editing `centrifugeExemptDir`, which is a visible diff.
 - Name only published looprig versions, listed in `publishedLooprigVersions`.
   Adding a module there is the same decision as depending on it, and the
-  version must exist on that module's remote first.
+  version must exist on that module's remote first. A forbidden module is
+  rejected for BEING FORBIDDEN, before that map is consulted — the ban must not
+  rest on the module being absent from a list of published ones, because
+  Factory ships in this same program and an indirect requirement has no import
+  for the import guard to see.
+- A nested module or repository under `host/` is invisible to the import guard:
+  the enumerator skips any directory holding `go.mod` or `.git`, which is right
+  for "this module's content" and means the boundary is a property of the
+  module, not of the tree. `nestedModuleAllowlist` is empty and
+  `TestModuleContainsNoUndeclaredNestedModule` fails loudly on any undeclared
+  one. If you publish a nested module from here — the workspace does this for
+  `flow/store` and `pluto/cmd/pluto` — declare it there and decide, explicitly,
+  whether the guard should reach into it.
 - No `replace` directives to local filesystem paths, and no vendoring. A
   `GOWORK=off` failure means a dependency release is still owed upstream; it is
   not a reason to add a `replace`.
