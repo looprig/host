@@ -38,6 +38,37 @@ drain. Factory consumes Host; Host never consumes Factory.
 - `drain` is unpublished. Define a narrow local interface and a fake; name the
   module only once its origin and tag exist.
 
+## Adding a boundary rule: the five mechanisms
+
+`import_boundary_test.go` is five independent mechanisms, deliberately not
+merged — the independence is worth more than the tidiness, and each has its own
+failure mode. It has already misfired twice for want of an index: the reason map
+was consumed by one guard and discarded by the other, and the file-level
+structural predicate was left behind when the two directory ones were shared.
+Route a new rule by asking what it is about.
+
+1. **One import path, in one file** — `importVerdict`. Layering bans, the
+   Centrifuge path scope. Return a reason; the message is consumed.
+2. **One looprig module go.mod names** — `looprigDependencyViolation`. Shared by
+   requirements and by versioned replacement targets, because a rule that
+   applies to one and not the other is not a rule.
+3. **The shape of a go.mod directive** — `replaceViolations`. The local
+   filesystem path rule lives here. Anything about the module a directive
+   NAMES belongs in 2, not here.
+4. **What the walk covers at all** — `scanNestedModules` and
+   `nestedModuleAllowlist`. A declared nested module buys an extra scan rooted
+   at it; it never suspends the boundary.
+5. **What any walk can see** — the exported predicates in `internal/modfiles`.
+   Every predicate deciding what a walk skips belongs there and needs a fuzz
+   ORACLE in the consumer, not a sample table: a table is defeated by choosing a
+   literal it does not list, and a widened predicate is a hole in every walk
+   over this tree simultaneously — including `make fmt-check`, which pipes the
+   same enumerator into gofmt.
+
+An exclusion added to make a guard pass must itself be tested. A too-wide
+exclusion produces exactly the same green as a correct one; that has been a live
+defect here twice.
+
 ## Code and security
 
 - Keep public contracts transport-neutral and use Core's `sessionwire/v1`

@@ -48,7 +48,7 @@ func Files(root string) ([]string, error) {
 			}
 			return nil
 		}
-		if entry.IsDir() || ignoredFile(entry.Name()) || !strings.HasSuffix(entry.Name(), ".go") {
+		if entry.IsDir() || IsIgnoredFileName(entry.Name()) || !strings.HasSuffix(entry.Name(), ".go") {
 			return nil
 		}
 		info, err := entry.Info()
@@ -96,11 +96,24 @@ func WriteNull(w io.Writer, paths []string) error {
 // mutants survived the whole suite proving it. Callers share the predicate now;
 // the SET it returns is pinned separately, because sharing makes the two walks
 // agree without stopping the shared answer from being widened.
+//
+// This package has THREE structural predicates, not two, and the seam is only
+// as good as the count: IsIgnoredFileName is the third, and it was left
+// unshared and unpinned for a round while a comment here claimed the exclusions
+// were exactly mirrored. Any predicate that decides what a walk does not see
+// belongs in this exported set and needs an oracle in the consumer.
 func IsIgnoredDirectoryName(name string) bool {
 	return name == "vendor" || name == "testdata" || goIgnoredName(name)
 }
 
-func ignoredFile(name string) bool {
+// IsIgnoredFileName reports whether a file with this name is excluded from
+// enumeration. It is exported for the same reason the two directory predicates
+// are, and it was the one left behind when they were shared: widening it hides
+// a file from the dependency guard AND from `make fmt-check`, which pipes this
+// same enumerator into gofmt. A mutant adding a "_generated.go" suffix here
+// survived the whole suite and the whole check — the escaped file was
+// unformatted, unchecked and unguarded at once.
+func IsIgnoredFileName(name string) bool {
 	return goIgnoredName(name)
 }
 
