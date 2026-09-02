@@ -3,6 +3,7 @@ package department
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -183,7 +184,7 @@ func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtim
 // publication is a later task's, and what this one can guarantee is that
 // nothing reaches it.
 func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentID, session RigSession) (Runtime, error) {
-	if session == nil {
+	if isNilSession(session) {
 		return nil, &RigLaunchError{
 			AgentID:   agentID,
 			SessionID: sessionID,
@@ -248,6 +249,11 @@ type rigRuntime struct {
 func (r *rigRuntime) SessionID() sessionwire.SessionID { return r.sessionID }
 func (r *rigRuntime) AgentID() sessionwire.AgentID     { return r.agentID }
 
+// RigSessionID reports Harness's identity for this runtime. It is the method
+// the package-level RigSessionID asserts for, so a wrapper that forwards it
+// keeps working.
+func (r *rigRuntime) RigSessionID() uuid.UUID { return r.rigID }
+
 // RigSessionID reports Harness's UUID for a runtime this package adapted, for
 // callers that must correlate with Harness's own records. It is deliberately
 // not part of Runtime: Host's contracts speak sessionwire identities.
@@ -260,11 +266,44 @@ func (r *rigRuntime) AgentID() sessionwire.AgentID     { return r.agentID }
 // helper or becomes a field on something the registry holds. Do not build on it
 // before that decision.
 func RigSessionID(runtime Runtime) (uuid.UUID, bool) {
-	adapted, ok := runtime.(*rigRuntime)
+	// An INTERFACE assertion, not runtime.(*rigRuntime). The concrete assertion
+	// breaks the day anything wraps a Runtime — a residency decorator, a
+	// metrics wrapper, a test spy — and it breaks by returning false, which
+	// reads as "not one of ours" when it means "your wrapper ate it". A wrapper
+	// that forwards this one method keeps working.
+	reporter, ok := runtime.(interface{ RigSessionID() uuid.UUID })
 	if !ok {
 		return uuid.UUID{}, false
 	}
-	return adapted.rigID, true
+	return reporter.RigSessionID(), true
+}
+
+// isNilSession reports whether a rig handed back nothing, in either of the two
+// ways Go allows.
+//
+// A nil INTERFACE is what a fake produces and what an obvious `return nil, nil`
+// produces. A TYPED NIL — a non-nil interface holding a nil *Session — is what
+// a real rig produces, from the commonest bug in the language:
+//
+//	var session *Session
+//	if err := launch(&session); err != nil { return nil, err }
+//	return session, nil   // non-nil interface, nil pointer
+//
+// The guard covered only the first, so a typed nil panicked at session.ID() —
+// the exact "nil dereference three layers away" this check's own comment claims
+// to prevent, arriving by the path a real implementation actually takes rather
+// than the one a test double does.
+func isNilSession(session RigSession) bool {
+	if session == nil {
+		return true
+	}
+	value := reflect.ValueOf(session)
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +347,16 @@ func (e *CompatibilityMismatchError) ErrorCode() sessionwire.ErrorCode {
 }
 
 // RigLaunchError wraps a failure the Rig itself reported, preserving the cause.
+//
+// It carries no ErrorCode, and neither does IncapableRuntimeError, while
+// CompatibilityMismatchError and UnknownAgentError do. That is deliberate and
+// worth saying, because every other code choice in this file is justified: the
+// two that carry one describe a well-formed request this Host cannot serve,
+// which is a client's business and a thing to branch on. A rig that refused to
+// launch, or one that produced a session missing capabilities, is a HOST
+// DEFECT — a misconfigured target or a broken build — and mapping it to a
+// public code would tell a client to retry something only an operator can fix.
+// Whoever maps these to the wire should choose a code at that seam.
 type RigLaunchError struct {
 	AgentID   sessionwire.AgentID
 	SessionID sessionwire.SessionID
@@ -316,8 +365,15 @@ type RigLaunchError struct {
 }
 
 func (e *RigLaunchError) Error() string {
-	return "department: rig " + e.Operation + " for agent " + strconv.Quote(string(e.AgentID)) +
-		" failed: " + e.Cause.Error()
+	// Cause is dereferenced only if it is there. This is an exported struct, so
+	// another package may construct one without a cause, and an Error method
+	// that panics is the worst possible place for a nil dereference: it fires
+	// while something is already reporting a failure.
+	message := "department: rig " + e.Operation + " for agent " + strconv.Quote(string(e.AgentID)) + " failed"
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
 }
 
 func (e *RigLaunchError) Unwrap() error { return e.Cause }

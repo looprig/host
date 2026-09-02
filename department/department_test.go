@@ -51,10 +51,12 @@ func pooledCapabilities() department.Capabilities {
 	}
 }
 
+// target returns a stub launch target declaring the given runtime build.
 func target(compatibility string) stubTarget {
 	return stubTarget{compatibility: department.CompatibilityID(compatibility), capabilities: pooledCapabilities()}
 }
 
+// registration binds an agent identity to a stub target for the given build.
 func registration(agent, compatibility string) department.Registration {
 	return department.Registration{AgentID: sessionwire.AgentID(agent), Target: target(compatibility)}
 }

@@ -1250,6 +1250,15 @@ func TestGoModRulesHaveOneSite(t *testing.T) {
 // FuzzBoundaryMarkerName's to boundaryMarkers. Three by one mechanism is a
 // missing check, not a slip.
 //
+// FIVE firings, zero false positives by the guard's own definition, and the
+// distribution is the useful part: ONE was a stolen doc comment (the shape the
+// check was built for) and FOUR were prose in one declaration's comment opening
+// with the name of a declaration that had no documentation anywhere. Both are
+// real — an undocumented declaration whose name reads like a doc heading
+// somewhere else is exactly how the first kind starts — but the message
+// described only the first repair, so four correct findings read as false
+// positives. It names both repairs now.
+//
 // The rule is stated over the SYMPTOM rather than over Go's naming convention,
 // because the convention alone gives both false negatives and false positives.
 // A line inside a doc comment that opens with the name of a declaration in this
@@ -1346,7 +1355,8 @@ func TestDocCommentsNameTheirOwnDeclaration(t *testing.T) {
 			// what a missing blank line produces, in both orderings.
 			continue
 		}
-		t.Errorf("%s: %s has no doc comment of its own, and a line opening with its name is attached to %q instead. Separate the two comments with a blank line so each documents its own declaration", doc.file, doc.word, strings.Join(doc.names, ", "))
+		t.Errorf("%s: %s has NO DOC COMMENT OF ITS OWN, and a line opening with its name sits inside %q's. Two edits fix this and they are different repairs: if the line was written FOR %s, separate the comments with a blank line so it attaches to the right declaration; if it merely MENTIONS %s in prose, give %s a doc comment of its own and this stops firing. The check cannot tell those apart, which is why it names both",
+			doc.file, doc.word, strings.Join(doc.names, ", "), doc.word, doc.word, doc.word)
 	}
 	if checked == 0 {
 		t.Fatal("no doc comment line opened with a declaration name, so nothing was checked and this guard is vacuous")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,7 @@ func launchRequest() department.CreateRequest {
 	}
 }
 
+// restoreRequest is launchRequest as a restore, for the given durable build.
 func restoreRequest(compatibility department.CompatibilityID) department.RestoreRequest {
 	return department.RestoreRequest{
 		TenantID:        "tenant-9f3",
@@ -49,6 +51,7 @@ func restoreRequest(compatibility department.CompatibilityID) department.Restore
 	}
 }
 
+// rigTarget builds a rig-backed launch target at the file's standard build.
 func rigTarget(t *testing.T, rig department.Rig) department.LaunchTarget {
 	t.Helper()
 	target, err := department.NewRigTarget(rig, "rig-2026-09", pooledCapabilities())
@@ -189,6 +192,12 @@ func TestAdaptedRuntimeCarriesHostIdentitiesNotHarnessOnes(t *testing.T) {
 	}
 }
 
+// maxWalkDepth bounds the recursion. A self-referential pointer is not a shape
+// any request struct has today, and an unbounded walk on one does not fail —
+// it exhausts the stack and kills the process, which is the one failure mode a
+// guard must never have. A bounded walk complains instead.
+const maxWalkDepth = 16
+
 // assertEveryFieldPropagated requires every field of the value the rig received
 // to carry data, so the assertion fails when the struct GROWS and not only when
 // a value changes.
@@ -207,15 +216,27 @@ func TestAdaptedRuntimeCarriesHostIdentitiesNotHarnessOnes(t *testing.T) {
 // alone stops the build — and not against COORDINATED growth, where the field
 // is added to both and propagated by neither.
 //
-// The cost is a real constraint on fixtures: every field must be given a value
-// that carries data, which for a future bool means true. That is defensible
-// rather than merely tolerable — a bool only ever exercised as false is not
-// exercised — but it is a constraint, and whoever hits it should know it was
-// chosen. See unpropagatedFields for the field classes reflection cannot judge
-// by IsZero alone, all of which are handled explicitly rather than skipped.
-func assertEveryFieldPropagated(t *testing.T, received any) {
+// allowedZero names fields, by their full dotted path, whose correct propagated
+// value IS the zero — the class for which "require non-zero" is the wrong
+// question. It exists because without it the only way to pass is to lie in the
+// fixture, and THE LIE DOES NOT STAY LOCAL: these same fixtures feed the
+// whole-value literal oracles beside this one, so forcing a future ReadOnly or
+// DisableTelemetry bool to true would silently make the non-default the only
+// case every other assertion in the file exercises. Name the field here and add
+// a separate test for the non-zero case instead. Nothing uses it today; it is
+// the documented alternative to the fixture lie, not a live exemption.
+//
+// Its limit of SCOPE is that the walk sees only the RIG-SIDE struct, the value
+// the rig actually received. A field added to RestoreRequest alone and never
+// forwarded is invisible to it. That is correct — this assertion is about what
+// crossed the seam — but it is not a completeness check on Host's own request
+// types.
+//
+// See unpropagatedFields for what it can and CANNOT judge. It does not claim to
+// cover every field class, and the classes it cannot are named there.
+func assertEveryFieldPropagated(t *testing.T, received any, allowedZero ...string) {
 	t.Helper()
-	complaints, err := unpropagatedFields(received)
+	complaints, err := unpropagatedFields(received, allowedZero...)
 	if err != nil {
 		t.Fatalf("assertEveryFieldPropagated: %v", err)
 	}
@@ -226,31 +247,50 @@ func assertEveryFieldPropagated(t *testing.T, received any) {
 
 // unpropagatedFields reports every field of received that carries no data. It
 // is separated from the assertion so it can be tested directly, which is the
-// only way to prove a walk does not SILENTLY SKIP a field class — and a guard
-// that skips one is worse than the enumeration it replaced, because the
-// enumeration at least failed visibly when it went stale.
+// only way to prove a walk does not silently skip a field class.
 //
-// Four classes cannot be judged by reflect.Value.IsZero and are handled here.
-// Each was measured rather than assumed:
+// WHAT IT JUDGES, and why each needed deciding rather than assuming:
 //
-//   - SLICES and MAPS: IsZero is true only for a NIL one. A non-nil empty slice
-//     is not the zero value and carries nothing, so it would have passed. Length
-//     is the question, not zero-ness.
-//   - INTERFACES and POINTERS: IsZero is true only when the interface or pointer
-//     is nil. any("") is a non-nil interface holding a zero payload and would
-//     have passed. The payload is unwrapped and asked the same question.
-//   - STRUCTS WITH UNEXPORTED FIELDS: recursing into them is a FALSE POSITIVE,
-//     and time.Time is the case that matters, since sessionwire already carries
-//     ObservedAt and ExpiresAt. A UTC time.Time has wall == 0 and loc == nil —
-//     nil loc IS UTC — so a walk into its fields reports two of three as zero
-//     for a perfectly good timestamp. Foreign structs get a whole-value IsZero
-//     instead; structs whose fields are all exported are still walked, because
-//     for those the per-field answer is both correct and more useful.
-//   - UNEXPORTED FIELDS: reported as unverifiable rather than skipped. A test
-//     outside this package cannot set one, so it would be permanently zero;
-//     saying so is fail-closed, and silently ignoring it is the hole this
-//     comment exists to deny.
-func unpropagatedFields(received any) ([]string, error) {
+//   - TYPES THAT JUDGE THEMSELVES. If a value has an IsZero() bool method, that
+//     answer wins. reflect.Value.IsZero is NOT the type's notion of empty and
+//     time.Time proves it in both directions: walking its fields reports a UTC
+//     timestamp as empty, because a nil location IS UTC; refusing to walk it and
+//     using reflect's answer reports the ZERO INSTANT IN A NON-UTC ZONE as
+//     populated, because loc is then non-nil. Both extremes are wrong for the
+//     same type. Asking the type is right for it, for netip.Addr, for uuid.UUID,
+//     and for anything else that follows the convention.
+//   - SLICES, MAPS and ARRAYS: length AND elements. Length alone was half the
+//     question, and the half it left was arbitrary rather than principled — a
+//     pointer to "" was unwrapped and reported while a []string{""} was not,
+//     which is the same emptiness with opposite verdicts. A Labels or Env field
+//     propagated but blanked is exactly the defect this walk exists to catch.
+//   - INTERFACES and POINTERS: nil, then the payload. any("") is a non-nil
+//     interface holding a zero value.
+//   - STRUCTS: an empty one is reported, because it can never carry data and no
+//     walk can judge it; one whose fields are all exported is walked; one with
+//     unexported fields and no IsZero is judged whole by reflect, which is the
+//     best available answer and an admitted approximation.
+//   - UNEXPORTED FIELDS are reported as unverifiable rather than skipped. A test
+//     outside this package cannot set one, so it would sit permanently zero.
+//
+// WHAT IT CANNOT JUDGE, stated because a guard that silently skips a class is
+// worse than the enumeration it replaced, and a doc claiming completeness is
+// worse than either:
+//
+//   - A struct with unexported fields and no IsZero method is judged only as a
+//     whole. Its individual fields are not checked, so a partially populated one
+//     passes.
+//   - Recursion is bounded at maxWalkDepth. Beyond it the walk complains rather
+//     than descending, so a legitimately deeper shape would be reported as a
+//     defect it is not.
+//   - PARTIAL emptiness inside a collection. A slice or map passes when ANY
+//     element carries data, so []string{"a", ""} and a partially filled array
+//     are accepted. Requiring every element would false-positive on a []byte or
+//     json.RawMessage holding a zero byte, which is ordinary data; see
+//     elementsCarryData for the reasoning behind the line.
+//   - A field whose correct value is the zero is a defect to this walk unless
+//     named in allowedZero. That is the trade, not an oversight.
+func unpropagatedFields(received any, allowedZero ...string) ([]string, error) {
 	value := reflect.ValueOf(received)
 	if value.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("need a struct, got %s", value.Kind())
@@ -258,41 +298,56 @@ func unpropagatedFields(received any) ([]string, error) {
 	if value.NumField() == 0 {
 		return nil, fmt.Errorf("%s has no fields, so this assertion would be vacuous", value.Type())
 	}
-	return walkForData(value, value.Type().Name()), nil
+	return walkForData(value, value.Type().Name(), allowedZero, 0), nil
 }
 
-func walkForData(value reflect.Value, path string) []string {
+func walkForData(value reflect.Value, path string, allowedZero []string, depth int) []string {
 	var complaints []string
 	for i := range value.NumField() {
 		field := value.Type().Field(i)
 		name := path + "." + field.Name
+		if slices.Contains(allowedZero, name) {
+			continue
+		}
 		if !field.IsExported() {
 			complaints = append(complaints, name+" is unexported, so this walk cannot verify it was propagated and a test outside this package cannot set it. Export it, or move the assertion into the package")
 			continue
 		}
-		complaints = append(complaints, valueCarriesData(value.Field(i), name)...)
+		complaints = append(complaints, valueCarriesData(value.Field(i), name, allowedZero, depth+1)...)
 	}
 	return complaints
 }
 
-func valueCarriesData(value reflect.Value, name string) []string {
-	switch value.Kind() {
-	case reflect.Slice, reflect.Map:
-		if value.Len() == 0 {
-			return []string{name + " is empty in what the rig received. A non-nil empty slice or map is NOT the zero value, so length is the question here and IsZero would have passed it"}
+func valueCarriesData(value reflect.Value, name string, allowedZero []string, depth int) []string {
+	if depth > maxWalkDepth {
+		return []string{name + " exceeded the walk's depth limit of " + strconv.Itoa(maxWalkDepth) + "; a cyclic value would otherwise exhaust the stack, and a guard that crashes reports nothing"}
+	}
+	// The type's own answer wins wherever it has one.
+	if value.CanInterface() {
+		if zeroer, ok := value.Interface().(interface{ IsZero() bool }); ok {
+			if zeroer.IsZero() {
+				return []string{name + " reports itself zero via " + value.Type().String() + ".IsZero in what the rig received"}
+			}
+			return nil
 		}
-		return nil
+	}
+	switch value.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Array:
+		return elementsCarryData(value, name, allowedZero, depth)
 	case reflect.Interface, reflect.Pointer:
 		if value.IsNil() {
 			return []string{name + " is nil in what the rig received"}
 		}
-		return valueCarriesData(value.Elem(), name)
+		return valueCarriesData(value.Elem(), name, allowedZero, depth+1)
 	case reflect.Struct:
-		if allFieldsExported(value.Type()) {
-			return walkForData(value, name)
+		if value.NumField() == 0 {
+			return []string{name + " is an empty struct; it can never carry data and this walk cannot judge it"}
 		}
-		// A foreign struct: judged whole rather than walked. Walking time.Time
-		// reports wall and loc as zero for any UTC timestamp.
+		if allFieldsExported(value.Type()) {
+			return walkForData(value, name, allowedZero, depth)
+		}
+		// A foreign struct with no IsZero: judged whole, which is an admitted
+		// approximation rather than a per-field answer.
 		if value.IsZero() {
 			return []string{name + " is the zero " + value.Type().String() + " in what the rig received"}
 		}
@@ -303,6 +358,58 @@ func valueCarriesData(value reflect.Value, name string) []string {
 		}
 		return nil
 	}
+}
+
+// elementsCarryData requires a collection to be non-empty AND at least one
+// element to carry data.
+//
+// "At least one", not "every one", and the line is a judgement rather than an
+// oversight. The escape this closes is a collection PROPAGATED BUT BLANKED —
+// []string{"", ""} or map[string]string{"k": ""} — which length alone passed,
+// and which made the old rule arbitrary rather than principled: a pointer to ""
+// was unwrapped and reported while a slice of "" was not, the same emptiness
+// with opposite verdicts.
+//
+// Requiring EVERY element would go too far in the other direction and produce
+// false positives on legitimate data. A []byte or json.RawMessage containing a
+// zero byte is ordinary, and so is a []string with one empty entry. Partial
+// emptiness INSIDE a collection is therefore out of scope: this walk asks
+// whether a field crossed the seam carrying something, not whether every
+// element of it is meaningful. A partially populated array or slice passes, and
+// that is stated in unpropagatedFields' limits.
+func elementsCarryData(value reflect.Value, name string, allowedZero []string, depth int) []string {
+	if value.Len() == 0 {
+		if value.Kind() == reflect.Array {
+			return []string{name + " is a zero-length array; it can never carry data"}
+		}
+		return []string{name + " is empty in what the rig received. A non-nil empty slice or map is NOT the zero value, so length is the question here and IsZero would have passed it"}
+	}
+
+	elements := make([]reflect.Value, 0, value.Len())
+	labels := make([]string, 0, value.Len())
+	if value.Kind() == reflect.Map {
+		for _, key := range value.MapKeys() {
+			elements = append(elements, value.MapIndex(key))
+			labels = append(labels, name+"["+fmt.Sprint(key.Interface())+"]")
+		}
+	} else {
+		for i := range value.Len() {
+			elements = append(elements, value.Index(i))
+			labels = append(labels, name+"["+strconv.Itoa(i)+"]")
+		}
+	}
+
+	var first []string
+	for i, element := range elements {
+		complaints := valueCarriesData(element, labels[i], allowedZero, depth+1)
+		if len(complaints) == 0 {
+			return nil
+		}
+		if first == nil {
+			first = complaints
+		}
+	}
+	return append([]string{name + " has " + strconv.Itoa(len(elements)) + " element(s) and NONE of them carries data, so the field was propagated blank"}, first...)
 }
 
 func allFieldsExported(typ reflect.Type) bool {
@@ -321,6 +428,30 @@ func allFieldsExported(typ reflect.Type) bool {
 type walkNested struct{ Name string }
 
 type walkForeign struct{ hidden string }
+
+type walkEmpty struct{}
+
+type walkCyclic struct {
+	Name string
+	Next *walkCyclic
+}
+
+type walkCollections struct {
+	Strings []string
+	Labels  map[string]string
+	Fixed   [2]walkNested
+	Raw     []byte
+}
+
+type walkOptional struct {
+	Str  string
+	Flag bool
+}
+
+type walkWithEmptyNested struct {
+	Str   string
+	Empty walkEmpty
+}
 
 type walkProbe struct {
 	Str     string
@@ -421,6 +552,14 @@ func TestTheWalkJudgesEveryFieldClass(t *testing.T) {
 	}
 	fields := map[string]string{"nil slice": "Slice", "nil pointer": "Pointer", "nil iface": "Iface"}
 
+	// FLOORED, and for the reason this whole file exists: deleting rows reduces
+	// coverage silently, which is the same staleness the walk was built to
+	// escape, reintroduced in the test that certifies the walk. Raise this
+	// deliberately when adding a class; do not lower it to match a deletion.
+	if len(emptied) != 14 {
+		t.Fatalf("the emptied table has %d rows, want 14. Each is a field class reflection treats differently; a deleted row is a class nobody checks", len(emptied))
+	}
+
 	for name, empty := range emptied {
 		t.Run("an empty "+name+" is reported", func(t *testing.T) {
 			t.Parallel()
@@ -448,6 +587,131 @@ func TestTheWalkJudgesEveryFieldClass(t *testing.T) {
 		}
 		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "hidden") }) {
 			t.Errorf("complaints = %q, want one naming the unexported field. Skipping it silently is the hole this whole test exists to deny", complaints)
+		}
+	})
+
+	// The NESTED empty struct, distinct from the top-level one below. The
+	// top-level case is refused outright; a nested one is reachable by the walk
+	// and was silently skipped, which is the failure mode this whole test denies.
+	// W1. The type's own IsZero wins, and time.Time is why: reflect gets it
+	// wrong in BOTH directions. Walking its fields calls a UTC timestamp empty,
+	// because a nil location IS UTC. Refusing to walk it and trusting
+	// reflect.Value.IsZero calls the ZERO INSTANT IN A NON-UTC ZONE populated,
+	// because loc is then non-nil — which is a live escape on a type sessionwire
+	// already carries.
+	t.Run("a type that judges itself is asked", func(t *testing.T) {
+		t.Parallel()
+		zoned := time.Time{}.In(time.FixedZone("Z", 3600))
+		if !zoned.IsZero() {
+			t.Fatal("the fixture is not the zero instant, so this row proves nothing")
+		}
+		if reflect.ValueOf(zoned).IsZero() {
+			t.Fatal("reflect already agrees with the type here, so this row cannot distinguish the two")
+		}
+		probe := full
+		probe.When = zoned
+		complaints, err := unpropagatedFields(probe)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "When") }) {
+			t.Errorf("complaints = %q, want one naming When. A zero instant carrying a location is still the zero instant, and only the type knows that", complaints)
+		}
+	})
+
+	// W2 and W4. A collection propagated but BLANKED passed on length alone,
+	// and the half-question was arbitrary: a pointer to "" was reported while a
+	// slice of "" was not.
+	t.Run("a collection whose elements carry nothing is reported", func(t *testing.T) {
+		t.Parallel()
+		populated := walkCollections{
+			Strings: []string{"carried"},
+			Labels:  map[string]string{"k": "carried"},
+			Fixed:   [2]walkNested{{Name: "carried"}, {}},
+			Raw:     []byte{0x00, 0x01},
+		}
+		complaints, err := unpropagatedFields(populated)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if len(complaints) != 0 {
+			t.Errorf("complaints = %q, want none. A partially filled collection is propagated, and a []byte holding a zero byte is ordinary data", complaints)
+		}
+
+		for name, blank := range map[string]walkCollections{
+			"Strings": {Strings: []string{"", ""}, Labels: map[string]string{"k": "v"}, Fixed: [2]walkNested{{Name: "x"}}, Raw: []byte{1}},
+			"Labels":  {Strings: []string{"x"}, Labels: map[string]string{"k": ""}, Fixed: [2]walkNested{{Name: "x"}}, Raw: []byte{1}},
+			"Fixed":   {Strings: []string{"x"}, Labels: map[string]string{"k": "v"}, Fixed: [2]walkNested{}, Raw: []byte{1}},
+			"Raw":     {Strings: []string{"x"}, Labels: map[string]string{"k": "v"}, Fixed: [2]walkNested{{Name: "x"}}, Raw: []byte{0, 0}},
+		} {
+			complaints, err := unpropagatedFields(blank)
+			if err != nil {
+				t.Fatalf("unpropagatedFields: %v", err)
+			}
+			if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "."+name) }) {
+				t.Errorf("a blanked %s produced %q, want a complaint naming it", name, complaints)
+			}
+		}
+	})
+
+	// W5. A cyclic value must COMPLAIN, not exhaust the stack. A guard whose
+	// failure mode on an input class is a crash reports nothing at all.
+	t.Run("a cyclic value is bounded rather than fatal", func(t *testing.T) {
+		t.Parallel()
+		cycle := &walkCyclic{Name: "carried"}
+		cycle.Next = cycle
+		complaints, err := unpropagatedFields(struct{ Cycle *walkCyclic }{Cycle: cycle})
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "depth limit") }) {
+			t.Errorf("complaints = %q, want one naming the depth limit", complaints)
+		}
+	})
+
+	// W6. The documented alternative to lying in a shared fixture.
+	t.Run("allowedZero exempts exactly the field it names", func(t *testing.T) {
+		t.Parallel()
+		probe := walkOptional{Str: "carried"}
+		complaints, err := unpropagatedFields(probe, "walkOptional.Flag")
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if len(complaints) != 0 {
+			t.Errorf("complaints = %q, want none: the zero field was named as permitted", complaints)
+		}
+		// And it exempts nothing else: blanking a second field still reports.
+		complaints, err = unpropagatedFields(walkOptional{}, "walkOptional.Flag")
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "Str") }) {
+			t.Errorf("complaints = %q, want one naming Str. An opt-out that exempts more than it names is worse than none", complaints)
+		}
+	})
+
+	t.Run("a pointer to an empty struct is reported", func(t *testing.T) {
+		t.Parallel()
+		complaints, err := unpropagatedFields(struct {
+			Str   string
+			Empty *walkEmpty
+		}{Str: "carried", Empty: &walkEmpty{}})
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "Empty") }) {
+			t.Errorf("complaints = %q, want one naming the pointer to an empty struct", complaints)
+		}
+	})
+
+	t.Run("a nested empty struct is reported rather than skipped", func(t *testing.T) {
+		t.Parallel()
+		complaints, err := unpropagatedFields(walkWithEmptyNested{Str: "carried"})
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, "Empty") }) {
+			t.Errorf("complaints = %q, want one naming the nested empty struct", complaints)
 		}
 	})
 
@@ -501,6 +765,58 @@ func TestRestoreFailsClosedOnCompatibilityMismatch(t *testing.T) {
 	}
 	if rig.Launches() != 1 {
 		t.Errorf("the matching restore launched %d times, want 1", rig.Launches())
+	}
+}
+
+// TestRestoreComparesAgainstTHISTargetsBuild varies the TARGET side, which
+// nothing did.
+//
+// Every other restore test builds its target through rigTarget, which hardcodes
+// "rig-2026-09", so only the request side ever varied — and replacing
+// `request.CompatibilityID != t.compatibility` with a comparison against the
+// literal "rig-2026-09" left the whole module green. This is the accessor /
+// comparison divergence that CompatibilityID's own doc gives as the reason it
+// has a test, uncovered on the comparison half: the accessor got its second
+// target two rounds ago and the comparison did not.
+//
+// The failure it admits is not subtle. A Host registering two agents at
+// different builds would have a target declared rig-2025-01 that ACCEPTS
+// durable state written by rig-2026-09 and REFUSES its own, reporting itself
+// contradictory on the way — "written by rig-2025-01 and this target launches
+// rig-2025-01" — because Target is read off t.compatibility while the decision
+// no longer is.
+func TestRestoreComparesAgainstTHISTargetsBuild(t *testing.T) {
+	t.Parallel()
+
+	rig := &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}
+	target, err := department.NewRigTarget(rig, "rig-2025-01", pooledCapabilities())
+	if err != nil {
+		t.Fatalf("NewRigTarget: %v", err)
+	}
+
+	// Its own build is accepted.
+	if _, err := target.Restore(t.Context(), restoreRequest("rig-2025-01")); err != nil {
+		t.Fatalf("Restore onto this target's own build: %v", err)
+	}
+	if rig.Launches() != 1 {
+		t.Fatalf("the matching restore launched %d times, want 1", rig.Launches())
+	}
+
+	// The build every OTHER test in this file uses is refused, which is the
+	// half a hardcoded comparison inverts.
+	runtime, err := target.Restore(t.Context(), restoreRequest("rig-2026-09"))
+	var mismatch *department.CompatibilityMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Restore onto a foreign build error = %v, want *CompatibilityMismatchError", err)
+	}
+	if runtime != nil {
+		t.Error("Restore returned a runtime alongside its error")
+	}
+	if rig.Launches() != 1 {
+		t.Errorf("the rig launched %d times; the refusal must be decided before anything is launched", rig.Launches())
+	}
+	if mismatch.Durable != "rig-2026-09" || mismatch.Target != "rig-2025-01" {
+		t.Errorf("mismatch = %+v, want Durable rig-2026-09 and Target rig-2025-01. An error naming the same build twice means the comparison and the accessor disagree", mismatch)
 	}
 }
 
@@ -614,6 +930,48 @@ func TestIncapableRuntimeErrorNamesEveryMissingCapability(t *testing.T) {
 	}
 }
 
+// TestRigSessionIDSurvivesAWrapperAndRefusesAStranger covers the branch nothing
+// covered, and the reason it is an interface assertion.
+//
+// runtime.(*rigRuntime) would break the day anything wraps a Runtime — a
+// residency decorator, a metrics wrapper, a spy — and it would break by
+// returning false, which reads as "not one of ours" when it means "your wrapper
+// ate it". The interface assertion survives a wrapper that forwards the method.
+func TestRigSessionIDSurvivesAWrapperAndRefusesAStranger(t *testing.T) {
+	t.Parallel()
+
+	rig := &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}
+	adapted, err := rigTarget(t, rig).Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if got, ok := department.RigSessionID(forwardingWrapper{Runtime: adapted}); !ok || got != rigSessionUUID {
+		t.Errorf("RigSessionID through a forwarding wrapper = (%v, %v), want (%v, true). A concrete type assertion would report false here and read as \"not one of ours\"", got, ok, rigSessionUUID)
+	}
+
+	// A Runtime this package did not adapt reports false, which is the branch
+	// that had no test at all.
+	if got, ok := department.RigSessionID(fakeRuntime{}); ok {
+		t.Errorf("RigSessionID of a foreign Runtime = (%v, %v), want (zero, false)", got, ok)
+	}
+	if _, ok := department.RigSessionID(opaqueWrapper{Runtime: adapted}); ok {
+		t.Error("RigSessionID reported true through a wrapper that does not forward it")
+	}
+}
+
+// forwardingWrapper is the decorator shape O2 will actually build.
+type forwardingWrapper struct{ department.Runtime }
+
+// RigSessionID forwards to the wrapped runtime.
+func (w forwardingWrapper) RigSessionID() uuid.UUID {
+	id, _ := department.RigSessionID(w.Runtime)
+	return id
+}
+
+// opaqueWrapper wraps a Runtime without forwarding the correlation method.
+type opaqueWrapper struct{ department.Runtime }
+
 // ---------------------------------------------------------------------------
 // Construction and rig failure
 // ---------------------------------------------------------------------------
@@ -672,9 +1030,18 @@ func TestNewRigTargetSharesTheDepartmentsCapabilityRules(t *testing.T) {
 		if (targetErr == nil) != (registryErr == nil) {
 			t.Errorf("for %+v NewRigTarget error = %v but department.New error = %v; the two disagree about the same rule", capabilities, targetErr, registryErr)
 		}
+		// BOTH halves. The extraction that created *InvalidCapabilitiesError
+		// also moved O1.1's "unwraps to nil" assertion off the capability rules
+		// to make room for it — so it created a guarantee, relocated the
+		// assertion that used to constrain that code, and then pinned only
+		// NewRigTarget's side. Deleting `Cause: err` from validateRegistration's
+		// capability branch left the suite green.
 		var invalid *department.InvalidCapabilitiesError
 		if !errors.As(targetErr, &invalid) {
 			t.Errorf("NewRigTarget error = %v; errors.As did not reach *InvalidCapabilitiesError", targetErr)
+		}
+		if !errors.As(registryErr, &invalid) {
+			t.Errorf("department.New error = %v; errors.As did not reach *InvalidCapabilitiesError. The registry applies the same rules through the same function, so it must carry the same typed cause", registryErr)
 		}
 	}
 
@@ -713,18 +1080,66 @@ func TestLaunchWrapsARigFailureWithoutLosingTheCause(t *testing.T) {
 			if runtime != nil {
 				t.Error("a failed launch returned a runtime")
 			}
-			if launchErr.Operation == "" {
-				t.Error("the error does not say which operation failed")
+			// The exact label, not merely a non-empty one: swapping "create"
+			// and "restore" left the suite green, which is a message that
+			// sends the reader to the wrong half of the adapter.
+			if launchErr.Operation != launch.name {
+				t.Errorf("Operation = %q, want %q", launchErr.Operation, launch.name)
 			}
 		})
 	}
+
+	// The Error method must not panic on a nil Cause. This is an EXPORTED
+	// struct, so another package may construct one without a cause, and an
+	// Error method that dereferences unconditionally fires its nil panic while
+	// something is already reporting a failure — the worst possible moment.
+	// Nothing tested this: deleting the nil check left the suite green because
+	// every RigLaunchError in this file is built by the adapter, which always
+	// supplies one.
+	t.Run("a launch error with no cause still formats", func(t *testing.T) {
+		t.Parallel()
+		bare := &department.RigLaunchError{AgentID: "reviewer", SessionID: "session-71c", Operation: "create"}
+		message := bare.Error()
+		if message == "" {
+			t.Fatal("Error() returned nothing")
+		}
+		if !strings.Contains(message, "reviewer") || !strings.Contains(message, "create") {
+			t.Errorf("Error() = %q, want it to name the agent and the operation", message)
+		}
+		if errors.Unwrap(bare) != nil {
+			t.Error("Unwrap() invented a cause")
+		}
+	})
 }
 
 // TestLaunchRejectsASessionTheRigDidNotReturn covers the rig that reports
 // success and hands back nothing, which is a contract violation this package
 // must not turn into a nil dereference three layers away.
+//
+// It covers BOTH nils. A nil interface is what a fake produces; a TYPED nil —
+// a non-nil interface holding a nil pointer — is what a real rig produces, from
+// `var s *Session; ...; return s, nil`, and that one panicked. The guard that
+// claimed to prevent a dereference three layers away covered only the nil this
+// package's own test double happens to make.
 func TestLaunchRejectsASessionTheRigDidNotReturn(t *testing.T) {
 	t.Parallel()
+
+	t.Run("a typed nil is not a session", func(t *testing.T) {
+		t.Parallel()
+		var absent *testkit.FullSession
+		rig := &testkit.FakeRig{Session: absent}
+		runtime, err := rigTarget(t, rig).Create(t.Context(), launchRequest())
+		if runtime != nil {
+			t.Error("Create returned a runtime for a typed-nil session")
+		}
+		var launchErr *department.RigLaunchError
+		if !errors.As(err, &launchErr) {
+			t.Fatalf("Create with a typed-nil session error = %v, want *RigLaunchError", err)
+		}
+		if !errors.Is(err, department.ErrNoRigSession) {
+			t.Error("a typed-nil session was not reported as an absent one")
+		}
+	})
 
 	rig := &testkit.FakeRig{}
 	runtime, err := rigTarget(t, rig).Create(t.Context(), launchRequest())
