@@ -266,10 +266,12 @@ func assertEveryFieldPropagated(t *testing.T, received any, allowedZero ...strin
 //     propagated but blanked is exactly the defect this walk exists to catch.
 //   - INTERFACES and POINTERS: nil, then the payload. any("") is a non-nil
 //     interface holding a zero value.
-//   - STRUCTS: an empty one is reported, because it can never carry data and no
-//     walk can judge it; one whose fields are all exported is walked; one with
-//     unexported fields and no IsZero is judged whole by reflect, which is the
-//     best available answer and an admitted approximation.
+//   - STRUCTS are asked LAST and in that order: an empty one is reported,
+//     because it can never carry data and no walk can judge it; one whose fields
+//     are all exported is WALKED PER-FIELD even if it has an IsZero, since the
+//     per-field answer is strictly better and a self-judging struct that gains a
+//     field would otherwise hide it; only one with unexported fields consults
+//     IsZero, then reflect.
 //   - UNEXPORTED FIELDS are reported as unverifiable rather than skipped. A test
 //     outside this package cannot set one, so it would sit permanently zero.
 //
@@ -283,6 +285,15 @@ func assertEveryFieldPropagated(t *testing.T, received any, allowedZero ...strin
 //   - Recursion is bounded at maxWalkDepth. Beyond it the walk complains rather
 //     than descending, so a legitimately deeper shape would be reported as a
 //     defect it is not.
+//   - A POINTER-RECEIVER IsZero splits one type in two: declared as a value
+//     field an all-exported struct is walked per-field, declared as a pointer it
+//     satisfies the interface and is judged whole. Whether the walk checks
+//     fields therefore depends on how the field was DECLARED, not on the type.
+//   - MAP KEYS are never judged, only values, so map[string]string{"": "v"}
+//     passes.
+//   - allowedZero naming a STRUCT field exempts its entire subtree, and keeps
+//     exempting it as the struct grows. An exemption written for one field
+//     silently widens to every field added under it later.
 //   - PARTIAL emptiness inside a collection. A slice or map passes when ANY
 //     element carries data, so []string{"a", ""} and a partially filled array
 //     are accepted. Requiring every element would false-positive on a []byte or
@@ -322,14 +333,43 @@ func valueCarriesData(value reflect.Value, name string, allowedZero []string, de
 	if depth > maxWalkDepth {
 		return []string{name + " exceeded the walk's depth limit of " + strconv.Itoa(maxWalkDepth) + "; a cyclic value would otherwise exhaust the stack, and a guard that crashes reports nothing"}
 	}
-	// The type's own answer wins wherever it has one.
-	if value.CanInterface() {
-		if zeroer, ok := value.Interface().(interface{ IsZero() bool }); ok {
-			if zeroer.IsZero() {
-				return []string{name + " reports itself zero via " + value.Type().String() + ".IsZero in what the rig received"}
-			}
-			return nil
+	// A STRUCT IS ASKED LAST, and the ordering is the whole of a defect this
+	// walk had. Consulting IsZero before the kind switch let a self-judging
+	// all-exported struct short-circuit the per-field walk — and IsZero methods
+	// are written when a type has one field and almost never updated when it
+	// grows, so the hand-maintained staleness the walk exists to escape came
+	// back through the new rule's front door:
+	//
+	//	type T struct{ A, B string }
+	//	func (t T) IsZero() bool { return t.A == "" }
+	//
+	// T{A: "x"} then reported nothing while B was added and never propagated.
+	// IsZero is now consulted only where the walk CANNOT do better: non-struct
+	// kinds, and structs with unexported fields. An all-exported struct keeps
+	// its per-field answer, which is strictly more informative than any
+	// whole-value verdict it could give about itself.
+	if value.Kind() == reflect.Struct {
+		if value.NumField() == 0 {
+			return []string{name + " is an empty struct; it can never carry data and this walk cannot judge it"}
 		}
+		if allFieldsExported(value.Type()) {
+			return walkForData(value, name, allowedZero, depth)
+		}
+		if complaints, judged := selfJudged(value, name); judged {
+			return complaints
+		}
+		// A foreign struct with no IsZero: judged whole, which is an admitted
+		// approximation rather than a per-field answer.
+		if value.IsZero() {
+			return []string{name + " is the zero " + value.Type().String() + " in what the rig received"}
+		}
+		return nil
+	}
+
+	// Every other kind: the type's own answer wins where it has one, because
+	// here the walk has nothing better to offer.
+	if complaints, judged := selfJudged(value, name); judged {
+		return complaints
 	}
 	switch value.Kind() {
 	case reflect.Slice, reflect.Map, reflect.Array:
@@ -339,25 +379,27 @@ func valueCarriesData(value reflect.Value, name string, allowedZero []string, de
 			return []string{name + " is nil in what the rig received"}
 		}
 		return valueCarriesData(value.Elem(), name, allowedZero, depth+1)
-	case reflect.Struct:
-		if value.NumField() == 0 {
-			return []string{name + " is an empty struct; it can never carry data and this walk cannot judge it"}
-		}
-		if allFieldsExported(value.Type()) {
-			return walkForData(value, name, allowedZero, depth)
-		}
-		// A foreign struct with no IsZero: judged whole, which is an admitted
-		// approximation rather than a per-field answer.
-		if value.IsZero() {
-			return []string{name + " is the zero " + value.Type().String() + " in what the rig received"}
-		}
-		return nil
 	default:
 		if value.IsZero() {
 			return []string{name + " is the zero value in what the rig received. Either the adapter does not propagate it or the fixture does not set it — for this assertion those are one defect, because a field nobody wired is invisible to a whole-value comparison: want and got agree at zero"}
 		}
 		return nil
 	}
+}
+
+// selfJudged asks a value whether it is zero, if its type says how.
+func selfJudged(value reflect.Value, name string) ([]string, bool) {
+	if !value.CanInterface() {
+		return nil, false
+	}
+	zeroer, ok := value.Interface().(interface{ IsZero() bool })
+	if !ok {
+		return nil, false
+	}
+	if zeroer.IsZero() {
+		return []string{name + " reports itself zero via " + value.Type().String() + ".IsZero in what the rig received"}, true
+	}
+	return nil, true
 }
 
 // elementsCarryData requires a collection to be non-empty AND at least one
@@ -442,6 +484,23 @@ type walkCollections struct {
 	Fixed   [2]walkNested
 	Raw     []byte
 }
+
+// walkVersion is a NON-STRUCT type that judges itself, which is the case the
+// element walk cannot answer: it reports emptiness by its leading component,
+// while "at least one element carries data" would call {0, 1, 0} populated.
+// uuid.UUID is the real instance of this shape in this program.
+type walkVersion [3]int
+
+// IsZero reports whether the version is unset, which it decides by its major.
+func (v walkVersion) IsZero() bool { return v[0] == 0 }
+
+// walkSelfJudging is the fifth class, and it is the shape an IsZero method
+// actually has in the wild: written when the type had ONE field, never revisited
+// when it grew. B is invisible to it.
+type walkSelfJudging struct{ A, B string }
+
+// IsZero reports whether the value is empty, judging only its first field.
+func (w walkSelfJudging) IsZero() bool { return w.A == "" }
 
 type walkOptional struct {
 	Str  string
@@ -654,6 +713,69 @@ func TestTheWalkJudgesEveryFieldClass(t *testing.T) {
 		}
 	})
 
+	// The NON-STRUCT half of "ask the type". It needs its own row because the
+	// time.Time row exercises the STRUCT branch — time.Time has unexported
+	// fields — so removing IsZero for every other kind was a survivor until
+	// this existed. An array whose type reports emptiness by one component
+	// disagrees with "at least one element carries data", which is exactly the
+	// case where the walk cannot do better than the type.
+	t.Run("a non-struct type that judges itself is asked", func(t *testing.T) {
+		t.Parallel()
+		probe := struct{ V walkVersion }{V: walkVersion{0, 1, 0}}
+		if !probe.V.IsZero() {
+			t.Fatal("the fixture does not report itself zero, so this row proves nothing")
+		}
+		if reflect.ValueOf(probe.V).IsZero() {
+			t.Fatal("reflect already agrees, so this row cannot distinguish the two")
+		}
+		complaints, err := unpropagatedFields(probe)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, ".V") }) {
+			t.Errorf("complaints = %q, want one naming V. An element walk would call {0,1,0} populated; only the type knows it is unset", complaints)
+		}
+		// And a populated one passes, so the row is not satisfied by a walk
+		// that rejects every value of this type.
+		complaints, err = unpropagatedFields(struct{ V walkVersion }{V: walkVersion{1, 0, 0}})
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if len(complaints) != 0 {
+			t.Errorf("complaints = %q, want none for a set version", complaints)
+		}
+	})
+
+	// The fifth class, and a direct consequence of the fix for the first: asking
+	// the type won for time.Time and then won too often. A self-judging struct
+	// whose fields are all exported must still be WALKED, because IsZero
+	// methods are written for one field and almost never updated when the
+	// struct grows — which is the hand-maintained staleness this whole walk
+	// exists to escape, re-entering through the new rule's front door.
+	t.Run("a self-judging all-exported struct is still walked per-field", func(t *testing.T) {
+		t.Parallel()
+		probe := struct{ S walkSelfJudging }{S: walkSelfJudging{A: "carried"}}
+		if probe.S.IsZero() {
+			t.Fatal("the fixture reports itself zero, so this row cannot show the walk overriding it")
+		}
+		complaints, err := unpropagatedFields(probe)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if !slices.ContainsFunc(complaints, func(c string) bool { return strings.Contains(c, ".S.B") }) {
+			t.Errorf("complaints = %q, want one naming S.B. The type says it is populated and it is missing a field; the per-field answer is the better one and must win", complaints)
+		}
+		// And the walk does not simply ignore the type: fully populated passes.
+		full := struct{ S walkSelfJudging }{S: walkSelfJudging{A: "carried", B: "carried"}}
+		complaints, err = unpropagatedFields(full)
+		if err != nil {
+			t.Fatalf("unpropagatedFields: %v", err)
+		}
+		if len(complaints) != 0 {
+			t.Errorf("complaints = %q, want none for a fully populated self-judging struct", complaints)
+		}
+	})
+
 	// W5. A cyclic value must COMPLAIN, not exhaust the stack. A guard whose
 	// failure mode on an input class is a crash reports nothing at all.
 	t.Run("a cyclic value is bounded rather than fatal", func(t *testing.T) {
@@ -817,6 +939,31 @@ func TestRestoreComparesAgainstTHISTargetsBuild(t *testing.T) {
 	}
 	if mismatch.Durable != "rig-2026-09" || mismatch.Target != "rig-2025-01" {
 		t.Errorf("mismatch = %+v, want Durable rig-2026-09 and Target rig-2025-01. An error naming the same build twice means the comparison and the accessor disagree", mismatch)
+	}
+
+	// The comparison is EXACT BYTE IDENTITY, and the two rows below are the
+	// leniencies a maintainer reaches for. Both FAIL OPEN, which is why they are
+	// pinned rather than left to taste: Core validates this field with
+	// validateHostLinkOpaque, an opaque-identity rule, so "tolerate a compatible
+	// family" or "ignore casing" is a contract change wearing the costume of a
+	// kindness. A prefix rule restores rig-2026-09-hotfix2 state onto a
+	// rig-2026-09 runtime; a case-insensitive one restores RIG-2026-09 state
+	// onto anything.
+	for _, durable := range []department.CompatibilityID{
+		"rig-2025-01-hotfix2", // extends the target's id
+		"RIG-2025-01",         // differs only in case
+		"rig-2025",            // a prefix OF the target's id
+	} {
+		runtime, err := target.Restore(t.Context(), restoreRequest(durable))
+		if !errors.As(err, &mismatch) {
+			t.Errorf("Restore of state written by %q error = %v, want *CompatibilityMismatchError. Compatibility is opaque byte identity, and every loosening of it fails open", durable, err)
+		}
+		if runtime != nil {
+			t.Errorf("Restore of state written by %q returned a runtime", durable)
+		}
+	}
+	if rig.Launches() != 1 {
+		t.Errorf("the rig launched %d times, want 1: none of the near-miss builds may launch", rig.Launches())
 	}
 }
 
