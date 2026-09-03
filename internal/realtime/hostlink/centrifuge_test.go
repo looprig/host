@@ -237,56 +237,75 @@ func TestServiceLinkIgnoresBrowserOriginAndDisablesCompression(t *testing.T) {
 	connection.Close()
 }
 
-func TestHostLinkRequiresExplicitJSONSubprotocol(t *testing.T) {
+func TestHostLinkAcceptsExplicitJSONSelectors(t *testing.T) {
+	auth := &recordingAuthenticator{wantToken: testCredential}
+	server, httpServer := startServer(t, auth, hostlink.Config{})
+	defer closeServers(t, server, httpServer)
+
+	for _, test := range []struct {
+		name            string
+		suffix          string
+		protocols       []string
+		wantSubprotocol string
+	}{
+		{name: "header", protocols: []string{"centrifuge-json"}, wantSubprotocol: "centrifuge-json"},
+		{name: "format query", suffix: "?format=json"},
+		{name: "protocol query", suffix: "?cf_protocol=json"},
+		{name: "repeated JSON query", suffix: "?format=json&format=json"},
+		{name: "both JSON queries", suffix: "?format=json&cf_protocol=json"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := websocket.Dialer{Subprotocols: test.protocols}
+			connection, response, err := dialer.Dial(wsURL(httpServer.URL)+test.suffix, nil)
+			if err != nil {
+				t.Fatalf("explicit JSON dial: %v (response %#v)", err, response)
+			}
+			defer connection.Close()
+			if got := connection.Subprotocol(); got != test.wantSubprotocol {
+				t.Fatalf("negotiated subprotocol = %q, want %q", got, test.wantSubprotocol)
+			}
+		})
+	}
+}
+
+func TestHostLinkRejectsInvalidProtocolSelectors(t *testing.T) {
 	auth := &recordingAuthenticator{wantToken: testCredential}
 	server, httpServer := startServer(t, auth, hostlink.Config{})
 	defer closeServers(t, server, httpServer)
 
 	for _, test := range []struct {
 		name      string
+		suffix    string
 		protocols []string
-		accepted  bool
+		header    http.Header
 	}{
-		{name: "JSON", protocols: []string{"centrifuge-json"}, accepted: true},
 		{name: "absent"},
-		{name: "unknown", protocols: []string{"something-else"}},
-		{name: "protobuf", protocols: []string{"centrifuge-protobuf"}},
-		{name: "JSON plus unknown", protocols: []string{"centrifuge-json", "something-else"}},
-		{name: "JSON plus protobuf", protocols: []string{"centrifuge-json", "centrifuge-protobuf"}},
+		{name: "unknown header", protocols: []string{"something-else"}},
+		{name: "protobuf header", protocols: []string{"centrifuge-protobuf"}},
+		{name: "JSON plus unknown header tokens", protocols: []string{"centrifuge-json", "something-else"}},
+		{name: "JSON plus protobuf header tokens", protocols: []string{"centrifuge-json", "centrifuge-protobuf"}},
+		{name: "empty header token", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json,"}}},
+		{name: "multiple physical header fields", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-json"}}},
+		{name: "protobuf in second physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-protobuf"}}},
+		{name: "header casing variant", protocols: []string{"Centrifuge-JSON"}},
+		{name: "format protobuf", suffix: "?format=protobuf", protocols: []string{"centrifuge-json"}},
+		{name: "format unknown", suffix: "?format=something-else", protocols: []string{"centrifuge-json"}},
+		{name: "format empty", suffix: "?format=", protocols: []string{"centrifuge-json"}},
+		{name: "format casing variant", suffix: "?format=JSON", protocols: []string{"centrifuge-json"}},
+		{name: "format repeated JSON then protobuf", suffix: "?format=json&format=protobuf", protocols: []string{"centrifuge-json"}},
+		{name: "format repeated JSON then empty", suffix: "?format=json&format=", protocols: []string{"centrifuge-json"}},
+		{name: "protocol protobuf", suffix: "?cf_protocol=protobuf", protocols: []string{"centrifuge-json"}},
+		{name: "protocol unknown", suffix: "?cf_protocol=something-else", protocols: []string{"centrifuge-json"}},
+		{name: "protocol empty", suffix: "?cf_protocol=", protocols: []string{"centrifuge-json"}},
+		{name: "protocol casing variant", suffix: "?cf_protocol=JSON", protocols: []string{"centrifuge-json"}},
+		{name: "protocol repeated JSON then protobuf", suffix: "?cf_protocol=json&cf_protocol=protobuf", protocols: []string{"centrifuge-json"}},
+		{name: "protocol repeated JSON then empty", suffix: "?cf_protocol=json&cf_protocol=", protocols: []string{"centrifuge-json"}},
+		{name: "valid format with invalid protocol", suffix: "?format=json&cf_protocol=protobuf"},
+		{name: "valid header with invalid format", suffix: "?format=unknown", protocols: []string{"centrifuge-json"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dialer := websocket.Dialer{Subprotocols: test.protocols}
-			connection, response, err := dialer.Dial(wsURL(httpServer.URL), nil)
-			if test.accepted {
-				if err != nil {
-					t.Fatalf("explicit JSON dial: %v", err)
-				}
-				defer connection.Close()
-				if got := connection.Subprotocol(); got != "centrifuge-json" {
-					t.Fatalf("negotiated subprotocol = %q, want centrifuge-json", got)
-				}
-				return
-			}
-			assertUpgradeRejected(t, connection, response, err)
-		})
-	}
-}
-
-func TestHostLinkRejectsProtobufQuerySelectors(t *testing.T) {
-	auth := &recordingAuthenticator{wantToken: testCredential}
-	server, httpServer := startServer(t, auth, hostlink.Config{})
-	defer closeServers(t, server, httpServer)
-
-	for _, test := range []struct {
-		name   string
-		suffix string
-	}{
-		{name: "format query", suffix: "?format=protobuf"},
-		{name: "protocol query", suffix: "?cf_protocol=protobuf"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			dialer := websocket.Dialer{Subprotocols: []string{"centrifuge-json"}}
-			connection, response, err := dialer.Dial(wsURL(httpServer.URL)+test.suffix, nil)
+			connection, response, err := dialer.Dial(wsURL(httpServer.URL)+test.suffix, test.header)
 			assertUpgradeRejected(t, connection, response, err)
 		})
 	}

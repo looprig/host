@@ -1,13 +1,18 @@
 package hostlink_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -24,147 +29,237 @@ func TestExportedPackageBoundaryDoesNotExposeCentrifuge(t *testing.T) {
 	}
 
 	set := token.NewFileSet()
-	var files []sourceFile
-	types := map[string]typeDeclaration{}
+	var files []*ast.File
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
 		}
 		path := filepath.Join(packageDir, entry.Name())
-		file, err := parser.ParseFile(set, path, nil, 0)
+		file, err := parser.ParseFile(set, path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("parse %s: %v", entry.Name(), err)
 		}
-		imports := importPaths(t, file)
-		files = append(files, sourceFile{name: entry.Name(), syntax: file, imports: imports})
-		for _, declaration := range file.Decls {
-			general, ok := declaration.(*ast.GenDecl)
-			if !ok || general.Tok != token.TYPE {
-				continue
-			}
-			for _, specification := range general.Specs {
-				typeSpec := specification.(*ast.TypeSpec)
-				types[typeSpec.Name.Name] = typeDeclaration{expression: typeSpec.Type, imports: imports}
-			}
-		}
+		files = append(files, file)
 	}
 	if len(files) == 0 {
 		t.Fatal("boundary guard found zero production Go files")
 	}
 
-	observedPackages := map[string]bool{}
+	exports := dependencyExports(t, packageDir)
+	lookup := func(path string) (io.ReadCloser, error) {
+		export, ok := exports[path]
+		if !ok || export == "" {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(export)
+	}
+	information := &types.Info{
+		Types: map[ast.Expr]types.TypeAndValue{},
+		Defs:  map[*ast.Ident]types.Object{},
+	}
+	checked, err := (&types.Config{Importer: importer.ForCompiler(set, "gc", lookup)}).Check("github.com/looprig/host/internal/realtime/hostlink", set, files, information)
+	if err != nil {
+		t.Fatalf("type-check production package: %v", err)
+	}
+
+	walker := boundaryTypeWalker{t: t, observedPackages: map[string]bool{}, seen: map[types.Type]bool{}}
 	exported := 0
+	for _, name := range checked.Scope().Names() {
+		if !ast.IsExported(name) {
+			continue
+		}
+		exported++
+		object := checked.Scope().Lookup(name)
+		walker.inspect(object.String(), object.Type())
+	}
+	if exported == 0 {
+		t.Fatal("boundary guard found zero exported package-scope objects")
+	}
+
+	exportedDeclarations := 0
 	for _, file := range files {
-		for _, declaration := range file.syntax.Decls {
+		for _, declaration := range file.Decls {
 			switch declaration := declaration.(type) {
 			case *ast.FuncDecl:
-				if !ast.IsExported(declaration.Name.Name) {
+				if !declaration.Name.IsExported() {
 					continue
 				}
-				exported++
-				assertBoundaryExpression(t, file.name+":"+declaration.Name.Name, declaration.Type, file.imports, types, observedPackages, map[string]bool{})
+				exportedDeclarations++
+				walker.inspect(declaration.Name.Name, information.Defs[declaration.Name].Type())
 			case *ast.GenDecl:
 				for _, specification := range declaration.Specs {
 					switch specification := specification.(type) {
 					case *ast.TypeSpec:
-						if !ast.IsExported(specification.Name.Name) {
+						if !specification.Name.IsExported() {
 							continue
 						}
-						exported++
-						assertBoundaryExpression(t, file.name+":"+specification.Name.Name, specification.Type, file.imports, types, observedPackages, map[string]bool{})
+						exportedDeclarations++
+						walker.inspect(specification.Name.Name, information.Defs[specification.Name].Type())
+						walker.inspect(specification.Name.Name+" definition", information.TypeOf(specification.Type))
 					case *ast.ValueSpec:
-						for index, name := range specification.Names {
-							if !ast.IsExported(name.Name) {
+						for _, name := range specification.Names {
+							if !name.IsExported() {
 								continue
 							}
-							exported++
-							if specification.Type != nil {
-								assertBoundaryExpression(t, file.name+":"+name.Name, specification.Type, file.imports, types, observedPackages, map[string]bool{})
-							} else if index < len(specification.Values) {
-								assertBoundaryExpression(t, file.name+":"+name.Name, specification.Values[index], file.imports, types, observedPackages, map[string]bool{})
-							} else {
-								t.Fatalf("%s:%s has an inferred exported type the guard cannot resolve", file.name, name.Name)
-							}
+							exportedDeclarations++
+							walker.inspect(name.Name, information.Defs[name].Type())
 						}
 					}
 				}
 			}
 		}
 	}
-	if exported == 0 {
-		t.Fatal("boundary guard found zero exported declarations")
+	if exportedDeclarations == 0 {
+		t.Fatal("boundary guard found zero exported source declarations")
 	}
 	for _, legal := range []string{"context", "net/http", "time", "github.com/looprig/core/sessionwire/v1"} {
-		if !observedPackages[legal] {
+		if !walker.observedPackages[legal] {
 			t.Errorf("boundary guard did not traverse legal package %q", legal)
 		}
 	}
 }
 
-type sourceFile struct {
-	name    string
-	syntax  *ast.File
-	imports map[string]string
+type listedPackage struct {
+	ImportPath string
+	Export     string
 }
 
-type typeDeclaration struct {
-	expression ast.Expr
-	imports    map[string]string
-}
-
-func importPaths(t *testing.T, file *ast.File) map[string]string {
+func dependencyExports(t *testing.T, packageDir string) map[string]string {
 	t.Helper()
-	imports := map[string]string{}
-	for _, specification := range file.Imports {
-		path, err := strconv.Unquote(specification.Path.Value)
-		if err != nil {
-			t.Fatalf("unquote import %s: %v", specification.Path.Value, err)
+	command := exec.Command("go", "list", "-deps", "-export", "-json", ".")
+	command.Dir = packageDir
+	command.Env = appendWithoutGoWork(os.Environ(), "GOWORK=off")
+	output, err := command.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("go list dependencies: %v\n%s", err, exitError.Stderr)
 		}
-		name := filepath.Base(path)
-		if specification.Name != nil {
-			name = specification.Name.Name
-		}
-		if name == "." && isCentrifugeImport(path) {
-			t.Fatalf("dot import could expose forbidden Centrifuge declarations: %s", path)
-		}
-		imports[name] = path
+		t.Fatalf("go list dependencies: %v", err)
 	}
-	return imports
-}
 
-func assertBoundaryExpression(t *testing.T, subject string, expression ast.Expr, imports map[string]string, types map[string]typeDeclaration, observedPackages map[string]bool, visiting map[string]bool) {
-	t.Helper()
-	ast.Inspect(expression, func(node ast.Node) bool {
-		switch node := node.(type) {
-		case *ast.SelectorExpr:
-			identifier, ok := node.X.(*ast.Ident)
-			if !ok {
-				return true
+	exports := map[string]string{}
+	decoder := json.NewDecoder(strings.NewReader(string(output)))
+	for {
+		var listed listedPackage
+		if err := decoder.Decode(&listed); err != nil {
+			if err == io.EOF {
+				break
 			}
-			path := imports[identifier.Name]
-			if path == "" {
-				return true
-			}
-			observedPackages[path] = true
-			if isCentrifugeImport(path) {
-				t.Fatalf("%s exposes forbidden type %s.%s from %s", subject, identifier.Name, node.Sel.Name, path)
-			}
-		case *ast.Ident:
-			declaration, ok := types[node.Name]
-			if !ok || visiting[node.Name] {
-				return true
-			}
-			visiting[node.Name] = true
-			assertBoundaryExpression(t, subject+"->"+node.Name, declaration.expression, declaration.imports, types, observedPackages, visiting)
-			delete(visiting, node.Name)
+			t.Fatalf("decode go list output: %v", err)
 		}
-		return true
-	})
+		if listed.Export != "" {
+			exports[listed.ImportPath] = listed.Export
+		}
+	}
+	if len(exports) == 0 {
+		t.Fatal("go list returned zero dependency exports")
+	}
+	return exports
 }
 
-func isCentrifugeImport(path string) bool {
-	const module = "github.com/centrifugal/centrifuge"
-	return path == module || strings.HasPrefix(path, module+"/")
+func appendWithoutGoWork(environment []string, goWork string) []string {
+	filtered := make([]string, 0, len(environment)+1)
+	for _, variable := range environment {
+		if !strings.HasPrefix(variable, "GOWORK=") {
+			filtered = append(filtered, variable)
+		}
+	}
+	return append(filtered, goWork)
+}
+
+type boundaryTypeWalker struct {
+	t                *testing.T
+	observedPackages map[string]bool
+	seen             map[types.Type]bool
+}
+
+func (walker *boundaryTypeWalker) inspect(subject string, typ types.Type) {
+	walker.t.Helper()
+	if typ == nil || walker.seen[typ] {
+		return
+	}
+	walker.seen[typ] = true
+
+	switch typ := typ.(type) {
+	case *types.Alias:
+		walker.inspectPackage(subject, typ.Obj())
+		for index := 0; index < typ.TypeArgs().Len(); index++ {
+			walker.inspect(subject, typ.TypeArgs().At(index))
+		}
+		walker.inspect(subject, types.Unalias(typ))
+	case *types.Named:
+		walker.inspectPackage(subject, typ.Obj())
+		for index := 0; index < typ.TypeArgs().Len(); index++ {
+			walker.inspect(subject, typ.TypeArgs().At(index))
+		}
+		walker.inspect(subject, typ.Underlying())
+		for index := 0; index < typ.NumMethods(); index++ {
+			method := typ.Method(index)
+			if method.Exported() {
+				walker.inspect(subject+" method "+method.Name(), method.Type())
+			}
+		}
+	case *types.Pointer:
+		walker.inspect(subject, typ.Elem())
+	case *types.Array:
+		walker.inspect(subject, typ.Elem())
+	case *types.Slice:
+		walker.inspect(subject, typ.Elem())
+	case *types.Map:
+		walker.inspect(subject, typ.Key())
+		walker.inspect(subject, typ.Elem())
+	case *types.Chan:
+		walker.inspect(subject, typ.Elem())
+	case *types.Struct:
+		for index := 0; index < typ.NumFields(); index++ {
+			field := typ.Field(index)
+			if field.Exported() || field.Anonymous() {
+				walker.inspect(subject+" field "+field.Name(), field.Type())
+			}
+		}
+	case *types.Signature:
+		walker.inspectTuple(subject, typ.Params())
+		walker.inspectTuple(subject, typ.Results())
+		if typeParameters := typ.TypeParams(); typeParameters != nil {
+			for index := 0; index < typeParameters.Len(); index++ {
+				walker.inspect(subject, typeParameters.At(index).Constraint())
+			}
+		}
+	case *types.Interface:
+		typ.Complete()
+		for index := 0; index < typ.NumExplicitMethods(); index++ {
+			method := typ.ExplicitMethod(index)
+			if method.Exported() {
+				walker.inspect(subject+" method "+method.Name(), method.Type())
+			}
+		}
+		for index := 0; index < typ.NumEmbeddeds(); index++ {
+			walker.inspect(subject, typ.EmbeddedType(index))
+		}
+	case *types.TypeParam:
+		walker.inspect(subject, typ.Constraint())
+	case *types.Union:
+		for index := 0; index < typ.Len(); index++ {
+			walker.inspect(subject, typ.Term(index).Type())
+		}
+	}
+}
+
+func (walker *boundaryTypeWalker) inspectTuple(subject string, tuple *types.Tuple) {
+	for index := 0; index < tuple.Len(); index++ {
+		walker.inspect(subject, tuple.At(index).Type())
+	}
+}
+
+func (walker *boundaryTypeWalker) inspectPackage(subject string, object *types.TypeName) {
+	if object.Pkg() == nil {
+		return
+	}
+	path := object.Pkg().Path()
+	walker.observedPackages[path] = true
+	if path == "github.com/centrifugal/centrifuge" || strings.HasPrefix(path, "github.com/centrifugal/centrifuge/") {
+		walker.t.Fatalf("%s exposes forbidden type %s from %s", subject, object.Name(), path)
+	}
 }
 
 func TestHostPinsTheCentrifugeServer(t *testing.T) {

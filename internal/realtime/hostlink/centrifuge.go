@@ -116,12 +116,32 @@ func (s *centrifugeServer) Handler() http.Handler { return s.handler }
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 
 func selectsJSONProtocol(request *http.Request) bool {
-	if request.URL.Query().Get("format") == "protobuf" || request.URL.Query().Get("cf_protocol") == "protobuf" {
+	selected := false
+	headerValues := request.Header.Values("Sec-WebSocket-Protocol")
+	if len(headerValues) > 1 {
 		return false
 	}
-	offered := strings.Split(request.Header.Get("Sec-WebSocket-Protocol"), ",")
-	if len(offered) != 1 {
-		return false
+	if len(headerValues) == 1 {
+		for _, token := range strings.Split(headerValues[0], ",") {
+			if strings.TrimSpace(token) != "centrifuge-json" {
+				return false
+			}
+			selected = true
+		}
 	}
-	return strings.TrimSpace(offered[0]) == "centrifuge-json"
+
+	query := request.URL.Query()
+	for _, key := range []string{"format", "cf_protocol"} {
+		values, supplied := query[key]
+		if !supplied {
+			continue
+		}
+		for _, value := range values {
+			if value != "json" {
+				return false
+			}
+			selected = true
+		}
+	}
+	return selected
 }
