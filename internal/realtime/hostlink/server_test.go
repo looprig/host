@@ -1,82 +1,176 @@
 package hostlink_test
 
 import (
-	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
-	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/host/internal/realtime/hostlink"
 	"golang.org/x/mod/modfile"
 )
 
-func TestServerBoundaryUsesLooprigOwnedTypes(t *testing.T) {
+func TestExportedPackageBoundaryDoesNotExposeCentrifuge(t *testing.T) {
 	t.Parallel()
 
-	var authenticator hostlink.Authenticator = acceptingAuthenticator{}
-	if err := authenticator.VerifyTenant(context.Background(), "tenant-a", "service-secret"); err != nil {
-		t.Fatalf("VerifyTenant: %v", err)
+	packageDir := packageDirectory(t)
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		t.Fatalf("read package directory: %v", err)
 	}
 
-	for _, boundary := range []reflect.Type{
-		reflect.TypeOf((*hostlink.Authenticator)(nil)).Elem(),
-		reflect.TypeOf((*hostlink.Server)(nil)).Elem(),
-		reflect.TypeOf(hostlink.Config{}),
-	} {
-		assertNoCentrifugeType(t, boundary, map[reflect.Type]bool{})
+	set := token.NewFileSet()
+	var files []sourceFile
+	types := map[string]typeDeclaration{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(packageDir, entry.Name())
+		file, err := parser.ParseFile(set, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		imports := importPaths(t, file)
+		files = append(files, sourceFile{name: entry.Name(), syntax: file, imports: imports})
+		for _, declaration := range file.Decls {
+			general, ok := declaration.(*ast.GenDecl)
+			if !ok || general.Tok != token.TYPE {
+				continue
+			}
+			for _, specification := range general.Specs {
+				typeSpec := specification.(*ast.TypeSpec)
+				types[typeSpec.Name.Name] = typeDeclaration{expression: typeSpec.Type, imports: imports}
+			}
+		}
+	}
+	if len(files) == 0 {
+		t.Fatal("boundary guard found zero production Go files")
+	}
+
+	observedPackages := map[string]bool{}
+	exported := 0
+	for _, file := range files {
+		for _, declaration := range file.syntax.Decls {
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				if !ast.IsExported(declaration.Name.Name) {
+					continue
+				}
+				exported++
+				assertBoundaryExpression(t, file.name+":"+declaration.Name.Name, declaration.Type, file.imports, types, observedPackages, map[string]bool{})
+			case *ast.GenDecl:
+				for _, specification := range declaration.Specs {
+					switch specification := specification.(type) {
+					case *ast.TypeSpec:
+						if !ast.IsExported(specification.Name.Name) {
+							continue
+						}
+						exported++
+						assertBoundaryExpression(t, file.name+":"+specification.Name.Name, specification.Type, file.imports, types, observedPackages, map[string]bool{})
+					case *ast.ValueSpec:
+						for index, name := range specification.Names {
+							if !ast.IsExported(name.Name) {
+								continue
+							}
+							exported++
+							if specification.Type != nil {
+								assertBoundaryExpression(t, file.name+":"+name.Name, specification.Type, file.imports, types, observedPackages, map[string]bool{})
+							} else if index < len(specification.Values) {
+								assertBoundaryExpression(t, file.name+":"+name.Name, specification.Values[index], file.imports, types, observedPackages, map[string]bool{})
+							} else {
+								t.Fatalf("%s:%s has an inferred exported type the guard cannot resolve", file.name, name.Name)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if exported == 0 {
+		t.Fatal("boundary guard found zero exported declarations")
+	}
+	for _, legal := range []string{"context", "net/http", "time", "github.com/looprig/core/sessionwire/v1"} {
+		if !observedPackages[legal] {
+			t.Errorf("boundary guard did not traverse legal package %q", legal)
+		}
 	}
 }
 
-type acceptingAuthenticator struct{}
-
-func (acceptingAuthenticator) VerifyTenant(context.Context, sessionwire.TenantID, string) error {
-	return nil
+type sourceFile struct {
+	name    string
+	syntax  *ast.File
+	imports map[string]string
 }
 
-func assertNoCentrifugeType(t *testing.T, typ reflect.Type, seen map[reflect.Type]bool) {
+type typeDeclaration struct {
+	expression ast.Expr
+	imports    map[string]string
+}
+
+func importPaths(t *testing.T, file *ast.File) map[string]string {
 	t.Helper()
-	if typ == nil || seen[typ] {
-		return
+	imports := map[string]string{}
+	for _, specification := range file.Imports {
+		path, err := strconv.Unquote(specification.Path.Value)
+		if err != nil {
+			t.Fatalf("unquote import %s: %v", specification.Path.Value, err)
+		}
+		name := filepath.Base(path)
+		if specification.Name != nil {
+			name = specification.Name.Name
+		}
+		if name == "." && isCentrifugeImport(path) {
+			t.Fatalf("dot import could expose forbidden Centrifuge declarations: %s", path)
+		}
+		imports[name] = path
 	}
-	seen[typ] = true
-	if typ.PkgPath() == "github.com/centrifugal/centrifuge" {
-		t.Fatalf("public boundary exposes Centrifuge type %s", typ)
-	}
-	switch typ.Kind() {
-	case reflect.Interface:
-		for index := 0; index < typ.NumMethod(); index++ {
-			assertNoCentrifugeType(t, typ.Method(index).Type, seen)
+	return imports
+}
+
+func assertBoundaryExpression(t *testing.T, subject string, expression ast.Expr, imports map[string]string, types map[string]typeDeclaration, observedPackages map[string]bool, visiting map[string]bool) {
+	t.Helper()
+	ast.Inspect(expression, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.SelectorExpr:
+			identifier, ok := node.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			path := imports[identifier.Name]
+			if path == "" {
+				return true
+			}
+			observedPackages[path] = true
+			if isCentrifugeImport(path) {
+				t.Fatalf("%s exposes forbidden type %s.%s from %s", subject, identifier.Name, node.Sel.Name, path)
+			}
+		case *ast.Ident:
+			declaration, ok := types[node.Name]
+			if !ok || visiting[node.Name] {
+				return true
+			}
+			visiting[node.Name] = true
+			assertBoundaryExpression(t, subject+"->"+node.Name, declaration.expression, declaration.imports, types, observedPackages, visiting)
+			delete(visiting, node.Name)
 		}
-	case reflect.Func:
-		for index := 0; index < typ.NumIn(); index++ {
-			assertNoCentrifugeType(t, typ.In(index), seen)
-		}
-		for index := 0; index < typ.NumOut(); index++ {
-			assertNoCentrifugeType(t, typ.Out(index), seen)
-		}
-	case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Chan:
-		assertNoCentrifugeType(t, typ.Elem(), seen)
-	case reflect.Map:
-		assertNoCentrifugeType(t, typ.Key(), seen)
-		assertNoCentrifugeType(t, typ.Elem(), seen)
-	case reflect.Struct:
-		for index := 0; index < typ.NumField(); index++ {
-			assertNoCentrifugeType(t, typ.Field(index).Type, seen)
-		}
-	}
+		return true
+	})
+}
+
+func isCentrifugeImport(path string) bool {
+	const module = "github.com/centrifugal/centrifuge"
+	return path == module || strings.HasPrefix(path, module+"/")
 }
 
 func TestHostPinsTheCentrifugeServer(t *testing.T) {
 	t.Parallel()
 
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller could not locate this package")
-	}
-	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", ".."))
+	moduleRoot := filepath.Clean(filepath.Join(packageDirectory(t), "..", "..", ".."))
 	data, err := os.ReadFile(filepath.Join(moduleRoot, "go.mod"))
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
@@ -97,4 +191,13 @@ func TestHostPinsTheCentrifugeServer(t *testing.T) {
 		}
 	}
 	t.Fatal("go.mod does not require github.com/centrifugal/centrifuge")
+}
+
+func packageDirectory(t *testing.T) string {
+	t.Helper()
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller could not locate this package")
+	}
+	return filepath.Dir(source)
 }

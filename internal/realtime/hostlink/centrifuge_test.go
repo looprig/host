@@ -28,6 +28,12 @@ type recordingAuthenticator struct {
 	credentials []string
 }
 
+type authenticatorFunc func(context.Context, sessionwire.TenantID, string) error
+
+func (function authenticatorFunc) VerifyTenant(ctx context.Context, tenant sessionwire.TenantID, credential string) error {
+	return function(ctx, tenant, credential)
+}
+
 func (a *recordingAuthenticator) VerifyTenant(_ context.Context, tenant sessionwire.TenantID, credential string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -86,6 +92,61 @@ func TestConnectAuthenticatesServiceAndNegotiatesCoreVersion(t *testing.T) {
 	}
 	if got, want := auth.calls(), []string{string(testTenant) + ":" + testCredential}; !reflectStringsEqual(got, want) {
 		t.Errorf("authentication calls = %v, want %v", got, want)
+	}
+}
+
+func TestAuthenticationReceivesTheConnectionContext(t *testing.T) {
+	type contextKey struct{}
+	const contextValue = "request-scoped-value"
+	received := make(chan context.Context, 1)
+	auth := authenticatorFunc(func(ctx context.Context, _ sessionwire.TenantID, _ string) error {
+		received <- ctx
+		return nil
+	})
+	server, err := hostlink.NewCentrifugeServer(hostlink.Config{TenantID: testTenant, Authenticator: auth})
+	if err != nil {
+		t.Fatalf("NewCentrifugeServer: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := server.Close(ctx); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		ctx := context.WithValue(request.Context(), contextKey{}, contextValue)
+		server.Handler().ServeHTTP(writer, request.WithContext(ctx))
+	}))
+	defer httpServer.Close()
+	connection := dial(t, httpServer.URL, "")
+	if reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}}); reply.Connect == nil {
+		connection.Close()
+		t.Fatalf("connect reply = %#v", reply)
+	}
+
+	var authenticationContext context.Context
+	select {
+	case ctx := <-received:
+		authenticationContext = ctx
+		if got := ctx.Value(contextKey{}); got != contextValue {
+			t.Errorf("authentication context value = %v, want %q", got, contextValue)
+		}
+	case <-time.After(time.Second):
+		connection.Close()
+		t.Fatal("authentication was not called")
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatalf("close connection: %v", err)
+	}
+	select {
+	case <-authenticationContext.Done():
+		if !errors.Is(authenticationContext.Err(), context.Canceled) {
+			t.Errorf("authentication context error = %v, want context.Canceled", authenticationContext.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authentication context was not canceled with its connection")
 	}
 }
 
@@ -176,7 +237,42 @@ func TestServiceLinkIgnoresBrowserOriginAndDisablesCompression(t *testing.T) {
 	connection.Close()
 }
 
-func TestHostLinkRejectsEveryProtobufSelection(t *testing.T) {
+func TestHostLinkRequiresExplicitJSONSubprotocol(t *testing.T) {
+	auth := &recordingAuthenticator{wantToken: testCredential}
+	server, httpServer := startServer(t, auth, hostlink.Config{})
+	defer closeServers(t, server, httpServer)
+
+	for _, test := range []struct {
+		name      string
+		protocols []string
+		accepted  bool
+	}{
+		{name: "JSON", protocols: []string{"centrifuge-json"}, accepted: true},
+		{name: "absent"},
+		{name: "unknown", protocols: []string{"something-else"}},
+		{name: "protobuf", protocols: []string{"centrifuge-protobuf"}},
+		{name: "JSON plus unknown", protocols: []string{"centrifuge-json", "something-else"}},
+		{name: "JSON plus protobuf", protocols: []string{"centrifuge-json", "centrifuge-protobuf"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := websocket.Dialer{Subprotocols: test.protocols}
+			connection, response, err := dialer.Dial(wsURL(httpServer.URL), nil)
+			if test.accepted {
+				if err != nil {
+					t.Fatalf("explicit JSON dial: %v", err)
+				}
+				defer connection.Close()
+				if got := connection.Subprotocol(); got != "centrifuge-json" {
+					t.Fatalf("negotiated subprotocol = %q, want centrifuge-json", got)
+				}
+				return
+			}
+			assertUpgradeRejected(t, connection, response, err)
+		})
+	}
+}
+
+func TestHostLinkRejectsProtobufQuerySelectors(t *testing.T) {
 	auth := &recordingAuthenticator{wantToken: testCredential}
 	server, httpServer := startServer(t, auth, hostlink.Config{})
 	defer closeServers(t, server, httpServer)
@@ -184,21 +280,28 @@ func TestHostLinkRejectsEveryProtobufSelection(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		suffix string
-		header http.Header
 	}{
 		{name: "format query", suffix: "?format=protobuf"},
 		{name: "protocol query", suffix: "?cf_protocol=protobuf"},
-		{name: "subprotocol header", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf"}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, response, err := websocket.DefaultDialer.Dial(wsURL(httpServer.URL)+test.suffix, test.header)
-			if err == nil {
-				t.Fatal("protobuf HostLink unexpectedly upgraded")
-			}
-			if response == nil || response.StatusCode != http.StatusBadRequest {
-				t.Fatalf("protobuf response = %#v, want HTTP 400", response)
-			}
+			dialer := websocket.Dialer{Subprotocols: []string{"centrifuge-json"}}
+			connection, response, err := dialer.Dial(wsURL(httpServer.URL)+test.suffix, nil)
+			assertUpgradeRejected(t, connection, response, err)
 		})
+	}
+}
+
+func assertUpgradeRejected(t *testing.T, connection *websocket.Conn, response *http.Response, err error) {
+	t.Helper()
+	if connection != nil {
+		connection.Close()
+	}
+	if err == nil {
+		t.Fatal("non-JSON HostLink unexpectedly upgraded")
+	}
+	if response == nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("non-JSON response = %#v, want HTTP 400", response)
 	}
 }
 

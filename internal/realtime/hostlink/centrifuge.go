@@ -102,7 +102,7 @@ func NewCentrifugeServer(config Config) (Server, error) {
 	})
 	server := &centrifugeServer{node: node}
 	server.handler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if requestsProtobuf(request) {
+		if !selectsJSONProtocol(request) {
 			http.Error(writer, "HostLink requires the JSON protocol", http.StatusBadRequest)
 			return
 		}
@@ -115,14 +115,13 @@ func (s *centrifugeServer) Handler() http.Handler { return s.handler }
 
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 
-func requestsProtobuf(request *http.Request) bool {
+func selectsJSONProtocol(request *http.Request) bool {
 	if request.URL.Query().Get("format") == "protobuf" || request.URL.Query().Get("cf_protocol") == "protobuf" {
-		return true
+		return false
 	}
-	for _, offered := range strings.Split(request.Header.Get("Sec-WebSocket-Protocol"), ",") {
-		if strings.TrimSpace(offered) == "centrifuge-protobuf" {
-			return true
-		}
+	offered := strings.Split(request.Header.Get("Sec-WebSocket-Protocol"), ",")
+	if len(offered) != 1 {
+		return false
 	}
-	return false
+	return strings.TrimSpace(offered[0]) == "centrifuge-json"
 }
