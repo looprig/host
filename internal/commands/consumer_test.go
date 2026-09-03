@@ -569,16 +569,70 @@ func TestNewConsumerRefusesAnIncompleteComposition(t *testing.T) {
 	}
 }
 
-// TestAFullPageIsWellDefinedBecauseTheBatchIsPositive is a TRIPWIRE ON A
-// BORROWED PROPERTY, not a test of this package's code.
+// TestNewConsumerRefusesAHostThatDidNotComeFromHostNew closes the hole a nil
+// check leaves open.
 //
-// Reconcile decides "the page was full" as len(page) == limit, where limit is
-// the Host's ReconcileBatch. That comparison only means what it says while the
-// batch is positive: at zero, an EMPTY page reads as full, the loop continues
-// immediately every round and never arms a timer. This package cannot enforce
-// that itself — it receives an already-constructed *host.Host — so it asserts
-// the guarantee at its source instead, and will fail loudly if host.New ever
-// stops refusing a non-positive batch.
+// EVERY FIELD OF host.Host IS UNEXPORTED AND THAT STOPS NOTHING HERE: Go
+// restricts NAMING a non-exported field from another package, not the empty
+// composite literal, so &host.Host{} compiles from any package and hands back a
+// nil Clock, a zero ReconcileInterval and a zero ReconcileBatch. A zero batch
+// makes an EMPTY page satisfy Reconcile's len(page) == limit test, so the pass
+// reports More, Run takes the immediate continuation, no timer is ever armed
+// and the loop spins hot forever; a nil Clock panics the loop the first time it
+// does arm one.
+//
+// ALL THREE ARE REPORTED RATHER THAN THE FIRST, and that is what makes each
+// check individually killable rather than only the first in sequence. There are
+// exactly two ways to obtain a *host.Host — host.New, which makes all three
+// valid, and the empty literal, which makes all three invalid — so no input
+// this test can construct would reach a second check behind a
+// first-violation-wins return.
+func TestNewConsumerRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
+	t.Parallel()
+
+	options := func(built *host.Host) Options {
+		return Options{
+			Host:       built,
+			Key:        registry.Key{TenantID: testTenant, SessionID: testSession},
+			LeaseEpoch: testEpoch,
+			Inbox:      &fakeInbox{},
+			Cursors:    &fakeCursors{},
+			Processor:  &fakeProcessor{},
+			Fence:      newFakeFence(),
+		}
+	}
+
+	t.Run("an unvalidated Host", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewConsumer(options(&host.Host{}))
+		var unusable *UnusableHostError
+		if !errors.As(err, &unusable) {
+			t.Fatalf("want *UnusableHostError, got %v", err)
+		}
+		want := []string{"Clock", "ReconcileInterval", "ReconcileBatch"}
+		if strings.Join(unusable.Accessors, ",") != strings.Join(want, ",") {
+			t.Errorf("Accessors = %v, want %v; every accessor this package reads off the Host must be named, or deleting one of the checks is undetectable", unusable.Accessors, want)
+		}
+	})
+
+	t.Run("a Host from host.New", func(t *testing.T) {
+		t.Parallel()
+		if _, err := NewConsumer(options(newTestHost(t, newManualClock(testClockAt)))); err != nil {
+			t.Fatalf("a Host that came from host.New was refused: %v", err)
+		}
+	})
+}
+
+// TestAFullPageIsWellDefinedBecauseTheBatchIsPositive is a TRIPWIRE ON A
+// BORROWED PROPERTY, kept alongside the constructor's own refusal rather than
+// instead of it.
+//
+// The two guard different producers and neither subsumes the other:
+// NewConsumer refuses any Host whose batch is not positive, which is what makes
+// Reconcile's len(page) == limit test well defined for every Consumer that
+// exists; this asserts that host.New refuses one too, so the ordinary
+// construction path fails at configuration time with a message about
+// ReconcileBatch rather than later with one about an unusable Host.
 func TestAFullPageIsWellDefinedBecauseTheBatchIsPositive(t *testing.T) {
 	t.Parallel()
 
@@ -1024,6 +1078,16 @@ func TestReconcileStopsWhenTheGrantIsLostMidPage(t *testing.T) {
 	if want := []sessionwire.CommandID{commandID(1)}; !equalIDs(f.processor.processedIDs(), want) {
 		t.Errorf("processed %v, want %v; a command must not be claimed under a grant already known to be gone", f.processor.processedIDs(), want)
 	}
+	// AN ABORTED PASS WRITES NO CURSOR. On THIS path that outcome is enforced
+	// twice over — the early return, and Fence.Write refusing before it calls
+	// the store at all — so the assertion pins the OUTCOME rather than either
+	// mechanism, and a mutation that removes only the early return is caught
+	// here by neither. Its twin in TestReconcileHonoursCancellation is the one
+	// that catches that, because there the grant is still held and the fence
+	// would let the write through.
+	if writes := f.cursors.written(); len(writes) != 0 {
+		t.Errorf("the cursor was written %v by a pass that aborted under a lost grant", writes)
+	}
 }
 
 // TestReconcileDoesNotAdvanceWhenTheCursorWriteFails asserts a refused cursor
@@ -1088,6 +1152,15 @@ func TestReconcileHonoursCancellation(t *testing.T) {
 	}
 	if want := []sessionwire.CommandID{commandID(1)}; !equalIDs(f.processor.processedIDs(), want) {
 		t.Errorf("processed %v, want %v", f.processor.processedIDs(), want)
+	}
+	// AN ABORTED PASS WRITES NO CURSOR, and this is the path that can lose the
+	// property: the grant is still held, so the fence would pass the write
+	// straight to the store, and only the early return stops it. A cancelled
+	// context is not a durable-write context. Measured — without this
+	// assertion, a mutation letting both abort branches fall through to the
+	// cursor write left the whole suite green.
+	if writes := f.cursors.written(); len(writes) != 0 {
+		t.Errorf("the cursor was written %v by a pass that aborted on a cancelled context", writes)
 	}
 }
 

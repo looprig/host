@@ -29,6 +29,7 @@ package commands
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -275,6 +276,40 @@ func (e *InvalidConsumerOptionsError) Error() string {
 	return "commands: invalid option " + strconv.Quote(e.Field) + ": " + e.Reason
 }
 
+// UnusableHostError reports a *host.Host this package cannot run over.
+//
+// IT EXISTS BECAUSE A NON-NIL HOST IS NOT A VALIDATED ONE. Every field of
+// host.Host is unexported, which restricts NAMING a field from another package
+// and nothing else: the empty composite literal &host.Host{} is legal
+// everywhere, compiles outside package host, and yields a nil Clock, a zero
+// ReconcileInterval and a zero ReconcileBatch. NewConsumer checked only for
+// nil, so such a value was accepted, and a zero batch is not cosmetic — see
+// Reconcile's note on what "full" means.
+//
+// Accessors names every accessor whose value is unusable rather than the first,
+// and that is what makes each check individually killable. The two ways to
+// obtain a Host are host.New, which produces all three valid, and an empty
+// literal, which produces all three invalid; a first-violation-wins error would
+// therefore exercise exactly one of the three checks no matter what a test did.
+type UnusableHostError struct {
+	// Accessors are the offending accessor names, in a fixed order.
+	Accessors []string
+}
+
+func (e *UnusableHostError) Error() string {
+	return "commands: the Host cannot be consumed over, because " + strings.Join(e.Accessors, ", ") +
+		" " + plural(len(e.Accessors), "is", "are") + " unusable; a *host.Host that did not come from host.New has none of them set"
+}
+
+// plural picks the verb form for a count. It exists so the message above reads
+// correctly for one accessor and for three, which is the whole of its job.
+func plural(count int, one, many string) string {
+	if count == 1 {
+		return one
+	}
+	return many
+}
+
 // PageProblem is a stable, machine-readable way a ListOrdered page broke the
 // ordering contract.
 //
@@ -431,6 +466,24 @@ type Consumer struct {
 func NewConsumer(options Options) (*Consumer, error) {
 	if options.Host == nil {
 		return nil, &InvalidConsumerOptionsError{Field: "Host", Reason: "must be set; the reconcile interval, batch and clock all come from it"}
+	}
+	// THE THREE ACCESSORS THIS PACKAGE READS, AND ONLY THOSE THREE. This is not
+	// a second host.New and restates none of its other rules; it is the
+	// boundary check for the values this package consumes, placed here because
+	// a nil check alone accepts &host.Host{} and there is no other point at
+	// which this package can refuse one. See UnusableHostError.
+	var unusable []string
+	if options.Host.Clock() == nil {
+		unusable = append(unusable, "Clock")
+	}
+	if options.Host.ReconcileInterval() <= 0 {
+		unusable = append(unusable, "ReconcileInterval")
+	}
+	if options.Host.ReconcileBatch() <= 0 {
+		unusable = append(unusable, "ReconcileBatch")
+	}
+	if len(unusable) > 0 {
+		return nil, &UnusableHostError{Accessors: unusable}
 	}
 	if options.Key.TenantID == "" || options.Key.SessionID == "" {
 		return nil, &InvalidConsumerOptionsError{Field: "Key", Reason: "must name both a tenant and a session; every SessionStore operation is scoped by the pair"}
@@ -646,9 +699,19 @@ func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 		// ABORTED PASSES WRITE NOTHING. Both of these mean the pass must not
 		// continue, and neither may be followed by a cursor write: a cancelled
 		// context is not a durable-write context, and a lost grant must not
-		// touch a fenced record at all. What was consumed is re-derived next
-		// pass, which costs a terminal-state check per record and no
-		// application, because the loop above skips a terminal record.
+		// touch a fenced record at all.
+		//
+		// WHAT RE-DERIVING COSTS DEPENDS ON THE RECORD, and an earlier version
+		// of this comment claimed it cost "a terminal-state check per record
+		// and no application", which is true of only half of them. A record the
+		// Processor drove to applied or rejected is skipped by the terminal
+		// short-circuit above and costs that check. A record consumed because
+		// its application prefix was OWNED is still `applying`, is not
+		// terminal, and IS handed to the Processor again. That is correct and
+		// §10.4 requires it — recovering an expired applying prefix is
+		// continuation of an existing application, not a new claim — but it is
+		// an application call, not a state check, and the sentence said
+		// otherwise.
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -693,18 +756,26 @@ func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 		c.setCursor(consumed)
 		result.Cursor = consumed
 	}
-	// "FULL" IS len(page) == limit AND NOTHING ELSE, and that is only a
-	// well-defined test because the limit is positive. It carried a `limit > 0`
-	// conjunct which was UNREACHABLE-FALSE — host.New refuses a non-positive
-	// ReconcileBatch and there is no other way to obtain a *host.Host — so no
-	// construction could distinguish it and a mutation deleting it survived.
-	// This file's standard is that a discriminator no mutant can kill is a
-	// claim nothing checks, so the conjunct is gone and the property it stood
-	// for is held where it can actually fail:
-	// TestAFullPageIsWellDefinedBecauseTheBatchIsPositive asserts host.New's
-	// refusal directly. If that ever relaxes, a zero limit would make an empty
-	// page read as full and the loop would continue forever without arming a
-	// timer, and the tripwire fires instead of the loop spinning.
+	// "FULL" IS len(page) == limit AND NOTHING ELSE, which is a well-defined
+	// test only because the limit is positive. At zero an EMPTY page satisfies
+	// it, Reconcile reports More, Run takes the immediate continuation, no
+	// timer is ever armed and the loop spins hot on an empty inbox forever.
+	//
+	// This carried a `limit > 0` conjunct, and an earlier version of this
+	// comment deleted it as unreachable-false on the ground that host.New
+	// refuses a non-positive ReconcileBatch and "there is no other way to
+	// obtain a *host.Host". THAT WAS WRONG, and wrong in the way that matters:
+	// unexported fields restrict naming a field, not the empty composite
+	// literal, so &host.Host{} compiles from any package and returns a zero
+	// batch. The equivalence had been established over the INTENDED
+	// construction path rather than over every construction path, which is
+	// exactly the error this program keeps paying for.
+	//
+	// The invariant now lives at the boundary that consumes it: NewConsumer
+	// refuses a Host whose ReconcileBatch is not positive, so no Consumer can
+	// reach this line with a zero limit. That check is inside this package,
+	// a test reaches it, and a mutation deleting it dies — which is what the
+	// conjunct never managed.
 	result.More = result.Blocked == nil && len(page) == limit
 	return result, nil
 }
