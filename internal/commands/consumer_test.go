@@ -693,6 +693,9 @@ func TestReconcileAdvancesPastTerminalRecordsWithoutTheProcessor(t *testing.T) {
 	if result.Cursor != 2 {
 		t.Errorf("cursor = %d, want 2", result.Cursor)
 	}
+	if result.Consumed != 2 {
+		t.Errorf("consumed = %d, want 2; a record the cursor passed was consumed by this pass whether or not a Processor was involved", result.Consumed)
+	}
 }
 
 // TestReconcileAdvancesPastAnOwnedApplicationPrefix asserts the second half of
@@ -990,8 +993,19 @@ func TestReconcileDoesNotAdvanceWhenTheCursorWriteFails(t *testing.T) {
 		f.cursors.saveErr = errTestStore
 		f.inbox.pages = [][]Command{{command(9, StatePending)}, {command(9, StatePending)}}
 	})
-	if _, err := f.consumer.Reconcile(context.Background()); !errors.Is(err, errTestStore) {
+	refused, err := f.consumer.Reconcile(context.Background())
+	if !errors.Is(err, errTestStore) {
 		t.Fatalf("want the store failure, got %v", err)
+	}
+	// PassResult.Cursor is the DURABLE cursor after the pass, so a refused
+	// write must leave it where it was. Reporting the position the pass wanted
+	// would tell a caller the session had consumed through a command no store
+	// agreed to, which is the same lie the in-memory cursor must not tell.
+	if refused.Cursor != 8 {
+		t.Errorf("the refused pass reported cursor %d, want the last acknowledged 8", refused.Cursor)
+	}
+	if refused.Consumed != 1 {
+		t.Errorf("consumed = %d, want 1; the pass did consume the record, and Consumed exceeding Cursor is exactly how an unacknowledged pass is visible", refused.Consumed)
 	}
 	f.cursors.mu.Lock()
 	f.cursors.saveErr = nil
