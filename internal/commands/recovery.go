@@ -86,6 +86,31 @@ func (a *Applier) plan(record Record, application Application, now time.Time) (s
 				" and this applier holds " + strconv.FormatUint(a.epoch, 10) + ", so this Host no longer owns the session",
 		}
 	}
+	// THE SAME QUESTION, ARRIVING FROM THE JOURNAL. The check above asks the
+	// RECORD whether a later epoch has claimed this command; this asks the
+	// STREAM whether a later epoch has fenced this applier out of it, which is
+	// the same fact by the other of §10.1's two mechanisms — exactly as
+	// ErrEpochSuperseded is the other way Lease.Lost is learned.
+	//
+	// IT IS ASKED ON EVERY ARM, and it was not. It sat inside planApplying, so
+	// it was consulted only for an applying record: a PENDING or expired-claimed
+	// record whose journal already proved this applier superseded was claimed
+	// and driven. No double application resulted, because the fenced journal
+	// refuses the prefix append — but ClaimCommand compares only claim epochs
+	// and accepts, so a stale Host durably took the claim for a whole TTL and
+	// the legitimate successor waited it out under this file's own deliberately
+	// stricter live-claim rule. That is precisely the harm the check above names
+	// in its own comment: the one write whose success takes work away from the
+	// Host that owns the session. The evidence was already in hand, because the
+	// correlation is read before this function is called.
+	if application.fences(a.epoch) {
+		return stepClaim, &ApplyError{
+			Refusal:   RefusalStaleEpoch,
+			CommandID: record.CommandID,
+			Reason: "the journal has committed an opening fence above epoch " + strconv.FormatUint(a.epoch, 10) +
+				", so this applier can no longer append to this session",
+		}
+	}
 	if err := a.checkApplication(record, application); err != nil {
 		return stepClaim, err
 	}
@@ -180,11 +205,12 @@ func (a *Applier) plan(record Record, application Application, now time.Time) (s
 //
 // THE TWO ARMS ARE THE TWO WRITERS. Under this applier's OWN epoch the record is
 // its own unfinished work, and driving it again is the continuation of one
-// application rather than a second one — but only once the journal has been
-// asked whether this applier may still write at all. Under a PREDECESSOR's epoch
-// it is somebody else's unfinished work, and this applier may settle it only on
-// the two proofs §10.4 requires: that no effect committed, and that the writer
-// which might still commit one has been fenced out of the stream.
+// application rather than a second one — plan has already established that this
+// applier is not itself fenced out, on every arm rather than on this one. Under
+// a PREDECESSOR's epoch it is somebody else's unfinished work, and this applier
+// may settle it only on the two proofs §10.4 requires: that no effect committed,
+// and that the writer which might still commit one has been fenced out of the
+// stream.
 func (a *Applier) planApplying(record Record, application Application) (step, error) {
 	if application.Outcome == ApplicationUnresolved {
 		return stepClaim, &ApplyError{
@@ -193,29 +219,14 @@ func (a *Applier) planApplying(record Record, application Application) (step, er
 			Reason:    "a correlated prefix exists whose outcome the journal cannot yet decide, so neither completing nor rejecting is safe",
 		}
 	}
-	// THE JOURNAL CAN PROVE THIS APPLIER IS THE SUPERSEDED ONE, and this check is
-	// where that proof is read. plan's first check asks the same question of the
-	// RECORD — is the claim under a later epoch — and a fence observed in the
-	// stream is the other way the answer arrives, exactly as ErrEpochSuperseded
-	// is the other way Lease.Lost is learned.
-	//
-	// IT WAS MISSING, AND THE ARM BELOW MADE IT REACHABLE. An abandoned outcome
-	// under this applier's OWN claim epoch means a correlated prefix exists and a
-	// fence above it was observed — that is what Abandoned is defined as — so the
-	// drive arm was appending a second prefix and driving the runtime under an
-	// epoch the journal had already proven superseded. The real writer refuses
-	// the fenced append, so it surfaced as a store failure; but the posture of
-	// this file is that the Host is STRICTER where the store cannot help, and
-	// here it was looser than evidence it had already read. The reject arm two
-	// checks below demands this same proof of a predecessor.
-	if application.fences(a.epoch) {
-		return stepClaim, &ApplyError{
-			Refusal:   RefusalStaleEpoch,
-			CommandID: record.CommandID,
-			Reason: "the journal has committed an opening fence above epoch " + strconv.FormatUint(a.epoch, 10) +
-				", so this applier can no longer append to this session",
-		}
-	}
+	// NO fences(a.epoch) CHECK HERE, AND ITS ABSENCE IS DELIBERATE. It lives in
+	// plan, one line below the record-side ownership check, because the two are
+	// the same question — has this applier been superseded — and asking it on
+	// one arm while claiming it is asked on all of them is what put a stale
+	// applier on a pending record's claim. What remains below is a DIFFERENT
+	// question about a DIFFERENT epoch: not whether THIS applier may write, but
+	// whether the PREDECESSOR that holds the applying record can still commit
+	// the effect a rejection would orphan.
 	if record.ClaimEpoch == a.epoch {
 		return stepDriveApplyingRecord, nil
 	}

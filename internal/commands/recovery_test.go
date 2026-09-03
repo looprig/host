@@ -525,41 +525,77 @@ func TestAnApplyingRecordThisApplierOwnsIsDrivenWithoutReclaiming(t *testing.T) 
 	}
 }
 
-// TestAnApplyingRecordThisApplierIsFencedOutOfIsRefused is the check the drive
-// arm was missing, and the case that made it reachable.
+// TestARecordThisApplierIsFencedOutOfIsRefusedOnEveryArm holds the journal-side
+// half of the ownership rule, for every state a non-terminal record can be in.
 //
-// An ABANDONED outcome means a correlated prefix exists and a fence above its
-// epoch was observed — that is what abandonment IS — so an abandoned application
-// under this applier's OWN claim epoch is the journal saying this applier has
-// been fenced out of the stream. The drive arm ran before that was read: it
-// appended a SECOND prefix and drove the runtime under an epoch already proven
-// superseded. The real journal writer refuses the fenced append, so the damage
-// surfaced as a store failure rather than as a double application — but the
-// posture of this package is to be stricter where the store cannot help, and
-// this was looser than evidence it had already read.
-func TestAnApplyingRecordThisApplierIsFencedOutOfIsRefused(t *testing.T) {
+// A fence above this applier's epoch is §10.1's OTHER mechanism saying what
+// plan's first check asks the record: this Host no longer owns the session. The
+// two must be asked in the same place, and for a while they were not — the
+// journal-side check sat inside planApplying, so it was consulted only for an
+// APPLYING record.
+//
+// THE PENDING ROW IS THE ONE THAT COST SOMETHING. No double application was
+// possible, because the fenced journal refuses the prefix append; but
+// ClaimCommand compares only claim epochs and accepts, so a superseded Host
+// durably took the claim for a whole TTL and the legitimate successor waited it
+// out under this file's own deliberately stricter live-claim rule. That is
+// exactly the harm plan's opening comment names, committed by the applier the
+// comment is warning about — and the evidence to refuse it was already read.
+//
+// The APPLYING row is the case that first made the gap reachable: an abandoned
+// outcome under this applier's own claim epoch is by definition a correlated
+// prefix followed by a fence above it, so the drive arm was appending a SECOND
+// prefix under an epoch the journal had already ruled out.
+func TestARecordThisApplierIsFencedOutOfIsRefusedOnEveryArm(t *testing.T) {
 	t.Parallel()
 
-	f := newApplierFixture(t, func(f *applierFixture) {
-		record := &f.stored().record
-		record.State, record.ClaimEpoch, record.ClaimExpiresAt = StateApplying, testEpoch, expired
-		f.stored().application = abandonedApplication(testEpoch, testEpoch+5)
-	})
-	outcome, err := f.process()
-	if refusalOf(err) != RefusalStaleEpoch {
-		t.Fatalf("got %v, want a %q refusal", err, RefusalStaleEpoch)
-	}
-	if prefixes := f.store.prefixes; len(prefixes) != 0 {
-		t.Errorf("a second application prefix %+v was appended under an epoch the journal has fenced out", prefixes)
-	}
-	if driven := f.runtime.commands(); len(driven) != 0 {
-		t.Errorf("the runtime was driven with %+v under an epoch the journal has fenced out", driven)
-	}
-	if writes := f.fence.fencedWrites(); writes != 0 {
-		t.Errorf("%d durable writes were attempted", writes)
-	}
-	if !outcome.PrefixOwned {
-		t.Error("PrefixOwned = false, though a correlated prefix exists")
+	fencedBy := testEpoch + 5
+	for _, testCase := range []struct {
+		name        string
+		state       State
+		claimEpoch  uint64
+		expiresAt   time.Time
+		application Application
+	}{
+		{
+			name: "pending", state: StatePending,
+			application: Application{Outcome: ApplicationAbsent, SupersedingEpoch: fencedBy},
+		},
+		{
+			name: "claimed, and the claim has expired", state: StateClaimed,
+			claimEpoch: testOtherEpoch, expiresAt: expired,
+			application: Application{Outcome: ApplicationAbsent, SupersedingEpoch: fencedBy},
+		},
+		{
+			name: "applying, with a prefix this applier abandoned", state: StateApplying,
+			claimEpoch: testEpoch, expiresAt: expired,
+			application: abandonedApplication(testEpoch, fencedBy),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			f := newApplierFixture(t, func(f *applierFixture) {
+				record := &f.stored().record
+				record.State, record.ClaimEpoch, record.ClaimExpiresAt = testCase.state, testCase.claimEpoch, testCase.expiresAt
+				f.stored().application = testCase.application
+			})
+			_, err := f.process()
+			if refusalOf(err) != RefusalStaleEpoch {
+				t.Fatalf("got %v, want a %q refusal", err, RefusalStaleEpoch)
+			}
+			if claims := f.store.claims; len(claims) != 0 {
+				t.Errorf("the claim %+v was taken by an applier the journal has fenced out; a superseded Host holds it for a whole TTL and the legitimate successor waits it out", claims)
+			}
+			if prefixes := f.store.prefixes; len(prefixes) != 0 {
+				t.Errorf("an application prefix %+v was appended under an epoch the journal has fenced out", prefixes)
+			}
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v under an epoch the journal has fenced out", driven)
+			}
+			if writes := f.fence.fencedWrites(); writes != 0 {
+				t.Errorf("%d durable writes were attempted", writes)
+			}
+		})
 	}
 }
 
