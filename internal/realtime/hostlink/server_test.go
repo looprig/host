@@ -44,6 +44,27 @@ func TestExportedPackageBoundaryDoesNotExposeCentrifuge(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("boundary guard found zero production Go files")
 	}
+	constraintControl, err := parser.ParseFile(set, "generic_constraint_control.go", `package hostlink
+
+import (
+	"context"
+	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+)
+
+type legalGenericConstraint interface {
+	~string
+	Check(context.Context, sessionwire.TenantID) time.Duration
+}
+
+type legalGenericTypeControl[T legalGenericConstraint] struct{}
+type legalGenericAliasControl[T legalGenericConstraint] = struct{}
+`, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse legal generic constraint control: %v", err)
+	}
+	files = append(files, constraintControl)
 
 	exports := dependencyExports(t, packageDir)
 	lookup := func(path string) (io.ReadCloser, error) {
@@ -60,6 +81,23 @@ func TestExportedPackageBoundaryDoesNotExposeCentrifuge(t *testing.T) {
 	checked, err := (&types.Config{Importer: importer.ForCompiler(set, "gc", lookup)}).Check("github.com/looprig/host/internal/realtime/hostlink", set, files, information)
 	if err != nil {
 		t.Fatalf("type-check production package: %v", err)
+	}
+
+	for _, control := range []string{"legalGenericTypeControl", "legalGenericAliasControl"} {
+		object := checked.Scope().Lookup(control)
+		if object == nil {
+			t.Fatalf("legal generic constraint control %q vanished", control)
+		}
+		controlWalker := boundaryTypeWalker{t: t, observedPackages: map[string]bool{}, seen: map[types.Type]bool{}}
+		controlWalker.inspect(control, object.Type())
+		if controlWalker.constraintWalks != 1 {
+			t.Fatalf("%s walked %d declared constraints, want 1", control, controlWalker.constraintWalks)
+		}
+		for _, legal := range []string{"context", "time", "github.com/looprig/core/sessionwire/v1"} {
+			if !controlWalker.observedPackages[legal] {
+				t.Errorf("%s did not traverse legal constraint package %q", control, legal)
+			}
+		}
 	}
 
 	walker := boundaryTypeWalker{t: t, observedPackages: map[string]bool{}, seen: map[types.Type]bool{}}
@@ -171,6 +209,7 @@ type boundaryTypeWalker struct {
 	t                *testing.T
 	observedPackages map[string]bool
 	seen             map[types.Type]bool
+	constraintWalks  int
 }
 
 func (walker *boundaryTypeWalker) inspect(subject string, typ types.Type) {
@@ -183,12 +222,14 @@ func (walker *boundaryTypeWalker) inspect(subject string, typ types.Type) {
 	switch typ := typ.(type) {
 	case *types.Alias:
 		walker.inspectPackage(subject, typ.Obj())
+		walker.inspectTypeParameters(subject, typ.TypeParams())
 		for index := 0; index < typ.TypeArgs().Len(); index++ {
 			walker.inspect(subject, typ.TypeArgs().At(index))
 		}
 		walker.inspect(subject, types.Unalias(typ))
 	case *types.Named:
 		walker.inspectPackage(subject, typ.Obj())
+		walker.inspectTypeParameters(subject, typ.TypeParams())
 		for index := 0; index < typ.TypeArgs().Len(); index++ {
 			walker.inspect(subject, typ.TypeArgs().At(index))
 		}
@@ -220,11 +261,7 @@ func (walker *boundaryTypeWalker) inspect(subject string, typ types.Type) {
 	case *types.Signature:
 		walker.inspectTuple(subject, typ.Params())
 		walker.inspectTuple(subject, typ.Results())
-		if typeParameters := typ.TypeParams(); typeParameters != nil {
-			for index := 0; index < typeParameters.Len(); index++ {
-				walker.inspect(subject, typeParameters.At(index).Constraint())
-			}
-		}
+		walker.inspectTypeParameters(subject, typ.TypeParams())
 	case *types.Interface:
 		typ.Complete()
 		for index := 0; index < typ.NumExplicitMethods(); index++ {
@@ -242,6 +279,16 @@ func (walker *boundaryTypeWalker) inspect(subject string, typ types.Type) {
 		for index := 0; index < typ.Len(); index++ {
 			walker.inspect(subject, typ.Term(index).Type())
 		}
+	}
+}
+
+func (walker *boundaryTypeWalker) inspectTypeParameters(subject string, parameters *types.TypeParamList) {
+	if parameters == nil {
+		return
+	}
+	for index := 0; index < parameters.Len(); index++ {
+		walker.constraintWalks++
+		walker.inspect(subject+" constraint", parameters.At(index).Constraint())
 	}
 }
 
