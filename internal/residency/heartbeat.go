@@ -59,8 +59,9 @@ var ErrFenceConflict = errors.New("residency: the journal fence was refused by a
 type epochFence struct {
 	lease Lease
 
-	mu    sync.Mutex
-	ended bool
+	mu     sync.Mutex
+	ended  bool
+	reason LossReason
 }
 
 // newEpochFence returns the fence for one lease grant.
@@ -97,12 +98,29 @@ func (f *epochFence) held() error {
 	}
 }
 
-// end records that ownership is gone for a reason other than a refused write —
-// Lost() closing, observed on the loop.
-func (f *epochFence) end() {
+// end records that ownership is gone, and why.
+func (f *epochFence) end(reason LossReason) {
 	f.mu.Lock()
-	f.ended = true
+	if !f.ended {
+		f.ended, f.reason = true, reason
+	}
 	f.mu.Unlock()
+}
+
+// endedBy reports whether ownership has ended and, if so, the reason recorded
+// for it.
+//
+// IT EXISTS SO NOTHING RE-DERIVES THE ANSWER. The beat used to classify the
+// error it got back with a narrower test than the fence's — only
+// ErrEpochSuperseded — so a fence conflict or a lost grant was counted as a
+// store failure, ConsecutiveFailures reported a run that was not one, and the
+// next beat surrendered with lease_lost for a conflict that was not that. The
+// misdiagnosis is the thing this package's own tests argue is part of the
+// contract.
+func (f *epochFence) endedBy() (LossReason, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reason, f.ended
 }
 
 // write performs one fenced write: refuse if ownership is already gone, run it,
@@ -112,8 +130,11 @@ func (f *epochFence) write(run func() error) error {
 		return err
 	}
 	err := run()
-	if errors.Is(err, ErrEpochSuperseded) || errors.Is(err, ErrFenceConflict) {
-		f.end()
+	switch {
+	case errors.Is(err, ErrEpochSuperseded):
+		f.end(LossReasonEpochSuperseded)
+	case errors.Is(err, ErrFenceConflict):
+		f.end(LossReasonFenceConflict)
 	}
 	return err
 }
@@ -159,6 +180,13 @@ const (
 	// LossReasonEpochSuperseded reports a fenced write refused because a later
 	// epoch has committed. It is the same fact by the other path.
 	LossReasonEpochSuperseded LossReason = "epoch_superseded"
+
+	// LossReasonFenceConflict reports a journal append refused by a successor's
+	// committed sequence, which is §10.1's OTHER fencing mechanism. It is a
+	// third name for the same fact and is kept distinct because an operator
+	// diagnosing "a later epoch committed" looks in a different place from one
+	// diagnosing "my journal sequence is stale".
+	LossReasonFenceConflict LossReason = "fence_conflict"
 )
 
 // LostResidency describes a residency this Host no longer owns.
@@ -252,10 +280,10 @@ func NewHeartbeatOwnership(options HeartbeatOptions) (*HeartbeatOwnership, error
 
 // BeginOwnership starts one residency's heartbeat under the SESSION context.
 func (o *HeartbeatOwnership) BeginOwnership(ctx context.Context, request OwnershipRequest) (OwnershipHandle, error) {
-	if request.Lease == nil {
+	if request.Fence == nil {
 		return nil, &InvalidManagerOptionsError{
-			Field:  "Lease",
-			Reason: "must be set; a heartbeat that cannot observe Lease.Lost() publishes a route under a lease it may no longer hold",
+			Field:  "Fence",
+			Reason: "must be set; a heartbeat with no fence cannot observe that its grant is gone and would publish a route under a lease it may no longer hold",
 		}
 	}
 	beat := &Heartbeat{
@@ -266,8 +294,7 @@ func (o *HeartbeatOwnership) BeginOwnership(ctx context.Context, request Ownersh
 		epoch:      request.LeaseEpoch,
 		generation: request.Generation,
 		runtime:    request.Runtime,
-		lease:      request.Lease,
-		fence:      newEpochFence(request.Lease),
+		fence:      request.Fence,
 		stopped:    make(chan struct{}),
 		done:       make(chan struct{}),
 		settled:    make(chan struct{}),
@@ -289,7 +316,6 @@ type Heartbeat struct {
 	epoch      uint64
 	generation uint64
 	runtime    department.Runtime
-	lease      Lease
 
 	// fence is the one mechanism every fenced write goes through. It also
 	// carries whether ownership has ended, which used to be a field here read
@@ -303,7 +329,14 @@ type Heartbeat struct {
 
 	// settled closes once the loop has left AND any teardown handoff has
 	// returned. done closes first, so a handle is never held hostage by an
-	// observer; settled is what a caller waits on to know the handoff is over.
+	// observer.
+	//
+	// IT IS UNEXPORTED WITH NO ACCESSOR, so no caller outside this package can
+	// wait on it — an earlier version of this comment said it was "what a
+	// caller waits on", which nothing could. Its readers are this package's own
+	// tests, which need to know the handoff is over before asserting what was
+	// handed over. If a caller ever needs it, that is an accessor with a
+	// contract, not a sentence.
 	settled chan struct{}
 
 	// writeMu serializes everything that reads the residency and then writes
@@ -320,11 +353,22 @@ type Heartbeat struct {
 
 	beats    int
 	failures int
-
-	// teardownOwned records that THIS heartbeat won registry.BeginTeardown,
-	// which is what distinguishes "the claim is ours" from "a rival holds it".
-	teardownOwned bool
 }
+
+// THERE IS NO "IS THE CLAIM OURS" FIELD, and its absence is a measured fact
+// rather than a simplification. One existed, and the conjunct that read it was
+// UNREACHABLE-TRUE: surrender is the only code here that claims a teardown, and
+// it ends the fence in the same breath, so a claim of this heartbeat's always
+// coexists with ownership already gone — and releasable consults the lease
+// first. Replacing the accessor's body with `return false` left the whole
+// package green, including the control that was written to pin it.
+//
+// That is this file's own rule arriving from the other side: a field written on
+// surrender and read by nobody is a claim nothing checks, and a discriminator
+// no mutant can kill is the same thing wearing a conditional. The question
+// "whose claim is this" becomes real the day something claims a teardown while
+// the lease is still held; the code to answer it belongs to that day, not to a
+// conjunct that reads as protection and is not.
 
 // THE LOOP CARRIES NO "lost" FLAG, and it did until an audit deleted every rung
 // in turn and found nothing failed. A field written on surrender and read by
@@ -425,7 +469,19 @@ func (h *Heartbeat) beginRelease(ctx context.Context) error {
 
 	entry, current := h.options.Registry.MarkReleasing(h.key, h.generation)
 	if !current {
-		return nil
+		// THE SAME FACT AS releasable's, ELEVEN LINES APART, and it used to get
+		// a different answer. releasable runs before the write lock, so a
+		// residency removed in between reached here and returned a CLEAN
+		// SUCCESS for "there was nothing of mine" — the one branch that did not
+		// follow the rule ErrNothingToRelease's own doc spends a paragraph
+		// establishing. Unreachable in production today; the file argues that
+		// success and no-op must not be indistinguishable, and an exception a
+		// paragraph away from the argument is where the next one is written.
+		return &ReleaseError{
+			Key:       h.key,
+			Unwritten: []string{"releasing observation: " + ErrNothingToRelease.Error()},
+			Cause:     ErrNothingToRelease,
+		}
 	}
 	observation := h.observation(entry, sessionwire.SessionResidencyReleasing, false)
 	if err := h.fence.write(func() error { return h.options.Locations.PublishResidency(ctx, observation) }); err != nil {
@@ -493,23 +549,20 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 // epoch it had been told was superseded.
 func (h *Heartbeat) leaseHeld() error { return h.fence.held() }
 
-// teardownIsOurs reports whether a teardown claim on the entry is this
-// heartbeat's own.
-func (h *Heartbeat) teardownIsOurs() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.teardownOwned
-}
-
 // releasable reports whether this handle may still act on the residency, or the
 // typed reason it may not.
 //
-// THE ORDER OF THE THREE CHECKS IS THE CONTRACT. A generation that is gone
-// means there is nothing of this heartbeat's, and it is checked first because
-// every later answer would be about somebody else's residency. A lost grant is
-// checked before a rival's teardown claim because it is the more specific
-// truth: when this heartbeat surrendered it claimed the teardown itself, so the
-// claim it would otherwise report is its own.
+// THE ORDER OF THE THREE CHECKS IS THE CONTRACT, and the middle one carries
+// the whole of the previous paragraph's argument. A generation that is gone
+// means there is nothing of this heartbeat's, and it is first because every
+// later answer would be about somebody else's residency. THE LEASE IS CHECKED
+// BEFORE THE TEARDOWN CLAIM, and that ordering is what makes the bare claim
+// check correct without a "whose claim" conjunct: when this heartbeat
+// surrendered it claimed the teardown ITSELF, so reaching the claim check with
+// its own claim would report a rival that does not exist — and the lease check
+// takes that case first, with the more specific truth. Reordering these two
+// silently inverts the guard, which is why a test pins the diagnosis and not
+// merely the refusal.
 func (h *Heartbeat) releasable() (registry.Entry, error) {
 	entry, current := h.options.Registry.Get(h.key)
 	if !current || entry.Generation != h.generation {
@@ -520,7 +573,7 @@ func (h *Heartbeat) releasable() (registry.Entry, error) {
 	if err := h.leaseHeld(); err != nil {
 		return entry, err
 	}
-	if entry.TeardownOwned && !h.teardownIsOurs() {
+	if entry.TeardownOwned {
 		// registry.BeginTeardown records ownership rather than inferring it
 		// from a re-enterable state, and this package built it that way so a
 		// second owner would not have to be guessed at. Reading it is the other
@@ -533,6 +586,12 @@ func (h *Heartbeat) releasable() (registry.Entry, error) {
 }
 
 // Beats reports how many observations this heartbeat has published.
+//
+// IT AND ConsecutiveFailures HAVE NO PRODUCTION CALLER TODAY. They are the only
+// observable of the retry contract — that an unreachable store is a run of
+// failures and not a loss of ownership — so the tests that pin that contract
+// are their readers, and O3.2's metrics will be. That is a weaker justification
+// than a consumer and is written down rather than left to be assumed.
 func (h *Heartbeat) Beats() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -638,8 +697,12 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// window between reading the registry and writing the record, which is
 	// where a lease can be lost while a beat is already in flight. A publish
 	// under a lost grant is the one thing a fenced record must never receive.
-	if err := h.leaseHeld(); err != nil {
-		return false, h.surrender(LossReasonLeaseLost)
+	if _, ended := h.fence.endedBy(); ended || h.leaseHeld() != nil {
+		reason, _ := h.fence.endedBy()
+		if reason == "" {
+			reason = LossReasonLeaseLost
+		}
+		return false, h.surrender(reason)
 	}
 	// FOR O4 AND O5, BECAUSE THE FLAG HAS NO OTHER READER YET: this
 	// observation is currently the ONLY consumer of registry.Entry.Accepting in
@@ -649,11 +712,11 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// claim-nothing-checks shape this lane keeps finding.
 	observation := h.observation(entry, residencyOf(entry.State), entry.Accepting && !h.options.Admissions.Draining())
 	if err := h.fence.write(func() error { return h.options.Locations.PublishResidency(ctx, observation) }); err != nil {
-		if errors.Is(err, ErrEpochSuperseded) {
+		if reason, ended := h.fence.endedBy(); ended {
 			// NOT AMBIGUITY AND NOT RETRIED. A refused fence is the backstop
 			// §10.1 describes: somebody else owns the session now, which is the
 			// same fact Lost() reports by the other path.
-			return false, h.surrender(LossReasonEpochSuperseded)
+			return false, h.surrender(reason)
 		}
 		// AMBIGUITY IS NOT LOSS. The store said nothing about who owns the
 		// session; the LEASE decides that and is still held. Retrying on the
@@ -685,6 +748,14 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 // ownership rather than inferring it from a re-enterable state, and it stops
 // admission in the same atomic step.
 //
+// FOR O6.1: THE LOCAL ENTRY MAY VANISH WHILE ResidencyLost IS RUNNING. done
+// closes before the handoff so a blocking observer cannot wedge the handle, and
+// the price of that is exactly this — a concurrent Stop followed by
+// FinishRelease removes the entry underneath an observer still executing. An
+// observer must therefore take what it needs from the LostResidency it is
+// handed, which carries the runtime and the identities, rather than reading the
+// registry back.
+//
 // "IMMEDIATELY" IS LOCAL AND ONLY EVENTUAL DURABLY, which is worth stating
 // because the unqualified phrase overclaims. The loop exits here without
 // writing, so the durable record goes on advertising Accepting true until it
@@ -698,10 +769,7 @@ func (h *Heartbeat) surrender(reason LossReason) *LostResidency {
 	// it decides nothing about whether this Host still owns the session, and
 	// recording it only on the winning branch would leave a loser writing
 	// fenced records under an epoch somebody else has superseded.
-	h.fence.end()
-	h.mu.Lock()
-	h.teardownOwned = won
-	h.mu.Unlock()
+	h.fence.end(LossReasonLeaseLost)
 	if !won {
 		// Either the residency has been replaced under this heartbeat, or
 		// somebody already owns the teardown. In both cases admission is

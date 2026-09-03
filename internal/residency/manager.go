@@ -199,11 +199,24 @@ type OwnershipRequest struct {
 	Generation      uint64
 	Runtime         department.Runtime
 
-	// Lease is the GRANT ITSELF and not just its epoch, because the heartbeat
-	// that runs under this ownership must watch Lost(). O3.1 disclosed that
-	// nothing consulted it; a heartbeat handed only an epoch number would go on
-	// publishing an accepting route under a lease this Host no longer holds.
-	Lease Lease
+	// Fence is the attach's OWN epochFence, handed on rather than rebuilt.
+	//
+	// IT IS THE GRANT'S FENCE AND NOT MERELY ITS LEASE, and the difference is
+	// what "the one mechanism" has to mean. Building a second fence over the
+	// same lease gave two objects that shared Lost() and did NOT share the
+	// classification: a supersession one of them observed was invisible to the
+	// other, so the Manager could know the epoch was stale while the heartbeat
+	// went on publishing under it. One grant, one fence.
+	//
+	// MEASURED AS EQUIVALENT TODAY, and kept anyway. Building a second fence
+	// here changes no observable behaviour, because the two ways the states
+	// could diverge are both unreachable: an attach whose fence ends fails and
+	// rolls back, which stops the heartbeat, and a heartbeat that ends its own
+	// fence does so after the attach has returned and nothing reads it. It is
+	// shared because "the one mechanism" has to be true rather than nearly
+	// true, and because the day a fenced write is added to a still-running
+	// attach the divergence becomes real with nothing to notice it.
+	Fence *epochFence
 }
 
 // Ownership begins the durable inbox consumption, event fan-out and heartbeat
@@ -1177,7 +1190,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		LeaseEpoch:      epoch,
 		Generation:      entry.Generation,
 		Runtime:         runtime,
-		Lease:           lease,
+		Fence:           fence,
 	})
 	switch {
 	case err != nil:
@@ -1208,7 +1221,23 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// leaves no observation at all, which projects `cold`, which is correct.
 	// Moving the first publish earlier would advertise a route for a session
 	// that may never exist.
-	resident := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyResident, !m.admissions.Draining())
+	// DERIVED FROM THE REGISTRY, exactly as a heartbeat derives it, and not
+	// from what this attach believes it just installed.
+	//
+	// The two writers share this record and their epoch, so the store cannot
+	// order them; what keeps them from contradicting each other is publishing
+	// the SAME FUNCTION of the SAME STATE. This step used to build `resident`
+	// as a literal and accepting as `!Draining()` while the beat built
+	// residencyOf(entry.State) and entry.Accepting && !Draining() — two of the
+	// three content axes divergent, so a heartbeat that had already surrendered
+	// between step 8 and here would have its releasing, not-accepting record
+	// overwritten with resident and accepting.
+	live, stillHeld := m.registry.Get(key)
+	if !stillHeld || live.Generation != entry.Generation {
+		return fail(StepAttached, "", "the residency was removed or replaced before it could be reported attached", nil)
+	}
+	resident := m.observation(key, request.AgentID, target.compatibility, epoch,
+		residencyOf(live.State), live.Accepting && !m.admissions.Draining())
 	if err := fence.write(func() error { return m.locations.PublishResidency(sessionCtx, resident) }); err != nil {
 		return fail(StepAttached, "", "the resident residency projection could not be written", err)
 	}

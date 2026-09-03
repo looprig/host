@@ -3556,3 +3556,56 @@ func TestAJournalFenceRefusedByALaterOwnerEndsTheAttach(t *testing.T) {
 		t.Errorf("a tombstone was written at %v after a later owner's fence refused this one", tombstones)
 	}
 }
+
+// TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState is B2.
+//
+// The two writers share the record and their epoch, so the store cannot order
+// them; what keeps them from contradicting each other is publishing the SAME
+// FUNCTION of the SAME STATE. Step 9 used to build `resident` as a literal and
+// accepting as !Draining(), while the beat builds residencyOf(entry.State) and
+// entry.Accepting && !Draining() — so a residency moved to releasing between
+// step 8 and step 9 had that state overwritten with resident and accepting.
+//
+// The registry is moved through the inWindow seam, which is by construction
+// between the install and the resident publish.
+func TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState(t *testing.T) {
+	f := newFixture(t)
+	f.ownership.inWindow = func() {
+		entry, held := f.registry.Get(f.key())
+		if !held {
+			t.Error("no residency inside the install window")
+			return
+		}
+		f.registry.inner.MarkReleasing(f.key(), entry.Generation)
+	}
+
+	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	published := f.locations.publishedAll()
+	last := published[len(published)-1]
+	entry, held := f.registry.Get(f.key())
+	if !held {
+		t.Fatal("the residency is gone")
+	}
+	if last.Accepting != entry.Accepting {
+		t.Errorf("step 9 published Accepting %t while the registry says %t", last.Accepting, entry.Accepting)
+	}
+	if entry.State == registry.StateReleasing && last.Residency != sessionwire.SessionResidencyReleasing {
+		t.Errorf("step 9 published residency %q while the registry says %q; the two writers must publish the same function of the same state", last.Residency, entry.State)
+	}
+
+	// The CONTROL, one position over: with the registry left alone the same
+	// attach publishes resident and accepting. Without it these assertions
+	// would pass for a Manager that always published releasing.
+	g := newFixture(t)
+	if _, err := g.manager.Attach(context.Background(), g.request(ModeCreate)); err != nil {
+		t.Fatalf("the control's Attach: %v", err)
+	}
+	control := g.locations.publishedAll()
+	final := control[len(control)-1]
+	if final.Residency != sessionwire.SessionResidencyResident || !final.Accepting {
+		t.Errorf("the control published (%q, accepting %t), want resident and true", final.Residency, final.Accepting)
+	}
+}

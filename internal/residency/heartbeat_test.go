@@ -288,7 +288,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		LeaseEpoch:      testEpoch,
 		Generation:      entry.Generation,
 		Runtime:         f.runtime,
-		Lease:           f.lease,
+		Fence:           newEpochFence(f.lease),
 	})
 	if err != nil {
 		t.Fatalf("BeginOwnership: %v", err)
@@ -1019,18 +1019,18 @@ func TestTheManagerStartsARealHeartbeat(t *testing.T) {
 	if beat.epoch != residency.LeaseEpoch {
 		t.Errorf("the heartbeat runs under epoch %d and the residency reports %d", beat.epoch, residency.LeaseEpoch)
 	}
-	if beat.lease == nil {
-		t.Fatal("the heartbeat was handed no lease, so it can never observe Lost()")
+	if beat.fence == nil {
+		t.Fatal("the heartbeat was handed no fence, so it can never observe that its grant is gone")
 	}
-	if beat.lease.Epoch() != residency.LeaseEpoch {
-		t.Errorf("the heartbeat holds a lease of epoch %d, want the residency's %d", beat.lease.Epoch(), residency.LeaseEpoch)
+	if beat.fence.lease == nil || beat.fence.lease.Epoch() != residency.LeaseEpoch {
+		t.Errorf("the heartbeat's fence holds %v, want a lease of the residency's epoch %d", beat.fence.lease, residency.LeaseEpoch)
 	}
 	if err := beat.Stop(context.Background()); err != nil {
 		t.Errorf("Stop: %v", err)
 	}
 }
 
-func TestBeginOwnershipRefusesARequestWithoutItsLease(t *testing.T) {
+func TestBeginOwnershipRefusesARequestWithoutItsFence(t *testing.T) {
 	f := newHeartbeatFixture(t)
 	ownership, err := NewHeartbeatOwnership(HeartbeatOptions{
 		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
@@ -1045,14 +1045,14 @@ func TestBeginOwnershipRefusesARequestWithoutItsLease(t *testing.T) {
 	})
 	if err == nil {
 		_ = handle.Stop(context.Background())
-		t.Fatal("ownership began without a lease, so nothing could ever observe Lost()")
+		t.Fatal("ownership began without a fence, so nothing could ever observe that the grant was gone")
 	}
 	if handle != nil {
 		t.Error("a refused BeginOwnership returned a handle")
 	}
 	var invalid *InvalidManagerOptionsError
-	if !errors.As(err, &invalid) || invalid.Field != "Lease" {
-		t.Errorf("error is %v, want an *InvalidManagerOptionsError naming Lease", err)
+	if !errors.As(err, &invalid) || invalid.Field != "Fence" {
+		t.Errorf("error is %v, want an *InvalidManagerOptionsError naming Fence", err)
 	}
 }
 
@@ -1218,6 +1218,33 @@ func TestALostLeaseWritesNothingThroughTheHandleEither(t *testing.T) {
 				// Cleared, so an attempted write would actually LAND. Leaving
 				// it set would make "nothing was published" true for the wrong
 				// reason.
+				f.locations.mu.Lock()
+				f.locations.publishErr = nil
+				f.locations.mu.Unlock()
+			},
+		},
+		{
+			// THE THIRD PATH. §10.1 has two fencing mechanisms and a store may
+			// surface both through the same call, so a location write refused
+			// by a successor's committed sequence is inside the contract. It
+			// matters because the beat used to re-derive the classification
+			// with a NARROWER test than the fence's — only ErrEpochSuperseded —
+			// so this arrived as a store failure, ConsecutiveFailures counted a
+			// run that was not one, and the operator was eventually told
+			// lease_lost for a conflict that was not that. Asking the fence
+			// what it recorded is what makes the three agree.
+			name:   "a fenced write is refused by a later owner's sequence",
+			reason: LossReasonFenceConflict,
+			build: func(f *heartbeatFixture) {
+				f.locations.publishErr = fmt.Errorf("sessionstore: %w", ErrFenceConflict)
+			},
+			end: func(t *testing.T, f *heartbeatFixture) {
+				if !f.pulseExpectingExit(t) {
+					t.Fatal("the heartbeat kept beating after a fenced write was refused by a later owner's sequence")
+				}
+				if failures := f.beat.ConsecutiveFailures(); failures != 0 {
+					t.Errorf("a refused fence was counted as %d store failures; it is not ambiguity", failures)
+				}
 				f.locations.mu.Lock()
 				f.locations.publishErr = nil
 				f.locations.mu.Unlock()
@@ -1398,7 +1425,7 @@ func TestABlockingTeardownObserverDoesNotWedgeTheHandle(t *testing.T) {
 	lease := &fakeLease{trace: f.trace, epoch: testEpoch, lost: make(chan struct{})}
 	handle, err := ownership.BeginOwnership(context.Background(), OwnershipRequest{
 		Key: f.key(), AgentID: testAgent, CompatibilityID: testCompat,
-		LeaseEpoch: testEpoch, Generation: entry.Generation, Runtime: f.runtime, Lease: lease,
+		LeaseEpoch: testEpoch, Generation: entry.Generation, Runtime: f.runtime, Fence: newEpochFence(lease),
 	})
 	if err != nil {
 		t.Fatalf("BeginOwnership: %v", err)
@@ -1490,18 +1517,55 @@ func TestARivalTeardownClaimIsNotReleasedThroughThisHandle(t *testing.T) {
 		t.Error("the local entry was removed out from under the claimed teardown owner")
 	}
 
-	// THE CONTROL, one position over: the claim this heartbeat made ITSELF does
-	// not refuse it. Without this row the check would pass for a handle that
-	// refused every claimed residency, including its own — which is the state
-	// O6.1 picks up after a loss.
+	// THE CONTROL, one position over, AND IT PINS THE ORDERING RATHER THAN A
+	// CONJUNCT. A handle whose OWN surrender claimed the teardown is the state
+	// O6.1 releases from, and it must not be told a rival holds the claim —
+	// there is no rival. What makes that true is that the lease is checked
+	// FIRST, not a "whose claim is this" test: such a conjunct existed, was
+	// unreachable-true, and left the package green when its accessor was
+	// replaced with `return false`. Asserting the DIAGNOSIS is what makes the
+	// ordering killable; asserting only that it was refused would not be.
 	g := newHeartbeatFixture(t)
 	close(g.lease.lost)
 	g.awaitExit(t)
 	if entry, held := g.registry.Get(g.key()); !held || !entry.TeardownOwned {
 		t.Fatal("the control's residency is not claimed for teardown")
 	}
-	if err := g.beat.FinishRelease(context.Background()); errors.Is(err, ErrTeardownOwnedElsewhere) {
-		t.Error("a handle refused its own teardown claim, which is the state a teardown owner releases from")
+	err := g.beat.FinishRelease(context.Background())
+	if errors.Is(err, ErrTeardownOwnedElsewhere) {
+		t.Error("a handle was told a rival owns the teardown of a claim it made itself; the lease must be checked before the claim")
+	}
+	if !errors.Is(err, ErrLeaseNotHeld) {
+		t.Errorf("the control reported %v, want ErrLeaseNotHeld: ownership is gone, which is the more specific truth and the one an operator acts on", err)
+	}
+}
+
+// TestAResidencyRemovedBetweenTheCheckAndTheWriteIsNotACleanRelease is B3: the
+// same fact, eleven lines apart, used to get two answers.
+//
+// releasable runs before the write lock, so a residency removed in between
+// reached MarkReleasing's !current branch and returned a CLEAN SUCCESS for
+// "there was nothing of mine" — while the identical condition a few lines
+// earlier returned ErrNothingToRelease. The seam that makes it reachable is the
+// registry read releasable itself performs.
+func TestAResidencyRemovedBetweenTheCheckAndTheWriteIsNotACleanRelease(t *testing.T) {
+	f := newHeartbeatFixture(t)
+	if err := f.beat.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	f.registry.afterGet = func() {
+		f.registry.inner.RemoveByGeneration(f.key(), f.entry.Generation)
+	}
+
+	err := f.beat.BeginRelease(context.Background())
+	if err == nil {
+		t.Fatal("a release whose residency vanished between the check and the write reported a clean success")
+	}
+	if !errors.Is(err, ErrNothingToRelease) {
+		t.Errorf("the failure %v does not unwrap to ErrNothingToRelease", err)
+	}
+	if published := len(f.locations.publishedAll()); published != 0 {
+		t.Errorf("%d observations were published for a residency that is gone", published)
 	}
 }
 
@@ -1649,9 +1713,13 @@ func TestASupersededEpochIsTheDiagnosisEvenWhenAnotherOwnerHoldsTheTeardown(t *t
 //
 // WHAT IT DOES NOT COVER: that the lock is held across the READ as well as the
 // write. A function that locked, wrote, and had read the entry earlier would
-// satisfy this and still publish a stale state. Nothing here catches that, and
-// the reason it does not happen is that both writers read inside the same
-// locked region — a fact this guard cannot see.
+// satisfy this and still publish a stale state. That gap is closed
+// BEHAVIOURALLY instead, by asking at the seam whether the lock is held at the
+// moment of the read — see TestTheBeatAndTheReleaseAreOneWriter — because a
+// structural rule over a read has no fixed shape to match.
+//
+// It also does not cover a lock released early with an explicit Unlock before
+// the write. Every site here defers, and nothing checks that.
 func TestEveryDurableLocationWriteHappensUnderTheWriteLock(t *testing.T) {
 	files := parseProductionFiles(t)
 	examined := 0
@@ -1690,6 +1758,24 @@ func TestEveryDurableLocationWriteHappensUnderTheWriteLock(t *testing.T) {
 			want:   0,
 		},
 		{
+			// THE REALISTIC EDIT, and it walked through the earlier detector: a
+			// maintainer moves the write above the lock and the guard stays
+			// green while the defect it is named for is back.
+			name:   "the write moved above the lock",
+			source: "package p\nfunc (h *Heartbeat) beat() { h.options.Locations.PublishResidency(nil, nil); h.writeMu.Lock(); h.writeMu.Unlock() }\n",
+			want:   1,
+		},
+		{
+			name:   "a lock that never runs",
+			source: "package p\nfunc (h *Heartbeat) beat() { if false { h.writeMu.Lock() }; h.options.Locations.PublishResidency(nil, nil) }\n",
+			want:   1,
+		},
+		{
+			name:   "a lock taken on another goroutine",
+			source: "package p\nfunc (h *Heartbeat) beat() { go func() { h.writeMu.Lock() }(); h.options.Locations.PublishResidency(nil, nil) }\n",
+			want:   1,
+		},
+		{
 			// The exclusion is itself probed: a too-wide one produces exactly
 			// the same green as a correct one, which has been a live defect in
 			// this module twice.
@@ -1719,6 +1805,31 @@ func isHeartbeatMethod(function *ast.FuncDecl) bool {
 	}
 	name, isIdent := pointer.X.(*ast.Ident)
 	return isIdent && name.Name == "Heartbeat"
+}
+
+// firstLocationWrite reports the position of the earliest durable location
+// write in a function, so a lock taken after it can be told from one taken
+// before.
+func firstLocationWrite(function *ast.FuncDecl) token.Pos {
+	earliest := token.Pos(-1)
+	ast.Inspect(function, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		method, isMethod := call.Fun.(*ast.SelectorExpr)
+		if !isMethod {
+			return true
+		}
+		switch method.Sel.Name {
+		case "PublishResidency", "TombstoneResidency":
+			if earliest < 0 || call.Pos() < earliest {
+				earliest = call.Pos()
+			}
+		}
+		return true
+	})
+	return earliest
 }
 
 // writesALocation reports whether a function calls a durable location write.
@@ -1753,19 +1864,23 @@ func writesALocation(function *ast.FuncDecl) bool {
 // which the unwinder's LIFO order guarantees. That is the part that matters and
 // it is true.
 //
-// AN EARLIER VERSION ALSO CLAIMED THE TWO WRITERS PUBLISH IDENTICAL CONTENT,
-// AND THAT WAS ALREADY FALSE. The Manager had no drain awareness at all and
-// passed accepting as a literal, while the heartbeat ANDs the entry's flag with
-// the Host's drain flag — so a drain landing inside an attach produced a
-// resident, accepting route on a draining Host. The Manager consults the one
-// drain flag now, and the claim is not restated: it was load-bearing for
-// nothing and wrong for something.
+// TWO VERSIONS OF THIS COMMENT CLAIMED THE WRITERS PUBLISH THE SAME CONTENT,
+// AND BOTH WERE FALSE — the second one inside the retraction of the first.
+// Step 9 built `resident` as a literal and accepting as `!Draining()`, while
+// the beat built residencyOf(entry.State) and entry.Accepting && !Draining():
+// two of three content axes divergent, not the one the retraction admitted to.
+// A clause that is true — the LIFO ordering — sat beside a clause that was not,
+// lending it credibility. That is the shape this lane keeps finding, arriving
+// once more inside the sentence written to stop it.
 //
-// The residual that remains is timestamps. The two writers read the clock
+// SO THE DIVERGENCE IS GONE RATHER THAN DOCUMENTED. Step 9 now derives from the
+// registry through the same functions the beat uses, so the two writers publish
+// the same function of the same state and there is nothing left for a comment
+// to be wrong about. What remains is timestamps: the two read the clock
 // independently, so a step 9 publish landing after a beat carries an earlier
-// ObservedAt and ExpiresAt than the record already holds. It is bounded by the
-// heartbeat margin and benign, and it is the second thing one writer publishes
-// that the other would not.
+// ObservedAt. It is bounded by the heartbeat margin, and it is the ONLY
+// remaining axis — which is a claim with a test behind it rather than an
+// argument.
 func unlockedLocationWrites(file *ast.File) []string {
 	var offenders []string
 	for _, declaration := range file.Decls {
@@ -1773,22 +1888,34 @@ func unlockedLocationWrites(file *ast.File) []string {
 		if !isFunction || !writesALocation(function) || !isHeartbeatMethod(function) {
 			continue
 		}
-		locked := false
-		ast.Inspect(function, func(node ast.Node) bool {
-			call, isCall := node.(*ast.CallExpr)
+		// THE LOCK MUST BE UNCONDITIONAL AND MUST PRECEDE THE WRITE. Looking
+		// for a Lock() call anywhere in the function was a convention dressed
+		// as a mechanism, and three realistic edits walked through it: the lock
+		// inside `if false`, the lock inside a `go func`, and — the one a
+		// maintainer actually makes — the write moved ABOVE the lock. The rule
+		// this test is named for is that the write happens under the lock, so
+		// the check is over statement position and statement nesting, not over
+		// the call's presence.
+		lockedAt := -1
+		for _, statement := range function.Body.List {
+			expression, isExpression := statement.(*ast.ExprStmt)
+			if !isExpression {
+				continue
+			}
+			call, isCall := expression.X.(*ast.CallExpr)
 			if !isCall {
-				return true
+				continue
 			}
 			method, isMethod := call.Fun.(*ast.SelectorExpr)
 			if !isMethod || method.Sel.Name != "Lock" {
-				return true
+				continue
 			}
 			if field, ok := method.X.(*ast.SelectorExpr); ok && field.Sel.Name == "writeMu" {
-				locked = true
+				lockedAt = int(statement.Pos())
+				break
 			}
-			return true
-		})
-		if !locked {
+		}
+		if lockedAt < 0 || lockedAt > int(firstLocationWrite(function)) {
 			offenders = append(offenders, function.Name.Name)
 		}
 	}
@@ -1951,6 +2078,18 @@ func TestEveryFencedWriteGoesThroughTheFence(t *testing.T) {
 			source: "package p\nfunc (m *Manager) attach() { fence.write(func() error { return m.locations.PublishResidency(nil, nil) }) }\n",
 			want:   0,
 		},
+		{
+			name:   "control: inside it through a field",
+			source: "package p\nfunc (h *Heartbeat) beat() { h.fence.write(func() error { return h.options.Locations.PublishResidency(nil, nil) }) }\n",
+			want:   0,
+		},
+		{
+			// ANY method named write used to satisfy this, which made the
+			// detector a convention about naming rather than a mechanism.
+			name:   "a write method that is not the fence",
+			source: "package p\nfunc (m *Manager) attach() { m.log.write(func() error { return m.locations.PublishResidency(nil, nil) }) }\n",
+			want:   1,
+		},
 	} {
 		parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", probe.source, parser.SkipObjectResolution)
 		if err != nil {
@@ -1993,8 +2132,26 @@ func fencedWrites(file *ast.File) (int, []string) {
 			if !isOuter {
 				continue
 			}
-			if wrapper, ok := outer.Fun.(*ast.SelectorExpr); ok && wrapper.Sel.Name == "write" {
-				return true
+			wrapper, ok := outer.Fun.(*ast.SelectorExpr)
+			if !ok || wrapper.Sel.Name != "write" {
+				continue
+			}
+			// THE RECEIVER MUST BE A FENCE. Accepting any method named write
+			// made the detector a convention about naming — the same argument
+			// this package applied to the classifier one level up — so
+			// `m.log.write(func() error { return …Publish… })` read as fenced.
+			// Without type information the receiver is checked by spelling,
+			// which is disclosed rather than pretended away: it is `fence` as a
+			// local or `X.fence` as a field, and nothing else.
+			switch receiver := wrapper.X.(type) {
+			case *ast.Ident:
+				if receiver.Name == "fence" {
+					return true
+				}
+			case *ast.SelectorExpr:
+				if receiver.Sel.Name == "fence" {
+					return true
+				}
 			}
 		}
 		unfenced = append(unfenced, method.Sel.Name)
