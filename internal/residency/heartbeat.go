@@ -202,15 +202,36 @@ type Heartbeat struct {
 	// observer; settled is what a caller waits on to know the handoff is over.
 	settled chan struct{}
 
+	// writeMu serializes everything that reads the residency and then writes
+	// its durable location: the beat, and beginRelease. See beat.
+	writeMu sync.Mutex
+
 	releaseMu sync.Mutex
 	begun     bool
 	beginErr  error
 	finished  bool
 	finishErr error
 
-	mu       sync.Mutex
+	mu sync.Mutex
+
 	beats    int
 	failures int
+
+	// ownershipEnded records that this Host no longer owns the session,
+	// whichever of the two paths said so.
+	//
+	// AN EARLIER VERSION HAD NO SUCH FIELD, and deleting it was right at the
+	// time: the loop was its only reader and a flag nothing checks is a claim
+	// nothing checks. leaseHeld is a reader now, and that changes the answer.
+	// Lost() is only one of the two ways ownership ends; the other —
+	// ErrEpochSuperseded on a fenced write — closes no channel, so a handle
+	// consulting Lost() alone would go on writing under an epoch it has been
+	// told in so many words was superseded.
+	ownershipEnded bool
+
+	// teardownOwned records that THIS heartbeat won registry.BeginTeardown,
+	// which is what distinguishes "the claim is ours" from "a rival holds it".
+	teardownOwned bool
 }
 
 // THE LOOP CARRIES NO "lost" FLAG, and it did until an audit deleted every rung
@@ -318,16 +339,21 @@ func (h *Heartbeat) FinishRelease(ctx context.Context) error {
 
 // beginRelease is BeginRelease's body, run at most once.
 func (h *Heartbeat) beginRelease(ctx context.Context) error {
+	if _, err := h.releasable(); err != nil {
+		if errors.Is(err, errNothingToRelease) {
+			return nil
+		}
+		return &ReleaseError{Key: h.key, Unwritten: []string{"releasing observation: " + err.Error()}, Cause: err}
+	}
+
+	// ONE WRITER. See writeMu: the beat and this share a record and an epoch,
+	// so the store's fence cannot order them and the lock must.
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+
 	entry, current := h.options.Registry.MarkReleasing(h.key, h.generation)
 	if !current {
-		// The residency is gone or has been replaced under this generation.
-		// There is nothing of this heartbeat's to release, and writing under a
-		// generation that is gone would remove a route its REPLACEMENT
-		// installed.
 		return nil
-	}
-	if err := h.leaseHeld(); err != nil {
-		return &ReleaseError{Key: h.key, Unwritten: []string{"releasing observation: " + err.Error()}, Cause: err}
 	}
 	observation := h.observation(entry, sessionwire.SessionResidencyReleasing, false)
 	if err := h.options.Locations.PublishResidency(ctx, observation); err != nil {
@@ -338,12 +364,25 @@ func (h *Heartbeat) beginRelease(ctx context.Context) error {
 
 // finishRelease is FinishRelease's body, run at most once.
 func (h *Heartbeat) finishRelease(ctx context.Context) error {
-	if entry, current := h.options.Registry.Get(h.key); !current || entry.Generation != h.generation {
+	_, err := h.releasable()
+	switch {
+	case errors.Is(err, errNothingToRelease):
 		return nil
+	case errors.Is(err, ErrTeardownOwnedElsewhere):
+		// The local entry is NOT removed. It is the claimed owner's.
+		return &ReleaseError{Key: h.key, Unwritten: []string{"residency tombstone: " + err.Error()}, Cause: err}
 	}
 
+	// ONE WRITER, uniformly. This half has already stopped the loop, so there
+	// is nothing to contend with — and taking the lock anyway is the point:
+	// "every durable location write happens under writeMu" is one rule with one
+	// mechanism, which a guard can check, rather than two mechanisms that a
+	// reader has to know are equivalent.
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+
 	var unwritten []string
-	if err := h.leaseHeld(); err != nil {
+	if err != nil {
 		unwritten = append(unwritten, "residency tombstone: "+err.Error())
 	} else if err := h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch); err != nil {
 		// §10.1: the route is removed by an EXPIRED epoch-fenced tombstone,
@@ -357,7 +396,7 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	h.options.Registry.RemoveByGeneration(h.key, h.generation)
 
 	if len(unwritten) > 0 {
-		return &ReleaseError{Key: h.key, Unwritten: unwritten, Cause: h.leaseHeld()}
+		return &ReleaseError{Key: h.key, Unwritten: unwritten, Cause: err}
 	}
 	return nil
 }
@@ -374,12 +413,63 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 // both, but the whole argument for writing nothing after a loss is that the
 // holder must not ATTEMPT it.
 func (h *Heartbeat) leaseHeld() error {
+	// BOTH PATHS, and the second is the stronger signal. Lost() fires on
+	// renewal failure or expiry and does NOT prove a successor exists;
+	// ErrEpochSuperseded IS that proof — the store has said a higher epoch
+	// committed. Consulting only the channel left the case where this Host has
+	// been told outright that it was superseded still writing a releasing
+	// observation and a tombstone, and reporting a clean release.
+	h.mu.Lock()
+	ended := h.ownershipEnded
+	h.mu.Unlock()
+	if ended {
+		return ErrLeaseNotHeld
+	}
 	select {
 	case <-h.lostSignal():
 		return ErrLeaseNotHeld
 	default:
 		return nil
 	}
+}
+
+// teardownIsOurs reports whether a teardown claim on the entry is this
+// heartbeat's own.
+func (h *Heartbeat) teardownIsOurs() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.teardownOwned
+}
+
+// releasable reports whether this handle may still act on the residency, or the
+// typed reason it may not.
+//
+// THE ORDER OF THE THREE CHECKS IS THE CONTRACT. A generation that is gone
+// means there is nothing of this heartbeat's, and it is checked first because
+// every later answer would be about somebody else's residency. A lost grant is
+// checked before a rival's teardown claim because it is the more specific
+// truth: when this heartbeat surrendered it claimed the teardown itself, so the
+// claim it would otherwise report is its own.
+func (h *Heartbeat) releasable() (registry.Entry, error) {
+	entry, current := h.options.Registry.Get(h.key)
+	if !current || entry.Generation != h.generation {
+		// Nothing of this heartbeat's. Writing under a generation that is gone
+		// would remove a route its REPLACEMENT installed.
+		return registry.Entry{}, errNothingToRelease
+	}
+	if err := h.leaseHeld(); err != nil {
+		return entry, err
+	}
+	if entry.TeardownOwned && !h.teardownIsOurs() {
+		// registry.BeginTeardown records ownership rather than inferring it
+		// from a re-enterable state, and this package built it that way so a
+		// second owner would not have to be guessed at. Reading it is the other
+		// half of that: a rival holding the claim owns the release, and
+		// removing the local entry out from under it is the failure the claim
+		// exists to prevent.
+		return entry, ErrTeardownOwnedElsewhere
+	}
+	return entry, nil
 }
 
 // Beats reports how many observations this heartbeat has published.
@@ -463,6 +553,18 @@ func (h *Heartbeat) loop(ctx context.Context) *LostResidency {
 
 // beat publishes one observation and reports whether the loop should continue.
 func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
+	// ONE WRITER, and this lock is what makes that claim true rather than
+	// nearly true. The beat reads the registry and then writes the location;
+	// beginRelease marks the entry releasing and then writes the same record
+	// under the SAME epoch, so the store's fence cannot order the two. Without
+	// this, a beat that had already read `resident` published it after
+	// beginRelease had published `releasing`, and the last durable word on a
+	// session whose admission was locally closed was "resident, accepting" for
+	// up to one heartbeat interval. FinishRelease's doc reasons about exactly
+	// this hazard against the tombstone; its twin here was missed.
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+
 	entry, current := h.options.Registry.Get(h.key)
 	if !current || entry.Generation != h.generation {
 		// The residency was removed or replaced under this heartbeat. It is not
@@ -533,6 +635,15 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 // expiry and to Factory's bounded due reconciler rather than to this Host.
 func (h *Heartbeat) surrender(reason LossReason) *LostResidency {
 	entry, won := h.options.Registry.BeginTeardown(h.key, h.generation)
+	// RECORDED ON BOTH BRANCHES, because ownership is gone either way. Whether
+	// this heartbeat won the teardown claim decides who performs the release;
+	// it decides nothing about whether this Host still owns the session, and
+	// recording it only on the winning branch would leave a loser writing
+	// fenced records under an epoch somebody else has superseded.
+	h.mu.Lock()
+	h.ownershipEnded = true
+	h.teardownOwned = won
+	h.mu.Unlock()
 	if !won {
 		// Either the residency has been replaced under this heartbeat, or
 		// somebody already owns the teardown. In both cases admission is
@@ -605,6 +716,16 @@ func residencyOf(state registry.ResidencyState) sessionwire.SessionResidency {
 // there is nothing to retry: the route expires on its own, and §15's bounded
 // due reconciler is what cleans up after a Host that stopped owning a session.
 var ErrLeaseNotHeld = errors.New("residency: this Host no longer holds the session lease")
+
+// ErrTeardownOwnedElsewhere is the cause a release carries when another caller
+// holds registry.BeginTeardown's single-owner claim on the residency. That
+// owner performs the release; this handle writes nothing and removes nothing.
+var ErrTeardownOwnedElsewhere = errors.New("residency: another caller owns the teardown of this residency")
+
+// errNothingToRelease is the internal sentinel for a residency that is gone or
+// has been replaced under this heartbeat. It is unexported because it is not a
+// failure a caller acts on: there is simply nothing of this handle's left.
+var errNothingToRelease = errors.New("residency: this heartbeat's residency is gone")
 
 // ReleaseError reports a release that could not write everything it owed.
 type ReleaseError struct {
