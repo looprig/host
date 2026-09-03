@@ -142,17 +142,16 @@ type Inbox interface {
 	ListOrdered(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, afterOrder uint64, limit int) ([]Command, error)
 }
 
-// Cursors is the durable command-consumption cursor of §10.4.
+// CursorWrites is the durable cursor's one write.
 //
-// It is a SEPARATE interface from Inbox because it is a different durable
-// object with a different writer discipline: the inbox is written by whoever
-// accepts and applies commands, and the cursor is written only by the current
-// lease holder, through the fence.
-type Cursors interface {
-	// LoadCursor returns the greatest acceptance order durably consumed for a
-	// session, or zero when none has been recorded.
-	LoadCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (uint64, error)
-
+// IT IS ITS OWN INTERFACE BECAUSE THE FENCING GUARD READS THESE DECLARATIONS.
+// TestEveryDurableWriteGoesThroughTheFence collects the methods of every
+// interface in this package whose name ends in "Writes" and requires each call
+// to one of them to be inside a Fence.Write, so the set of durable writes is
+// derived from the seams rather than from a list somebody has to remember to
+// widen. Cursors below still has both methods, so nothing that implements it
+// changed.
+type CursorWrites interface {
 	// SaveCursor records the cursor under the writer's lease epoch. The
 	// implementation rejects an epoch lower than the greatest already
 	// committed for the record.
@@ -168,6 +167,20 @@ type Cursors interface {
 	// ReconcileInterval and counting the refusals as store trouble. Wrap or
 	// return residency.ErrEpochSuperseded.
 	SaveCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, epoch uint64, order uint64) error
+}
+
+// Cursors is the durable command-consumption cursor of §10.4.
+//
+// It is a SEPARATE interface from Inbox because it is a different durable
+// object with a different writer discipline: the inbox is written by whoever
+// accepts and applies commands, and the cursor is written only by the current
+// lease holder, through the fence.
+type Cursors interface {
+	// LoadCursor returns the greatest acceptance order durably consumed for a
+	// session, or zero when none has been recorded.
+	LoadCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (uint64, error)
+
+	CursorWrites
 }
 
 // Fence is the lease-epoch guard every durable write goes through.

@@ -1934,136 +1934,14 @@ func TestConcurrentPassesDoNotApplyACommandTwice(t *testing.T) {
 // Structural guard
 // ---------------------------------------------------------------------------
 
-// TestEveryDurableCursorWriteGoesThroughTheFence holds the ONE mechanism rule
-// for this package's single durable write. It is a structural check rather than
-// a behavioural one because a behavioural test can only see the writes that
-// exist today: the seventh caller of SaveCursor is the one that will forget.
-//
-// The claim is EXACTLY its enumeration and no wider: every call whose callee is
-// a selector named SaveCursor, in a production file of this package, is
-// lexically inside a call whose callee is a selector named Write. A write
-// smuggled through a function value assigned elsewhere is not covered.
-func TestEveryDurableCursorWriteGoesThroughTheFence(t *testing.T) {
-	t.Parallel()
-
-	t.Run("the package obeys it", func(t *testing.T) {
-		t.Parallel()
-		fset := token.NewFileSet()
-		parsed, err := parser.ParseFile(fset, "consumer.go", nil, parser.ParseComments)
-		if err != nil {
-			t.Fatalf("parse consumer.go: %v", err)
-		}
-		found, unfenced := cursorWrites(fset, parsed)
-		if found == 0 {
-			t.Fatal("consumer.go contains no SaveCursor call at all, so this guard is vacuous")
-		}
-		if len(unfenced) != 0 {
-			t.Errorf("these SaveCursor calls are not inside a fenced write, so a cursor could advance under a lease a successor has taken: %s", strings.Join(unfenced, "; "))
-		}
-	})
-
-	// The guard is PROBED with declarations that genuinely violate it, rather
-	// than by mutating the assertion: an assertion that survives because
-	// nothing in the package breaks the property is a fact about the package,
-	// not about the guard.
-	for _, testCase := range []struct {
-		name     string
-		source   string
-		found    int
-		unfenced int
-	}{
-		{
-			name:     "a fenced write",
-			source:   "package p\nfunc f() { fence.Write(func() error { return c.SaveCursor(ctx, t, s, e, o) }) }\n",
-			found:    1,
-			unfenced: 0,
-		},
-		{
-			name:     "a bare write",
-			source:   "package p\nfunc f() { _ = c.SaveCursor(ctx, t, s, e, o) }\n",
-			found:    1,
-			unfenced: 1,
-		},
-		{
-			name:     "a write inside some other call",
-			source:   "package p\nfunc f() { log(func() error { return c.SaveCursor(ctx, t, s, e, o) }) }\n",
-			found:    1,
-			unfenced: 1,
-		},
-		{
-			name:     "a second write beside a fenced one",
-			source:   "package p\nfunc f() { fence.Write(func() error { return c.SaveCursor(ctx, t, s, e, o) }); _ = c.SaveCursor(ctx, t, s, e, o) }\n",
-			found:    2,
-			unfenced: 1,
-		},
-		{
-			name:     "no write at all",
-			source:   "package p\nfunc f() { _ = c.LoadCursor(ctx, t, s) }\n",
-			found:    0,
-			unfenced: 0,
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			fset := token.NewFileSet()
-			parsed, err := parser.ParseFile(fset, "probe.go", testCase.source, parser.ParseComments)
-			if err != nil {
-				t.Fatalf("parse the probe: %v", err)
-			}
-			found, unfenced := cursorWrites(fset, parsed)
-			if found != testCase.found {
-				t.Errorf("found %d SaveCursor calls, want %d", found, testCase.found)
-			}
-			if len(unfenced) != testCase.unfenced {
-				t.Errorf("reported %d unfenced writes %v, want %d", len(unfenced), unfenced, testCase.unfenced)
-			}
-		})
-	}
-}
-
-// cursorWrites returns how many SaveCursor calls a file contains and the
-// positions of those not lexically inside a Write call.
-func cursorWrites(fset *token.FileSet, file *ast.File) (int, []string) {
-	var (
-		found    int
-		unfenced []string
-		fenced   int
-	)
-	var walk func(node ast.Node) bool
-	walk = func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		name := selectorName(call.Fun)
-		switch name {
-		case "Write":
-			fenced++
-			for _, argument := range call.Args {
-				ast.Inspect(argument, walk)
-			}
-			fenced--
-			return false
-		case "SaveCursor":
-			found++
-			if fenced == 0 {
-				unfenced = append(unfenced, fset.Position(call.Pos()).String())
-			}
-		}
-		return true
-	}
-	ast.Inspect(file, walk)
-	return found, unfenced
-}
-
-// selectorName returns the method name a call expression selects, or "".
-func selectorName(fun ast.Expr) string {
-	selector, ok := fun.(*ast.SelectorExpr)
-	if !ok {
-		return ""
-	}
-	return selector.Sel.Name
-}
+// The structural guard that used to live here — "every SaveCursor call in
+// consumer.go is inside a Fence.Write" — MOVED AND WIDENED in O4.2, to
+// TestEveryDurableWriteGoesThroughTheFence in apply_test.go. It is not two
+// guards: the new one covers every production file of this package and derives
+// its subject from the `…Writes` interface declarations, so SaveCursor is
+// inside its claim and so is every write the applier makes. Leaving the old one
+// beside it would have been one rule at two sites, which is the shape this
+// module keeps paying for.
 
 // TestHintCarriesNoAuthority holds step 3 as a MECHANISM rather than as a
 // convention: Consumer.Hint's CommandID parameter is UNNAMED, so no body can
