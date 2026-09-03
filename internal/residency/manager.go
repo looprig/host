@@ -223,6 +223,19 @@ type Admissions interface {
 
 	// Release credits an admitted session's weight back.
 	Release(registry.Key) bool
+
+	// Draining reports whether this Host has begun graceful drain.
+	//
+	// IT IS ON THE LEDGER RATHER THAN BESIDE IT because they are the same
+	// object and the same rule: internal/service owns exactly one of each, and
+	// two sources of "draining" is a Host that stops accepting in one place
+	// while advertising Accepting from the other. This Manager WAS that second
+	// place — step 9 published accepting as a literal true — so an attach
+	// admitted a moment before a drain began went on to advertise an accepting
+	// route on a draining Host. The window is not narrow: Admit refuses new
+	// sessions once draining, but an already-admitted attach spans the lease,
+	// the journal fence and the whole of hydration.
+	Draining() bool
 }
 
 // LocalRegistry is the local residency index this manager installs into.
@@ -1160,7 +1173,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// leaves no observation at all, which projects `cold`, which is correct.
 	// Moving the first publish earlier would advertise a route for a session
 	// that may never exist.
-	resident := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyResident, true)
+	resident := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyResident, !m.admissions.Draining())
 	if err := m.locations.PublishResidency(sessionCtx, resident); err != nil {
 		return fail(StepAttached, "", "the resident residency projection could not be written", err)
 	}

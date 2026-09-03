@@ -515,6 +515,11 @@ func (a *tracingAdmissions) Release(key registry.Key) bool {
 	return a.inner.Release(key)
 }
 
+// Draining delegates, so a test that begins a drain on the REAL ledger changes
+// what the Manager advertises. A stub returning false would let a Manager that
+// never consulted the flag pass.
+func (a *tracingAdmissions) Draining() bool { return a.inner.Draining() }
+
 func (a *tracingAdmissions) counts() (admits, releases int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -3353,5 +3358,55 @@ func TestACompensationThatReportsItDidNothingIsNamed(t *testing.T) {
 	}
 	if len(control.Unreleased) != 0 {
 		t.Errorf("a clean rollback named %v as unreleased", control.Unreleased)
+	}
+}
+
+// TestAnAttachThatFinishesOnADrainingHostDoesNotAdvertiseAccepting closes the
+// Manager's half of the one-drain-flag rule.
+//
+// internal/service names two sources of "draining" as the defect — a Host that
+// stops accepting in one place while advertising Accepting from the other — and
+// the Manager WAS that second place: step 9 passed accepting as a literal true
+// while the heartbeat ANDs the entry's flag with the Host's. Admit refuses new
+// sessions once draining, but an already-admitted attach spans the lease, the
+// journal fence and the whole of hydration, so a drain lands inside it
+// routinely rather than by contrivance.
+//
+// The drain is begun through the REAL ledger, mid-attach, at the one seam that
+// puts it between admission and the resident publish.
+func TestAnAttachThatFinishesOnADrainingHostDoesNotAdvertiseAccepting(t *testing.T) {
+	f := newFixture(t)
+	f.registry.afterGet = nil
+	f.ownership.inWindow = func() { f.publisher.BeginDrain() }
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if !residency.Attached {
+		t.Fatal("the attach did not complete, so this test never reached its subject")
+	}
+
+	published := f.locations.publishedAll()
+	if len(published) != 2 {
+		t.Fatalf("%d observations were published, want the attaching/resident pair", len(published))
+	}
+	if published[1].Residency != sessionwire.SessionResidencyResident {
+		t.Fatalf("the second observation reports %q, want resident", published[1].Residency)
+	}
+	if published[1].Accepting {
+		t.Error("an attach that finished on a draining Host advertised an accepting route; the drain flag has one source and this is a reader of it")
+	}
+
+	// The CONTROL, one position over: without the drain the same attach
+	// advertises accepting. Without this row the assertion above would pass for
+	// a Manager that never advertised accepting at all.
+	g := newFixture(t)
+	if _, err := g.manager.Attach(context.Background(), g.request(ModeCreate)); err != nil {
+		t.Fatalf("the control's Attach: %v", err)
+	}
+	control := g.locations.publishedAll()
+	if len(control) != 2 || !control[1].Accepting {
+		t.Errorf("the control published %d observations with resident accepting %t, want 2 and true", len(control), control[len(control)-1].Accepting)
 	}
 }

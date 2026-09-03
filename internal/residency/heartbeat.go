@@ -340,9 +340,6 @@ func (h *Heartbeat) FinishRelease(ctx context.Context) error {
 // beginRelease is BeginRelease's body, run at most once.
 func (h *Heartbeat) beginRelease(ctx context.Context) error {
 	if _, err := h.releasable(); err != nil {
-		if errors.Is(err, errNothingToRelease) {
-			return nil
-		}
 		return &ReleaseError{Key: h.key, Unwritten: []string{"releasing observation: " + err.Error()}, Cause: err}
 	}
 
@@ -356,7 +353,7 @@ func (h *Heartbeat) beginRelease(ctx context.Context) error {
 		return nil
 	}
 	observation := h.observation(entry, sessionwire.SessionResidencyReleasing, false)
-	if err := h.options.Locations.PublishResidency(ctx, observation); err != nil {
+	if err := h.noteFencedWrite(h.options.Locations.PublishResidency(ctx, observation)); err != nil {
 		return &ReleaseError{Key: h.key, Unwritten: []string{"releasing observation: " + err.Error()}, Cause: err}
 	}
 	return nil
@@ -366,8 +363,8 @@ func (h *Heartbeat) beginRelease(ctx context.Context) error {
 func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	_, err := h.releasable()
 	switch {
-	case errors.Is(err, errNothingToRelease):
-		return nil
+	case errors.Is(err, ErrNothingToRelease):
+		return &ReleaseError{Key: h.key, Unwritten: []string{"residency tombstone: " + err.Error()}, Cause: err}
 	case errors.Is(err, ErrTeardownOwnedElsewhere):
 		// The local entry is NOT removed. It is the claimed owner's.
 		return &ReleaseError{Key: h.key, Unwritten: []string{"residency tombstone: " + err.Error()}, Cause: err}
@@ -382,9 +379,17 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	defer h.writeMu.Unlock()
 
 	var unwritten []string
+	cause := err
 	if err != nil {
 		unwritten = append(unwritten, "residency tombstone: "+err.Error())
-	} else if err := h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch); err != nil {
+	} else if err := h.noteFencedWrite(h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch)); err != nil {
+		// Y2: the STORE'S error becomes the cause. It was taken from
+		// releasable, which is nil on this path, so the one error that is not
+		// ambiguity — a superseded epoch — survived as text only while
+		// beginRelease ten lines up preserved it. Cause exists precisely so a
+		// caller tells a lost grant from an unreachable store with errors.Is
+		// rather than by matching a sentence.
+		cause = err
 		// §10.1: the route is removed by an EXPIRED epoch-fenced tombstone,
 		// never by erasing the fencing high-water mark, so a later epoch is
 		// still rejected after the logical record is gone.
@@ -396,7 +401,7 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	h.options.Registry.RemoveByGeneration(h.key, h.generation)
 
 	if len(unwritten) > 0 {
-		return &ReleaseError{Key: h.key, Unwritten: unwritten, Cause: err}
+		return &ReleaseError{Key: h.key, Unwritten: unwritten, Cause: cause}
 	}
 	return nil
 }
@@ -433,6 +438,28 @@ func (h *Heartbeat) leaseHeld() error {
 	}
 }
 
+// noteFencedWrite classifies the outcome of a fenced write and records the one
+// classification that ends ownership.
+//
+// IT IS CALLED BESIDE EVERY FENCED WRITE, which is three places and not one.
+// The classification lived inside beat, so the release path — which has its own
+// fenced writes and never runs surrender — was told in so many words that a
+// higher epoch had committed and went on to tombstone under its own. O6.1's
+// shape makes that the NORMAL case rather than a contrivance: BeginRelease,
+// then a slow checkpoint, then FinishRelease, with a successor taking the lease
+// in between and the refusal arriving before Lost() has propagated.
+//
+// It records only; what to do about it belongs to the caller, because the loop
+// surrenders and the release path reports.
+func (h *Heartbeat) noteFencedWrite(err error) error {
+	if errors.Is(err, ErrEpochSuperseded) {
+		h.mu.Lock()
+		h.ownershipEnded = true
+		h.mu.Unlock()
+	}
+	return err
+}
+
 // teardownIsOurs reports whether a teardown claim on the entry is this
 // heartbeat's own.
 func (h *Heartbeat) teardownIsOurs() bool {
@@ -455,7 +482,7 @@ func (h *Heartbeat) releasable() (registry.Entry, error) {
 	if !current || entry.Generation != h.generation {
 		// Nothing of this heartbeat's. Writing under a generation that is gone
 		// would remove a route its REPLACEMENT installed.
-		return registry.Entry{}, errNothingToRelease
+		return registry.Entry{}, ErrNothingToRelease
 	}
 	if err := h.leaseHeld(); err != nil {
 		return entry, err
@@ -591,7 +618,7 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// claim-nothing-checks shape this lane keeps finding.
 	observation := h.observation(entry, residencyOf(entry.State), entry.Accepting && !h.options.Drain.Draining())
 	if err := h.options.Locations.PublishResidency(ctx, observation); err != nil {
-		if errors.Is(err, ErrEpochSuperseded) {
+		if errors.Is(h.noteFencedWrite(err), ErrEpochSuperseded) {
 			// NOT AMBIGUITY AND NOT RETRIED. A refused fence is the backstop
 			// §10.1 describes: somebody else owns the session now, which is the
 			// same fact Lost() reports by the other path.
@@ -722,10 +749,16 @@ var ErrLeaseNotHeld = errors.New("residency: this Host no longer holds the sessi
 // owner performs the release; this handle writes nothing and removes nothing.
 var ErrTeardownOwnedElsewhere = errors.New("residency: another caller owns the teardown of this residency")
 
-// errNothingToRelease is the internal sentinel for a residency that is gone or
-// has been replaced under this heartbeat. It is unexported because it is not a
-// failure a caller acts on: there is simply nothing of this handle's left.
-var errNothingToRelease = errors.New("residency: this heartbeat's residency is gone")
+// ErrNothingToRelease reports that the residency this handle was created for is
+// gone or has been replaced under it.
+//
+// IT IS RETURNED RATHER THAN COLLAPSED TO NIL, and the distinction is §9.3's.
+// Step 1 is a precondition for step 3: a caller that reads nil from
+// BeginRelease and proceeds to checkpoint is checkpointing a residency whose
+// admission this handle did not stop, because there was nothing here to stop.
+// Success and no-op must not be indistinguishable — the argument this file
+// makes for ReleaseError, applied to the one return that did not follow it.
+var ErrNothingToRelease = errors.New("residency: this heartbeat's residency is gone or has been replaced")
 
 // ReleaseError reports a release that could not write everything it owed.
 type ReleaseError struct {

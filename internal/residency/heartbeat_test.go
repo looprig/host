@@ -173,11 +173,14 @@ type heartbeatFixture struct {
 	locations *fakeLocations
 	publisher *service.CapacityPublisher
 	teardown  *fakeTeardown
-	lease     *fakeLease
-	runtime   *fakeRuntime
-	entry     registry.Entry
-	beat      *Heartbeat
-	cancel    context.CancelFunc
+	// tombstoneErr is applied after the fixture builds, so a test can fail the
+	// tombstone while the releasing observation still succeeds.
+	tombstoneErr error
+	lease        *fakeLease
+	runtime      *fakeRuntime
+	entry        registry.Entry
+	beat         *Heartbeat
+	cancel       context.CancelFunc
 }
 
 func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *heartbeatFixture {
@@ -267,6 +270,10 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 	})
 	if err != nil {
 		t.Fatalf("NewHeartbeatOwnership: %v", err)
+	}
+
+	if f.tombstoneErr != nil {
+		f.locations.tombstoneErr = f.tombstoneErr
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1308,11 +1315,27 @@ func TestAReplacedResidencyIsNotReleasedByTheOldHandle(t *testing.T) {
 		t.Fatal("the replacement was not installed under a new generation")
 	}
 
-	if err := f.beat.BeginRelease(context.Background()); err != nil {
-		t.Errorf("BeginRelease reported %v for a residency that is not its own", err)
-	}
-	if err := f.beat.FinishRelease(context.Background()); err != nil {
-		t.Errorf("FinishRelease reported %v for a residency that is not its own", err)
+	// REPORTED, NOT COLLAPSED TO NIL. §9.3 makes step 1 a precondition for
+	// step 3, so a caller reading nil from BeginRelease and going on to
+	// checkpoint would be checkpointing a residency whose admission this handle
+	// never stopped, because there was nothing here to stop. Success and no-op
+	// must not be indistinguishable — the argument this file already makes for
+	// ReleaseError, applied to the one return that did not follow it.
+	for _, row := range []struct {
+		name string
+		call func() error
+	}{
+		{"BeginRelease", func() error { return f.beat.BeginRelease(context.Background()) }},
+		{"FinishRelease", func() error { return f.beat.FinishRelease(context.Background()) }},
+	} {
+		err := row.call()
+		if !errors.Is(err, ErrNothingToRelease) {
+			t.Errorf("%s reported %v for a residency that is not its own, want an error unwrapping to ErrNothingToRelease", row.name, err)
+		}
+		var refused *ReleaseError
+		if !errors.As(err, &refused) {
+			t.Errorf("%s reported %T, want *ReleaseError", row.name, err)
+		}
 	}
 
 	if published := len(f.locations.publishedAll()); published != 0 {
@@ -1498,13 +1521,28 @@ func TestARivalTeardownClaimIsNotReleasedThroughThisHandle(t *testing.T) {
 func TestTheBeatAndTheReleaseAreOneWriter(t *testing.T) {
 	f := newHeartbeatFixture(t)
 	released := make(chan error, 1)
+	// THE SEAM ASKS A STATE QUESTION RATHER THAN FORCING AN INTERLEAVING, which
+	// is what makes it decidable. afterGet runs, by construction, after the
+	// beat's registry read; if the read happened under the write lock the lock
+	// is held right now and TryLock must fail. Forcing the release to make
+	// progress here would deadlock the passing case; asking whether the lock is
+	// held does not, and it distinguishes "the lock exists" from "the lock
+	// covers the read".
+	lockedAcrossTheRead := false
 	f.registry.afterGet = func() {
+		if f.beat.writeMu.TryLock() {
+			f.beat.writeMu.Unlock()
+			lockedAcrossTheRead = true
+		}
 		go func() { released <- f.beat.BeginRelease(context.Background()) }()
 	}
 
 	f.pulse(t)
 	if err := <-released; err != nil {
 		t.Fatalf("BeginRelease: %v", err)
+	}
+	if lockedAcrossTheRead {
+		t.Error("the beat read the registry WITHOUT holding the write lock, so its publish can be based on a state another writer has already superseded; the lock existing is not the same as the lock covering the read")
 	}
 	f.pulse(t)
 
@@ -1698,14 +1736,25 @@ func writesALocation(function *ast.FuncDecl) bool {
 // subject and this repository has lost guards to exactly that. The subject is
 // the set of writers writeMu governs, which is the methods on this type.
 //
-// THE MANAGER IS EXCLUDED, and with a reason rather than by omission. Its
-// attach publishes the same record, and it is serialized differently: one
-// attach per key holds the slot, and its rollback stops the heartbeat before it
-// tombstones, which the unwinder's LIFO order guarantees. What that leaves
-// uncovered is step 9's resident publish racing an early beat — both carry
-// resident and accepting, so the records are content-identical and only their
-// timestamps differ, and a later beat carries the later time. If either writer
-// ever publishes something the other would not, this exclusion is wrong.
+// THE MANAGER IS EXCLUDED ON ORDERING, AND ON NOTHING ELSE. Its attach
+// publishes the same record and is serialized differently: one attach per key
+// holds the slot, and its rollback stops the heartbeat before it tombstones,
+// which the unwinder's LIFO order guarantees. That is the part that matters and
+// it is true.
+//
+// AN EARLIER VERSION ALSO CLAIMED THE TWO WRITERS PUBLISH IDENTICAL CONTENT,
+// AND THAT WAS ALREADY FALSE. The Manager had no drain awareness at all and
+// passed accepting as a literal, while the heartbeat ANDs the entry's flag with
+// the Host's drain flag — so a drain landing inside an attach produced a
+// resident, accepting route on a draining Host. The Manager consults the one
+// drain flag now, and the claim is not restated: it was load-bearing for
+// nothing and wrong for something.
+//
+// The residual that remains is timestamps. The two writers read the clock
+// independently, so a step 9 publish landing after a beat carries an earlier
+// ObservedAt and ExpiresAt than the record already holds. It is bounded by the
+// heartbeat margin and benign, and it is the second thing one writer publishes
+// that the other would not.
 func unlockedLocationWrites(file *ast.File) []string {
 	var offenders []string
 	for _, declaration := range file.Decls {
@@ -1733,4 +1782,103 @@ func unlockedLocationWrites(file *ast.File) []string {
 		}
 	}
 	return offenders
+}
+
+// TestASupersededEpochOnTheRELEASEPathAlsoEndsOwnership is Y1: the third way
+// ownership ends, and the one neither branch of surrender can reach.
+//
+// surrender runs only on the loop. The release path has its own fenced writes,
+// so a BeginRelease refused for a later epoch classified nothing, and the
+// FinishRelease that followed tombstoned under an epoch this Host had just been
+// told was superseded — and reported a clean release. O6.1's shape makes that
+// the NORMAL case, not a contrivance: BeginRelease, a slow checkpoint,
+// FinishRelease, with a successor taking the lease in between and the refusal
+// arriving before Lost() has propagated.
+func TestASupersededEpochOnTheRELEASEPathAlsoEndsOwnership(t *testing.T) {
+	f := newHeartbeatFixture(t, func(f *heartbeatFixture) {
+		f.locations.publishErr = fmt.Errorf("sessionstore: %w", ErrEpochSuperseded)
+	})
+	if err := f.beat.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	begun := f.beat.BeginRelease(context.Background())
+	if !errors.Is(begun, ErrEpochSuperseded) {
+		t.Fatalf("BeginRelease reported %v, want an error unwrapping to ErrEpochSuperseded", begun)
+	}
+	// The refusal was SEEN. What follows is whether it was BELIEVED.
+	f.locations.mu.Lock()
+	f.locations.publishErr = nil
+	f.locations.mu.Unlock()
+
+	finished := f.beat.FinishRelease(context.Background())
+	if finished == nil {
+		t.Fatal("FinishRelease reported a clean release after this Host was told a later epoch had committed")
+	}
+	if !errors.Is(finished, ErrLeaseNotHeld) {
+		t.Errorf("FinishRelease reported %v, want an error unwrapping to ErrLeaseNotHeld: a superseded epoch ends ownership wherever it is observed", finished)
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("a tombstone was written at %v after the epoch was superseded on the release path", tombstones)
+	}
+
+	// The CONTROL, one position over: the same two calls against a store that
+	// answers write both records. Without it these assertions would pass for a
+	// release that never writes anything.
+	g := newHeartbeatFixture(t)
+	if err := g.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("the control's BeginRelease reported %v", err)
+	}
+	if err := g.beat.FinishRelease(context.Background()); err != nil {
+		t.Fatalf("the control's FinishRelease reported %v", err)
+	}
+	if len(g.locations.tombstones()) != 1 {
+		t.Errorf("the control wrote %d tombstones, want 1", len(g.locations.tombstones()))
+	}
+}
+
+// TestARefusedTombstoneCarriesTheStoresOwnCause is Y2.
+//
+// finishRelease took its Cause from releasable, which is nil on this path, so
+// the one error that is NOT ambiguity survived as text only — while
+// beginRelease, ten lines up, preserved it. Cause was added so a caller could
+// tell a lost grant from an unreachable store with errors.Is instead of
+// matching a sentence; an operator reading the dropped one sees an unreachable
+// store.
+func TestARefusedTombstoneCarriesTheStoresOwnCause(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		fail  error
+		wants error
+	}{
+		{name: "a superseded epoch", fail: fmt.Errorf("sessionstore: %w", ErrEpochSuperseded), wants: ErrEpochSuperseded},
+		{name: "an unreachable store", fail: errors.New("dial tcp: connection refused"), wants: nil},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newHeartbeatFixture(t, func(f *heartbeatFixture) { f.tombstoneErr = row.fail })
+			if err := f.beat.BeginRelease(context.Background()); err != nil {
+				t.Fatalf("BeginRelease: %v", err)
+			}
+			err := f.beat.FinishRelease(context.Background())
+			var refused *ReleaseError
+			if !errors.As(err, &refused) {
+				t.Fatalf("error is %T, want *ReleaseError", err)
+			}
+			if refused.Cause == nil {
+				t.Fatal("the refusal carries no cause, so the store's own error survives as text only")
+			}
+			if !errors.Is(refused.Cause, row.fail) {
+				t.Errorf("the refusal's cause is %v, want the store's %v", refused.Cause, row.fail)
+			}
+			// The DISCRIMINATOR: the two rows differ only in what the store
+			// said, so a cause that were always the same value would pass one
+			// and fail the other.
+			if row.wants != nil && !errors.Is(err, row.wants) {
+				t.Errorf("the failure does not unwrap to %v", row.wants)
+			}
+			if row.wants == nil && errors.Is(err, ErrEpochSuperseded) {
+				t.Error("an unreachable store was reported as a superseded epoch")
+			}
+		})
+	}
 }
