@@ -209,11 +209,16 @@ type fakeCursors struct {
 	stored uint64
 	// loads is the scripted sequence of values LoadCursor returns. When empty
 	// the stored value is returned, which is what a conforming store does.
-	loads    []uint64
-	loadErr  error
-	saveErr  error
-	loadHits int
-	saves    []saveCall
+	loads   []uint64
+	loadErr error
+	saveErr error
+	// afterSave, when set, runs immediately after a successful durable write.
+	// It is the only way a test can reach the instant BETWEEN a pass writing
+	// its cursor and the loop deciding what to do next, which is where a lease
+	// can be lost without the pass ever seeing it.
+	afterSave func()
+	loadHits  int
+	saves     []saveCall
 }
 
 // LoadCursor returns the durable consumption cursor.
@@ -240,6 +245,9 @@ func (f *fakeCursors) SaveCursor(_ context.Context, tenant sessionwire.TenantID,
 		return f.saveErr
 	}
 	f.stored = order
+	if f.afterSave != nil {
+		f.afterSave()
+	}
 	return nil
 }
 
@@ -1288,6 +1296,89 @@ func TestRunStopsWithoutRunningAnotherPass(t *testing.T) {
 
 			if got := len(f.processor.processedIDs()); got != testCase.wantProcessed {
 				t.Errorf("processed %v (%d), want %d: %s", f.processor.processedIDs(), got, testCase.wantProcessed, testCase.reason)
+			}
+			if got := len(f.inbox.requests()); got != testCase.wantListed {
+				t.Errorf("ListOrdered was called %d times, want %d: %s", got, testCase.wantListed, testCase.reason)
+			}
+			if got := len(f.clock.requests()); got != testCase.wantTimers {
+				t.Errorf("%d timers were armed, want %d: %s", got, testCase.wantTimers, testCase.reason)
+			}
+		})
+	}
+}
+
+// TestRunStopsBetweenPagesWithoutListingAnother covers the OTHER two arms of
+// the leading precedence select, which the Stop test cannot reach.
+//
+// Reaching them needs the stop to land in a window the pass itself cannot see,
+// and THE TWO WINDOWS ARE NOT THE SAME ONE — the first version of this test
+// assumed they were and was wrong about the second. A cancellation is invisible
+// after the last record of a page, because nothing in Reconcile is consulted
+// there. A lost grant in that same window is NOT invisible: the cursor write
+// still to come is fenced, so the pass fails, the loop takes its error path and
+// the leading select is never reached. The grant must therefore be lost AFTER
+// the cursor write has been acknowledged, which is a real instant and is what
+// the Cursors hook exists for.
+//
+// In both rows the pass then completes normally, reports a full page, and the
+// leading select is the only thing standing between a cancelled or superseded
+// consumer and another whole pass. What that saves differs and the reasons say
+// so: for cancellation a cursor read, a list and a timer; for a lost grant the
+// round and its timer, since the fence refuses the next pass before it reads.
+func TestRunStopsBetweenPagesWithoutListingAnother(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name string
+		// install wires the hook that ends the consumer in this row's window.
+		install    func(*consumerFixture, context.CancelFunc)
+		wantListed int
+		wantTimers int
+		reason     string
+	}{
+		{
+			name: "cancellation after the last record of a page",
+			install: func(f *consumerFixture, cancel context.CancelFunc) {
+				f.processor.before = func(command Command) {
+					if command.AcceptedOrder == 3 {
+						cancel()
+					}
+				}
+			},
+			wantListed: 1,
+			wantTimers: 0,
+			reason:     "without the leading check the next pass reads the cursor and lists a page under a context that is already cancelled, and arms a timer on the way out",
+		},
+		{
+			name: "the grant lost after the cursor write",
+			install: func(f *consumerFixture, _ context.CancelFunc) {
+				f.cursors.afterSave = func() { f.fence.close() }
+			},
+			wantListed: 1,
+			wantTimers: 0,
+			reason:     "the fence refuses the next pass before it reads anything, so the leading check saves the round and its armed timer rather than a durable read",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			f := newConsumerFixture(t, func(f *consumerFixture) {
+				f.inbox.all = []Command{
+					command(1, StatePending), command(2, StatePending),
+					command(3, StatePending), command(4, StatePending),
+				}
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			testCase.install(f, cancel)
+			done := f.run(t, ctx)
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the loop did not leave")
+			}
+
+			if want := []sessionwire.CommandID{commandID(1), commandID(2), commandID(3)}; !equalIDs(f.processor.processedIDs(), want) {
+				t.Errorf("processed %v, want %v", f.processor.processedIDs(), want)
 			}
 			if got := len(f.inbox.requests()); got != testCase.wantListed {
 				t.Errorf("ListOrdered was called %d times, want %d: %s", got, testCase.wantListed, testCase.reason)
