@@ -144,9 +144,11 @@ func (f *fakeTeardown) handedOver() []LostResidency {
 	return append([]LostResidency(nil), f.lost...)
 }
 
-// The Host's ONE drain flag satisfies DrainState as written, which is the
-// compile-time half of not building a second one.
-var _ DrainState = (*service.CapacityPublisher)(nil)
+// The Host's ONE ledger satisfies Admissions — the drain flag included — which
+// is the compile-time half of not building a second one. The heartbeat and the
+// Manager name the SAME interface, so a composition cannot hand them different
+// objects without noticing.
+var _ Admissions = (*service.CapacityPublisher)(nil)
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -265,7 +267,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		HostGeneration: testGeneration,
 		Registry:       f.registry,
 		Locations:      f.locations,
-		Drain:          publisher,
+		Admissions:     publisher,
 		Teardown:       f.teardown,
 	})
 	if err != nil {
@@ -983,7 +985,7 @@ func TestTheManagerStartsARealHeartbeat(t *testing.T) {
 		HostGeneration: testGeneration,
 		Registry:       f.registry,
 		Locations:      f.locations,
-		Drain:          f.publisher,
+		Admissions:     f.publisher,
 		Teardown:       &fakeTeardown{},
 	})
 	if err != nil {
@@ -1032,7 +1034,7 @@ func TestBeginOwnershipRefusesARequestWithoutItsLease(t *testing.T) {
 	f := newHeartbeatFixture(t)
 	ownership, err := NewHeartbeatOwnership(HeartbeatOptions{
 		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
-		Locations: f.locations, Drain: f.publisher, Teardown: f.teardown,
+		Locations: f.locations, Admissions: f.publisher, Teardown: f.teardown,
 	})
 	if err != nil {
 		t.Fatalf("NewHeartbeatOwnership: %v", err)
@@ -1058,7 +1060,7 @@ func TestNewHeartbeatOwnershipRefusesAnIncompleteConfiguration(t *testing.T) {
 	f := newHeartbeatFixture(t)
 	complete := HeartbeatOptions{
 		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
-		Locations: f.locations, Drain: f.publisher, Teardown: f.teardown,
+		Locations: f.locations, Admissions: f.publisher, Teardown: f.teardown,
 	}
 	if _, err := NewHeartbeatOwnership(complete); err != nil {
 		t.Fatalf("the complete configuration was refused: %v", err)
@@ -1071,7 +1073,7 @@ func TestNewHeartbeatOwnershipRefusesAnIncompleteConfiguration(t *testing.T) {
 		{"HostGeneration", func(o *HeartbeatOptions) { o.HostGeneration = 0 }},
 		{"Registry", func(o *HeartbeatOptions) { o.Registry = nil }},
 		{"Locations", func(o *HeartbeatOptions) { o.Locations = nil }},
-		{"Drain", func(o *HeartbeatOptions) { o.Drain = nil }},
+		{"Admissions", func(o *HeartbeatOptions) { o.Admissions = nil }},
 		{"Teardown", func(o *HeartbeatOptions) { o.Teardown = nil }},
 	} {
 		t.Run(row.field, func(t *testing.T) {
@@ -1384,7 +1386,7 @@ func TestABlockingTeardownObserverDoesNotWedgeTheHandle(t *testing.T) {
 	}
 	ownership, err := NewHeartbeatOwnership(HeartbeatOptions{
 		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
-		Locations: f.locations, Drain: f.publisher, Teardown: blocking,
+		Locations: f.locations, Admissions: f.publisher, Teardown: blocking,
 	})
 	if err != nil {
 		t.Fatalf("NewHeartbeatOwnership: %v", err)
@@ -1538,8 +1540,17 @@ func TestTheBeatAndTheReleaseAreOneWriter(t *testing.T) {
 	}
 
 	f.pulse(t)
-	if err := <-released; err != nil {
-		t.Fatalf("BeginRelease: %v", err)
+	// A DIAGNOSTIC ARM, because this is the one blocking receive in the file
+	// whose signal comes from a hook rather than from the subject's own loop: a
+	// mutant that removed the beat's registry read would never run afterGet and
+	// would hang here instead of reporting. No passing run reaches it.
+	select {
+	case err := <-released:
+		if err != nil {
+			t.Fatalf("BeginRelease: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the release never ran, so the beat never read the registry")
 	}
 	if lockedAcrossTheRead {
 		t.Error("the beat read the registry WITHOUT holding the write lock, so its publish can be based on a state another writer has already superseded; the lock existing is not the same as the lock covering the read")
@@ -1881,4 +1892,113 @@ func TestARefusedTombstoneCarriesTheStoresOwnCause(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEveryFencedWriteGoesThroughTheFence is the guard the classification rule
+// was missing, and its absence is why three commits each fixed the sites they
+// happened to know about.
+//
+// Its neighbour — one writer, one lock — had a structural guard and stayed
+// right. This rule was "remember to classify the error", enforced by nothing,
+// and it was applied at three sites in one file while a second writer in
+// another file had four more with none. THE MUTATION EVIDENCE IS THE ARGUMENT:
+// of the three sites that did classify, only one was killable — the other two
+// were equivalent, because something else recorded the same fact first. Two
+// thirds of the convention was already unenforced by test, which is precisely
+// the state in which the next writer is added without it.
+//
+// It covers EVERY production file, the Manager included. The write-lock guard
+// excludes the Manager with a reason; this one must not, because the rule is
+// about the record and not about the type that writes it.
+func TestEveryFencedWriteGoesThroughTheFence(t *testing.T) {
+	files := parseProductionFiles(t)
+	total := 0
+	for name, file := range files {
+		writes, unfenced := fencedWrites(file)
+		total += writes
+		for _, offender := range unfenced {
+			t.Errorf("%s: %s is a fenced write that does not go through epochFence.write, so a later owner's refusal is never classified", name, offender)
+		}
+	}
+	// FLOORED at the sites that exist, so a guard that stopped finding them
+	// fails rather than passing. Six location writes plus the journal fence.
+	if total < 7 {
+		t.Fatalf("%d fenced writes were found, want at least the seven this package makes", total)
+	}
+
+	for _, probe := range []struct {
+		name   string
+		source string
+		want   int
+	}{
+		{
+			name:   "a publish outside the fence",
+			source: "package p\nfunc (m *Manager) attach() { m.locations.PublishResidency(nil, nil) }\n",
+			want:   1,
+		},
+		{
+			name:   "a tombstone outside the fence",
+			source: "package p\nfunc (m *Manager) roll() { m.locations.TombstoneResidency(nil, \"\", \"\", 1) }\n",
+			want:   1,
+		},
+		{
+			name:   "a journal fence outside the fence",
+			source: "package p\nfunc (m *Manager) open() { m.journal.CommitOpeningFence(nil, \"\", \"\", 1) }\n",
+			want:   1,
+		},
+		{
+			name:   "control: the same publish inside it",
+			source: "package p\nfunc (m *Manager) attach() { fence.write(func() error { return m.locations.PublishResidency(nil, nil) }) }\n",
+			want:   0,
+		},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", probe.source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%s: parsing the probe: %v", probe.name, err)
+		}
+		if _, unfenced := fencedWrites(parsed); len(unfenced) != probe.want {
+			t.Errorf("%s: the detector reported %v (%d), want %d", probe.name, unfenced, len(unfenced), probe.want)
+		}
+	}
+}
+
+// fencedWrites returns how many fenced writes a file makes and which of them do
+// not go through epochFence.write.
+func fencedWrites(file *ast.File) (int, []string) {
+	fenced := map[string]bool{
+		"PublishResidency":   true,
+		"TombstoneResidency": true,
+		"CommitOpeningFence": true,
+	}
+	total := 0
+	var unfenced []string
+	var stack []ast.Node
+	ast.Inspect(file, func(node ast.Node) bool {
+		if node == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		defer func() { stack = append(stack, node) }()
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		method, isMethod := call.Fun.(*ast.SelectorExpr)
+		if !isMethod || !fenced[method.Sel.Name] {
+			return true
+		}
+		total++
+		for _, ancestor := range stack {
+			outer, isOuter := ancestor.(*ast.CallExpr)
+			if !isOuter {
+				continue
+			}
+			if wrapper, ok := outer.Fun.(*ast.SelectorExpr); ok && wrapper.Sel.Name == "write" {
+				return true
+			}
+		}
+		unfenced = append(unfenced, method.Sel.Name)
+		return true
+	})
+	return total, unfenced
 }

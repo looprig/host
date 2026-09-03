@@ -88,6 +88,16 @@ type SessionLeases interface {
 type JournalFencer interface {
 	// CommitOpeningFence appends the fence stamped with the lease epoch,
 	// committed by sequence CAS against the tip read immediately beforehand.
+	//
+	// A REFUSED CAS RETURNS ErrFenceConflict, and that is a contract rather
+	// than a courtesy. §10.1 fences the journal with an in-stream ownership
+	// record and not an epoch column, so a successor's committed fence makes
+	// this writer's sequence permanently stale and every later append fails
+	// "even if it has not observed Lease.Lost()". That is the same fact
+	// ErrEpochSuperseded carries on the mutable records; a fencer that reports
+	// it as an untyped error leaves the one write that is not a location write
+	// unclassifiable, which is where the next occurrence of this defect would
+	// have been.
 	CommitOpeningFence(context.Context, sessionwire.TenantID, sessionwire.SessionID, uint64) error
 }
 
@@ -939,6 +949,19 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 	unwound.own("session lease", lease.Release)
 
+	// THE ONE MECHANISM, for this attach's four fenced writes. Three of them
+	// were unclassified: a step 9 publish refused for a later epoch was seen
+	// and then the unwinder tombstoned at the same epoch anyway — and a
+	// tombstone is a ROUTE REMOVAL, so under a store that fences removals less
+	// strictly than publishes that takes the SUCCESSOR's route away. The
+	// heartbeat guards its equivalent by generation; the unwinder had nothing.
+	//
+	// It also closes the other half O3.1 disclosed and this program has been
+	// chasing since: the Manager never consulted Lost() at all, so a grant
+	// closing mid-attach still ended in an accepting route published under a
+	// lease this Host does not hold, and Attached: true returned to the caller.
+	fence := newEpochFence(lease)
+
 	epoch := lease.Epoch()
 	if epoch == 0 {
 		// Refused HERE rather than at step 7. Core rejects a zero lease_epoch
@@ -949,7 +972,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 
 	// -- 3. the opening journal fence, BEFORE hydration ----------------------
-	if err := m.journal.CommitOpeningFence(sessionCtx, key.TenantID, key.SessionID, epoch); err != nil {
+	if err := fence.write(func() error {
+		return m.journal.CommitOpeningFence(sessionCtx, key.TenantID, key.SessionID, epoch)
+	}); err != nil {
 		return fail(StepFence, "", "the opening journal fence could not be committed", err)
 	}
 	// A COMMITTED FENCE IS NOT COMPENSATED, and that is the design rather than
@@ -1125,13 +1150,23 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	// -- 7. the epoch-fenced durable residency projection --------------------
 	observation := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyAttaching, false)
-	if err := m.locations.PublishResidency(sessionCtx, observation); err != nil {
+	if err := fence.write(func() error { return m.locations.PublishResidency(sessionCtx, observation) }); err != nil {
 		return fail(StepPublish, "", "the durable residency projection could not be written", err)
 	}
 	unwound.own("residency tombstone", func(ctx context.Context) error {
 		// §10.1: the route is removed by an EXPIRED epoch-fenced tombstone,
 		// never by erasing the fencing high-water mark.
-		return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, epoch)
+		//
+		// THROUGH THE FENCE, and here that matters more than anywhere else in
+		// this file. A tombstone is a route REMOVAL, so writing one after the
+		// store has said a later epoch committed does not merely fail
+		// harmlessly under a strict store — under any store that fences
+		// removals less strictly than publishes it takes the SUCCESSOR's route
+		// away. Refusing leaves this Host's own record to expire, which §18.2
+		// assigns to registry expiry and Factory's due reconciler.
+		return fence.write(func() error {
+			return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, epoch)
+		})
 	})
 
 	// -- 8. inbox, event and heartbeat ownership -----------------------------
@@ -1174,7 +1209,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// Moving the first publish earlier would advertise a route for a session
 	// that may never exist.
 	resident := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyResident, !m.admissions.Draining())
-	if err := m.locations.PublishResidency(sessionCtx, resident); err != nil {
+	if err := fence.write(func() error { return m.locations.PublishResidency(sessionCtx, resident) }); err != nil {
 		return fail(StepAttached, "", "the resident residency projection could not be written", err)
 	}
 

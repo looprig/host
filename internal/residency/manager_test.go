@@ -3,6 +3,7 @@ package residency
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go/ast"
 	"go/parser"
@@ -3408,5 +3409,150 @@ func TestAnAttachThatFinishesOnADrainingHostDoesNotAdvertiseAccepting(t *testing
 	control := g.locations.publishedAll()
 	if len(control) != 2 || !control[1].Accepting {
 		t.Errorf("the control published %d observations with resident accepting %t, want 2 and true", len(control), control[len(control)-1].Accepting)
+	}
+}
+
+// TestASupersededEpochDuringAnAttachStopsTheRollbackTombstoning is the
+// Manager's half of the rule the heartbeat has enforced three times.
+//
+// Step 9's publish is refused for a later epoch — SEEN — and the unwinder then
+// wrote the tombstone at that same epoch anyway. The consequence is worse here
+// than on the handle: a tombstone is a route REMOVAL, so under any store that
+// fences removals less strictly than publishes it takes the SUCCESSOR's route
+// away. The heartbeat guards its equivalent by generation; the unwinder had no
+// equivalent at all.
+func TestASupersededEpochDuringAnAttachStopsTheRollbackTombstoning(t *testing.T) {
+	f := newFixture(t, func(f *fixture) {
+		f.locations.publishErr = fmt.Errorf("sessionstore: %w", ErrEpochSuperseded)
+		f.locations.failOnCall = 2
+	})
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the refused resident publish was not reported")
+	}
+	if !errors.Is(err, ErrEpochSuperseded) {
+		t.Fatalf("the failure %v does not unwrap to ErrEpochSuperseded, so it was never seen", err)
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("the rollback tombstoned at %v after the store said a later epoch had committed; a tombstone is a route removal and this one may be the successor's", tombstones)
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	named := false
+	for _, unreleased := range attach.Unreleased {
+		if strings.HasPrefix(unreleased, "residency tombstone: ") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("the failure does not name the tombstone among what it could not write: %v; a route left to expire is an operator's business", attach.Unreleased)
+	}
+	// Everything ELSE still comes back. Refusing one fenced write must not
+	// abandon the rest of the ladder.
+	if consumed := f.publisher.ConsumedWeight(); consumed != 0 {
+		t.Errorf("the ledger still charges %d", consumed)
+	}
+	if held := f.leases.heldCount(); held != 0 {
+		t.Errorf("%d lease grant(s) are still held", held)
+	}
+	if _, held := f.registry.Get(f.key()); held {
+		t.Error("the local registry still holds the residency")
+	}
+
+	// The CONTROL, one position over: the same failure from an UNREACHABLE
+	// store does tombstone, because nothing has said the epoch is stale.
+	g := newFixture(t, func(g *fixture) {
+		g.locations.publishErr = errors.New("dial tcp: connection refused")
+		g.locations.failOnCall = 2
+	})
+	if _, err := g.manager.Attach(context.Background(), g.request(ModeCreate)); err == nil {
+		t.Fatal("the control's injected failure was not reported")
+	}
+	if tombstones := g.locations.tombstones(); len(tombstones) != 1 {
+		t.Errorf("the control wrote %d tombstones, want 1: an unreachable store says nothing about who owns the record", len(tombstones))
+	}
+}
+
+// TestAnAttachWhoseLeaseClosesMidWayDoesNotReportItselfAttached closes the half
+// of Lease.Lost() that O3.1 disclosed and O3.2 closed only for the heartbeat.
+//
+// Step 4 of the runbook says lease loss stops admission; the Manager is the
+// other place admission is granted, and it never consulted Lost() at all — so a
+// grant closing mid-attach still ended in an accepting route published under a
+// lease this Host does not hold, with Attached: true returned to the caller.
+func TestAnAttachWhoseLeaseClosesMidWayDoesNotReportItselfAttached(t *testing.T) {
+	f := newFixture(t)
+	f.ownership.inWindow = func() {
+		f.leases.mu.Lock()
+		granted := append([]*fakeLease(nil), f.leases.granted...)
+		f.leases.mu.Unlock()
+		if len(granted) != 1 {
+			t.Errorf("%d leases were granted, want 1", len(granted))
+			return
+		}
+		close(granted[0].lost)
+	}
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatalf("an attach whose lease closed mid-way reported itself attached: %+v", residency)
+	}
+	if !errors.Is(err, ErrLeaseNotHeld) {
+		t.Errorf("the failure %v does not unwrap to ErrLeaseNotHeld", err)
+	}
+	for _, observation := range f.locations.publishedAll() {
+		if observation.Accepting {
+			t.Errorf("an accepting route was published under a lease this Host does not hold: %+v", observation)
+		}
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("the rollback tombstoned at %v under a lost grant", tombstones)
+	}
+	if held := f.leases.heldCount(); held != 0 {
+		t.Errorf("%d lease grant(s) are still held", held)
+	}
+	if _, held := f.registry.Get(f.key()); held {
+		t.Error("the local registry still holds a residency whose lease is gone")
+	}
+}
+
+// TestAJournalFenceRefusedByALaterOwnerEndsTheAttach is §10.1's OTHER fencing
+// mechanism, which had no typed error at all and so could not be classified
+// even in principle.
+//
+// The journal is fenced by an in-stream ownership record rather than an epoch
+// column, and a successor's committed fence makes this writer's sequence
+// permanently stale — "even if it has not observed Lease.Lost()". That is the
+// same fact ErrEpochSuperseded carries, arriving through the mechanism nobody's
+// frame included.
+func TestAJournalFenceRefusedByALaterOwnerEndsTheAttach(t *testing.T) {
+	f := newFixture(t, func(f *fixture) {
+		f.journal.err = fmt.Errorf("sessionstore: %w", ErrFenceConflict)
+	})
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the refused journal fence was not reported")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if attach.Step != StepFence {
+		t.Errorf("the failure names step %q, want %q", attach.Step, StepFence)
+	}
+	if !errors.Is(err, ErrFenceConflict) {
+		t.Errorf("the failure %v does not unwrap to ErrFenceConflict", err)
+	}
+	f.assertNothingHeld(t)
+
+	// THE DISCRIMINATOR: a fence refused by a LATER OWNER must be classified,
+	// so nothing later in this attach writes under the stale epoch. Reaching a
+	// tombstone at all would mean the classification was dropped.
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("a tombstone was written at %v after a later owner's fence refused this one", tombstones)
 	}
 }

@@ -29,16 +29,105 @@ import (
 // see either first.
 var ErrEpochSuperseded = errors.New("residency: a later lease epoch has already committed for this record")
 
-// DrainState reports whether this Host has begun graceful drain.
+// ErrFenceConflict is what a JournalFencer returns when its sequence
+// compare-and-swap is refused.
 //
-// IT IS THE HOST'S ONE DRAIN FLAG AND NOT A SECOND ONE. internal/service owns
-// it and its documentation names this task's consumers explicitly: two sources
-// of "draining" is a Host that stops accepting in one place while still
-// advertising Accepting from the other, and neither package's tests could see
-// it. *service.CapacityPublisher satisfies this as written.
-type DrainState interface {
-	Draining() bool
+// §10.1 HAS TWO FENCING MECHANISMS AND THIS IS THE OTHER ONE. The journal is
+// fenced by an in-stream ownership record rather than an epoch column: a
+// successor's committed fence permanently makes the predecessor's tracked
+// sequence stale, so "every later append from the predecessor fails with a
+// typed conflict EVEN IF IT HAS NOT OBSERVED Lease.Lost()". That is the same
+// meaning ErrEpochSuperseded carries on the mutable records, and this module
+// had no sentinel for it at all — so the one fenced write that is not a
+// location write could not be classified even in principle.
+var ErrFenceConflict = errors.New("residency: the journal fence was refused by a later owner's committed sequence")
+
+// epochFence is the ONE mechanism every fenced write goes through.
+//
+// IT IS A MECHANISM AND NOT A CONVENTION, and the difference is the whole
+// reason this type exists. The rule was "remember to classify the error", and
+// remembering was enforced by nothing: it was applied at three sites in one
+// file while a fourth writer in another file had three more, none classified.
+// Its neighbour — one writer, one lock — had a structural guard and stayed
+// right. A rule you can forget is a rule that will be forgotten by whoever adds
+// the seventh write.
+//
+// So a write goes through write(): it refuses before the call when ownership is
+// already gone, and it records ownership as gone when the store or the ledger
+// says a later owner has committed. Both fencing mechanisms of §10.1 end
+// ownership, because both mean the same thing.
+type epochFence struct {
+	lease Lease
+
+	mu    sync.Mutex
+	ended bool
 }
+
+// newEpochFence returns the fence for one lease grant.
+func newEpochFence(lease Lease) *epochFence { return &epochFence{lease: lease} }
+
+// lost is the grant's loss channel, or a nil channel when there is no grant.
+//
+// A NIL CHANNEL BLOCKS FOREVER IN A SELECT, which is exactly "this grant has not
+// been lost". Every construction path refuses a missing lease, so the nil case
+// is unreachable — and that is the point: without it, the mutation removing
+// that refusal kills its guard by PANICKING before the test can compare
+// anything, and a kill by panic is not an assertion kill.
+func (f *epochFence) lost() <-chan struct{} {
+	if f.lease == nil {
+		return nil
+	}
+	return f.lease.Lost()
+}
+
+// held reports ErrLeaseNotHeld when this grant no longer owns the session,
+// by either of the two ways that can be known.
+func (f *epochFence) held() error {
+	f.mu.Lock()
+	ended := f.ended
+	f.mu.Unlock()
+	if ended {
+		return ErrLeaseNotHeld
+	}
+	select {
+	case <-f.lost():
+		return ErrLeaseNotHeld
+	default:
+		return nil
+	}
+}
+
+// end records that ownership is gone for a reason other than a refused write —
+// Lost() closing, observed on the loop.
+func (f *epochFence) end() {
+	f.mu.Lock()
+	f.ended = true
+	f.mu.Unlock()
+}
+
+// write performs one fenced write: refuse if ownership is already gone, run it,
+// and classify what came back.
+func (f *epochFence) write(run func() error) error {
+	if err := f.held(); err != nil {
+		return err
+	}
+	err := run()
+	if errors.Is(err, ErrEpochSuperseded) || errors.Is(err, ErrFenceConflict) {
+		f.end()
+	}
+	return err
+}
+
+// MEASURED, AND ONE ARM IS EQUIVALENT TODAY. Removing ErrFenceConflict from the
+// classification above changes no observable behaviour: the journal fence is
+// the only journal write this package makes, it happens at step 3, and nothing
+// fenced follows it in an attach that failed there — the rollback ladder at
+// that point holds an admission, a context and a lease, none of them fenced. It
+// is kept because the arm becomes load-bearing the moment there is a second
+// journal write, which O4's inbox consumption is, and because the alternative
+// is a sentinel that exists and is never consulted. What DOES hold it today is
+// the structural guard: the write must be routed through here whether or not
+// the classification can yet be observed.
 
 // HeartbeatRegistry is the local index a heartbeat reads and, on loss or
 // release, claims.
@@ -112,8 +201,16 @@ type HeartbeatOptions struct {
 	Registry  HeartbeatRegistry
 	Locations Locations
 
-	// Drain is the Host's ONE drain flag. See DrainState.
-	Drain DrainState
+	// Admissions is the Host's ONE ledger, and its drain flag with it.
+	//
+	// IT IS THE WHOLE LEDGER RATHER THAN A NARROWER DrainState, which this
+	// package used to declare. That interface was a strict subset, so a
+	// composition could satisfy the two independently and hand the Manager one
+	// object and the heartbeat another — moving "two sources of draining" from
+	// a code possibility to a COMPOSITION possibility, which is the defect the
+	// Workspaces note in manager.go describes. Naming the same type in both
+	// places is what makes them the same object by construction.
+	Admissions Admissions
 
 	// Teardown receives a residency whose ownership is gone, once.
 	Teardown TeardownObserver
@@ -143,7 +240,7 @@ func NewHeartbeatOwnership(options HeartbeatOptions) (*HeartbeatOwnership, error
 	}{
 		{"Registry", options.Registry != nil},
 		{"Locations", options.Locations != nil},
-		{"Drain", options.Drain != nil},
+		{"Admissions", options.Admissions != nil},
 		{"Teardown", options.Teardown != nil},
 	} {
 		if !required.present {
@@ -170,6 +267,7 @@ func (o *HeartbeatOwnership) BeginOwnership(ctx context.Context, request Ownersh
 		generation: request.Generation,
 		runtime:    request.Runtime,
 		lease:      request.Lease,
+		fence:      newEpochFence(request.Lease),
 		stopped:    make(chan struct{}),
 		done:       make(chan struct{}),
 		settled:    make(chan struct{}),
@@ -192,6 +290,12 @@ type Heartbeat struct {
 	generation uint64
 	runtime    department.Runtime
 	lease      Lease
+
+	// fence is the one mechanism every fenced write goes through. It also
+	// carries whether ownership has ended, which used to be a field here read
+	// by a method beside it — three sites, one file, and a fourth writer
+	// elsewhere with none.
+	fence *epochFence
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -217,18 +321,6 @@ type Heartbeat struct {
 	beats    int
 	failures int
 
-	// ownershipEnded records that this Host no longer owns the session,
-	// whichever of the two paths said so.
-	//
-	// AN EARLIER VERSION HAD NO SUCH FIELD, and deleting it was right at the
-	// time: the loop was its only reader and a flag nothing checks is a claim
-	// nothing checks. leaseHeld is a reader now, and that changes the answer.
-	// Lost() is only one of the two ways ownership ends; the other —
-	// ErrEpochSuperseded on a fenced write — closes no channel, so a handle
-	// consulting Lost() alone would go on writing under an epoch it has been
-	// told in so many words was superseded.
-	ownershipEnded bool
-
 	// teardownOwned records that THIS heartbeat won registry.BeginTeardown,
 	// which is what distinguishes "the claim is ours" from "a rival holds it".
 	teardownOwned bool
@@ -239,23 +331,6 @@ type Heartbeat struct {
 // nobody is a claim nothing checks — the same shape as the session-context rung
 // whose deletion passed O3.1's entire suite. What ownership was lost is
 // reported where it can be acted on: once, to the teardown observer.
-
-// lostSignal is the lease-loss channel, or a nil channel when there is no
-// lease at all.
-//
-// A NIL CHANNEL BLOCKS FOREVER IN A SELECT, which is exactly "this grant has
-// not been lost" and is why this is not a defensive shrug. BeginOwnership
-// refuses a request without a lease, so the nil case is unreachable in
-// production — and that is the point: without this, the mutation that removes
-// that refusal kills the guard by PANICKING on a nil interface before the test
-// can compare anything, and a kill by panic is not an assertion kill. With it,
-// the same mutation dies on the comparison the test actually makes.
-func (h *Heartbeat) lostSignal() <-chan struct{} {
-	if h.lease == nil {
-		return nil
-	}
-	return h.lease.Lost()
-}
 
 // Heartbeat is an OwnershipHandle.
 var _ OwnershipHandle = (*Heartbeat)(nil)
@@ -353,7 +428,7 @@ func (h *Heartbeat) beginRelease(ctx context.Context) error {
 		return nil
 	}
 	observation := h.observation(entry, sessionwire.SessionResidencyReleasing, false)
-	if err := h.noteFencedWrite(h.options.Locations.PublishResidency(ctx, observation)); err != nil {
+	if err := h.fence.write(func() error { return h.options.Locations.PublishResidency(ctx, observation) }); err != nil {
 		return &ReleaseError{Key: h.key, Unwritten: []string{"releasing observation: " + err.Error()}, Cause: err}
 	}
 	return nil
@@ -382,7 +457,9 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	cause := err
 	if err != nil {
 		unwritten = append(unwritten, "residency tombstone: "+err.Error())
-	} else if err := h.noteFencedWrite(h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch)); err != nil {
+	} else if err := h.fence.write(func() error {
+		return h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch)
+	}); err != nil {
 		// Y2: the STORE'S error becomes the cause. It was taken from
 		// releasable, which is nil on this path, so the one error that is not
 		// ambiguity — a superseded epoch — survived as text only while
@@ -408,57 +485,13 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 
 // leaseHeld reports ErrLeaseNotHeld when this heartbeat's grant is gone.
 //
-// IT IS CHECKED ON THE OBJECT, not only inside surrender, and that distinction
-// was a live escape. The rule "a holder that has lost its grant must not touch a
-// fenced record — not even to tombstone it" was enforced on the loop's path and
-// nowhere else, so a teardown owner reaching this handle after a loss — which is
-// the intended O6.1 path, since Manager.sessions carries the handle even though
-// LostResidency does not — published a `releasing` observation and a tombstone
-// under a lease this Host no longer held, and got nil back. A real store fences
-// both, but the whole argument for writing nothing after a loss is that the
-// holder must not ATTEMPT it.
-func (h *Heartbeat) leaseHeld() error {
-	// BOTH PATHS, and the second is the stronger signal. Lost() fires on
-	// renewal failure or expiry and does NOT prove a successor exists;
-	// ErrEpochSuperseded IS that proof — the store has said a higher epoch
-	// committed. Consulting only the channel left the case where this Host has
-	// been told outright that it was superseded still writing a releasing
-	// observation and a tombstone, and reporting a clean release.
-	h.mu.Lock()
-	ended := h.ownershipEnded
-	h.mu.Unlock()
-	if ended {
-		return ErrLeaseNotHeld
-	}
-	select {
-	case <-h.lostSignal():
-		return ErrLeaseNotHeld
-	default:
-		return nil
-	}
-}
-
-// noteFencedWrite classifies the outcome of a fenced write and records the one
-// classification that ends ownership.
-//
-// IT IS CALLED BESIDE EVERY FENCED WRITE, which is three places and not one.
-// The classification lived inside beat, so the release path — which has its own
-// fenced writes and never runs surrender — was told in so many words that a
-// higher epoch had committed and went on to tombstone under its own. O6.1's
-// shape makes that the NORMAL case rather than a contrivance: BeginRelease,
-// then a slow checkpoint, then FinishRelease, with a successor taking the lease
-// in between and the refusal arriving before Lost() has propagated.
-//
-// It records only; what to do about it belongs to the caller, because the loop
-// surrenders and the release path reports.
-func (h *Heartbeat) noteFencedWrite(err error) error {
-	if errors.Is(err, ErrEpochSuperseded) {
-		h.mu.Lock()
-		h.ownershipEnded = true
-		h.mu.Unlock()
-	}
-	return err
-}
+// IT DELEGATES, because the rule is the fence's. Both ways ownership can be
+// known to be gone live there: Lost() closing, and a fenced write refused by a
+// later owner. Lost() fires on renewal failure or expiry and does NOT prove a
+// successor exists; a refused fenced write IS that proof, and it closes no
+// channel — so a handle consulting only the channel went on writing under an
+// epoch it had been told was superseded.
+func (h *Heartbeat) leaseHeld() error { return h.fence.held() }
 
 // teardownIsOurs reports whether a teardown claim on the entry is this
 // heartbeat's own.
@@ -556,7 +589,7 @@ func (h *Heartbeat) loop(ctx context.Context) *LostResidency {
 			return nil
 		case <-h.stopped:
 			return nil
-		case <-h.lostSignal():
+		case <-h.fence.lost():
 			return h.surrender(LossReasonLeaseLost)
 		case <-timer.C:
 			// Precedence, not a race: every reason to stop is consulted before
@@ -566,7 +599,7 @@ func (h *Heartbeat) loop(ctx context.Context) *LostResidency {
 				return nil
 			case <-h.stopped:
 				return nil
-			case <-h.lostSignal():
+			case <-h.fence.lost():
 				return h.surrender(LossReasonLeaseLost)
 			default:
 			}
@@ -605,10 +638,8 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// window between reading the registry and writing the record, which is
 	// where a lease can be lost while a beat is already in flight. A publish
 	// under a lost grant is the one thing a fenced record must never receive.
-	select {
-	case <-h.lostSignal():
+	if err := h.leaseHeld(); err != nil {
 		return false, h.surrender(LossReasonLeaseLost)
-	default:
 	}
 	// FOR O4 AND O5, BECAUSE THE FLAG HAS NO OTHER READER YET: this
 	// observation is currently the ONLY consumer of registry.Entry.Accepting in
@@ -616,9 +647,9 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// immediately" is a flag nothing enforces. Whoever admits a command or a
 	// HostLink bind must read it, or step 4's guarantee becomes the
 	// claim-nothing-checks shape this lane keeps finding.
-	observation := h.observation(entry, residencyOf(entry.State), entry.Accepting && !h.options.Drain.Draining())
-	if err := h.options.Locations.PublishResidency(ctx, observation); err != nil {
-		if errors.Is(h.noteFencedWrite(err), ErrEpochSuperseded) {
+	observation := h.observation(entry, residencyOf(entry.State), entry.Accepting && !h.options.Admissions.Draining())
+	if err := h.fence.write(func() error { return h.options.Locations.PublishResidency(ctx, observation) }); err != nil {
+		if errors.Is(err, ErrEpochSuperseded) {
 			// NOT AMBIGUITY AND NOT RETRIED. A refused fence is the backstop
 			// §10.1 describes: somebody else owns the session now, which is the
 			// same fact Lost() reports by the other path.
@@ -667,8 +698,8 @@ func (h *Heartbeat) surrender(reason LossReason) *LostResidency {
 	// it decides nothing about whether this Host still owns the session, and
 	// recording it only on the winning branch would leave a loser writing
 	// fenced records under an epoch somebody else has superseded.
+	h.fence.end()
 	h.mu.Lock()
-	h.ownershipEnded = true
 	h.teardownOwned = won
 	h.mu.Unlock()
 	if !won {
