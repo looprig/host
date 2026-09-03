@@ -139,6 +139,12 @@ type listCall struct {
 type fakeInbox struct {
 	mu sync.Mutex
 
+	// all, when non-empty, makes this inbox answer like a CONFORMING STORE:
+	// the records strictly after the requested order, truncated to the limit.
+	// A scripted page sequence cannot express "the second caller saw the first
+	// caller's effect", which is the whole subject of a concurrency test.
+	all []Command
+
 	// pages is consumed one entry per call. The LAST entry is repeated once
 	// exhausted, so a loop test does not have to script every idle pass.
 	pages [][]Command
@@ -154,6 +160,15 @@ func (f *fakeInbox) ListOrdered(_ context.Context, tenant sessionwire.TenantID, 
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, listCall{TenantID: tenant, SessionID: session, AfterOrder: after, Limit: limit})
 	index := len(f.calls) - 1
+	if len(f.all) > 0 {
+		page := []Command{}
+		for _, record := range f.all {
+			if record.AcceptedOrder > after && len(page) < limit {
+				page = append(page, record)
+			}
+		}
+		return page, nil
+	}
 	var err error
 	if index < len(f.errs) {
 		err = f.errs[index]
@@ -1266,6 +1281,74 @@ func TestReconcileReportsAFailedCursorLoad(t *testing.T) {
 	}
 	if len(f.inbox.requests()) != 0 {
 		t.Errorf("the inbox was listed %d times with no cursor to list from", len(f.inbox.requests()))
+	}
+}
+
+// TestConcurrentPassesDoNotApplyACommandTwice holds the one-pass-at-a-time
+// rule. Reconcile is exported for attach-time reconciliation and the resident
+// loop calls it too, so two callers is the ordinary composition; two passes
+// over one cursor would list the same page and hand the same command to the
+// Processor twice.
+//
+// The assertion is DECIDABLE rather than timed: the second pass either parks on
+// the busy slot or runs to completion, exactly one of those happens, and a
+// select between them settles it.
+func TestConcurrentPassesDoNotApplyACommandTwice(t *testing.T) {
+	t.Parallel()
+
+	f := newConsumerFixture(t, func(f *consumerFixture) {
+		f.inbox.all = []Command{command(1, StatePending), command(2, StatePending)}
+	})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	f.processor.before = func(Command) {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	parked := make(chan struct{})
+	f.consumer.mu.Lock()
+	f.consumer.parked = func() { close(parked) }
+	f.consumer.mu.Unlock()
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := f.consumer.Reconcile(context.Background())
+		first <- err
+	}()
+	<-entered
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := f.consumer.Reconcile(context.Background())
+		second <- err
+	}()
+	select {
+	case <-parked:
+	case err := <-second:
+		t.Fatalf("the second pass ran to completion (%v) while the first was inside the Processor; both read the same cursor and both list the same page", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second pass neither parked nor returned")
+	}
+	close(release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if want := []sessionwire.CommandID{commandID(1), commandID(2)}; !equalIDs(f.processor.processedIDs(), want) {
+		t.Errorf("processed %v, want %v; a command applied twice is exactly-once turned into a scheduling accident", f.processor.processedIDs(), want)
+	}
+	requests := f.inbox.requests()
+	if len(requests) != 2 {
+		t.Fatalf("ListOrdered was called %d times, want 2", len(requests))
+	}
+	if requests[1].AfterOrder != 2 {
+		t.Errorf("the second pass listed after %d, want 2; it must see the first pass's acknowledged cursor", requests[1].AfterOrder)
 	}
 }
 

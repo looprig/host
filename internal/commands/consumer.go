@@ -390,11 +390,27 @@ type Consumer struct {
 	processor Processor
 	fence     Fence
 
-	// passMu serializes passes. ONE PASS AT A TIME is not a convenience: two
-	// concurrent passes would read the same cursor, list the same page and hand
-	// the same command to the Processor twice, which moves exactly-once
-	// application from a durable property into a scheduling accident.
-	passMu sync.Mutex
+	// passes is a ONE-SLOT SEMAPHORE holding the right to run a pass.
+	//
+	// ONE PASS AT A TIME is not a convenience: two concurrent passes read the
+	// same cursor, list the same page and hand the same command to the
+	// Processor twice, which moves exactly-once application from a durable
+	// property into a scheduling accident. Reconcile is exported and the loop
+	// calls it too, so the two-callers case is the ordinary one, not a corner.
+	//
+	// IT IS A CHANNEL RATHER THAN A sync.Mutex SO THAT PARKING IS OBSERVABLE,
+	// which is what turns "a second pass must not run while the first is inside
+	// the Processor" from a race into a decidable question: exactly one of
+	// parked-or-returned happens, so a select between the two is
+	// deterministic. A mutex offers no such seam, and the property went
+	// unchecked while it was one — a mutation deleting the whole lock left the
+	// package green.
+	passes chan struct{}
+
+	// parked, when set, is called immediately before a pass blocks on a busy
+	// slot. It is unexported, set only from inside this package, and read under
+	// mu.
+	parked func()
 
 	// hint is a ONE-SLOT WAKE, not a queue. The queue is the durable inbox; a
 	// second pending hint would only ask for a pass that is already about to
@@ -443,6 +459,7 @@ func NewConsumer(options Options) (*Consumer, error) {
 		cursors:   options.Cursors,
 		processor: options.Processor,
 		fence:     options.Fence,
+		passes:    make(chan struct{}, 1),
 		hint:      make(chan struct{}, 1),
 		stopped:   make(chan struct{}),
 	}, nil
@@ -548,6 +565,30 @@ func (c *Consumer) Run(ctx context.Context) {
 	}
 }
 
+// acquirePass takes the right to run a pass, reporting that it had to wait.
+//
+// The non-blocking attempt first, then the hook, then the blocking send: a slot
+// freed between the two sends makes this report a park that did not cost
+// anything, which over-reports waiting and never under-reports it. The
+// direction matters because the hook exists to prove a second pass DID wait.
+func (c *Consumer) acquirePass() {
+	select {
+	case c.passes <- struct{}{}:
+		return
+	default:
+	}
+	c.mu.Lock()
+	parked := c.parked
+	c.mu.Unlock()
+	if parked != nil {
+		parked()
+	}
+	c.passes <- struct{}{}
+}
+
+// releasePass hands the right to run a pass back.
+func (c *Consumer) releasePass() { <-c.passes }
+
 // record stores what the loop would otherwise discard.
 func (c *Consumer) record(result PassResult, err error) {
 	c.mu.Lock()
@@ -565,8 +606,8 @@ func (c *Consumer) record(result PassResult, err error) {
 // 9, and a composition that wants the first pass to have completed before it
 // answers a Factory bind calls this directly rather than racing the loop.
 func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
-	c.passMu.Lock()
-	defer c.passMu.Unlock()
+	c.acquirePass()
+	defer c.releasePass()
 
 	// REFUSED BEFORE THE READ, not only before the write. A Host that has lost
 	// the session lease has no business claiming commands out of an inbox a
