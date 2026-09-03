@@ -697,12 +697,13 @@ func (h *Heartbeat) beat(ctx context.Context) (bool, *LostResidency) {
 	// window between reading the registry and writing the record, which is
 	// where a lease can be lost while a beat is already in flight. A publish
 	// under a lost grant is the one thing a fenced record must never receive.
-	if _, ended := h.fence.endedBy(); ended || h.leaseHeld() != nil {
-		reason, _ := h.fence.endedBy()
-		if reason == "" {
-			reason = LossReasonLeaseLost
-		}
+	// ONE READ of the verdict, acted on directly. Reading it, then re-reading
+	// it to decide what to do with it, is the take-the-verdict-then-act-on-a-
+	// re-read shape this package argues against everywhere else.
+	if reason, ended := h.fence.endedBy(); ended {
 		return false, h.surrender(reason)
+	} else if h.leaseHeld() != nil {
+		return false, h.surrender(LossReasonLeaseLost)
 	}
 	// FOR O4 AND O5, BECAUSE THE FLAG HAS NO OTHER READER YET: this
 	// observation is currently the ONLY consumer of registry.Entry.Accepting in
@@ -769,7 +770,12 @@ func (h *Heartbeat) surrender(reason LossReason) *LostResidency {
 	// it decides nothing about whether this Host still owns the session, and
 	// recording it only on the winning branch would leave a loser writing
 	// fenced records under an epoch somebody else has superseded.
-	h.fence.end(LossReasonLeaseLost)
+	// THE REASON IS THE ONE PASSED IN, not a constant. Hardcoding lease_lost
+	// here was equivalent only by coincidence — every caller that could pass
+	// another reason had already ended the fence, so the first-wins guard in
+	// end() swallowed it — and this file's standard is that a value is right by
+	// construction rather than by an argument about who calls it.
+	h.fence.end(reason)
 	if !won {
 		// Either the residency has been replaced under this heartbeat, or
 		// somebody already owns the teardown. In both cases admission is

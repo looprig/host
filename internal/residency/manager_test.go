@@ -417,6 +417,11 @@ type fakeOwnership struct {
 	// seam that reaches that window, and no other collaborator is called inside
 	// it.
 	inWindow func()
+
+	// withRequest runs in the same window and is handed the request, which is
+	// how a test reaches the attach's own fence — the object a real heartbeat
+	// starting here would go on to write through.
+	withRequest func(OwnershipRequest)
 }
 
 func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipRequest) (OwnershipHandle, error) {
@@ -435,6 +440,12 @@ func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipReq
 		// invented rather than a property of the subject.
 		o.mu.Unlock()
 		hook()
+		o.mu.Lock()
+	}
+	if withRequest := o.withRequest; withRequest != nil {
+		o.withRequest = nil
+		o.mu.Unlock()
+		withRequest(request)
 		o.mu.Lock()
 	}
 	if o.err != nil {
@@ -3607,5 +3618,128 @@ func TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState(t *testing
 	final := control[len(control)-1]
 	if final.Residency != sessionwire.SessionResidencyResident || !final.Accepting {
 		t.Errorf("the control published (%q, accepting %t), want resident and true", final.Residency, final.Accepting)
+	}
+}
+
+// TestTheHeartbeatsFenceIsTheAttachsFence is the shared-fence hole, which an
+// earlier disclosure called equivalent on a reason that was false.
+//
+// The heartbeat starts at step 8 and TWO fenced writes follow it inside the
+// same attach: step 9's publish and the unwinder's tombstone. So a beat refused
+// with ErrEpochSuperseded ends the heartbeat's fence WITHOUT closing Lost() —
+// which is the case the fence exists for — and with a fence of its own the
+// Manager knows nothing and tombstones at an epoch a successor has superseded.
+// A tombstone is a route removal, and the route may be the successor's.
+//
+// The hook stands in for that beat exactly: one refused write through the very
+// object a real heartbeat starting here is handed.
+func TestTheHeartbeatsFenceIsTheAttachsFence(t *testing.T) {
+	f := newFixture(t)
+	f.ownership.withRequest = func(request OwnershipRequest) {
+		if request.Fence == nil {
+			t.Error("ownership was begun with no fence")
+			return
+		}
+		_ = request.Fence.write(func() error {
+			return fmt.Errorf("sessionstore: %w", ErrEpochSuperseded)
+		})
+	}
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("the attach reported success although its grant had been superseded by a write the heartbeat made")
+	}
+	if !errors.Is(err, ErrLeaseNotHeld) {
+		t.Errorf("the failure %v does not unwrap to ErrLeaseNotHeld; the heartbeat's refusal must be the Manager's too", err)
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("the rollback tombstoned at %v under an epoch a successor has superseded", tombstones)
+	}
+	// Lost() is OPEN throughout, which is the point: this is the path that
+	// closes no channel, and a fence that only watched the channel would have
+	// let both later writes through.
+	f.leases.mu.Lock()
+	granted := append([]*fakeLease(nil), f.leases.granted...)
+	f.leases.mu.Unlock()
+	if len(granted) != 1 {
+		t.Fatalf("%d leases were granted, want 1", len(granted))
+	}
+	select {
+	case <-granted[0].lost:
+		t.Fatal("the lease reported itself lost, so this test did not exercise the path that closes no channel")
+	default:
+	}
+
+	// assertNothingHeld is NOT used here, and the reason is the point rather
+	// than an exemption. It requires a published projection to be tombstoned,
+	// which is right on every other failure path — and wrong on this one, where
+	// refusing the tombstone is the correct act and the route is deliberately
+	// left to expire. What must hold instead is that the route left behind is
+	// REPORTED, and everything that is this attach's to give back is given back.
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	named := false
+	for _, unreleased := range attach.Unreleased {
+		if strings.HasPrefix(unreleased, "residency tombstone: ") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("a route was left live and unnamed: %v; §18.2 leaves it to registry expiry, and an operator must be told which", attach.Unreleased)
+	}
+	if consumed := f.publisher.ConsumedWeight(); consumed != 0 {
+		t.Errorf("the ledger still charges %d", consumed)
+	}
+	if held := f.leases.heldCount(); held != 0 {
+		t.Errorf("%d lease grant(s) are still held", held)
+	}
+	if _, held := f.registry.Get(f.key()); held {
+		t.Error("the local registry still holds the residency")
+	}
+	if _, live := f.manager.SessionContext(f.key()); live {
+		t.Error("a session context survives a failed attach")
+	}
+}
+
+// TestAResidencyRemovedBeforeStep9IsNotReportedAttached pins the branch B2's
+// fix introduced: step 9 re-reads the registry, so it can find the residency
+// gone or replaced.
+func TestAResidencyRemovedBeforeStep9IsNotReportedAttached(t *testing.T) {
+	f := newFixture(t)
+	f.ownership.inWindow = func() {
+		entry, held := f.registry.Get(f.key())
+		if !held {
+			t.Error("no residency inside the install window")
+			return
+		}
+		f.registry.inner.RemoveByGeneration(f.key(), entry.Generation)
+	}
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err == nil {
+		t.Fatal("an attach whose residency vanished before step 9 reported itself attached")
+	}
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("error is %T, want *AttachError", err)
+	}
+	if attach.Step != StepAttached {
+		t.Errorf("the failure names step %q, want %q", attach.Step, StepAttached)
+	}
+	// The entry-removal compensation cannot remove what is already gone, and it
+	// says so rather than reporting a clean rollback.
+	named := false
+	for _, unreleased := range attach.Unreleased {
+		if strings.HasPrefix(unreleased, "registry entry: ") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("the rollback does not name the registry entry among what it could not release: %v", attach.Unreleased)
+	}
+	if _, live := f.manager.SessionContext(f.key()); live {
+		t.Error("a session context survives an attach that never reached step 9")
 	}
 }

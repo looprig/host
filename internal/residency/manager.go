@@ -208,14 +208,16 @@ type OwnershipRequest struct {
 	// other, so the Manager could know the epoch was stale while the heartbeat
 	// went on publishing under it. One grant, one fence.
 	//
-	// MEASURED AS EQUIVALENT TODAY, and kept anyway. Building a second fence
-	// here changes no observable behaviour, because the two ways the states
-	// could diverge are both unreachable: an attach whose fence ends fails and
-	// rolls back, which stops the heartbeat, and a heartbeat that ends its own
-	// fence does so after the attach has returned and nothing reads it. It is
-	// shared because "the one mechanism" has to be true rather than nearly
-	// true, and because the day a fenced write is added to a still-running
-	// attach the divergence becomes real with nothing to notice it.
+	// IT CLOSES A REAL HOLE, and an earlier version of this comment called it
+	// equivalent on a reason that was simply wrong — that a heartbeat ends its
+	// own fence only after the attach has returned. It does not: the heartbeat
+	// starts at step 8 and TWO fenced writes follow it inside the same attach.
+	// So a beat refused with ErrEpochSuperseded ends the heartbeat's fence
+	// without closing Lost(); step 9 then fails for some other reason; and the
+	// unwinder's tombstone goes through a Manager fence that knows nothing, at
+	// an epoch a successor has already superseded. That closure's own comment
+	// calls that the worst case in the file, because a tombstone is a route
+	// removal and the route may be the successor's.
 	Fence *epochFence
 }
 

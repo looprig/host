@@ -175,6 +175,10 @@ type heartbeatFixture struct {
 	locations *fakeLocations
 	publisher *service.CapacityPublisher
 	teardown  *fakeTeardown
+	// fence is the grant's fence, held so a test can end it from the OUTSIDE —
+	// which is what the Manager does when one of its own fenced writes is
+	// refused while this heartbeat is running.
+	fence *epochFence
 	// tombstoneErr is applied after the fixture builds, so a test can fail the
 	// tombstone while the releasing observation still succeeds.
 	tombstoneErr error
@@ -274,6 +278,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		t.Fatalf("NewHeartbeatOwnership: %v", err)
 	}
 
+	f.fence = newEpochFence(f.lease)
 	if f.tombstoneErr != nil {
 		f.locations.tombstoneErr = f.tombstoneErr
 	}
@@ -288,7 +293,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		LeaseEpoch:      testEpoch,
 		Generation:      entry.Generation,
 		Runtime:         f.runtime,
-		Fence:           newEpochFence(f.lease),
+		Fence:           f.fence,
 	})
 	if err != nil {
 		t.Fatalf("BeginOwnership: %v", err)
@@ -1718,8 +1723,16 @@ func TestASupersededEpochIsTheDiagnosisEvenWhenAnotherOwnerHoldsTheTeardown(t *t
 // moment of the read — see TestTheBeatAndTheReleaseAreOneWriter — because a
 // structural rule over a read has no fixed shape to match.
 //
-// It also does not cover a lock released early with an explicit Unlock before
-// the write. Every site here defers, and nothing checks that.
+// TWO FALSE POSITIVES ARE KNOWN AND FAIL SAFE, which is the direction to fail
+// in but not a reason to leave them unnamed. A lock taken inside a top-level
+// nested block is rejected, because accepting nested statements is what let the
+// `if false` edit through. And hoisting the write into a closure —
+// `publish := func(){…}; Lock(); defer Unlock(); publish()` — is rejected,
+// because firstLocationWrite finds the write inside the literal, which precedes
+// the lock. That second one is a plausible refactor of finishRelease, and A
+// GUARD THAT REJECTS A CORRECT REFACTOR IS A GUARD SOMEONE WEAKENS RATHER THAN
+// SATISFIES: whoever makes it should teach the guard about closures, not delete
+// the rule.
 func TestEveryDurableLocationWriteHappensUnderTheWriteLock(t *testing.T) {
 	files := parseProductionFiles(t)
 	examined := 0
@@ -1774,6 +1787,16 @@ func TestEveryDurableLocationWriteHappensUnderTheWriteLock(t *testing.T) {
 			name:   "a lock taken on another goroutine",
 			source: "package p\nfunc (h *Heartbeat) beat() { go func() { h.writeMu.Lock() }(); h.options.Locations.PublishResidency(nil, nil) }\n",
 			want:   1,
+		},
+		{
+			name:   "a lock released before the write",
+			source: "package p\nfunc (h *Heartbeat) beat() { h.writeMu.Lock(); h.writeMu.Unlock(); h.options.Locations.PublishResidency(nil, nil) }\n",
+			want:   1,
+		},
+		{
+			name:   "control: a deferred unlock is not an early one",
+			source: "package p\nfunc (h *Heartbeat) beat() { h.writeMu.Lock(); defer h.writeMu.Unlock(); h.options.Locations.PublishResidency(nil, nil) }\n",
+			want:   0,
 		},
 		{
 			// The exclusion is itself probed: a too-wide one produces exactly
@@ -1915,7 +1938,33 @@ func unlockedLocationWrites(file *ast.File) []string {
 				break
 			}
 		}
-		if lockedAt < 0 || lockedAt > int(firstLocationWrite(function)) {
+		// AN EARLY Unlock IS THE SAME FAMILY as the write moved above the lock,
+		// and it was surviving: Lock(); Unlock(); write reads as locked. With
+		// statement positions already in hand the scan costs one more loop.
+		unlockedAt := -1
+		for _, statement := range function.Body.List {
+			expression, isExpression := statement.(*ast.ExprStmt)
+			if !isExpression {
+				continue
+			}
+			call, isCall := expression.X.(*ast.CallExpr)
+			if !isCall {
+				continue
+			}
+			method, isMethod := call.Fun.(*ast.SelectorExpr)
+			if !isMethod || method.Sel.Name != "Unlock" {
+				continue
+			}
+			if field, ok := method.X.(*ast.SelectorExpr); ok && field.Sel.Name == "writeMu" {
+				unlockedAt = int(statement.Pos())
+				break
+			}
+		}
+		write := int(firstLocationWrite(function))
+		switch {
+		case lockedAt < 0 || lockedAt > write:
+			offenders = append(offenders, function.Name.Name)
+		case unlockedAt >= 0 && unlockedAt < write:
 			offenders = append(offenders, function.Name.Name)
 		}
 	}
@@ -2140,16 +2189,20 @@ func fencedWrites(file *ast.File) (int, []string) {
 			// made the detector a convention about naming — the same argument
 			// this package applied to the classifier one level up — so
 			// `m.log.write(func() error { return …Publish… })` read as fenced.
-			// Without type information the receiver is checked by spelling,
-			// which is disclosed rather than pretended away: it is `fence` as a
-			// local or `X.fence` as a field, and nothing else.
+			// Without type information the receiver is checked by SPELLING,
+			// and TestFenceIsTheOnlyThingSpelledFence is what makes that sound
+			// rather than a convention: it pins the biconditional over this
+			// package's declarations, so "spelled fence" and "is an
+			// *epochFence" are the same set. Both directions were live — a
+			// fence under another name is a false positive, a non-fence called
+			// fence is a false NEGATIVE — and only the second is unsafe.
 			switch receiver := wrapper.X.(type) {
 			case *ast.Ident:
-				if receiver.Name == "fence" {
+				if spelledFence(receiver.Name) {
 					return true
 				}
 			case *ast.SelectorExpr:
-				if receiver.Sel.Name == "fence" {
+				if spelledFence(receiver.Sel.Name) {
 					return true
 				}
 			}
@@ -2158,4 +2211,198 @@ func fencedWrites(file *ast.File) (int, []string) {
 		return true
 	})
 	return total, unfenced
+}
+
+// TestFenceIsTheOnlyThingSpelledFence converts the fence detector's naming
+// CONVENTION into a MECHANISM, which is the argument this package made one
+// level up and then did not apply to its own guard.
+//
+// TestEveryFencedWriteGoesThroughTheFence decides "is this wrapper a fence" by
+// the receiver's spelling, because an AST guard cannot name a type without type
+// information and taking that dependency is a release-graph event for one
+// check. Spelling is sound only if the two directions hold, and both were live:
+// an *epochFence named otherwise is a false positive, and a non-fence spelled
+// `fence` is a false NEGATIVE, which is the unsafe one.
+//
+// So this pins the biconditional over the package's own declarations. Every
+// *epochFence binding is spelled `fence`, and nothing else is — which makes
+// "receiver spelled fence" equivalent to "receiver is an *epochFence" without
+// a type checker.
+func TestFenceIsTheOnlyThingSpelledFence(t *testing.T) {
+	files := parseProductionFiles(t)
+	bindings := 0
+	for name, file := range files {
+		for _, binding := range fenceBindings(file) {
+			bindings++
+			switch {
+			case binding.isFence && !spelledFence(binding.name):
+				t.Errorf("%s: %s is an *epochFence spelled %q; the write guard decides by spelling, so a fence under another name is a fenced write it cannot see", name, binding.where, binding.name)
+			case !binding.isFence && spelledFence(binding.name):
+				t.Errorf("%s: %s is spelled \"fence\" and is not an *epochFence; the write guard would read writes through it as fenced when they are not", name, binding.where)
+			}
+		}
+	}
+	// FLOORED: the field on Heartbeat, the local in attach, and the field on
+	// OwnershipRequest at least.
+	if bindings < 3 {
+		t.Fatalf("%d bindings were examined, want at least the three this package declares", bindings)
+	}
+
+	for _, probe := range []struct {
+		name   string
+		source string
+		want   int
+	}{
+		{
+			name:   "an epochFence under another name",
+			source: "package p\ntype H struct{ guard *epochFence }\n",
+			want:   1,
+		},
+		{
+			name:   "something else called fence",
+			source: "package p\ntype H struct{ fence *sync.Mutex }\n",
+			want:   1,
+		},
+		{
+			name:   "a local from newEpochFence under another name",
+			source: "package p\nfunc f() { guard := newEpochFence(nil); _ = guard }\n",
+			want:   1,
+		},
+		{
+			name:   "control: both directions satisfied",
+			source: "package p\ntype H struct{ fence *epochFence }\nfunc f() { fence := newEpochFence(nil); _ = fence }\n",
+			want:   0,
+		},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", probe.source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%s: parsing the probe: %v", probe.name, err)
+		}
+		violations := 0
+		for _, binding := range fenceBindings(parsed) {
+			if binding.isFence != spelledFence(binding.name) {
+				violations++
+			}
+		}
+		if violations != probe.want {
+			t.Errorf("%s: the detector reported %d violations, want %d", probe.name, violations, probe.want)
+		}
+	}
+}
+
+// spelledFence reports whether a name is the fence spelling, ignoring the
+// capital Go uses for export. OwnershipRequest.Fence and Heartbeat.fence are
+// the same word and must satisfy the same rule.
+func spelledFence(name string) bool { return strings.EqualFold(name, "fence") }
+
+// fenceBinding is one name bound to a type, for the biconditional above.
+type fenceBinding struct {
+	name    string
+	where   string
+	isFence bool
+}
+
+// fenceBindings enumerates the declarations that bind a name to a type this
+// guard cares about: struct fields, function parameters, and short variable
+// declarations from newEpochFence.
+func fenceBindings(file *ast.File) []fenceBinding {
+	var bindings []fenceBinding
+	isFenceType := func(expr ast.Expr) bool {
+		pointer, isPointer := expr.(*ast.StarExpr)
+		if !isPointer {
+			return false
+		}
+		name, isIdent := pointer.X.(*ast.Ident)
+		return isIdent && name.Name == "epochFence"
+	}
+	named := func(field *ast.Field, where string) {
+		for _, name := range field.Names {
+			fence := isFenceType(field.Type)
+			if !fence && !spelledFence(name.Name) {
+				continue
+			}
+			bindings = append(bindings, fenceBinding{name: name.Name, where: where + " " + name.Name, isFence: fence})
+		}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch declaration := node.(type) {
+		case *ast.StructType:
+			for _, field := range declaration.Fields.List {
+				named(field, "field")
+			}
+		case *ast.FuncDecl:
+			if declaration.Type.Params != nil {
+				for _, field := range declaration.Type.Params.List {
+					named(field, "parameter of "+declaration.Name.Name)
+				}
+			}
+		case *ast.AssignStmt:
+			for i, right := range declaration.Rhs {
+				if i >= len(declaration.Lhs) {
+					break
+				}
+				target, isIdent := declaration.Lhs[i].(*ast.Ident)
+				if !isIdent {
+					continue
+				}
+				call, isCall := right.(*ast.CallExpr)
+				fromFence := false
+				if isCall {
+					if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "newEpochFence" {
+						fromFence = true
+					}
+				}
+				if !fromFence && !spelledFence(target.Name) {
+					continue
+				}
+				bindings = append(bindings, fenceBinding{name: target.Name, where: "local " + target.Name, isFence: fromFence})
+			}
+		}
+		return true
+	})
+	return bindings
+}
+
+// TestTheHeartbeatWritesThroughTheGrantsFenceNotACopy is the kill for a second
+// fence per grant, and it needed the write to come from the OTHER side.
+//
+// An earlier attempt ended the fence the REQUEST carried, which is the
+// Manager's own object either way, so it could not tell one fence from two.
+// What distinguishes them is a refusal observed by one party being visible to
+// the other: here the Manager's write is refused for a later epoch — closing no
+// channel, which is the case the fence exists for — and the heartbeat must
+// surrender on its next beat rather than publish under an epoch it has been
+// told is stale.
+func TestTheHeartbeatWritesThroughTheGrantsFenceNotACopy(t *testing.T) {
+	f := newHeartbeatFixture(t)
+
+	// The Manager's own fenced write, refused. Lost() stays open.
+	if err := f.fence.write(func() error {
+		return fmt.Errorf("sessionstore: %w", ErrEpochSuperseded)
+	}); !errors.Is(err, ErrEpochSuperseded) {
+		t.Fatalf("the seeded refusal reported %v", err)
+	}
+	select {
+	case <-f.lease.lost:
+		t.Fatal("the lease closed, so this test did not exercise the path that closes no channel")
+	default:
+	}
+
+	if !f.pulseExpectingExit(t) {
+		t.Fatal("the heartbeat kept beating after the grant's fence recorded a superseded epoch; it is writing through a fence of its own")
+	}
+	f.awaitExit(t)
+
+	if published := len(f.locations.publishedAll()); published != 0 {
+		t.Errorf("%d observations were published under an epoch a successor has superseded", published)
+	}
+	handed := f.teardown.handedOver()
+	if len(handed) != 1 || handed[0].Reason != LossReasonEpochSuperseded {
+		t.Fatalf("the loss handed over %v, want exactly one epoch_superseded", handed)
+	}
+	// And the release path refuses too, for the same fact through the same
+	// object.
+	if err := f.beat.BeginRelease(context.Background()); !errors.Is(err, ErrLeaseNotHeld) {
+		t.Errorf("BeginRelease reported %v, want ErrLeaseNotHeld", err)
+	}
 }
