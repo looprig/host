@@ -295,6 +295,13 @@ func TestHostLinkRejectsInvalidProtocolSelectors(t *testing.T) {
 		{name: "unknown in first physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"something-else", "centrifuge-json"}}},
 		{name: "protobuf in second physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-protobuf"}}},
 		{name: "protobuf in first physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
+		// A valid query selector alone sets selected, so these rows are the only
+		// ones that isolate the multi-physical-field guard: without it the header
+		// branch is skipped and the upgrade succeeds negotiating centrifuge-protobuf.
+		{name: "protobuf-first multiple physical header fields with valid format query", suffix: "?format=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
+		{name: "JSON-first multiple physical header fields with valid format query", suffix: "?format=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-protobuf"}}},
+		{name: "protobuf-first multiple physical header fields with valid protocol query", suffix: "?cf_protocol=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
+		{name: "duplicate JSON physical header fields with valid protocol query", suffix: "?cf_protocol=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-json"}}},
 		{name: "header casing variant", protocols: []string{"Centrifuge-JSON"}},
 		{name: "format protobuf", suffix: "?format=protobuf", protocols: []string{"centrifuge-json"}},
 		{name: "format unknown", suffix: "?format=something-else", protocols: []string{"centrifuge-json"}},
