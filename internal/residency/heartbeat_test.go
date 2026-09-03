@@ -312,11 +312,17 @@ func (f *heartbeatFixture) pulseExpectingExit(t *testing.T) bool {
 	return !f.clock.waitForTimerOrExit(t, f.beat.done)
 }
 
-// awaitExit blocks until the loop has left.
+// awaitExit blocks until the loop has left AND any teardown handoff has
+// returned.
+//
+// IT WAITS ON settled, NOT done, and the difference is a race this fixture
+// would otherwise have. done closes before the observer runs — deliberately, so
+// a blocking observer cannot wedge the handle — so a test asserting what was
+// handed over must wait for the handoff rather than for the loop.
 func (f *heartbeatFixture) awaitExit(t *testing.T) {
 	t.Helper()
 	select {
-	case <-f.beat.done:
+	case <-f.beat.settled:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the heartbeat never left")
 	}
@@ -676,15 +682,43 @@ func TestReleaseMarksReleasingPublishesItAndTombstones(t *testing.T) {
 	f.pulse(t)
 	before := f.trace.recorded()
 
-	if err := f.beat.Release(context.Background()); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := f.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("BeginRelease: %v", err)
+	}
+	// THE SEAM O6.1 CHECKPOINTS IN. Everything up to here must have happened
+	// before a checkpoint runs; nothing after it may have.
+	begun := f.trace.recorded()[len(before):]
+	if wantBegun := []string{"registry.releasing", "location.publish:releasing"}; !reflect.DeepEqual(begun, wantBegun) {
+		t.Fatalf("BeginRelease did\n  %v\nwant\n  %v", begun, wantBegun)
+	}
+	if entry, held := f.registry.Get(f.key()); !held || entry.Accepting || entry.State != registry.StateReleasing {
+		t.Error("admission is still open after BeginRelease; §9.3 stops it before the checkpoint, not after")
+	}
+	// The loop is STILL RUNNING, and its beats now carry the releasing state. A
+	// heartbeat that stopped here would let the route expire mid-checkpoint and
+	// read as cold while this Host still holds the lease and the runtime.
+	select {
+	case <-f.beat.done:
+		t.Fatal("the heartbeat stopped at BeginRelease; a checkpoint can outlast the registry expiry")
+	default:
+	}
+	f.pulse(t)
+	beating := f.locations.publishedAll()
+	mid := beating[len(beating)-1]
+	if mid.Residency != sessionwire.SessionResidencyReleasing || mid.Accepting {
+		t.Errorf("a beat during the checkpoint window published residency %q accepting %t, want releasing and false", mid.Residency, mid.Accepting)
 	}
 
-	got := f.trace.recorded()[len(before):]
-	want := []string{"registry.releasing", "location.publish:releasing", "location.tombstone", "registry.remove"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("release did\n  %v\nwant\n  %v", got, want)
+	beforeFinish := len(f.trace.recorded())
+	if err := f.beat.FinishRelease(context.Background()); err != nil {
+		t.Fatalf("FinishRelease: %v", err)
 	}
+	finished := f.trace.recorded()[beforeFinish:]
+	if wantFinished := []string{"location.tombstone", "registry.remove"}; !reflect.DeepEqual(finished, wantFinished) {
+		t.Fatalf("FinishRelease did\n  %v\nwant\n  %v", finished, wantFinished)
+	}
+	got := f.trace.recorded()[len(before):]
+	_ = got
 	published := f.locations.publishedAll()
 	releasing := published[len(published)-1]
 	if releasing.Residency != sessionwire.SessionResidencyReleasing {
@@ -718,8 +752,11 @@ func TestReleaseMarksReleasingPublishesItAndTombstones(t *testing.T) {
 // fixture whose numbers coincided is how this task lost a probe once already.
 func TestReleaseWritesTheExpiredEpochTombstoneAgainstItsOwnHighWater(t *testing.T) {
 	f := newHeartbeatFixture(t)
-	if err := f.beat.Release(context.Background()); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := f.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("BeginRelease: %v", err)
+	}
+	if err := f.beat.FinishRelease(context.Background()); err != nil {
+		t.Fatalf("FinishRelease: %v", err)
 	}
 	tombstones := f.locations.tombstones()
 	if len(tombstones) != 1 {
@@ -822,27 +859,35 @@ func TestAReleaseThatCannotWriteNamesWhatItOwed(t *testing.T) {
 		f.locations.tombstoneErr = stuck
 	})
 
-	err := f.beat.Release(context.Background())
-	if err == nil {
-		t.Fatal("a release that wrote neither the releasing observation nor the tombstone reported success")
+	begun := f.beat.BeginRelease(context.Background())
+	err := f.beat.FinishRelease(context.Background())
+	if begun == nil || err == nil {
+		t.Fatalf("a release that wrote neither the releasing observation (%v) nor the tombstone (%v) reported success", begun, err)
 	}
-	var refused *ReleaseError
-	if !errors.As(err, &refused) {
-		t.Fatalf("error is %T, want *ReleaseError", err)
-	}
-	for _, want := range []string{"releasing observation", "residency tombstone"} {
+	for _, row := range []struct {
+		half   error
+		wanted string
+	}{
+		{begun, "releasing observation"},
+		{err, "residency tombstone"},
+	} {
+		var refused *ReleaseError
+		if !errors.As(row.half, &refused) {
+			t.Fatalf("error is %T, want *ReleaseError", row.half)
+		}
 		found := false
 		for _, unwritten := range refused.Unwritten {
-			if strings.HasPrefix(unwritten, want+": ") {
+			if strings.HasPrefix(unwritten, row.wanted+": ") {
 				found = true
 			}
 		}
 		if !found {
-			t.Errorf("the failure does not name %q among what it could not write: %v", want, refused.Unwritten)
+			t.Errorf("the failure does not name %q among what it could not write: %v", row.wanted, refused.Unwritten)
 		}
 	}
-	// It CONTINUES past a failed write, for the reason the attach rollback
-	// does: abandoning the rest turns one stale record into two.
+	// A refused FIRST half does not abandon the second, for the reason the
+	// attach rollback continues: abandoning the rest turns one stale record
+	// into two.
 	if f.trace.indexOf("location.tombstone") < 0 {
 		t.Error("a refused releasing observation abandoned the tombstone")
 	}
@@ -855,7 +900,7 @@ func TestAReleaseThatCannotWriteNamesWhatItOwed(t *testing.T) {
 	// is already gone — finding nothing to release and reporting success, which
 	// converts a stale durable route into a clean bill of health.
 	writes := len(f.trace.recorded())
-	again := f.beat.Release(context.Background())
+	again := f.beat.FinishRelease(context.Background())
 	if !errors.Is(again, err) {
 		t.Errorf("a repeated release reported %v, want the first verdict %v", again, err)
 	}
@@ -866,11 +911,14 @@ func TestAReleaseThatCannotWriteNamesWhatItOwed(t *testing.T) {
 	// The CONTROL: a store that answers leaves nothing named, and a repeat of
 	// THAT is silent too.
 	g := newHeartbeatFixture(t)
-	if err := g.beat.Release(context.Background()); err != nil {
-		t.Errorf("a clean release reported %v", err)
+	if err := g.beat.BeginRelease(context.Background()); err != nil {
+		t.Errorf("a clean BeginRelease reported %v", err)
 	}
-	if err := g.beat.Release(context.Background()); err != nil {
-		t.Errorf("a repeated clean release reported %v", err)
+	if err := g.beat.FinishRelease(context.Background()); err != nil {
+		t.Errorf("a clean FinishRelease reported %v", err)
+	}
+	if err := g.beat.FinishRelease(context.Background()); err != nil {
+		t.Errorf("a repeated clean FinishRelease reported %v", err)
 	}
 }
 
@@ -1088,7 +1136,11 @@ func TestStopAndReleaseAreSafeTogether(t *testing.T) {
 				errs[i] = f.beat.Stop(context.Background())
 				return
 			}
-			errs[i] = f.beat.Release(context.Background())
+			if err := f.beat.BeginRelease(context.Background()); err != nil {
+				errs[i] = err
+				return
+			}
+			errs[i] = f.beat.FinishRelease(context.Background())
 		}()
 	}
 	close(start)
@@ -1110,5 +1162,213 @@ func TestStopAndReleaseAreSafeTogether(t *testing.T) {
 	}
 	if _, held := f.registry.Get(f.key()); held {
 		t.Error("the residency survived the release")
+	}
+}
+
+// TestALostLeaseWritesNothingThroughTheHandleEither is F1: the rule that a
+// holder which has lost its grant must not touch a fenced record was enforced
+// inside the loop's own path and NOWHERE ELSE.
+//
+// It is reachable through the intended O6.1 route rather than by contrivance:
+// LostResidency carries no handle, but Manager.sessions[key].ownership does, so
+// a teardown owner releasing residency after a loss goes straight through these
+// methods. Before this, they consulted the generation and never the lease, and
+// wrote a `releasing` observation and a tombstone stamped with an epoch this
+// Host no longer held — returning nil. A real store fences both; the whole
+// argument for writing nothing after a loss is that the holder must not ATTEMPT
+// the write.
+func TestALostLeaseWritesNothingThroughTheHandleEither(t *testing.T) {
+	f := newHeartbeatFixture(t)
+	close(f.lease.lost)
+	f.awaitExit(t)
+	// The loop surrendered: the entry is owned for teardown and still present,
+	// which is exactly the state O6.1 picks the handle up in.
+	if entry, held := f.registry.Get(f.key()); !held || !entry.TeardownOwned {
+		t.Fatal("the loss did not leave the residency claimed for teardown, so this test never reached its subject")
+	}
+	before := f.trace.recorded()
+
+	begun := f.beat.BeginRelease(context.Background())
+	finished := f.beat.FinishRelease(context.Background())
+
+	for _, row := range []struct {
+		half error
+		name string
+	}{{begun, "BeginRelease"}, {finished, "FinishRelease"}} {
+		if row.half == nil {
+			t.Errorf("%s reported success after the lease was lost", row.name)
+			continue
+		}
+		if !errors.Is(row.half, ErrLeaseNotHeld) {
+			t.Errorf("%s reported %v, want an error unwrapping to ErrLeaseNotHeld", row.name, row.half)
+		}
+		var refused *ReleaseError
+		if !errors.As(row.half, &refused) {
+			t.Errorf("%s reported %T, want *ReleaseError", row.name, row.half)
+		}
+	}
+	for _, forbidden := range []string{"location.publish:releasing", "location.tombstone"} {
+		for _, step := range f.trace.recorded()[len(before):] {
+			if step == forbidden {
+				t.Errorf("%q was written under a lost lease", forbidden)
+			}
+		}
+	}
+	if published := len(f.locations.publishedAll()); published != 0 {
+		t.Errorf("%d observations were published after the lease was lost", published)
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("a tombstone was written under a lost lease: %v", tombstones)
+	}
+	// The LOCAL entry still goes: leaving it would make this Host believe it
+	// holds a session it has released.
+	if _, held := f.registry.Get(f.key()); held {
+		t.Error("the local registry still holds a residency that has been released")
+	}
+
+	// The CONTROL, one position over: the same two calls with the lease still
+	// held write both records. Without this the assertions above would pass for
+	// a release that never wrote anything at all.
+	g := newHeartbeatFixture(t)
+	if err := g.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("the control's BeginRelease reported %v", err)
+	}
+	if err := g.beat.FinishRelease(context.Background()); err != nil {
+		t.Fatalf("the control's FinishRelease reported %v", err)
+	}
+	if len(g.locations.publishedAll()) != 1 || len(g.locations.tombstones()) != 1 {
+		t.Errorf("the control published %d observations and %d tombstones, want 1 and 1",
+			len(g.locations.publishedAll()), len(g.locations.tombstones()))
+	}
+}
+
+// TestAReplacedResidencyIsNotReleasedByTheOldHandle is F3, and it is a row away
+// from TestAReplacedResidencyStopsItsHeartbeat's fixture: the same setup, the
+// other entry point.
+//
+// A release that ignored the generation would tombstone under this heartbeat's
+// epoch and remove a route the REPLACEMENT installed — taking a live session
+// off the map to clean up one that is already gone.
+func TestAReplacedResidencyIsNotReleasedByTheOldHandle(t *testing.T) {
+	f := newHeartbeatFixture(t)
+	if !f.registry.inner.RemoveByGeneration(f.key(), f.entry.Generation) {
+		t.Fatal("the seeded residency could not be removed")
+	}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	replacement, installed := f.registry.inner.Insert(f.key(), registry.Admission{
+		AgentID: testAgent, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
+	})
+	if !installed || replacement.Generation == f.entry.Generation {
+		t.Fatal("the replacement was not installed under a new generation")
+	}
+
+	if err := f.beat.BeginRelease(context.Background()); err != nil {
+		t.Errorf("BeginRelease reported %v for a residency that is not its own", err)
+	}
+	if err := f.beat.FinishRelease(context.Background()); err != nil {
+		t.Errorf("FinishRelease reported %v for a residency that is not its own", err)
+	}
+
+	if published := len(f.locations.publishedAll()); published != 0 {
+		t.Errorf("%d observations were published for a generation that is gone", published)
+	}
+	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
+		t.Errorf("the old handle tombstoned the replacement's route: %v", tombstones)
+	}
+	entry, held := f.registry.Get(f.key())
+	if !held {
+		t.Fatal("the old handle removed the replacement residency")
+	}
+	if entry.Generation != replacement.Generation || entry.State != registry.StateResident || !entry.Accepting {
+		t.Errorf("the replacement was disturbed: %+v", entry)
+	}
+}
+
+// blockingTeardown never returns from ResidencyLost.
+type blockingTeardown struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingTeardown) ResidencyLost(context.Context, LostResidency) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+}
+
+// TestABlockingTeardownObserverDoesNotWedgeTheHandle is F5.
+//
+// The observer is arbitrary caller code called on the heartbeat's own
+// goroutine. Stop waits for the loop to leave and FinishRelease calls Stop, so
+// an observer that blocked used to wedge every caller of this handle —
+// including O3.1's attach rollback, which is the one path that must never hang.
+// The handle is freed before the observer runs, so a wedged observer now costs
+// one goroutine and nothing else.
+func TestABlockingTeardownObserverDoesNotWedgeTheHandle(t *testing.T) {
+	blocking := &blockingTeardown{entered: make(chan struct{}), release: make(chan struct{})}
+	// The fixture's own heartbeat is left alone; this drives a SECOND handle
+	// over the same collaborators, because the property under test is about
+	// the handle a wedged observer belongs to.
+	f := newHeartbeatFixture(t)
+	if err := f.beat.Stop(context.Background()); err != nil {
+		t.Fatalf("stopping the fixture's own heartbeat: %v", err)
+	}
+	ownership, err := NewHeartbeatOwnership(HeartbeatOptions{
+		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
+		Locations: f.locations, Drain: f.publisher, Teardown: blocking,
+	})
+	if err != nil {
+		t.Fatalf("NewHeartbeatOwnership: %v", err)
+	}
+	entry, held := f.registry.Get(f.key())
+	if !held {
+		t.Fatal("no seeded residency")
+	}
+	lease := &fakeLease{trace: f.trace, epoch: testEpoch, lost: make(chan struct{})}
+	handle, err := ownership.BeginOwnership(context.Background(), OwnershipRequest{
+		Key: f.key(), AgentID: testAgent, CompatibilityID: testCompat,
+		LeaseEpoch: testEpoch, Generation: entry.Generation, Runtime: f.runtime, Lease: lease,
+	})
+	if err != nil {
+		t.Fatalf("BeginOwnership: %v", err)
+	}
+	defer close(blocking.release)
+
+	close(lease.lost)
+	<-blocking.entered
+
+	// THE TWO SIGNALS MEAN DIFFERENT THINGS, and with the observer provably
+	// inside its call the difference is decidable rather than a race: done is
+	// closed because the loop has left, and settled is NOT because the handoff
+	// has not returned. A settled that closed with done would let awaitExit
+	// outrun the handoff, and every assertion about what was handed over would
+	// pass or fail on scheduling.
+	beating, isHeartbeat := handle.(*Heartbeat)
+	if !isHeartbeat {
+		t.Fatalf("BeginOwnership returned %T, want *Heartbeat", handle)
+	}
+	select {
+	case <-beating.done:
+	default:
+		t.Error("done is still open while the loop has left; the handle is being held by the observer")
+	}
+	select {
+	case <-beating.settled:
+		t.Error("settled closed while the teardown observer is still inside its call, so a test waiting on it can outrun the handoff it is asserting about")
+	default:
+	}
+
+	// The observer is wedged. Stop must still return, because the loop has
+	// already left; without that ordering this receive never completes and the
+	// harness kills the run instead of reporting anything.
+	stopped := make(chan error, 1)
+	go func() { stopped <- handle.Stop(context.Background()) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("Stop reported %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop is wedged behind a blocking teardown observer, and so is every other caller of this handle")
 	}
 }
