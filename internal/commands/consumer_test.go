@@ -1142,6 +1142,32 @@ func TestDuplicateHintsApplyACommandOnce(t *testing.T) {
 	}
 }
 
+// TestHintNeverBlocks holds the half of Hint's contract that is about the
+// CALLER rather than about the consumer. A HostLink RPC handler calls it; a
+// Hint that blocked while the consumer was busy would convert a slow pass into
+// stalled transport, which is the failure a one-slot wake exists to avoid.
+//
+// The claim is exactly this: more hints than the wake can hold, with nothing
+// draining it, all return. It says nothing about delivery — a dropped hint is
+// the design, because the durable order is the queue.
+func TestHintNeverBlocks(t *testing.T) {
+	t.Parallel()
+
+	f := newConsumerFixture(t)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		for range 16 {
+			f.consumer.Hint(commandID(1))
+		}
+	}()
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Hint blocked with no consumer draining the wake; a HostLink handler would stall on a busy session")
+	}
+}
+
 // TestRunContinuesImmediatelyAfterAFullPage asserts a full page is followed by
 // another pass with no timer in between, so a Host resuming with a long backlog
 // converges at the store's pace rather than one page per interval.
