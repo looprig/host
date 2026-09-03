@@ -85,6 +85,7 @@ var (
 	errTestClaimLost        = errors.New("commands_test: the claim is not this caller's, or is no longer live")
 	errTestDeadlinePassed   = errors.New("commands_test: the apply deadline has passed")
 	errTestNoEvidence       = errors.New("commands_test: the journal does not support this settlement")
+	errTestUnrevisioned     = errors.New("commands_test: zero is not a revision any provider assigns")
 	errTestInvalidResult    = errors.New("commands_test: the terminal result is not usable")
 )
 
@@ -299,6 +300,10 @@ func (s *fakeStore) ClaimCommand(_ context.Context, _ sessionwire.TenantID, _ se
 		return 0, errors.New("commands_test: no such command")
 	}
 	switch {
+	// Zero is not a revision any provider assigns, so it cannot be one a caller
+	// read, and a compare-and-swap naming it would be unconditional.
+	case claim.ExpectedRevision == 0:
+		return 0, errTestUnrevisioned
 	case stored.record.Revision != claim.ExpectedRevision:
 		return 0, errTestRevisionConflict
 	case stored.record.State.Terminal():
@@ -336,6 +341,10 @@ func (s *fakeStore) BeginApplying(_ context.Context, _ sessionwire.TenantID, _ s
 		return 0, errors.New("commands_test: no such command")
 	}
 	switch {
+	// Zero is not a revision any provider assigns, so it cannot be one a caller
+	// read, and a compare-and-swap naming it would be unconditional.
+	case applying.ExpectedRevision == 0:
+		return 0, errTestUnrevisioned
 	case stored.record.Revision != applying.ExpectedRevision:
 		return 0, errTestRevisionConflict
 	case stored.record.State != StateClaimed:
@@ -372,6 +381,8 @@ func (s *fakeStore) CompleteCommand(_ context.Context, _ sessionwire.TenantID, _
 		return errors.New("commands_test: no such command")
 	}
 	switch {
+	case completion.ExpectedRevision == 0:
+		return errTestUnrevisioned
 	case stored.record.Revision != completion.ExpectedRevision:
 		return errTestRevisionConflict
 	case completion.Effect.CompletedAt.IsZero() || completion.Effect.EventID == "" || completion.Effect.JournalSeq == 0:
@@ -402,6 +413,9 @@ func (s *fakeStore) RejectCommand(_ context.Context, _ sessionwire.TenantID, _ s
 	stored, ok := s.commands[command]
 	if !ok {
 		return errors.New("commands_test: no such command")
+	}
+	if rejection.ExpectedRevision == 0 {
+		return errTestUnrevisioned
 	}
 	if stored.record.Revision != rejection.ExpectedRevision {
 		return errTestRevisionConflict
@@ -1253,11 +1267,8 @@ func TestAppliedAndRejectedAreMutuallyExclusive(t *testing.T) {
 		_, err := f.applier.complete(context.Background(), record, record.Revision, Application{
 			Outcome: ApplicationCommitted, EffectEventID: testEffectEventID, EffectSeq: testEffectSeq,
 		})
-		// A refused completion with an owned prefix is reported as recoverable
-		// rather than as an error — that is complete's documented rule — so what
-		// this asserts is the RECORD, which is the thing that must not move.
-		if err != nil {
-			t.Fatalf("complete reported %v", err)
+		if !errors.Is(err, errTestStateConflict) {
+			t.Fatalf("completing a rejected command reported %v, want the store's state conflict", err)
 		}
 		if state, _ := f.store.stateOf(commandID(1)); state != StateRejected {
 			t.Errorf("the record is now %q; a terminal state was overwritten", state)
@@ -1273,8 +1284,8 @@ func TestATerminalCommandBecomesNotDue(t *testing.T) {
 
 	f := newApplierFixture(t)
 	f.store.errs["CompleteCommand"] = errTestStore
-	if _, err := f.process(); err != nil {
-		t.Fatalf("the pass reported %v, and a committed effect is not a failure", err)
+	if _, err := f.process(); !errors.Is(err, errTestStore) {
+		t.Fatalf("the refused completion reported %v, want the store failure", err)
 	}
 	if _, due := f.store.stateOf(commandID(1)); !due {
 		t.Fatal("a command whose terminal write did not commit is no longer due, so no reconciler will ever finish it")
@@ -1648,6 +1659,85 @@ func TestTheCompletionIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.T
 	if outcome.State.Terminal() {
 		t.Errorf("outcome state = %q, which reports a terminal state no store acknowledged", outcome.State)
 	}
+}
+
+// TestAConsumerWritesNoCursorWhenTheGrantEndedDuringACompletion is the half of
+// the rule above that lives at the composition, and it is what makes the silent
+// arm safe rather than merely documented.
+//
+// complete reports a lost grant as an owned prefix with no error, which the
+// cursor rule treats as consumable — so on its own that would advance the cursor
+// past a command whose settlement never landed. It does not, and the mechanism
+// is the one the applier shares with the consumer: the cursor write goes through
+// the SAME fence, so a pass that ended with the grant gone writes nothing and
+// the record is re-derived by whoever owns the session next.
+func TestAConsumerWritesNoCursorWhenTheGrantEndedDuringACompletion(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t)
+	f.runtime.before = func() { f.fence.end() }
+	cursors := &fakeCursors{}
+	consumer, err := NewConsumer(Options{
+		Host: f.host, Key: registry.Key{TenantID: testTenant, SessionID: testSession},
+		LeaseEpoch: testEpoch, Inbox: &fakeInbox{pages: [][]Command{{command(1, StatePending)}}},
+		Cursors: cursors, Processor: f.applier, Fence: f.fence,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	result, err := consumer.Reconcile(context.Background())
+	if !errors.Is(err, errTestGrantGone) {
+		t.Fatalf("Reconcile reported %v, want the grant-gone cause", err)
+	}
+	if writes := cursors.written(); len(writes) != 0 {
+		t.Errorf("the cursor was written %+v by a pass whose grant had ended", writes)
+	}
+	if result.Cursor != 0 {
+		t.Errorf("the pass reports cursor %d, want the unacknowledged 0", result.Cursor)
+	}
+	if state, due := f.store.stateOf(commandID(1)); state != StateApplying || !due {
+		t.Errorf("the record is %q (due %v), want an applying record still due for the next owner", state, due)
+	}
+}
+
+// TestARecordWithNoRevisionIsRefusedBeforeAnyTransition holds the rule
+// Record.Revision's own documentation states, on the side that can act on it.
+//
+// Zero is not a revision any provider assigns, so it cannot be one this applier
+// read, and a compare-and-swap naming it is unconditional — two Hosts that both
+// saw a pending record would both succeed. THE STORE REFUSES IT, and that is not
+// enough on its own: a Host willing to issue the request is a Host whose
+// exactly-once property is being enforced by somebody else's input validation.
+// Both halves are asserted here, because the fake-only version of this check
+// would have left the production side unguarded and green.
+func TestARecordWithNoRevisionIsRefusedBeforeAnyTransition(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the applier will not issue one", func(t *testing.T) {
+		t.Parallel()
+		f := newApplierFixture(t, func(f *applierFixture) { f.stored().record.Revision = 0 })
+		_, err := f.process()
+		if refusalOf(err) != RefusalUnrevisionedRecord {
+			t.Fatalf("got %v, want a %q refusal", err, RefusalUnrevisionedRecord)
+		}
+		if writes := f.fence.fencedWrites(); writes != 0 {
+			t.Errorf("%d durable writes named a revision no provider assigns", writes)
+		}
+		if driven := f.runtime.commands(); len(driven) != 0 {
+			t.Errorf("the runtime was driven with %+v", driven)
+		}
+	})
+
+	t.Run("the store would refuse one", func(t *testing.T) {
+		t.Parallel()
+		f := newApplierFixture(t)
+		_, err := f.store.ClaimCommand(context.Background(), testTenant, testSession, commandID(1), Claim{
+			ExpectedRevision: 0, Epoch: testEpoch, ExpiresAt: unexpired,
+		})
+		if !errors.Is(err, errTestUnrevisioned) {
+			t.Fatalf("the store accepted an unrevisioned claim: %v", err)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

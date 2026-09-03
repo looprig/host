@@ -525,6 +525,72 @@ func TestAnApplyingRecordThisApplierOwnsIsDrivenWithoutReclaiming(t *testing.T) 
 	}
 }
 
+// TestAnApplyingRecordThisApplierIsFencedOutOfIsRefused is the check the drive
+// arm was missing, and the case that made it reachable.
+//
+// An ABANDONED outcome means a correlated prefix exists and a fence above its
+// epoch was observed — that is what abandonment IS — so an abandoned application
+// under this applier's OWN claim epoch is the journal saying this applier has
+// been fenced out of the stream. The drive arm ran before that was read: it
+// appended a SECOND prefix and drove the runtime under an epoch already proven
+// superseded. The real journal writer refuses the fenced append, so the damage
+// surfaced as a store failure rather than as a double application — but the
+// posture of this package is to be stricter where the store cannot help, and
+// this was looser than evidence it had already read.
+func TestAnApplyingRecordThisApplierIsFencedOutOfIsRefused(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t, func(f *applierFixture) {
+		record := &f.stored().record
+		record.State, record.ClaimEpoch, record.ClaimExpiresAt = StateApplying, testEpoch, expired
+		f.stored().application = abandonedApplication(testEpoch, testEpoch+5)
+	})
+	outcome, err := f.process()
+	if refusalOf(err) != RefusalStaleEpoch {
+		t.Fatalf("got %v, want a %q refusal", err, RefusalStaleEpoch)
+	}
+	if prefixes := f.store.prefixes; len(prefixes) != 0 {
+		t.Errorf("a second application prefix %+v was appended under an epoch the journal has fenced out", prefixes)
+	}
+	if driven := f.runtime.commands(); len(driven) != 0 {
+		t.Errorf("the runtime was driven with %+v under an epoch the journal has fenced out", driven)
+	}
+	if writes := f.fence.fencedWrites(); writes != 0 {
+		t.Errorf("%d durable writes were attempted", writes)
+	}
+	if !outcome.PrefixOwned {
+		t.Error("PrefixOwned = false, though a correlated prefix exists")
+	}
+}
+
+// TestAResumedApplicationRevalidatesItsPayload covers the payload check on the
+// path that reaches it WITHOUT a claim.
+//
+// The drive arm reloads the private body and checks it exactly as the claim arm
+// does, and until this existed only the claim arm was tested: deleting the check
+// from the resumed path survived the package. The two are separate calls because
+// the two paths reach the runtime by different routes, and a guard on one of them
+// is not a guard on the other.
+func TestAResumedApplicationRevalidatesItsPayload(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t, func(f *applierFixture) {
+		stored := f.put(KindInput, StatePending)
+		stored.payload = Payload{}
+		stored.record.State, stored.record.ClaimEpoch, stored.record.ClaimExpiresAt = StateApplying, testEpoch, expired
+	})
+	_, err := f.process()
+	if refusalOf(err) != RefusalMissingPayload {
+		t.Fatalf("got %v, want a %q refusal", err, RefusalMissingPayload)
+	}
+	if driven := f.runtime.commands(); len(driven) != 0 {
+		t.Errorf("the runtime was driven with %+v for a command whose body is gone", driven)
+	}
+	if prefixes := f.store.prefixes; len(prefixes) != 0 {
+		t.Errorf("an application prefix %+v was appended for an application that cannot begin", prefixes)
+	}
+}
+
 // TestACorrelationAboutAnotherApplicationIsRefused asserts a prefix that names
 // something else is not evidence about this command.
 //
@@ -640,47 +706,76 @@ func TestACommittedCorrelationNamingNoEventIsRefused(t *testing.T) {
 	}
 }
 
-// TestAnAmbiguousCompletionLeavesTheCommandRecoverable is the case
-// Outcome.PrefixOwned exists for.
+// TestACompletionRefusedWhileTheGrantIsHeldStopsTheCursor is the correction to
+// a test that proved the wrong thing.
 //
-// The effect is durable in the journal and the terminal write came back with an
-// ambiguous store failure, so nothing durable says whether the command is
-// terminal. That is EXACTLY §10.4's recoverable condition, so the pass reports it
-// as owned rather than as a failure: the record stays due, and a later pass — this
-// Host's or a successor's — records the same effect from the same evidence. The
-// half that makes it exactly-once is the second pass, which completes WITHOUT
-// driving the runtime again.
-func TestAnAmbiguousCompletionLeavesTheCommandRecoverable(t *testing.T) {
+// Its predecessor called Process twice ON THE BARE APPLIER, where there is no
+// cursor, and concluded from the second pass that a refused completion was
+// recoverable. AT THE COMPOSITION THERE IS A CURSOR: Reconcile treats
+// PrefixOwned as consumable, advances, and commits — and every later page is
+// listed strictly after that cursor. Nothing in this lane re-reads a command
+// below it; there is no due sweep. So the old behaviour left a record durably
+// applying over a committed effect, unsettleable by the reconciler (§10.4
+// forbids it touching applying) and by rejection (provesNoEffect is false), with
+// a pass that reported no Blocked at all.
+//
+// THE TEST THEREFORE RUNS THROUGH THE REAL CONSUMER, because that is the level
+// the defect existed at. The exactly-once half is kept: the retry completes the
+// command WITHOUT driving the runtime again.
+func TestACompletionRefusedWhileTheGrantIsHeldStopsTheCursor(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
 	f.store.errs["CompleteCommand"] = errTestStore
-	outcome, err := f.process()
+	cursors := &fakeCursors{}
+	inbox := &fakeInbox{pages: [][]Command{{command(1, StatePending)}, {command(1, StateApplying)}}}
+	consumer, err := NewConsumer(Options{
+		Host: f.host, Key: registry.Key{TenantID: testTenant, SessionID: testSession},
+		LeaseEpoch: testEpoch, Inbox: inbox, Cursors: cursors, Processor: f.applier, Fence: f.fence,
+	})
 	if err != nil {
-		t.Fatalf("the pass reported %v; a committed effect is recoverable and is not a failure", err)
+		t.Fatalf("NewConsumer: %v", err)
 	}
-	if !outcome.PrefixOwned {
-		t.Error("PrefixOwned = false, so the consumer's cursor stops on a command nothing can re-drive from the inbox")
+	// A PROCESSOR ERROR IS REPORTED THROUGH Blocked, NOT THROUGH Reconcile's
+	// return: O4.1 made a failed command stop the pass and NAME itself, which is
+	// the whole of "not silently". So the assertion is the pass result, and the
+	// thing that changed is that there is one at all — before the fix this pass
+	// reported Blocked nil, consumed one, and a committed cursor.
+	result, err := consumer.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile reported %v", err)
 	}
-	if outcome.State.Terminal() {
-		t.Errorf("outcome state = %q, which reports a terminal state no store acknowledged", outcome.State)
+	if result.Blocked == nil || result.Blocked.CommandID != commandID(1) {
+		t.Fatalf("the pass reports Blocked %+v, want the command it could not settle; LastPass is the only place an operator sees this", result.Blocked)
 	}
-	if driven := f.runtime.commands(); len(driven) != 1 {
-		t.Fatalf("the runtime was driven %d times, want once", len(driven))
+	if !errors.Is(result.Blocked.Cause, errTestStore) {
+		t.Errorf("the blocked command carries %v, want the store failure that stopped it", result.Blocked.Cause)
+	}
+	if result.Consumed != 0 {
+		t.Errorf("consumed = %d, want 0; a command that was not settled was counted as consumed", result.Consumed)
+	}
+	if writes := cursors.written(); len(writes) != 0 {
+		t.Errorf("the cursor was written %+v past a command no later reader would revisit", writes)
+	}
+	if state, due := f.store.stateOf(commandID(1)); state != StateApplying || !due {
+		t.Errorf("the record is %q (due %v), want an applying record still due", state, due)
 	}
 
+	// The retry settles it from the same evidence, and drives nothing.
 	f.store.mu.Lock()
 	delete(f.store.errs, "CompleteCommand")
 	f.store.mu.Unlock()
-	second, err := f.process()
-	if err != nil {
+	if _, err := consumer.Reconcile(context.Background()); err != nil {
 		t.Fatalf("the recovery pass reported %v", err)
 	}
-	if second.State != StateApplied {
-		t.Errorf("outcome state = %q, want %q", second.State, StateApplied)
+	if state, _ := f.store.stateOf(commandID(1)); state != StateApplied {
+		t.Errorf("the record is %q, want %q", state, StateApplied)
 	}
 	if driven := f.runtime.commands(); len(driven) != 1 {
 		t.Errorf("the runtime was driven %d times in total, want once; the recovery pass re-applied a committed effect", len(driven))
+	}
+	if writes := cursors.written(); len(writes) != 1 || writes[0].Order != 1 {
+		t.Errorf("the cursor was written %+v, want one write past the settled command", writes)
 	}
 }
 

@@ -452,6 +452,11 @@ type InboxWrites interface {
 // an append to the session's own stream under the journal fence. Both are
 // fenced, and both are covered by the same structural guard, which is what the
 // naming convention buys — a second write seam needed no edit to the guard.
+//
+// SO THE SAME PROHIBITION APPLIES HERE: DO NOT RENAME THIS TYPE OUT OF THE
+// CONVENTION. The guard's one measured survivor is exactly that rename, and it
+// spans both write seams; a warning on only one of them would leave the newer
+// seam looking unclaimed.
 type JournalWrites interface {
 	// AppendApplicationPrefix commits the private correlation record before the
 	// runtime-visible effect begins. The lease epoch is the writer's own and is
@@ -492,6 +497,14 @@ const (
 	// RefusalUnknownState reports a durable state this package cannot reason
 	// about.
 	RefusalUnknownState ApplyRefusal = "unknown_state"
+
+	// RefusalUnrevisionedRecord reports a record carrying no provider revision.
+	//
+	// Zero is not a revision any provider assigns, so it cannot be a revision a
+	// caller read, and a compare-and-swap naming it is unconditional. The store
+	// refuses it as an invalid request; this Host refuses to ISSUE it, which is
+	// the half a fake cannot supply.
+	RefusalUnrevisionedRecord ApplyRefusal = "unrevisioned_record"
 
 	// RefusalForeignRecord reports a record that is not the one asked for, or
 	// not this session's.
@@ -781,6 +794,12 @@ func (a *Applier) checkRecord(record Record, command Command) error {
 			Refusal:   RefusalUnknownState,
 			CommandID: command.CommandID,
 			Reason:    "the durable state " + strconv.Quote(string(record.State)) + " is not one of this package's five",
+		}
+	case record.Revision == 0:
+		return &ApplyError{
+			Refusal:   RefusalUnrevisionedRecord,
+			CommandID: command.CommandID,
+			Reason:    "the record carries no provider revision, so every transition this applier made would be a blind write dressed as a compare-and-swap",
 		}
 	case record.RuntimeCommandID.IsZero():
 		return &ApplyError{
@@ -1088,16 +1107,25 @@ func (a *Applier) gateResumable(gate Gate, found bool) (string, bool) {
 // round-trip to be told the result is malformed, and reading it back would leave
 // an applied command pointing at nothing.
 //
-// AN AMBIGUOUS FAILURE HERE IS REPORTED AS AN OWNED PREFIX rather than as an
-// error. The effect is durable in the journal whether or not this CAS landed,
-// which is exactly Outcome.PrefixOwned's meaning, so the pass may pass it and a
-// later one — this Host's or a successor's — records the same effect from the
-// same evidence.
+// A FAILED SETTLEMENT IS SILENT ONLY WHEN THE GRANT IS GONE, and the two arms
+// are not symmetric. This function used to report EVERY refusal as an owned
+// prefix, justified by "a later pass records the same effect from the same
+// evidence" — WHICH NAMED A READER THAT DOES NOT EXIST. PrefixOwned is
+// consumable: Consumer.Reconcile counts the record consumed, advances its
+// cursor and commits it, and every later page is listed strictly after that
+// cursor. Nothing else reads the inbox — there is no ListDue sweep in this lane
+// — so one timed-out CAS left a record durably `applying` over a committed
+// effect, which §10.4 forbids the reconciler from touching and which
+// RejectCommand refuses for want of provesNoEffect. The command never became
+// terminal, and the pass reported no Blocked, so an operator reading LastPass
+// saw a healthy session.
 //
-// A REFUSED FENCED WRITE LANDS HERE TOO, and reporting an owned prefix for it is
-// still true. It does not let a pass carry on under a lease it has lost, because
-// that is enforced twice over elsewhere: the consumer consults the fence between
-// records, and its own cursor write goes through the same fence.
+// A LOST GRANT IS THE ONE CASE WHERE THE SILENCE IS SAFE, and it is safe because
+// of a mechanism rather than a hope: the consumer's own cursor write goes
+// through the same fence, so a pass that got here with the grant gone writes no
+// cursor at all and re-derives the record next time. That arm keeps reporting an
+// owned prefix — the effect IS durable in the journal, and this Host has no
+// business writing anything more.
 func (a *Applier) complete(ctx context.Context, record Record, revision uint64, application Application) (Outcome, error) {
 	effect := application.effect(a.now())
 	if err := effect.Validate(); err != nil {
@@ -1110,7 +1138,15 @@ func (a *Applier) complete(ctx context.Context, record Record, revision uint64, 
 			Effect:           effect,
 		})
 	}); err != nil {
-		return Outcome{State: StateApplying, PrefixOwned: true}, nil
+		if lost := a.fence.Held(); lost != nil {
+			return Outcome{State: StateApplying, PrefixOwned: true}, nil
+		}
+		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the terminal completion was refused while this Host still holds the session, and no later reader would revisit a command the cursor had passed",
+			Cause:     err,
+		}
 	}
 	return Outcome{State: StateApplied}, nil
 }

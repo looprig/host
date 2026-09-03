@@ -141,7 +141,17 @@ func (a *Applier) plan(record Record, application Application, now time.Time) (s
 	// live, even at the same epoch, and the one move that remains is to enter
 	// applying before it lapses. An earlier version re-claimed here and would
 	// have been refused by the store on every resumed pass.
-	if claimLive && record.State == StateClaimed {
+	//
+	// THIS CARRIED A `State == StateClaimed` CONJUNCT AND NO LONGER DOES. It is
+	// the twin of the `ClaimEpoch != 0` conjunct deleted above and was
+	// unkillable for the same kind of reason — a fact about the enumeration
+	// rather than a case. Four of the five states are already gone by here:
+	// Process returns before this for both terminal ones, checkRecord refuses an
+	// unknown one, and StateApplying is handled immediately above. That leaves
+	// pending and claimed, and a pending record has never been claimed, so its
+	// expiry is the zero instant and claimLive is false. The conjunct could
+	// therefore only ever agree with claimLive.
+	if claimLive {
 		return stepApplyUnderHeldClaim, nil
 	}
 
@@ -169,12 +179,12 @@ func (a *Applier) plan(record Record, application Application, now time.Time) (s
 // planApplying decides an applying record with no committed effect.
 //
 // THE TWO ARMS ARE THE TWO WRITERS. Under this applier's OWN epoch the record is
-// its own unfinished work: the journal shows nothing committed, so the effect
-// never began and driving it again is the continuation of one application rather
-// than a second one. Under a PREDECESSOR's epoch it is somebody else's
-// unfinished work, and this applier may settle it only on the two proofs §10.4
-// requires — that no effect committed, and that the writer which might still
-// commit one has been fenced out of the stream.
+// its own unfinished work, and driving it again is the continuation of one
+// application rather than a second one — but only once the journal has been
+// asked whether this applier may still write at all. Under a PREDECESSOR's epoch
+// it is somebody else's unfinished work, and this applier may settle it only on
+// the two proofs §10.4 requires: that no effect committed, and that the writer
+// which might still commit one has been fenced out of the stream.
 func (a *Applier) planApplying(record Record, application Application) (step, error) {
 	if application.Outcome == ApplicationUnresolved {
 		return stepClaim, &ApplyError{
@@ -183,16 +193,40 @@ func (a *Applier) planApplying(record Record, application Application) (step, er
 			Reason:    "a correlated prefix exists whose outcome the journal cannot yet decide, so neither completing nor rejecting is safe",
 		}
 	}
+	// THE JOURNAL CAN PROVE THIS APPLIER IS THE SUPERSEDED ONE, and this check is
+	// where that proof is read. plan's first check asks the same question of the
+	// RECORD — is the claim under a later epoch — and a fence observed in the
+	// stream is the other way the answer arrives, exactly as ErrEpochSuperseded
+	// is the other way Lease.Lost is learned.
+	//
+	// IT WAS MISSING, AND THE ARM BELOW MADE IT REACHABLE. An abandoned outcome
+	// under this applier's OWN claim epoch means a correlated prefix exists and a
+	// fence above it was observed — that is what Abandoned is defined as — so the
+	// drive arm was appending a second prefix and driving the runtime under an
+	// epoch the journal had already proven superseded. The real writer refuses
+	// the fenced append, so it surfaced as a store failure; but the posture of
+	// this file is that the Host is STRICTER where the store cannot help, and
+	// here it was looser than evidence it had already read. The reject arm two
+	// checks below demands this same proof of a predecessor.
+	if application.fences(a.epoch) {
+		return stepClaim, &ApplyError{
+			Refusal:   RefusalStaleEpoch,
+			CommandID: record.CommandID,
+			Reason: "the journal has committed an opening fence above epoch " + strconv.FormatUint(a.epoch, 10) +
+				", so this applier can no longer append to this session",
+		}
+	}
 	if record.ClaimEpoch == a.epoch {
 		return stepDriveApplyingRecord, nil
 	}
-	if !application.provesNoEffect() {
-		return stepClaim, &ApplyError{
-			Refusal:   RefusalUnresolvedApplication,
-			CommandID: record.CommandID,
-			Reason:    "the journal reports the application as " + strconv.Quote(string(application.Outcome)) + ", which proves neither an effect nor its absence",
-		}
-	}
+	// NO provesNoEffect CHECK HERE, AND ITS ABSENCE IS THE ENUMERATION. Committed
+	// returned stepComplete in plan, Conflicted was refused by checkApplication,
+	// Unresolved was refused above, and an unknown outcome was refused by
+	// checkApplication too. Absent and Abandoned are what remain, and both prove
+	// no effect — so the guard that used to stand here could never produce its
+	// own error string. It is deleted rather than kept as decoration; what it
+	// stood for is the case enumeration, stated here where a sixth outcome would
+	// be added.
 	// THE FENCE, NOT THE EPOCH. Holding a later lease epoch says this applier
 	// may act; it does not say the predecessor cannot. Only a committed opening
 	// fence above the applier's epoch proves the effect a rejection would orphan
