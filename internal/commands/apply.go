@@ -295,7 +295,10 @@ type Gates interface {
 // "Writes" and requires every call to one of them to be lexically inside a
 // Fence.Write. A durable write added to this interface is guarded the moment it
 // is declared; a durable write declared on a seam named otherwise is not, which
-// is the guard's one stated limit.
+// is the guard's one stated limit — DO NOT RENAME THIS TYPE OUT OF THE
+// CONVENTION. Each write below also has a behavioural test that loses the grant
+// immediately before it, so the structural guard is the forward claim rather
+// than the only one.
 type InboxWrites interface {
 	// ClaimCommand CASes a record into StateClaimed under a lease epoch. The
 	// implementation refuses the CAS when the record no longer matches the
@@ -681,6 +684,22 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 			Refusal:   RefusalStore,
 			CommandID: record.CommandID,
 			Reason:    "the application prefix could not be committed, so the runtime was not driven",
+			Cause:     err,
+		}
+	}
+
+	// THE LAST CHECK BEFORE AN IRREVERSIBLE EFFECT, and the only one here that
+	// is not a write. Every step above this line is a durable write the fence
+	// can refuse; the runtime call is not, and it is the one step no successor
+	// can undo. A grant that ended between the prefix and here means this Host
+	// no longer owns the session, so it stops rather than driving a runtime it
+	// is about to lose — and the prefix it already committed is exactly what
+	// lets whoever owns the session next finish the command.
+	if err := a.fence.Held(); err != nil {
+		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
+			Refusal:   RefusalStaleEpoch,
+			CommandID: record.CommandID,
+			Reason:    "the grant ended after the application prefix was committed, so the runtime was not driven",
 			Cause:     err,
 		}
 	}

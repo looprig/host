@@ -94,6 +94,12 @@ type fakeStore struct {
 	// errs maps an operation name to the error it fails with.
 	errs map[string]error
 
+	// after maps an operation name to a hook run once it has been recorded.
+	// IT IS HOW A GRANT ENDS MID-PROTOCOL: the durable writes of one
+	// application are separated by instants, and the fence must be consulted at
+	// each of them rather than once at the top.
+	after map[string]func()
+
 	// calls is every operation in order, which is what the ordering assertions
 	// — payload after claim, prefix before the runtime — are made from.
 	calls []string
@@ -110,12 +116,16 @@ func newFakeStore() *fakeStore {
 		prefixes: map[sessionwire.CommandID]Prefix{},
 		gates:    map[sessionwire.GateID]Gate{},
 		errs:     map[string]error{},
+		after:    map[string]func(){},
 	}
 }
 
 // record notes an operation and returns the scripted error for it.
 func (s *fakeStore) record(op string) error {
 	s.calls = append(s.calls, op)
+	if hook := s.after[op]; hook != nil {
+		hook()
+	}
 	return s.errs[op]
 }
 
@@ -277,12 +287,19 @@ type fakeRuntime struct {
 	mu        sync.Mutex
 	envelopes []sessionwire.CommandEnvelope
 	err       error
+
+	// before runs at the start of the call, which is the only place a test can
+	// stand between the application prefix and the terminal CAS.
+	before func()
 }
 
 // ApplyCommand records the envelope and returns the scripted error.
 func (r *fakeRuntime) ApplyCommand(_ context.Context, envelope sessionwire.CommandEnvelope) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.before != nil {
+		r.before()
+	}
 	r.envelopes = append(r.envelopes, envelope)
 	return r.err
 }
@@ -1051,6 +1068,132 @@ func TestALostGrantStopsTheApplicationBeforeItClaims(t *testing.T) {
 	}
 }
 
+// TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt asserts the fence is
+// consulted at EVERY durable write of one application, not once at the top.
+//
+// THE STRUCTURAL GUARD IS NOT ENOUGH ON ITS OWN, and measuring it is what
+// showed that: unfencing BeginApplying, the application prefix or the terminal
+// CAS one at a time was killed by TestEveryDurableWriteGoesThroughTheFence and
+// by NOTHING ELSE, because the only behavioural lost-grant test loses the grant
+// before the first write and never reaches the later three. A guard whose
+// subject is a naming convention is exactly the guard that stops covering a
+// write the day somebody renames a seam, so each write now has a behavioural
+// kill of its own as well.
+//
+// THE GRANT ENDS THE WAY A SELECT CANNOT SEE — a store refusing a write under a
+// superseded epoch, which closes no channel — because that is the path a
+// mid-protocol loss actually arrives on.
+//
+// THE TERMINAL CAS IS NOT A ROW HERE, AND THE REASON IS THE POINT. It was one,
+// and the row was VACUOUS: with the grant ending after the prefix, the check
+// before the runtime call returns first, so the terminal CAS is never attempted
+// for a reason that has nothing to do with its fencing — the assertion passed
+// against a build whose terminal CAS was unfenced. Its own test stands where
+// nothing else can return first, which is inside the runtime call.
+func TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name      string
+		ends      string
+		forbidden string
+	}{
+		{"before the record enters applying", "ClaimCommand", "BeginApplying"},
+		{"before the application prefix", "BeginApplying", "RecordApplicationPrefix"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			f := newApplierFixture(t)
+			f.store.after[testCase.ends] = func() { f.fence.end() }
+			_, err := f.process()
+			if !errors.Is(err, errTestGrantGone) {
+				t.Fatalf("got %v, want the grant-gone cause", err)
+			}
+			operations := f.store.operations()
+			if indexOf(operations, testCase.ends) < 0 {
+				t.Fatalf("the operations ran as %v, which never reached %s, so this row asserts nothing", operations, testCase.ends)
+			}
+			if indexOf(operations, testCase.forbidden) >= 0 {
+				t.Errorf("the operations ran as %v; %s committed under a grant that had already ended", operations, testCase.forbidden)
+			}
+			if applied := f.runtime.applied(); len(applied) != 0 {
+				t.Errorf("the runtime was driven with %v under a grant that had already ended", applied)
+			}
+		})
+	}
+}
+
+// TestTheRuntimeIsNotDrivenAfterTheGrantEnds asserts the one check in the apply
+// path that is not a write.
+//
+// Every other step is a durable write the fence refuses on this Host's behalf.
+// The runtime call is not: it is the one step no successor can undo, so the
+// grant is consulted immediately before it and a Host that has lost the session
+// stops rather than driving a runtime it is about to lose. The prefix it
+// already committed is what lets the next owner finish the command.
+//
+// THE ASSERTION IS THE RUNTIME AND NOT THE TERMINAL CAS. The CAS is also absent
+// on this path, and asserting it here would assert nothing: this check returns
+// first, so the CAS is unreached whether or not it is fenced. That version of
+// this test passed against a build whose terminal CAS was unfenced, which is a
+// proof it was vacuous rather than a reason to keep it.
+func TestTheRuntimeIsNotDrivenAfterTheGrantEnds(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t)
+	f.store.after["RecordApplicationPrefix"] = func() { f.fence.end() }
+	outcome, err := f.process()
+	if !errors.Is(err, errTestGrantGone) {
+		t.Fatalf("got %v, want the grant-gone cause", err)
+	}
+	operations := f.store.operations()
+	if indexOf(operations, "RecordApplicationPrefix") < 0 {
+		t.Fatalf("the operations ran as %v, which never committed a prefix, so this test asserts nothing", operations)
+	}
+	if applied := f.runtime.applied(); len(applied) != 0 {
+		t.Errorf("the runtime was driven with %v under a grant that had already ended", applied)
+	}
+	if !outcome.PrefixOwned {
+		t.Error("PrefixOwned = false, though the prefix was committed and is what the next owner finishes from")
+	}
+}
+
+// TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall is the row
+// its table sibling cannot hold.
+//
+// The grant ends INSIDE the runtime call, which is the only instant between the
+// application prefix and the terminal CAS at which nothing else returns first:
+// the check before the call has already passed, and the effect has already been
+// driven. What the fence must still refuse is the terminal CAS.
+//
+// THE PASS REPORTS NO ERROR, and that is the documented behaviour rather than a
+// hole. The prefix is committed, so the command is recoverable whatever the
+// reason the CAS did not land, which is exactly Outcome.PrefixOwned's meaning;
+// nothing durable moves under the lost grant either way, because the consumer
+// consults the fence between records and its own cursor write goes through it.
+func TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t)
+	f.runtime.before = func() { f.fence.end() }
+	outcome, err := f.process()
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if applied := f.runtime.applied(); len(applied) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once: the grant was held when the call began, and this test asserts nothing if it never ran", len(applied))
+	}
+	if operations := f.store.operations(); indexOf(operations, "FinalizeCommand") >= 0 {
+		t.Errorf("the operations ran as %v; the terminal compare-and-swap committed under a grant that had ended", operations)
+	}
+	if !outcome.PrefixOwned {
+		t.Error("PrefixOwned = false, though the correlation was committed before the call")
+	}
+	if outcome.State.Terminal() {
+		t.Errorf("outcome state = %q, which reports a terminal state no store acknowledged", outcome.State)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The consumer's own reader
 // ---------------------------------------------------------------------------
@@ -1140,6 +1283,16 @@ func TestTheApplierIsTheSeamTheConsumerConsumes(t *testing.T) {
 // smuggled through a function value assigned elsewhere. The naming convention is
 // what makes the guard extend itself, and it is stated on InboxWrites where
 // somebody adding a seam will read it.
+//
+// THAT LIMIT WAS MEASURED, and what it costs was measured with it. Renaming
+// InboxWrites out of the convention SURVIVES this guard — the methods leave its
+// subject and it goes on passing. What that no longer costs is today's writes:
+// each of the four has a behavioural kill of its own as well, so the rename
+// alone unfences nothing that any test would miss. What it does cost is the
+// forward claim, which is the whole reason a structural guard exists: the NEXT
+// write added to a renamed seam would be unguarded and this test would not say
+// so. That is the residual, and it is a rename in a diff rather than a silent
+// omission.
 func TestEveryDurableWriteGoesThroughTheFence(t *testing.T) {
 	t.Parallel()
 
