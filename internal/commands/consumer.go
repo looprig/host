@@ -156,6 +156,17 @@ type Cursors interface {
 	// SaveCursor records the cursor under the writer's lease epoch. The
 	// implementation rejects an epoch lower than the greatest already
 	// committed for the record.
+	//
+	// THE REJECTION MUST CARRY A SENTINEL THE FENCE CLASSIFIES, and that is a
+	// contract rather than a courtesy. Every cursor write goes through
+	// Fence.Write, and the fence records ownership as gone only for the errors
+	// it recognises — residency.epochFence classifies exactly
+	// residency.ErrEpochSuperseded and residency.ErrFenceConflict and treats
+	// anything else as an ambiguous store failure. So an implementation that
+	// reports a superseded epoch as an untyped error leaves this Host believing
+	// it still owns a session a successor has taken, retrying once per
+	// ReconcileInterval and counting the refusals as store trouble. Wrap or
+	// return residency.ErrEpochSuperseded.
 	SaveCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, epoch uint64, order uint64) error
 }
 
@@ -207,6 +218,26 @@ type Outcome struct {
 // INTO a runtime and takes a wire envelope; this one is the whole durable
 // protocol around such a call, including the claim, the payload load and the
 // terminal CAS.
+//
+// FOUR THINGS O4.2 INHERITS, recorded here because each is a decision this task
+// took and none is visible from the signature:
+//
+//  1. A Processor IS HANDED NO Fence. Its claim and terminal CAS are fenced
+//     writes and need their own holder, and the structural guard in this
+//     package covers SaveCursor and nothing else — so O4.2's writes are exactly
+//     the "seventh caller" case that guard was written for, and arrive outside
+//     it. Widen the guard or give the Processor the fence; do not leave both.
+//  2. A PANICKING Processor TAKES THE HOST DOWN. Run calls this on its own
+//     goroutine and there is no recover anywhere in the path; releasePass is
+//     deferred, so the pass slot is freed and the process is not.
+//  3. acquirePass HAS NO CONTEXT OR STOP ESCAPE, so Stop cannot bound Run's
+//     exit while another caller holds the slot. Harmless while every pass is
+//     context-bounded; it becomes a drain question at O5.
+//  4. Inbox and Cursors survive O4.2 without widening, and that is deliberate
+//     rather than lucky: O4.2's claim and terminal CAS write the SAME durable
+//     SessionInbox record this Inbox reads, under the same one-writer-per-lease
+//     discipline. Two seams over one object is fine. Drifting into a second
+//     writer discipline without noticing is not.
 type Processor interface {
 	// Process handles one command and reports what the cursor may conclude.
 	Process(context.Context, Command) (Outcome, error)
@@ -240,7 +271,19 @@ type BlockedCommand struct {
 
 // PassResult is what one reconciliation pass did.
 type PassResult struct {
-	// Cursor is the durable consumption cursor AFTER the pass.
+	// Cursor is the greatest durable consumption cursor this consumer knows of
+	// at the moment the pass ended.
+	//
+	// IT IS ONE RULE ON EVERY EXIT, which it was not: three exits reported the
+	// cursor the pass had loaded and two reported a bare zero, so a pass
+	// refused before it could read anything told an operator reading LastPass
+	// that the session had consumed nothing — the exact misdiagnosis the
+	// Consumed/Cursor split below exists to prevent. Every exit now reports the
+	// held cursor.
+	//
+	// ZERO MEANS ONE THING: this consumer has never had a cursor acknowledged,
+	// either because the session has consumed nothing or because no pass has
+	// yet managed to read one.
 	Cursor uint64
 
 	// Examined is how many records the page held.
@@ -343,6 +386,17 @@ const (
 	// PageProblemUnknownState reports a durable state this consumer cannot
 	// reason about.
 	PageProblemUnknownState PageProblem = "unknown_state"
+
+	// PageProblemDuplicateCommandID reports the same public command identity
+	// twice in one page.
+	//
+	// §10.4 makes CommandID the inbox's STABLE KEY, so two records carrying one
+	// is the store contradicting itself in the same way a repeated acceptance
+	// order does — and it is not caught by the order checks, because the two
+	// copies may sit at strictly increasing orders. Left unchecked it hands one
+	// command to the Processor twice inside a single pass, which is what the
+	// serialization prevents ACROSS passes.
+	PageProblemDuplicateCommandID PageProblem = "duplicate_command_id"
 )
 
 // PageError reports a ListOrdered page this consumer refused.
@@ -380,8 +434,15 @@ func (e *PageError) Unwrap() error { return e.Cause }
 // has already had acknowledged.
 //
 // It is REFUSED rather than obeyed. This Host is the only writer of the cursor
-// while it holds the fence, so a lower value is the store contradicting a write
-// it acknowledged; obeying it would re-drive every command in between.
+// while it holds the fence, so a lower value is the store contradicting itself;
+// obeying it would re-drive every command in between.
+//
+// THE HIGH-WATER COMES FROM READS AS WELL AS WRITES, which is wider than an
+// earlier version of this comment said. Held is set by every successful load,
+// not only by an acknowledged write, so a store that answers 10 and then 5 is
+// refused even though this consumer wrote neither. That is deliberate: the
+// contradiction is the store's either way, and the consequence of obeying it is
+// the same.
 type CursorRegressionError struct {
 	Key    registry.Key
 	Loaded uint64
@@ -433,13 +494,18 @@ type Consumer struct {
 	// property into a scheduling accident. Reconcile is exported and the loop
 	// calls it too, so the two-callers case is the ordinary one, not a corner.
 	//
-	// IT IS A CHANNEL RATHER THAN A sync.Mutex SO THAT PARKING IS OBSERVABLE,
-	// which is what turns "a second pass must not run while the first is inside
-	// the Processor" from a race into a decidable question: exactly one of
-	// parked-or-returned happens, so a select between the two is
-	// deterministic. A mutex offers no such seam, and the property went
-	// unchecked while it was one — a mutation deleting the whole lock left the
-	// package green.
+	// PARKING IS OBSERVABLE, which is what turns "a second pass must not run
+	// while the first is inside the Processor" from a race into a decidable
+	// question: exactly one of parked-or-returned happens, so a select between
+	// the two is deterministic. That the seam EXISTS is the load-bearing part —
+	// the property went unchecked while there was none, and a mutation deleting
+	// the whole lock left the package green.
+	//
+	// THE CHANNEL IS A PREFERENCE AND NOT A NECESSITY, and an earlier version
+	// of this comment claimed otherwise: sync.Mutex.TryLock gives the same
+	// try-then-hook-then-block shape and this module builds at go 1.26.6, so a
+	// mutex would serve. Do not read the choice as an argument that it would
+	// not.
 	passes chan struct{}
 
 	// parked, when set, is called immediately before a pass blocks on a busy
@@ -597,6 +663,23 @@ func (c *Consumer) Run(ctx context.Context) {
 			return
 		default:
 		}
+		// BOTH WAYS OWNERSHIP ENDS, and this is the second one. The select
+		// above can only see the channel; a fence that ended because a store
+		// refused a write under a superseded epoch CLOSES NO CHANNEL, which is
+		// what Fence's own documentation says four hundred lines above and what
+		// this loop forgot. residency.epochFence is exactly that shape: end()
+		// sets a flag, held() starts refusing, and lost() goes on returning the
+		// lease's channel, which nothing closed.
+		//
+		// Without this the loop does not exit, it SPINS: every pass is refused
+		// at Reconcile's own top-of-pass check, returns an error, arms a timer
+		// and repeats, one failed pass per ReconcileInterval forever, with
+		// Failures() climbing unbounded — and Failures() is the signal an
+		// operator reads. Nothing wires a real fence yet, so this was unowned
+		// rather than broken in production; it would have arrived with O7.1.
+		if err := c.fence.Held(); err != nil {
+			return
+		}
 
 		result, err := c.Reconcile(ctx)
 		c.record(result, err)
@@ -658,6 +741,12 @@ func (c *Consumer) record(result PassResult, err error) {
 // O3.1's sequence begins inbox ownership at step 8 and reports attached at step
 // 9, and a composition that wants the first pass to have completed before it
 // answers a Factory bind calls this directly rather than racing the loop.
+//
+// IT IS SAFE TO CALL WHILE Run IS RUNNING, and that is stated here because
+// here is where a caller reads it. Passes are serialized: a second one waits
+// for the first rather than reading the same cursor and listing the same page.
+// The sentence lived only on the unexported field that implements it, which no
+// caller can see.
 func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 	c.acquirePass()
 	defer c.releasePass()
@@ -666,12 +755,12 @@ func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 	// the session lease has no business claiming commands out of an inbox a
 	// successor now owns, and the read is what leads to the claim.
 	if err := c.fence.Held(); err != nil {
-		return PassResult{}, err
+		return PassResult{Cursor: c.heldCursor()}, err
 	}
 
 	cursor, err := c.loadCursor(ctx)
 	if err != nil {
-		return PassResult{}, err
+		return PassResult{Cursor: c.heldCursor()}, err
 	}
 
 	limit := c.host.ReconcileBatch()
@@ -798,6 +887,14 @@ func (c *Consumer) loadCursor(ctx context.Context) (uint64, error) {
 	return stored, nil
 }
 
+// heldCursor is the greatest cursor this consumer has had acknowledged, or zero
+// when it has never had one. See PassResult.Cursor.
+func (c *Consumer) heldCursor() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cursor
+}
+
 // setCursor records an acknowledged cursor.
 func (c *Consumer) setCursor(order uint64) {
 	c.mu.Lock()
@@ -822,6 +919,7 @@ func (c *Consumer) validatePage(page []Command, cursor uint64, limit int) error 
 		}
 	}
 	previous := cursor
+	seen := make(map[sessionwire.CommandID]int, len(page))
 	for index, record := range page {
 		if record.TenantID != c.key.TenantID || record.SessionID != c.key.SessionID {
 			return &PageError{
@@ -873,6 +971,22 @@ func (c *Consumer) validatePage(page []Command, cursor uint64, limit int) error 
 					" does not increase on its predecessor's " + strconv.FormatUint(previous, 10),
 			}
 		}
+		// LAST, DELIBERATELY. A page carrying one record twice breaks the
+		// order rule as well — the copy cannot strictly increase on itself —
+		// and the order violation is the more specific finding, so it is
+		// reported first. This check exists for the case the order rule cannot
+		// see: the same CommandID at two DIFFERENT, strictly increasing orders.
+		if first, duplicate := seen[record.CommandID]; duplicate {
+			return &PageError{
+				Problem:       PageProblemDuplicateCommandID,
+				Index:         index,
+				CommandID:     record.CommandID,
+				AcceptedOrder: record.AcceptedOrder,
+				Reason: "the page already carries this command at index " + strconv.Itoa(first) +
+					"; CommandID is the inbox's stable key and cannot name two records",
+			}
+		}
+		seen[record.CommandID] = index
 		previous = record.AcceptedOrder
 	}
 	return nil

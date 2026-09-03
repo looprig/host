@@ -145,6 +145,12 @@ type fakeInbox struct {
 	// caller's effect", which is the whole subject of a concurrency test.
 	all []Command
 
+	// afterList, when set, runs immediately after a page is built and before
+	// it is returned. It is the only way a test can lose the grant in the
+	// window BETWEEN the top-of-pass check and the first record, which is where
+	// a pass can abort having consumed nothing at all.
+	afterList func()
+
 	// pages is consumed one entry per call. The LAST entry is repeated once
 	// exhausted, so a loop test does not have to script every idle pass.
 	pages [][]Command
@@ -160,12 +166,16 @@ func (f *fakeInbox) ListOrdered(_ context.Context, tenant sessionwire.TenantID, 
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, listCall{TenantID: tenant, SessionID: session, AfterOrder: after, Limit: limit})
 	index := len(f.calls) - 1
+	hook := f.afterList
 	if len(f.all) > 0 {
 		page := []Command{}
 		for _, record := range f.all {
 			if record.AcceptedOrder > after && len(page) < limit {
 				page = append(page, record)
 			}
+		}
+		if hook != nil {
+			hook()
 		}
 		return page, nil
 	}
@@ -184,7 +194,11 @@ func (f *fakeInbox) ListOrdered(_ context.Context, tenant sessionwire.TenantID, 
 	if index >= len(f.pages) {
 		index = len(f.pages) - 1
 	}
-	return append([]Command(nil), f.pages[index]...), nil
+	page := append([]Command(nil), f.pages[index]...)
+	if hook != nil {
+		hook()
+	}
+	return page, nil
 }
 
 // requests returns every ListOrdered call, in order.
@@ -318,6 +332,7 @@ type fakeFence struct {
 	mu sync.Mutex
 
 	lost   chan struct{}
+	ended  bool
 	writes int
 }
 
@@ -326,6 +341,12 @@ func newFakeFence() *fakeFence { return &fakeFence{lost: make(chan struct{})} }
 
 // Held reports the typed reason ownership is gone, or nil.
 func (f *fakeFence) Held() error {
+	f.mu.Lock()
+	ended := f.ended
+	f.mu.Unlock()
+	if ended {
+		return errTestGrantGone
+	}
 	select {
 	case <-f.lost:
 		return errTestGrantGone
@@ -348,8 +369,19 @@ func (f *fakeFence) Write(run func() error) error {
 	return run()
 }
 
-// close closes the loss channel, which is the OTHER way ownership ends.
+// close closes the loss channel: the lease itself was lost.
 func (f *fakeFence) close() { close(f.lost) }
+
+// end records ownership as gone WITHOUT closing the loss channel, which is the
+// OTHER of §10.1's two mechanisms and the one a select cannot see. It is what
+// residency.epochFence does when a store refuses a write under a superseded
+// epoch: end() sets a flag, held() starts refusing, and lost() goes on
+// returning the lease's channel, which nothing closed.
+func (f *fakeFence) end() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ended = true
+}
 
 // fencedWrites reports how many writes went through the fence.
 func (f *fakeFence) fencedWrites() int {
@@ -958,6 +990,15 @@ func TestReconcileRefusesANonConformingPage(t *testing.T) {
 			index:  0,
 		},
 		{
+			name: "the same command twice at increasing orders",
+			page: []Command{
+				command(1, StatePending),
+				{TenantID: testTenant, SessionID: testSession, CommandID: commandID(1), AcceptedOrder: 2, State: StatePending},
+			},
+			reason: PageProblemDuplicateCommandID,
+			index:  1,
+		},
+		{
 			name:   "a page wider than the limit",
 			page:   []Command{command(1, StatePending), command(2, StatePending), command(3, StatePending), command(4, StatePending)},
 			reason: PageProblemOverLimit,
@@ -1052,8 +1093,52 @@ func TestReconcileRefusesToRunUnderALostGrant(t *testing.T) {
 	if len(f.inbox.requests()) != 0 {
 		t.Errorf("the inbox was read %d times under a lost grant", len(f.inbox.requests()))
 	}
+	// UNKILLABLE BY CONSTRUCTION, AND KEPT ANYWAY — labelled rather than left
+	// for a reader to rediscover. Every cursor write in this package routes
+	// through Fence.Write, which refuses before it calls the store, and
+	// TestEveryDurableCursorWriteGoesThroughTheFence is what holds that routing
+	// in place. So no mutation of Reconcile alone can make this fire; it pins
+	// the outcome a reader of this test expects, and the mechanism is held
+	// elsewhere.
 	if len(f.cursors.written()) != 0 {
 		t.Errorf("the cursor was written under a lost grant")
+	}
+}
+
+// TestReconcileReportsALostGrantBeforeItConsumedAnything is the case its
+// mid-page sibling cannot reach, and the two are not redundant.
+//
+// The sibling loses the grant INSIDE record 1's Process, so record 1 completes,
+// the pass has consumed something, and the fenced cursor write it then attempts
+// fails and produces the error. Here the grant is lost as the page is
+// delivered, so the pass aborts at the FIRST record with nothing consumed,
+// `consumed > cursor` is false and the fenced write is never reached — leaving
+// the early return as the only thing between this and a pass that reports
+// SUCCESS while having abandoned its page. An aborted pass and an idle one must
+// not be indistinguishable.
+//
+// Measured: turning that early return into a `break` survives the sibling and
+// every other test in this package, and dies here.
+func TestReconcileReportsALostGrantBeforeItConsumedAnything(t *testing.T) {
+	t.Parallel()
+
+	f := newConsumerFixture(t, func(f *consumerFixture) {
+		f.inbox.pages = [][]Command{{command(1, StatePending), command(2, StatePending)}}
+	})
+	f.inbox.afterList = func() { f.fence.close() }
+
+	result, err := f.consumer.Reconcile(context.Background())
+	if !errors.Is(err, errTestGrantGone) {
+		t.Fatalf("a pass aborted by a lost grant reported %v, not the loss; a caller cannot tell it from an idle pass", err)
+	}
+	if handled := f.processor.processedIDs(); len(handled) != 0 {
+		t.Errorf("the processor was handed %v under a grant already known to be gone", handled)
+	}
+	if result.Consumed != 0 {
+		t.Errorf("consumed = %d, want 0", result.Consumed)
+	}
+	if result.More {
+		t.Error("More = true; an aborted pass has not consumed its page")
 	}
 }
 
@@ -1080,11 +1165,16 @@ func TestReconcileStopsWhenTheGrantIsLostMidPage(t *testing.T) {
 	}
 	// AN ABORTED PASS WRITES NO CURSOR. On THIS path that outcome is enforced
 	// twice over — the early return, and Fence.Write refusing before it calls
-	// the store at all — so the assertion pins the OUTCOME rather than either
-	// mechanism, and a mutation that removes only the early return is caught
-	// here by neither. Its twin in TestReconcileHonoursCancellation is the one
-	// that catches that, because there the grant is still held and the fence
-	// would let the write through.
+	// the store at all — so this assertion pins the OUTCOME rather than either
+	// mechanism and CANNOT catch the removal of the early return.
+	//
+	// AN EARLIER VERSION OF THIS COMMENT WENT ON TO SAY THAT REMOVAL IS
+	// "caught by its twin in TestReconcileHonoursCancellation", AND THAT WAS
+	// FALSE. The twin catches the removal of the ctx.Err() return, which is a
+	// different line; turning the fence.Held() return into a `break` survived
+	// this whole package. A redundancy label is a claim about coverage and
+	// needs the same evidence as any other claim. The case is real and now has
+	// its own test: TestReconcileReportsALostGrantBeforeItConsumedAnything.
 	if writes := f.cursors.written(); len(writes) != 0 {
 		t.Errorf("the cursor was written %v by a pass that aborted under a lost grant", writes)
 	}
@@ -1536,6 +1626,130 @@ func TestRunLeavesWhenTheGrantIsLost(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the loop did not leave after the grant was lost")
+	}
+}
+
+// TestRunLeavesWhenTheGrantEndsWithoutClosingItsChannel is the OTHER of
+// §10.1's two mechanisms, and the loop used to be blind to it.
+//
+// Both of Run's selects can only see Fence.Lost(). A fence that ended because a
+// store refused a write under a superseded epoch closes NO channel — which is
+// what Fence's own documentation says and what residency.epochFence does — so
+// the loop went round again, Reconcile refused the pass at its top-of-pass
+// check, an error came back, a timer was armed, and it repeated one failed pass
+// per interval FOREVER with Failures() climbing. Not an exit that was slow: an
+// exit that never happened.
+//
+// The assertion is DECIDABLE rather than timed: after the grant ends the loop
+// either leaves or arms another timer, exactly one of those happens, and a
+// select between them settles it instantly.
+func TestRunLeavesWhenTheGrantEndsWithoutClosingItsChannel(t *testing.T) {
+	t.Parallel()
+
+	f := newConsumerFixture(t, func(f *consumerFixture) { f.inbox.pages = [][]Command{nil} })
+	done := f.run(t, context.Background())
+
+	f.clock.waitForTimer(t)
+	f.fence.end()
+	f.clock.fire(t)
+
+	select {
+	case <-done:
+	case <-f.clock.created:
+		t.Fatal("the loop armed another timer instead of leaving: a fence that ended without closing its channel is invisible to a select, so the loop spins one refused pass per ReconcileInterval forever")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the loop neither left nor armed a timer")
+	}
+	if got := f.consumer.Failures(); got != 0 {
+		t.Errorf("Failures = %d, want 0; leaving on the ended fence means no pass was driven under it", got)
+	}
+}
+
+// TestARefusedPassReportsTheCursorItHolds pins PassResult.Cursor's one rule at
+// the two exits that used to break it.
+//
+// A pass refused before it could read anything reported a bare zero, so an
+// operator reading LastPass after a wedged pass saw "consumed nothing" for a
+// session that had consumed plenty — the misdiagnosis the Consumed/Cursor split
+// exists to prevent, produced by the field the split is made of.
+func TestARefusedPassReportsTheCursorItHolds(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name   string
+		break_ func(*consumerFixture)
+	}{
+		{
+			name:   "refused by the fence before the read",
+			break_: func(f *consumerFixture) { f.fence.close() },
+		},
+		{
+			name:   "refused by an unreadable cursor store",
+			break_: func(f *consumerFixture) { f.cursors.loadErr = errTestStore },
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			f := newConsumerFixture(t, func(f *consumerFixture) {
+				f.cursors.stored = 12
+				f.inbox.pages = [][]Command{{command(13, StatePending), command(14, StatePending)}, nil}
+			})
+			first, err := f.consumer.Reconcile(context.Background())
+			if err != nil {
+				t.Fatalf("first Reconcile: %v", err)
+			}
+			if first.Cursor != 14 {
+				t.Fatalf("first pass cursor = %d, want 14", first.Cursor)
+			}
+
+			testCase.break_(f)
+			refused, err := f.consumer.Reconcile(context.Background())
+			if err == nil {
+				t.Fatal("the second pass was not refused")
+			}
+			if refused.Cursor != 14 {
+				t.Errorf("the refused pass reported cursor %d, want the 14 this consumer holds; zero would read as \"this session has consumed nothing\"", refused.Cursor)
+			}
+			if refused.Consumed != 0 {
+				t.Errorf("consumed = %d, want 0", refused.Consumed)
+			}
+		})
+	}
+}
+
+// TestTheHeldCursorComesFromTheLoadAndNotOnlyFromTheWrite covers the half of
+// the regression rule a write-only high-water misses.
+//
+// A consumer that idles — passes that read the cursor and find nothing to do —
+// never writes, so if the held value were set only by an acknowledged write it
+// would stay at zero and a store that answered 10 and then 5 would be obeyed,
+// re-driving every command in between. Measured: deleting the assignment in
+// loadCursor left the rest of this package green.
+func TestTheHeldCursorComesFromTheLoadAndNotOnlyFromTheWrite(t *testing.T) {
+	t.Parallel()
+
+	f := newConsumerFixture(t, func(f *consumerFixture) {
+		f.inbox.pages = [][]Command{nil}
+		f.cursors.loads = []uint64{10, 5}
+	})
+	first, err := f.consumer.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if first.Cursor != 10 {
+		t.Fatalf("first pass cursor = %d, want the loaded 10", first.Cursor)
+	}
+	if writes := f.cursors.written(); len(writes) != 0 {
+		t.Fatalf("an idle pass wrote %v; this test is only meaningful when nothing was written", writes)
+	}
+
+	_, err = f.consumer.Reconcile(context.Background())
+	var regressed *CursorRegressionError
+	if !errors.As(err, &regressed) {
+		t.Fatalf("want *CursorRegressionError, got %v", err)
+	}
+	if regressed.Loaded != 5 || regressed.Held != 10 {
+		t.Errorf("loaded/held = %d/%d, want 5/10", regressed.Loaded, regressed.Held)
 	}
 }
 
