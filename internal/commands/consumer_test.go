@@ -1299,14 +1299,24 @@ func TestConcurrentPassesDoNotApplyACommandTwice(t *testing.T) {
 	f := newConsumerFixture(t, func(f *consumerFixture) {
 		f.inbox.all = []Command{command(1, StatePending), command(2, StatePending)}
 	})
+	// THE GATE ADMITS ONE CALLER AND DOES NOT BLOCK THE OTHERS, and that is
+	// not a detail. A sync.Once here makes every later caller wait on the
+	// first's Do, so an unserialized second pass parks inside the Processor
+	// instead of running to completion — and the test then fails on its
+	// ten-second "neither parked nor returned" diagnostic rather than on the
+	// arm that names the defect. Measured against two mutations that deleted
+	// the serialization.
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	var once sync.Once
+	admit := make(chan struct{}, 1)
+	admit <- struct{}{}
 	f.processor.before = func(Command) {
-		once.Do(func() {
+		select {
+		case <-admit:
 			close(entered)
 			<-release
-		})
+		default:
+		}
 	}
 	parked := make(chan struct{})
 	f.consumer.mu.Lock()
