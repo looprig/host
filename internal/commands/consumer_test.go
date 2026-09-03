@@ -569,6 +569,51 @@ func TestNewConsumerRefusesAnIncompleteComposition(t *testing.T) {
 	}
 }
 
+// TestAFullPageIsWellDefinedBecauseTheBatchIsPositive is a TRIPWIRE ON A
+// BORROWED PROPERTY, not a test of this package's code.
+//
+// Reconcile decides "the page was full" as len(page) == limit, where limit is
+// the Host's ReconcileBatch. That comparison only means what it says while the
+// batch is positive: at zero, an EMPTY page reads as full, the loop continues
+// immediately every round and never arms a timer. This package cannot enforce
+// that itself — it receives an already-constructed *host.Host — so it asserts
+// the guarantee at its source instead, and will fail loudly if host.New ever
+// stops refusing a non-positive batch.
+func TestAFullPageIsWellDefinedBecauseTheBatchIsPositive(t *testing.T) {
+	t.Parallel()
+
+	dept, err := department.New([]department.Registration{{AgentID: testAgent, Target: stubTarget{}}})
+	if err != nil {
+		t.Fatalf("department.New: %v", err)
+	}
+	for _, batch := range []int{0, -1} {
+		options := host.Options{
+			HostID:            sessionwire.HostID("host-inbox"),
+			TenantID:          testTenant,
+			InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
+			IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
+			Department:        dept,
+			SessionStore:      stubSessionStore{},
+			Workspaces:        stubWorkspaces{},
+			Clock:             newManualClock(testClockAt),
+			Auth:              stubAuth{},
+			Placement:         sessionwire.HostPlacementPooled,
+			Capacity:          4,
+			WarmTTL:           97 * time.Second,
+			RegistryHeartbeat: 5 * time.Second,
+			RegistryExpiry:    31 * time.Second,
+			ClaimTTL:          11 * time.Second,
+			ApplyDeadline:     47 * time.Second,
+			CommandQueueSize:  257,
+			ReconcileInterval: testReconcileInterval,
+			ReconcileBatch:    batch,
+		}
+		if _, err := host.New(options); err == nil {
+			t.Errorf("host.New accepted ReconcileBatch %d; this package reads a full page as len(page) == the batch, which at zero makes an EMPTY page full and the loop spin without ever arming a timer", batch)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // One pass over the durable order
 // ---------------------------------------------------------------------------

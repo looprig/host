@@ -693,7 +693,19 @@ func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 		c.setCursor(consumed)
 		result.Cursor = consumed
 	}
-	result.More = result.Blocked == nil && limit > 0 && len(page) == limit
+	// "FULL" IS len(page) == limit AND NOTHING ELSE, and that is only a
+	// well-defined test because the limit is positive. It carried a `limit > 0`
+	// conjunct which was UNREACHABLE-FALSE — host.New refuses a non-positive
+	// ReconcileBatch and there is no other way to obtain a *host.Host — so no
+	// construction could distinguish it and a mutation deleting it survived.
+	// This file's standard is that a discriminator no mutant can kill is a
+	// claim nothing checks, so the conjunct is gone and the property it stood
+	// for is held where it can actually fail:
+	// TestAFullPageIsWellDefinedBecauseTheBatchIsPositive asserts host.New's
+	// refusal directly. If that ever relaxes, a zero limit would make an empty
+	// page read as full and the loop would continue forever without arming a
+	// timer, and the tripwire fires instead of the loop spinning.
+	result.More = result.Blocked == nil && len(page) == limit
 	return result, nil
 }
 
