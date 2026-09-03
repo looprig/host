@@ -1194,6 +1194,111 @@ func TestRunContinuesImmediatelyAfterAFullPage(t *testing.T) {
 	}
 }
 
+// TestRunStopsWithoutRunningAnotherPass covers the ONE PATH on which the
+// loop's leading precedence select is the only stop check there is. A pass that
+// consumed a full page continues immediately, skipping the post-pass select
+// entirely, so without that leading check a stopped consumer runs another whole
+// pass and applies another command.
+//
+// ONLY THE Stop ROW REACHES THAT PATH, and saying so is the point of having
+// three rows rather than one. Reconcile cannot see Stop at all, so Stop is the
+// only reason a full page can be followed by another one; the other two are
+// caught INSIDE the pass, before the second command of the first page, which is
+// why they consume one command rather than three and pay for one armed timer
+// that Stop does not. A single "the loop exits" assertion would have been true
+// of all three and would have distinguished none of them.
+//
+// The costs below are what each path genuinely does, not a shared triple:
+//
+//	Stop                one list, three applied, no timer
+//	cancellation        one list, one applied, one timer
+//	the grant is lost   one list, one applied, one timer
+func TestRunStopsWithoutRunningAnotherPass(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name string
+		// stop ends the consumer while the first pass is inside the Processor.
+		stop func(*consumerFixture, context.CancelFunc)
+		// wantProcessed is how many commands may be applied in total.
+		wantProcessed int
+		// wantListed is how many ListOrdered calls the store may see.
+		wantListed int
+		// wantTimers is how many timers the loop may arm.
+		wantTimers int
+		reason     string
+	}{
+		{
+			name:          "after Stop",
+			stop:          func(f *consumerFixture, _ context.CancelFunc) { f.consumer.Stop() },
+			wantProcessed: 3,
+			wantListed:    1,
+			wantTimers:    0,
+			reason:        "Reconcile cannot see Stop, so the pass runs to the end of its full page and the LEADING select is the only thing that stops a second page being listed and a fourth command being APPLIED",
+		},
+		{
+			name:          "after cancellation",
+			stop:          func(_ *consumerFixture, cancel context.CancelFunc) { cancel() },
+			wantProcessed: 1,
+			wantListed:    1,
+			wantTimers:    1,
+			reason:        "the pass itself refuses before the SECOND command of the page, so only one is applied, and the loop leaves through the post-pass select having armed one timer",
+		},
+		{
+			name:          "after the grant is lost",
+			stop:          func(f *consumerFixture, _ context.CancelFunc) { f.fence.close() },
+			wantProcessed: 1,
+			wantListed:    1,
+			wantTimers:    1,
+			reason:        "the fence refuses before the SECOND command of the page, for the same cost as cancellation but by the other of the two mechanisms",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			f := newConsumerFixture(t, func(f *consumerFixture) {
+				f.inbox.all = []Command{
+					command(1, StatePending), command(2, StatePending),
+					command(3, StatePending), command(4, StatePending),
+				}
+			})
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			admit := make(chan struct{}, 1)
+			admit <- struct{}{}
+			f.processor.before = func(Command) {
+				select {
+				case <-admit:
+					close(entered)
+					<-release
+				default:
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := f.run(t, ctx)
+
+			<-entered
+			testCase.stop(f, cancel)
+			close(release)
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the loop did not leave")
+			}
+
+			if got := len(f.processor.processedIDs()); got != testCase.wantProcessed {
+				t.Errorf("processed %v (%d), want %d: %s", f.processor.processedIDs(), got, testCase.wantProcessed, testCase.reason)
+			}
+			if got := len(f.inbox.requests()); got != testCase.wantListed {
+				t.Errorf("ListOrdered was called %d times, want %d: %s", got, testCase.wantListed, testCase.reason)
+			}
+			if got := len(f.clock.requests()); got != testCase.wantTimers {
+				t.Errorf("%d timers were armed, want %d: %s", got, testCase.wantTimers, testCase.reason)
+			}
+		})
+	}
+}
+
 // TestRunLeavesWhenTheGrantIsLost asserts the loop stops on the same signal the
 // heartbeat does, rather than going on reading an inbox a successor now owns.
 func TestRunLeavesWhenTheGrantIsLost(t *testing.T) {
