@@ -13,6 +13,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// disconnectAuthentication and disconnectUnsupportedVersion are the two
+// terminal HostLink disconnect codes. Both sit in 4500-4999, documented by
+// centrifuge@v0.38.0 disconnect.go:26 as an application terminal range in
+// which a client performs no automatic reconnect. The codes are distinct because they
+// distinguish two different failures to the Factory client, and the tests
+// assert each exact value rather than only the range.
 const (
 	disconnectAuthentication     uint32 = 4500
 	disconnectUnsupportedVersion uint32 = 4501
@@ -39,9 +45,16 @@ func NewCentrifugeServer(config Config) (Server, error) {
 	if (config.PingInterval == 0) != (config.PongTimeout == 0) {
 		return nil, errors.New("hostlink: ping interval and pong timeout must be configured together")
 	}
+	// One second is the resolution of the wire, not a preference: Centrifuge
+	// advertises the interval as whole seconds — client.go:2466 sends
+	// res.Ping = uint32(c.pingInterval.Seconds()) — so a sub-second interval
+	// truncates to ping: 0, which a client cannot tell apart from no ping.
 	if config.PingInterval > 0 && config.PingInterval < time.Second {
 		return nil, errors.New("hostlink: ping interval must be at least one second")
 	}
+	// Deliberately stricter than the dependency: Centrifuge only logs a warning
+	// for this configuration (warnAboutIncorrectPingPongConfig, config.go:229-231)
+	// and then runs with it. HostLink rejects it at construction instead.
 	if config.PingInterval > 0 && config.PongTimeout > 0 && config.PongTimeout >= config.PingInterval {
 		return nil, errors.New("hostlink: pong timeout must be shorter than ping interval")
 	}
@@ -115,6 +128,29 @@ func (s *centrifugeServer) Handler() http.Handler { return s.handler }
 
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 
+// selectsJSONProtocol reports whether the request explicitly selects the JSON
+// client protocol, and is the sole gate in front of the Centrifuge WebSocket
+// handler.
+//
+// Provenance of the two query keys. "format" and "cf_protocol" are not names
+// HostLink chose; they mirror centrifuge@v0.38.0 handler_websocket.go:139,
+// which selects the protobuf protocol when
+// query.Get("format") == "protobuf" || query.Get("cf_protocol") == "protobuf".
+// Mirroring a dependency's private selection logic is only safe while the
+// dependency cannot add a third key underneath the mirror, which is why the
+// version guard in server_test.go asserts the exact version v0.38.0 rather
+// than a minimum. That guard and this function are one unit: moving the pin
+// obliges re-reading handler_websocket.go's key list.
+//
+// Policy. The result is an AND over every signal that was supplied and an OR
+// over their presence — selected does double duty as "nothing invalid seen so
+// far" and "something explicit was seen at all" — so an absent selector is a
+// rejection, not a default. Where the two differ, HostLink is deliberately
+// stricter than Centrifuge: Centrifuge reads only the first value of each key
+// via query.Get, while this rejects if any value of any supplied key is not
+// "json", and it rejects a repeated physical Sec-WebSocket-Protocol field
+// outright because gorilla's Subprotocols reads only the first such field
+// (websocket@v1.5.3 server.go:311-321) and would silently ignore the rest.
 func selectsJSONProtocol(request *http.Request) bool {
 	selected := false
 	headerValues := request.Header.Values("Sec-WebSocket-Protocol")

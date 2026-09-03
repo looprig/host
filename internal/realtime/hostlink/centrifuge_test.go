@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +53,10 @@ func (a *recordingAuthenticator) calls() []string {
 	return append([]string(nil), a.credentials...)
 }
 
-type connectReply struct {
+// clientReply is the subset of a Centrifuge client-protocol reply these tests
+// read. It is not connect-specific: the optional-facilities test decodes
+// publish, history, presence and subscribe replies through it too.
+type clientReply struct {
 	ID      uint32 `json:"id"`
 	Connect *struct {
 		Data json.RawMessage `json:"data"`
@@ -61,13 +67,6 @@ type connectReply struct {
 		Code    uint32 `json:"code"`
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
-	Push *struct {
-		Disconnect *struct {
-			Code      uint32 `json:"code"`
-			Reason    string `json:"reason"`
-			Reconnect bool   `json:"reconnect"`
-		} `json:"disconnect,omitempty"`
-	} `json:"push,omitempty"`
 }
 
 func TestConnectAuthenticatesServiceAndNegotiatesCoreVersion(t *testing.T) {
@@ -90,7 +89,7 @@ func TestConnectAuthenticatesServiceAndNegotiatesCoreVersion(t *testing.T) {
 	if negotiated.Version != sessionwire.CurrentWireVersion {
 		t.Errorf("negotiated version = %d, want %d", negotiated.Version, sessionwire.CurrentWireVersion)
 	}
-	if got, want := auth.calls(), []string{string(testTenant) + ":" + testCredential}; !reflectStringsEqual(got, want) {
+	if got, want := auth.calls(), []string{string(testTenant) + ":" + testCredential}; !slices.Equal(got, want) {
 		t.Errorf("authentication calls = %v, want %v", got, want)
 	}
 }
@@ -191,7 +190,7 @@ func TestConnectRejectsInvalidServiceCredential(t *testing.T) {
 	disconnect := rejectedConnect(t, connection, "wrong-secret", sessionwire.VersionNegotiationRequest{
 		SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
 	})
-	assertTerminalDisconnect(t, disconnect, "authentication")
+	assertTerminalDisconnect(t, disconnect, 4500, "authentication")
 }
 
 func TestConnectRejectsUnsupportedCoreVersion(t *testing.T) {
@@ -204,7 +203,7 @@ func TestConnectRejectsUnsupportedCoreVersion(t *testing.T) {
 	disconnect := rejectedConnect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{
 		SupportedVersions: []sessionwire.WireVersion{2, 3},
 	})
-	assertTerminalDisconnect(t, disconnect, "unsupported wire version")
+	assertTerminalDisconnect(t, disconnect, 4501, "unsupported wire version")
 	if len(auth.calls()) != 1 {
 		t.Fatalf("authentication calls = %d, want 1 at connect time", len(auth.calls()))
 	}
@@ -254,8 +253,11 @@ func TestHostLinkAcceptsExplicitJSONSelectors(t *testing.T) {
 		{name: "repeated JSON format query", suffix: "?format=json&format=json"},
 		{name: "repeated JSON protocol query", suffix: "?cf_protocol=json&cf_protocol=json"},
 		{name: "both JSON queries", suffix: "?format=json&cf_protocol=json"},
-		{name: "protocol version v1", suffix: "?format=json&cf_protocol_version=v1"},
-		{name: "protocol version v2", suffix: "?format=json&cf_protocol_version=v2"},
+		// The selector reads only "format" and "cf_protocol", so an unrecognized
+		// query key must not turn a valid selection into a rejection. This row is
+		// named for that property: cf_protocol_version appears nowhere in
+		// centrifuge@v0.38.0's production code, so no value of it can be read.
+		{name: "unrecognized query key alongside JSON", suffix: "?format=json&cf_protocol_version=v1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dialer := websocket.Dialer{Subprotocols: test.protocols}
@@ -276,12 +278,13 @@ func TestHostLinkRejectsInvalidProtocolSelectors(t *testing.T) {
 	server, httpServer := startServer(t, auth, hostlink.Config{})
 	defer closeServers(t, server, httpServer)
 
-	for _, test := range []struct {
+	type rejection struct {
 		name      string
 		suffix    string
 		protocols []string
 		header    http.Header
-	}{
+	}
+	tests := []rejection{
 		{name: "absent"},
 		{name: "unknown header", protocols: []string{"something-else"}},
 		{name: "protobuf header", protocols: []string{"centrifuge-protobuf"}},
@@ -295,32 +298,55 @@ func TestHostLinkRejectsInvalidProtocolSelectors(t *testing.T) {
 		{name: "unknown in first physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"something-else", "centrifuge-json"}}},
 		{name: "protobuf in second physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-protobuf"}}},
 		{name: "protobuf in first physical header field", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
-		// A valid query selector alone sets selected, so these rows are the only
-		// ones that isolate the multi-physical-field guard: without it the header
-		// branch is skipped and the upgrade succeeds negotiating centrifuge-protobuf.
+		// A query selector alone sets selected, so these are the only rows that isolate
+		// the multi-physical-field guard: drop it and len(headerValues) == 1 is false,
+		// the header is never inspected, and the query admits the upgrade on its own.
+		// What then gets negotiated depends on field order — gorilla reads only the
+		// first Sec-WebSocket-Protocol field — so the protobuf-first rows would speak
+		// centrifuge-protobuf and the other two centrifuge-json. The duplicate-JSON row
+		// is the one that shows a repeated physical field is refused even when every
+		// token is valid, which no protobuf-carrying row can show.
 		{name: "protobuf-first multiple physical header fields with valid format query", suffix: "?format=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
 		{name: "JSON-first multiple physical header fields with valid format query", suffix: "?format=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-protobuf"}}},
 		{name: "protobuf-first multiple physical header fields with valid protocol query", suffix: "?cf_protocol=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-protobuf", "centrifuge-json"}}},
 		{name: "duplicate JSON physical header fields with valid protocol query", suffix: "?cf_protocol=json", header: http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json", "centrifuge-json"}}},
 		{name: "header casing variant", protocols: []string{"Centrifuge-JSON"}},
-		{name: "format protobuf", suffix: "?format=protobuf", protocols: []string{"centrifuge-json"}},
-		{name: "format unknown", suffix: "?format=something-else", protocols: []string{"centrifuge-json"}},
-		{name: "format empty", suffix: "?format=", protocols: []string{"centrifuge-json"}},
-		{name: "format casing variant", suffix: "?format=JSON", protocols: []string{"centrifuge-json"}},
-		{name: "format repeated JSON then protobuf", suffix: "?format=json&format=protobuf", protocols: []string{"centrifuge-json"}},
-		{name: "format repeated protobuf then JSON", suffix: "?format=protobuf&format=json", protocols: []string{"centrifuge-json"}},
-		{name: "format repeated JSON then empty", suffix: "?format=json&format=", protocols: []string{"centrifuge-json"}},
-		{name: "protocol protobuf", suffix: "?cf_protocol=protobuf", protocols: []string{"centrifuge-json"}},
-		{name: "protocol unknown", suffix: "?cf_protocol=something-else", protocols: []string{"centrifuge-json"}},
-		{name: "protocol empty", suffix: "?cf_protocol=", protocols: []string{"centrifuge-json"}},
-		{name: "protocol casing variant", suffix: "?cf_protocol=JSON", protocols: []string{"centrifuge-json"}},
-		{name: "protocol repeated JSON then protobuf", suffix: "?cf_protocol=json&cf_protocol=protobuf", protocols: []string{"centrifuge-json"}},
-		{name: "protocol repeated protobuf then JSON", suffix: "?cf_protocol=protobuf&cf_protocol=json", protocols: []string{"centrifuge-json"}},
-		{name: "protocol repeated JSON then empty", suffix: "?cf_protocol=json&cf_protocol=", protocols: []string{"centrifuge-json"}},
 		{name: "valid format with invalid protocol", suffix: "?format=json&cf_protocol=protobuf"},
 		{name: "invalid format with valid protocol", suffix: "?format=protobuf&cf_protocol=json"},
-		{name: "valid header with invalid format", suffix: "?format=unknown", protocols: []string{"centrifuge-json"}},
-	} {
+	}
+
+	// The production selector loops over {"format", "cf_protocol"} and applies the
+	// same rule to each, so the two key paths are generated here from one variant
+	// list rather than written out twice. That makes their identity structural:
+	// the halves cannot drift, and a variant added below is added to both keys.
+	// Every row also carries a valid centrifuge-json header, so the rejection can
+	// only come from the query value.
+	for _, key := range []string{"format", "cf_protocol"} {
+		for _, variant := range []struct {
+			name   string
+			values []string
+		}{
+			{name: "protobuf", values: []string{"protobuf"}},
+			{name: "unknown", values: []string{"something-else"}},
+			{name: "empty", values: []string{""}},
+			{name: "casing variant", values: []string{"JSON"}},
+			{name: "repeated JSON then protobuf", values: []string{"json", "protobuf"}},
+			{name: "repeated protobuf then JSON", values: []string{"protobuf", "json"}},
+			{name: "repeated JSON then empty", values: []string{"json", ""}},
+		} {
+			query := url.Values{}
+			for _, value := range variant.values {
+				query.Add(key, value)
+			}
+			tests = append(tests, rejection{
+				name:      key + " " + variant.name,
+				suffix:    "?" + query.Encode(),
+				protocols: []string{"centrifuge-json"},
+			})
+		}
+	}
+
+	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dialer := websocket.Dialer{Subprotocols: test.protocols}
 			connection, response, err := dialer.Dial(wsURL(httpServer.URL)+test.suffix, test.header)
@@ -339,6 +365,18 @@ func assertUpgradeRejected(t *testing.T, connection *websocket.Conn, response *h
 	}
 	if response == nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("non-JSON response = %#v, want HTTP 400", response)
+	}
+	// Status alone does not identify the rejecting layer: gorilla's own handshake
+	// validation also answers 400. On ErrBadHandshake the dialer preserves up to
+	// 1KB of the body (websocket@v1.5.3 client.go:398-403), so read it and pin the
+	// rejection to HostLink's own selector message.
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read rejection body: %v", err)
+	}
+	response.Body.Close()
+	if !strings.Contains(string(body), "HostLink requires the JSON protocol") {
+		t.Fatalf("rejection body = %q, want HostLink's protocol-selector message", body)
 	}
 }
 
@@ -399,7 +437,7 @@ func TestOptionalRealtimeFacilitiesAreUnavailable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read optional command response for %s: %v", command, err)
 		}
-		var reply connectReply
+		var reply clientReply
 		if err := json.Unmarshal(payload, &reply); err != nil {
 			t.Fatalf("decode optional command response %q: %v", payload, err)
 		}
@@ -463,11 +501,14 @@ func TestGracefulCloseStopsConnectionsAndIsIdempotent(t *testing.T) {
 	}
 }
 
-func startServer(t *testing.T, auth hostlink.Authenticator, overrides hostlink.Config) (hostlink.Server, *httptest.Server) {
+// startServer builds a server from heartbeat, whose TenantID and Authenticator
+// are overwritten by testTenant and auth; only the heartbeat fields are read
+// from it.
+func startServer(t *testing.T, auth hostlink.Authenticator, heartbeat hostlink.Config) (hostlink.Server, *httptest.Server) {
 	t.Helper()
-	overrides.TenantID = testTenant
-	overrides.Authenticator = auth
-	server, err := hostlink.NewCentrifugeServer(overrides)
+	heartbeat.TenantID = testTenant
+	heartbeat.Authenticator = auth
+	server, err := hostlink.NewCentrifugeServer(heartbeat)
 	if err != nil {
 		t.Fatalf("NewCentrifugeServer: %v", err)
 	}
@@ -497,7 +538,7 @@ func dial(t *testing.T, serverURL, origin string) *websocket.Conn {
 	return connection
 }
 
-func connect(t *testing.T, connection *websocket.Conn, token string, request sessionwire.VersionNegotiationRequest) connectReply {
+func connect(t *testing.T, connection *websocket.Conn, token string, request sessionwire.VersionNegotiationRequest) clientReply {
 	t.Helper()
 	writeConnect(t, connection, token, request)
 	connection.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -505,7 +546,7 @@ func connect(t *testing.T, connection *websocket.Conn, token string, request ses
 	if err != nil {
 		t.Fatalf("read connect reply: %v", err)
 	}
-	var reply connectReply
+	var reply clientReply
 	if err := json.Unmarshal(payload, &reply); err != nil {
 		t.Fatalf("decode connect reply %q: %v", payload, err)
 	}
@@ -553,10 +594,18 @@ func writeConnect(t *testing.T, connection *websocket.Conn, token string, reques
 	}
 }
 
-func assertTerminalDisconnect(t *testing.T, disconnect *websocket.CloseError, reason string) {
+// assertTerminalDisconnect pins both halves of a HostLink rejection: the exact
+// disconnect code, which is what tells the two failures apart, and separately
+// its membership of Centrifuge's 4500-4999 application terminal range, which is
+// the dependency contract that makes the code terminal at all. The codes are
+// unexported and this test is external, so they are written out here.
+func assertTerminalDisconnect(t *testing.T, disconnect *websocket.CloseError, code int, reason string) {
 	t.Helper()
+	if disconnect.Code != code {
+		t.Fatalf("disconnect code = %d, want %d", disconnect.Code, code)
+	}
 	if disconnect.Code < 4500 || disconnect.Code > 4999 {
-		t.Fatalf("disconnect code = %d, want terminal application range", disconnect.Code)
+		t.Fatalf("disconnect code = %d, want Centrifuge's terminal application range", disconnect.Code)
 	}
 	if !strings.Contains(disconnect.Text, reason) {
 		t.Fatalf("disconnect reason = %q, want to contain %q", disconnect.Text, reason)
@@ -565,16 +614,4 @@ func assertTerminalDisconnect(t *testing.T, disconnect *websocket.CloseError, re
 
 func wsURL(serverURL string) string {
 	return "ws" + strings.TrimPrefix(serverURL, "http") + "/connection/websocket"
-}
-
-func reflectStringsEqual(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }

@@ -44,17 +44,28 @@ func TestExportedPackageBoundaryDoesNotExposeCentrifuge(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("boundary guard found zero production Go files")
 	}
+	// This synthetic file is type-checked as a member of the production package,
+	// so it reads exactly like production source to the checker and must never
+	// itself name a type the guard forbids — a centrifuge type here would make
+	// the guard fail against its own control rather than against the package.
+	//
+	// The constraint's union carries http.ConnState, a named type from a package
+	// the Check signature does not mention, so net/http can only reach
+	// observedPackages through the walker's *types.Union case. That is what gives
+	// that case a reader: the union's other term is the basic type string, which
+	// has no *types.TypeName and so records nothing.
 	constraintControl, err := parser.ParseFile(set, "generic_constraint_control.go", `package hostlink
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 )
 
 type legalGenericConstraint interface {
-	~string
+	~string | http.ConnState
 	Check(context.Context, sessionwire.TenantID) time.Duration
 }
 
@@ -93,7 +104,13 @@ type legalGenericAliasControl[T legalGenericConstraint] = struct{}
 		if controlWalker.constraintWalks != 1 {
 			t.Fatalf("%s walked %d declared constraints, want 1", control, controlWalker.constraintWalks)
 		}
-		for _, legal := range []string{"context", "time", "github.com/looprig/core/sessionwire/v1"} {
+		// A traversal assertion is sufficient here even though the guard is a
+		// rejection guard: inspectPackage is the single place that both records
+		// into observedPackages and fatals on a centrifuge path, so proving the
+		// walker reached a package proves the forbidden-path check ran there.
+		// net/http is reachable only through the constraint's union term, so
+		// deleting the *types.Union case makes this loop fail.
+		for _, legal := range []string{"context", "net/http", "time", "github.com/looprig/core/sessionwire/v1"} {
 			if !controlWalker.observedPackages[legal] {
 				t.Errorf("%s did not traverse legal constraint package %q", control, legal)
 			}
