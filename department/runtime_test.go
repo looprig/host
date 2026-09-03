@@ -1461,12 +1461,20 @@ func TestAdaptedRuntimeForwardsToTheSession(t *testing.T) {
 		t.Errorf("the session saw %d releases, want 1", session.Released())
 	}
 
-	envelope := sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: "command-4b2"}
-	if err := runtime.ApplyCommand(t.Context(), envelope); err != nil {
+	command := department.RuntimeCommand{
+		CommandID:        "command-4b2",
+		RuntimeCommandID: uuid.MustParse("3f2a1c40-5d6e-4a7b-8c9d-0e1f2a3b4c5d"),
+		Kind:             "input",
+		Payload:          []byte(`{"blocks":[]}`),
+	}
+	if err := runtime.ApplyCommand(t.Context(), command); err != nil {
 		t.Fatalf("ApplyCommand: %v", err)
 	}
-	if applied := session.Applied(); len(applied) != 1 || applied[0].CommandID != "command-4b2" {
-		t.Errorf("the session applied %+v, want the envelope the runtime was given", applied)
+	// THE WHOLE VALUE, not the identity. The seam exists to carry the runtime
+	// mapping and the private body as well as the public id, and comparing only
+	// the id is what let a version of it that carried neither look correct.
+	if applied := session.Applied(); len(applied) != 1 || !reflect.DeepEqual(applied[0], command) {
+		t.Errorf("the session applied %+v, want the whole command the runtime was given %+v", applied, command)
 	}
 
 	if _, err := runtime.SubscribeCommitted(t.Context(), "event-88"); err != nil {

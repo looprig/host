@@ -599,7 +599,7 @@ func (r *fakeRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (
 	return published, nil
 }
 
-func (r *fakeRuntime) ApplyCommand(context.Context, sessionwire.CommandEnvelope) error { return nil }
+func (r *fakeRuntime) ApplyCommand(context.Context, department.RuntimeCommand) error { return nil }
 
 func (r *fakeRuntime) counts() (released, shutdowns int) {
 	r.mu.Lock()

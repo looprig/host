@@ -808,7 +808,7 @@ var harnessH41LifecycleShapes = map[string][]string{
 // Host requires of a runtime, sorted, spelled out.
 var hostRuntimeMethodSet = []string{
 	"AgentID func() v1.AgentID",
-	"ApplyCommand func(context.Context, v1.CommandEnvelope) error",
+	"ApplyCommand func(context.Context, department.RuntimeCommand) error",
 	"Done func() <-chan struct {}",
 	"ReleaseResidency func(context.Context) error",
 	"SessionID func() v1.SessionID",
@@ -902,4 +902,4 @@ func (fakeRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (<-c
 	return nil, nil
 }
 
-func (fakeRuntime) ApplyCommand(context.Context, sessionwire.CommandEnvelope) error { return nil }
+func (fakeRuntime) ApplyCommand(context.Context, department.RuntimeCommand) error { return nil }

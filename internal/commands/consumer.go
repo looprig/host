@@ -228,29 +228,31 @@ type Outcome struct {
 // whether the cursor may pass afterwards.
 //
 // It is not department.CommandApplier. That interface is Host's control path
-// INTO a runtime and takes a wire envelope; this one is the whole durable
-// protocol around such a call, including the claim, the payload load and the
-// terminal CAS.
+// INTO a runtime and takes one admitted command; this one is the whole durable
+// protocol around such a call, including the claim, the payload load, the
+// journal correlation and the terminal settlement.
 //
-// FOUR THINGS O4.2 INHERITS, recorded here because each is a decision this task
-// took and none is visible from the signature:
+// WHAT O4.2 DID WITH THE HAND-OFFS THIS COMMENT USED TO CARRY. Two of the four
+// were closed, and the other two are open and are O5's; they are stated in the
+// present tense because the next implementer reads them here.
 //
-//  1. A Processor IS HANDED NO Fence. Its claim and terminal CAS are fenced
-//     writes and need their own holder, and the structural guard in this
-//     package covers SaveCursor and nothing else — so O4.2's writes are exactly
-//     the "seventh caller" case that guard was written for, and arrive outside
-//     it. Widen the guard or give the Processor the fence; do not leave both.
-//  2. A PANICKING Processor TAKES THE HOST DOWN. Run calls this on its own
-//     goroutine and there is no recover anywhere in the path; releasePass is
-//     deferred, so the pass slot is freed and the process is not.
-//  3. acquirePass HAS NO CONTEXT OR STOP ESCAPE, so Stop cannot bound Run's
-//     exit while another caller holds the slot. Harmless while every pass is
-//     context-bounded; it becomes a drain question at O5.
-//  4. Inbox and Cursors survive O4.2 without widening, and that is deliberate
-//     rather than lucky: O4.2's claim and terminal CAS write the SAME durable
-//     SessionInbox record this Inbox reads, under the same one-writer-per-lease
-//     discipline. Two seams over one object is fine. Drifting into a second
-//     writer discipline without noticing is not.
+//  1. CLOSED. A Processor is still handed no Fence — an Applier holds its own,
+//     supplied at its own construction — and the structural guard no longer
+//     covers SaveCursor alone: TestEveryDurableWriteGoesThroughTheFence derives
+//     its subject from every `…Writes` interface in this package and covers
+//     every production file, so the applier's transitions are inside it. Both
+//     halves were done rather than either.
+//  2. OPEN. A PANICKING Processor TAKES THE HOST DOWN. Run calls this on its
+//     own goroutine and there is no recover anywhere in the path; releasePass
+//     is deferred, so the pass slot is freed and the process is not.
+//  3. OPEN. acquirePass HAS NO CONTEXT OR STOP ESCAPE, so Stop cannot bound
+//     Run's exit while another caller holds the slot. Harmless while every pass
+//     is context-bounded; it becomes a drain question at O5.
+//  4. CLOSED, as predicted. Inbox and Cursors survived O4.2 without widening:
+//     the applier's transitions write the SAME durable SessionInbox record this
+//     Inbox reads, under the same one-writer-per-lease discipline, through a
+//     separate InboxWrites seam. Two seams over one object is fine. Drifting
+//     into a second writer discipline without noticing is not.
 type Processor interface {
 	// Process handles one command and reports what the cursor may conclude.
 	Process(context.Context, Command) (Outcome, error)

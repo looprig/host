@@ -341,10 +341,50 @@ type PublicationSubscriber interface {
 	SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error)
 }
 
+// RuntimeCommand is one admitted command as Host hands it to a runtime.
+//
+// IT IS NOT sessionwire.CommandEnvelope, AND THAT WAS A DEFECT RATHER THAN A
+// CHOICE. This seam took the envelope, which released Core defines as exactly a
+// wire version and a public CommandID — so the two things a runtime needs in
+// order to DO anything never crossed it. §16 requires Host to forward the
+// RuntimeCommandID into the Harness API and H3.1 states the same contract from
+// the other side, and the command's substance could not cross either: the inbox
+// payload is private to Factory and Host, and SessionStore imports only Core and
+// storage, so a runtime handed a bare CommandID has no way to obtain the blocks
+// it is being asked to apply. An input command applied across that seam was a
+// durable no-op.
+//
+// THE PAYLOAD MAY BE A REFERENCE INSTEAD OF BYTES, and Host does not
+// dereference it. §10.1 gives a private body an independent immutable object
+// reference once it exceeds its inline threshold, and at most one of the two is
+// ever set; the runtime resolves the reference through its own object read
+// rather than having the bytes copied through Host's memory.
+//
+// WHAT STILL DOES NOT CROSS is anything Host decoded. Host is not the semantic
+// validator of a command body — Harness is — so the bytes travel opaque.
+type RuntimeCommand struct {
+	// CommandID is the public, retry-stable identity.
+	CommandID sessionwire.CommandID
+
+	// RuntimeCommandID is the once-allocated mapping from the winning
+	// acceptance record. It is what correlates the runtime's own durable effect
+	// with the command that asked for it, which is why §16 forwards it rather
+	// than letting each side derive one.
+	RuntimeCommandID uuid.UUID
+
+	// Kind is the command kind the acceptance record carries, opaque here.
+	Kind string
+
+	// Payload and PayloadRef are the private body. At most one is set, and
+	// neither is set for a command that has none.
+	Payload    []byte
+	PayloadRef sessionwire.ObjectReference
+}
+
 // CommandApplier applies one admitted runtime command. This is Host's control
 // path into a runtime.
 type CommandApplier interface {
-	ApplyCommand(context.Context, sessionwire.CommandEnvelope) error
+	ApplyCommand(context.Context, RuntimeCommand) error
 }
 
 // Runtime is a live agent runtime, expressed as the composition of the narrow

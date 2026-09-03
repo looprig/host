@@ -1,23 +1,42 @@
-// Applying an admitted command is §10.4's durable protocol around ONE call
-// into a runtime, and this file is that protocol. The consumer decided which
-// command is next; everything from here is about doing it exactly once.
+// Applying an admitted command is §10.4's durable protocol around ONE call into
+// a runtime, and this file is that protocol. The consumer decided which command
+// is next; everything from here is about doing it exactly once.
 //
 // THE SHAPE IS FIXED BY THE STATE MACHINE, not chosen: a command is claimed
-// under the current lease epoch, its private payload is loaded from
-// SessionStore only after that claim, it is revalidated, the application prefix
-// that correlates CommandID and RuntimeCommandID with the epoch is committed
-// BEFORE the runtime-visible effect begins, and the record is then terminally
-// CASed to one of two mutually exclusive states. Every one of those steps
+// under the current lease epoch, its private payload is loaded from SessionStore
+// only after that claim, it is revalidated, it enters applying, the application
+// prefix that correlates CommandID and RuntimeCommandID with the epoch is
+// appended to the journal BEFORE the runtime-visible effect, the runtime is
+// driven, and the record is then terminally settled. Every one of those steps
 // exists because the process can stop between any two of them.
 //
-// WHAT CROSSES INTO THE RUNTIME IS A sessionwire.CommandEnvelope AND NOTHING
-// ELSE. That is step 4's "never send raw private payload" as a type rather than
-// as a rule: the envelope carries a wire version and a public CommandID, so
-// there is no field a payload could travel in even by accident.
+// THE SEAMS ARE NARROW LOCAL INTERFACES OVER METHODS THAT EXIST. That is worth
+// stating precisely, because an earlier version of this file claimed the
+// opposite. sessionstore v0.1.0 HAS all of them — GetCommand, the inbox record's
+// private Payload/PayloadRef with GetObject behind a reference,
+// FindCommandApplication, ReadGates, ClaimCommand, BeginApplyingCommand,
+// CompleteCommand, RejectCommand, and the journal's application-prefix envelope
+// — and the shapes below are modelled on those rather than invented beside them.
+// They are declared locally for the reason O4.1 declared Inbox and Cursors
+// locally: naming a looprig module in go.mod is the same decision as depending
+// on it, and that decision is a release-ordering commitment recorded elsewhere.
+// What O4.1's declaration could also say, and this one cannot, is that the
+// module lacks the operation; consulting the module is what shows a shape is
+// wrong, and not consulting it is what let a terminal transition the store
+// refuses sit behind a green test.
+//
+// WHAT SETTLES A COMMAND AS APPLIED IS DURABLE EVIDENCE, not this Host's
+// confidence. §10.4 ends an application at a correlated journal effect and the
+// store requires the terminal write to NAME that effect, so the applier reads
+// the correlation back after driving the runtime and completes with what the
+// journal says. A command whose runtime call returned while committing nothing
+// is not applied, and saying so is the difference between exactly-once and a
+// durable no-op recorded as success.
 package commands
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -36,17 +55,16 @@ import (
 // Kind is the command kind §10.4's SessionInbox record carries.
 //
 // It is Host's own enumeration rather than a projection of a Core request type,
-// because what Host branches on is the CONSEQUENCE — whether a command is
-// driven into the runtime, satisfied by residency itself, or revalidated
-// against durable gate state first — and Core's records are shaped for
-// admission, not for that.
+// because what Host branches on is what it must REVALIDATE before applying, and
+// Core's records are shaped for admission rather than for that. It travels to
+// the runtime opaque: see department.RuntimeCommand.
 type Kind string
 
 const (
-	// KindCreate and KindRestore are the two commands whose consequence is
-	// RESIDENCY. By the time one reaches this Host the runtime it asks for
-	// exists, because a Host holds an admitted session's runtime before it
-	// consumes that session's inbox at all.
+	// KindCreate and KindRestore ask for a session that, by the time the
+	// command reaches this Host, exists. They are still DRIVEN INTO THE RUNTIME
+	// like every other kind — see the note on Process — because what settles a
+	// command is a correlated durable effect, and residency is not one.
 	KindCreate  Kind = "create"
 	KindRestore Kind = "restore"
 
@@ -63,11 +81,11 @@ const (
 // known reports whether a kind is one this Host can apply.
 //
 // AN UNKNOWN KIND IS NOT REJECTED, and that asymmetry with State.known is
-// deliberate. A newer Factory may admit a kind a newer Host applies and this
-// one does not; rejecting it here would make an older Host in a rolling
-// deployment durably destroy work a newer one would have done. Refusing leaves
-// the record for a Host that understands it, and §10.4 already bounds how long
-// that can last: the apply deadline turns an unapplied command into
+// deliberate. A newer Factory may admit a kind a newer Host applies and this one
+// does not; rejecting it here would make an older Host in a rolling deployment
+// durably destroy work a newer one would have done. Refusing leaves the record
+// for a Host that understands it, and §10.4 already bounds how long that can
+// last: the apply deadline turns an unapplied command into
 // rejected/runtime_unavailable through Factory's deadline reconciler.
 func (k Kind) known() bool {
 	switch k {
@@ -78,24 +96,13 @@ func (k Kind) known() bool {
 	}
 }
 
-// drivesRuntime reports whether applying this kind means calling into the
-// runtime. Create and restore do not: see KindCreate.
-func (k Kind) drivesRuntime() bool {
-	switch k {
-	case KindCreate, KindRestore:
-		return false
-	default:
-		return true
-	}
-}
-
 // Record is the SessionInbox record §10.4 describes, as an applier reads it.
 //
 // IT IS THE AGGREGATE Command IS NOT. The consumer's Command is the ordering
-// decision's three fields; this is what a claim, a deadline check, a
-// correlation and a terminal CAS are made from — and it is read FRESH inside
-// Process rather than taken from the page, because a page is a snapshot and a
-// claim is a compare-and-swap against now.
+// decision's three fields; this is what a claim, a deadline check, a correlation
+// and a terminal settlement are made from — and it is read FRESH inside Process
+// rather than taken from the page, because a page is a snapshot and every
+// transition below is a compare-and-swap against the record as it is now.
 //
 // It carries no payload. That is not an omission: see Payload.
 type Record struct {
@@ -103,10 +110,10 @@ type Record struct {
 	SessionID sessionwire.SessionID
 	CommandID sessionwire.CommandID
 
-	// RuntimeCommandID is the UUID the WINNING CreateOrdered record allocated.
+	// RuntimeCommandID is the UUID the WINNING acceptance record allocated.
 	// §10.4 allows two Factory replicas to propose different UUIDs while racing
-	// one public ID and makes only the winner's usable, so this is read from
-	// the durable record and never minted here.
+	// one public ID and makes only the winner's usable, so this is read from the
+	// durable record, never minted here, and §16 forwards it to the runtime.
 	RuntimeCommandID uuid.UUID
 
 	Kind  Kind
@@ -116,48 +123,96 @@ type Record struct {
 	// fresh can be checked against the page record it came from.
 	AcceptedOrder uint64
 
+	// Revision is the provider revision every compare-and-swap names.
+	//
+	// IT IS REQUIRED, NOT AN OPTIMISATION. A transition is a decision about a
+	// record the caller has read; one that named no revision would be a blind
+	// write dressed as a compare-and-swap, and two writers that both read a
+	// pending record would both succeed.
+	Revision uint64
+
 	// ApplyDeadline is the outer bound §10.4 puts on applying this command. A
-	// NEW claim may not start at or after it; continuing an owned application
-	// prefix may.
+	// NEW claim may not start at or after it; continuing an application may.
 	ApplyDeadline time.Time
 
 	// ClaimEpoch and ClaimExpiresAt are the current claim, or the zero values
-	// when there is none.
+	// when there is none. A terminal record keeps the claim that settled it.
 	ClaimEpoch     uint64
 	ClaimExpiresAt time.Time
 }
 
 // Payload is the PRIVATE part of the record, loaded from SessionStore after a
-// claim and never sent anywhere.
+// claim and handed to the runtime opaque.
 //
 // It is a separate load rather than a field of Record for one reason: step 4
 // says the payload is loaded AFTER the claim, and a field on the record a claim
-// is decided from would be loaded before it. Two calls make the ordering a
-// thing a test can see.
+// is decided from would be loaded before it. Two calls make the ordering a thing
+// a test can see.
+//
+// AT MOST ONE OF THE TWO IS SET. §10.1 gives a private body an independent
+// immutable object reference once it exceeds its inline threshold; Host passes
+// the reference on rather than dereferencing it, so a large body never travels
+// through Host's memory.
 type Payload struct {
-	// GateID is the gate a gate response answers, and is what the durable
-	// gate/owner recheck of §9.4 is run against.
-	GateID sessionwire.GateID
-
-	// Body is the opaque private request body. Host does not decode it —
-	// Harness is the semantic validator — and it does not cross HostLink or the
-	// runtime seam.
+	// Body is the inline private request body.
 	Body []byte
+
+	// Ref is the object reference a body too large to inline is stored behind.
+	Ref sessionwire.ObjectReference
+}
+
+// present reports whether the command has a private body at all, in either
+// form.
+func (p Payload) present() bool { return len(p.Body) > 0 || p.Ref != (sessionwire.ObjectReference{}) }
+
+// wellFormed reports whether at most one of the two forms is set, which is the
+// store's own invariant restated where this package consumes it.
+func (p Payload) wellFormed() bool {
+	return len(p.Body) == 0 || p.Ref == (sessionwire.ObjectReference{})
 }
 
 // Prefix is §10.4's private application-prefix record, which correlates a
-// command with its runtime allocation BEFORE the runtime-visible effect begins.
+// command with its runtime allocation before the runtime-visible effect begins.
 //
 // ITS EXISTENCE IS THE WHOLE RECOVERY SIGNAL. A crash before it means no effect
 // began and the command may be applied afresh; a crash after it means an effect
-// may have begun and the next lease holder finishes the durable prefix rather
-// than driving the runtime again. Both identities are carried because §10.4
-// correlates both, and a prefix that names one of them but not the other
-// correlates nothing.
+// may have begun, and what happened is then a question for the journal rather
+// than for the record's state.
+//
+// IT CARRIES NO LEASE EPOCH, and that is stronger than carrying one: the journal
+// writer stamps its own grant onto the record and refuses one a caller chose, so
+// the epoch on a prefix is the epoch that actually held the stream rather than
+// the epoch a caller believed it held.
 type Prefix struct {
 	CommandID        sessionwire.CommandID
 	RuntimeCommandID uuid.UUID
-	LeaseEpoch       uint64
+	Kind             Kind
+}
+
+// Effect is the durable journal event that carried a command's effect, which is
+// what a terminal application RECORDS.
+//
+// "Applied" with no event is a claim that something happened with nothing to
+// point at, so this is required rather than optional, and it is read out of the
+// journal correlation rather than composed by the caller.
+type Effect struct {
+	CompletedAt time.Time
+	EventID     sessionwire.EventID
+	JournalSeq  uint64
+}
+
+// Validate refuses an effect that names no durable event.
+func (e Effect) Validate() error {
+	switch {
+	case e.CompletedAt.IsZero():
+		return &ApplyError{Refusal: RefusalInvalidEffect, Reason: "the effect records no completion instant"}
+	case e.EventID.Validate() != nil:
+		return &ApplyError{Refusal: RefusalInvalidEffect, Reason: "the effect names no valid public event"}
+	case e.JournalSeq == 0:
+		return &ApplyError{Refusal: RefusalInvalidEffect, Reason: "the effect names no journal sequence"}
+	default:
+		return nil
+	}
 }
 
 // Gate is the durable gate state §9.4's release-race backstop is decided from.
@@ -168,90 +223,144 @@ type Gate struct {
 	Open bool
 
 	// OwnerHostID and OwnerEpoch are the resident owner the gate was opened
-	// under. A gate response is resumable only while both still name this
-	// Host's current residency, because continuation is out of scope: a runtime
-	// that was released and relaunched no longer holds what the gate suspended.
+	// under. A gate response is resumable only while both still name this Host's
+	// current residency, because continuation is out of scope: a runtime that was
+	// released and relaunched no longer holds what the gate suspended.
 	OwnerHostID sessionwire.HostID
 	OwnerEpoch  uint64
 }
 
-// Claim is one compare-and-swap into StateClaimed.
-//
-// THE EXPECTED FIELDS ARE THE EXACTLY-ONCE MECHANISM, not bookkeeping. Two
-// Hosts that both read a pending record and both decide to apply it are made
-// safe by the store refusing the second CAS, and a claim that did not say what
-// it expected could not be refused.
-type Claim struct {
-	// ExpectedState and ExpectedClaimEpoch are the record as it was read.
-	ExpectedState      State
-	ExpectedClaimEpoch uint64
-
-	// Epoch is the lease epoch the claim is taken under, and ExpiresAt is its
-	// bounded TTL. §10.4: a claim never extends the command's apply deadline.
-	Epoch     uint64
-	ExpiresAt time.Time
-}
-
 // ---------------------------------------------------------------------------
-// The terminal result
+// What the journal proves
 // ---------------------------------------------------------------------------
 
-// Result is one of §10.4's two MUTUALLY EXCLUSIVE terminal CAS states.
+// ApplicationOutcome is what a session's journal proves about one command's
+// application.
 //
-// MUTUAL EXCLUSION IS A MECHANISM HERE AND NOT A RULE: the state is ONE
-// unexported field holding one of two values, so no Result can carry both, and
-// no caller outside this package can build one that does — the constructors are
-// the only way to set it. What a caller CAN build is the zero value, because
-// Result{} compiles from any package however unexported its fields are; that is
-// what Validate is for, and finalization refuses an invalid one before it
-// writes.
-type Result struct {
-	state   State
-	reason  sessionwire.ErrorCode
-	message string
-}
+// IT IS FIVE-VALUED AND NOT A BOOLEAN, and the earlier two-valued shape
+// (`(Prefix, bool, error)`) is why this is stated at length: each value unlocks
+// a DIFFERENT settlement, and a seam that could only say "a prefix exists"
+// forced a caller to guess between finishing a command and refusing it. The
+// vocabulary is sessionstore's, because the answers are the store's to give.
+type ApplicationOutcome string
 
-// Applied returns the applied terminal result.
-func Applied() Result { return Result{state: StateApplied} }
+const (
+	// ApplicationAbsent means no record in the journal names this command.
+	// Nothing has been applied under it.
+	ApplicationAbsent ApplicationOutcome = "absent"
 
-// Rejected returns the rejected terminal result, carrying the typed public
-// reason a caller polling CommandStatus will read.
-func Rejected(reason sessionwire.ErrorCode, message string) Result {
-	return Result{state: StateRejected, reason: reason, message: message}
-}
+	// ApplicationCommitted means a correlated prefix is immediately followed by
+	// the public event that carried its effect. The command has been applied,
+	// whichever lease did it, and that event is what a completion names.
+	ApplicationCommitted ApplicationOutcome = "committed"
 
-// State reports which of the two terminal states this result commits.
-func (r Result) State() State { return r.state }
+	// ApplicationAbandoned means a correlated prefix is immediately followed by
+	// an opening fence above its own epoch: the application started and its
+	// writer lost the stream before committing anything more.
+	ApplicationAbandoned ApplicationOutcome = "abandoned"
 
-// Rejection reports the typed reason and message, and whether this result is a
-// rejection at all.
-func (r Result) Rejection() (sessionwire.ErrorCode, string, bool) {
-	if r.state != StateRejected {
-		return "", "", false
-	}
-	return r.reason, r.message, true
-}
+	// ApplicationUnresolved means a correlated prefix exists whose outcome
+	// cannot be read yet. Both settlements refuse; the answer may become
+	// readable later.
+	ApplicationUnresolved ApplicationOutcome = "unresolved"
 
-// Validate refuses a Result that is not exactly one of the two terminal states
-// with the fields that state requires.
-func (r Result) Validate() error {
-	switch r.state {
-	case StateApplied:
-		if r.reason != "" || r.message != "" {
-			return &ApplyError{Refusal: RefusalInvalidResult, Reason: "an applied result carries a rejection reason"}
-		}
-		return nil
-	case StateRejected:
-		if r.reason == "" {
-			return &ApplyError{Refusal: RefusalInvalidResult, Reason: "a rejected result carries no typed reason, and §10.4 makes the reason part of the terminal state"}
-		}
-		return nil
+	// ApplicationConflicted means a prefix names this command's public identity
+	// with a different runtime identity or kind. The durable mapping is broken,
+	// so no settlement is safe and an operator has to look.
+	ApplicationConflicted ApplicationOutcome = "conflicted"
+)
+
+// known reports whether an outcome is one this package can act on. An unknown
+// one is refused rather than defaulted, for State.known's reason.
+func (o ApplicationOutcome) known() bool {
+	switch o {
+	case ApplicationAbsent, ApplicationCommitted, ApplicationAbandoned, ApplicationUnresolved, ApplicationConflicted:
+		return true
 	default:
-		return &ApplyError{
-			Refusal: RefusalInvalidResult,
-			Reason:  "the state " + strconv.Quote(string(r.state)) + " is not one of the two terminal states; a Result must come from Applied or Rejected",
-		}
+		return false
 	}
+}
+
+// Application is what one session's journal proves about one command.
+type Application struct {
+	CommandID        sessionwire.CommandID
+	RuntimeCommandID uuid.UUID
+
+	Outcome ApplicationOutcome
+
+	// PrefixEpoch is the lease epoch the correlated prefix was appended under,
+	// and is zero when the outcome is Absent.
+	PrefixEpoch uint64
+
+	// EffectEventID and EffectSeq name the public event that carried the effect,
+	// and are zero unless the outcome is Committed.
+	EffectEventID sessionwire.EventID
+	EffectSeq     uint64
+
+	// SupersedingEpoch is the highest opening-fence epoch the walk observed. A
+	// writer at or below it is provably fenced out of the stream, which is the
+	// only thing that makes a negative answer about an in-flight applier safe.
+	SupersedingEpoch uint64
+}
+
+// hasPrefix reports whether a correlated application prefix exists at all. It
+// is Outcome.PrefixOwned's durable meaning: the command is recoverable from the
+// journal rather than re-drivable from the inbox.
+func (a Application) hasPrefix() bool { return a.Outcome != ApplicationAbsent }
+
+// provesNoEffect reports whether the journal establishes that nothing was ever
+// applied under this command. Only two outcomes do.
+func (a Application) provesNoEffect() bool {
+	return a.Outcome == ApplicationAbsent || a.Outcome == ApplicationAbandoned
+}
+
+// fences reports whether the journal proves a writer holding the given lease
+// epoch can no longer append to this session.
+func (a Application) fences(epoch uint64) bool { return a.SupersedingEpoch > epoch }
+
+// effect is the terminal result a committed application is settled with, taken
+// from the journal rather than from the caller.
+func (a Application) effect(at time.Time) Effect {
+	return Effect{CompletedAt: at, EventID: a.EffectEventID, JournalSeq: a.EffectSeq}
+}
+
+// ---------------------------------------------------------------------------
+// Transitions
+// ---------------------------------------------------------------------------
+//
+// Each is one read and one revision compare-and-swap of the same authoritative
+// record Inbox lists. THE EXPECTED REVISION IS THE EXACTLY-ONCE MECHANISM: two
+// Hosts that both read a pending record and both decide to apply it are made
+// safe by the store refusing the second CAS, and a transition that did not say
+// which revision it decided on could not be refused.
+
+// Claim takes a short-lived claim so one writer works on a command at a time.
+type Claim struct {
+	ExpectedRevision uint64
+	Epoch            uint64
+	ExpiresAt        time.Time
+}
+
+// Applying moves a claimed command into applying: the statement that
+// application is starting now, not that capacity has been reserved.
+type Applying struct {
+	ExpectedRevision uint64
+	Epoch            uint64
+	ExpiresAt        time.Time
+}
+
+// Completion records that an applying command's effect committed.
+type Completion struct {
+	ExpectedRevision uint64
+	Epoch            uint64
+	Effect           Effect
+}
+
+// Rejection settles a command with a durable typed reason.
+type Rejection struct {
+	ExpectedRevision uint64
+	Epoch            uint64
+	Detail           sessionwire.ErrorDetail
 }
 
 // ---------------------------------------------------------------------------
@@ -259,27 +368,32 @@ func (r Result) Validate() error {
 // ---------------------------------------------------------------------------
 //
 // The reads and the writes are SEPARATE interfaces over the same durable
-// object, which is the discipline O4.1 recorded: the claim and the terminal CAS
-// write the same SessionInbox record Inbox lists, under the same
-// one-writer-per-lease rule, and the split is about fencing rather than about
-// ownership. Every method of a `…Writes` interface is a durable write and goes
-// through Fence.Write; TestEveryDurableWriteGoesThroughTheFence holds that
-// structurally, and it derives the method set from these declarations rather
-// than from a list, so a method added here is covered without anyone
-// remembering to widen a guard.
+// objects, which is the discipline O4.1 recorded: the transitions below write
+// the same SessionInbox record Inbox lists, under the same one-writer-per-lease
+// rule, and the split is about fencing rather than about ownership. Every method
+// of a `…Writes` interface is a durable write and goes through Fence.Write;
+// TestEveryDurableWriteGoesThroughTheFence holds that structurally and derives
+// the method set from these declarations, so a method added here is covered
+// without anyone remembering to widen a guard.
 
 // CommandRecords reads the private durable command state.
 type CommandRecords interface {
-	// LoadCommand returns the full inbox record for one command.
+	// LoadCommand returns the full inbox record for one command, including the
+	// revision a later compare-and-swap names.
 	LoadCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) (Record, error)
 
-	// LoadPayload returns the private payload or dereferenced object body. It
-	// is called only after a claim has been committed.
+	// LoadPayload returns the private body or its object reference. It is called
+	// only after a claim has been committed.
 	LoadPayload(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) (Payload, error)
+}
 
-	// LoadApplicationPrefix reports the durable application-prefix correlation
-	// for a command, and whether one exists at all.
-	LoadApplicationPrefix(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) (Prefix, bool, error)
+// Applications reads what a session's journal proves about a command.
+type Applications interface {
+	// FindApplication correlates the journal against the command's OWN durable
+	// identities. A caller does not supply them: one that could name the runtime
+	// identity to correlate on could ask about a mapping that was never
+	// accepted, and the answer would be evidence about nothing.
+	FindApplication(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) (Application, error)
 }
 
 // Gates reads durable gate state for the §9.4 release-race backstop.
@@ -288,7 +402,8 @@ type Gates interface {
 	LoadGate(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, gate sessionwire.GateID) (Gate, bool, error)
 }
 
-// InboxWrites is every durable write an applier makes to the command aggregate.
+// InboxWrites is every durable transition an applier makes to the command
+// record.
 //
 // EVERY METHOD HERE IS FENCED. The name is load-bearing: the structural guard
 // collects the methods of each interface in this package whose name ends in
@@ -296,30 +411,52 @@ type Gates interface {
 // Fence.Write. A durable write added to this interface is guarded the moment it
 // is declared; a durable write declared on a seam named otherwise is not, which
 // is the guard's one stated limit — DO NOT RENAME THIS TYPE OUT OF THE
-// CONVENTION. Each write below also has a behavioural test that loses the grant
+// CONVENTION. Each write also has a behavioural test that loses the grant
 // immediately before it, so the structural guard is the forward claim rather
 // than the only one.
+//
+// APPLIED AND REJECTED ARE MUTUALLY EXCLUSIVE BY CONSTRUCTION HERE: they are
+// two methods with different required evidence — a journal effect for one, a
+// typed public reason for the other — so no single call can commit both, and the
+// store refuses either against a record that is already terminal.
 type InboxWrites interface {
-	// ClaimCommand CASes a record into StateClaimed under a lease epoch. The
-	// implementation refuses the CAS when the record no longer matches the
-	// claim's expected state and claim epoch, and returns
-	// residency.ErrEpochSuperseded when a later epoch has committed.
-	ClaimCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, claim Claim) error
+	// ClaimCommand CASes a record into StateClaimed and returns its new
+	// revision. It is refused for a terminal record, for an applying record at
+	// any epoch, for an epoch below the record's high-water mark, at or after
+	// the apply deadline, and against a live claim at the same epoch — A CLAIM
+	// CANNOT BE RENEWED.
+	ClaimCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, claim Claim) (uint64, error)
 
-	// BeginApplying CASes a claimed record into StateApplying. §10.4 permits
-	// this only for the current lease holder, with the runtime ready and
-	// application beginning immediately; it is not a placement reservation.
-	BeginApplying(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, epoch uint64, expiresAt time.Time) error
+	// BeginApplying CASes a claimed record into StateApplying and returns its
+	// new revision. Only the holder of a LIVE claim at the claim's own epoch may
+	// make it; there is no deadline check, which is what stops a reconciler's
+	// clock from cancelling work that is about to commit.
+	BeginApplying(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, applying Applying) (uint64, error)
 
-	// RecordApplicationPrefix commits the private correlation record before the
-	// runtime-visible effect begins.
-	RecordApplicationPrefix(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, prefix Prefix) error
+	// CompleteCommand settles an applying command as applied. It is admitted
+	// only from StateApplying, and a caller whose epoch is not the claim's must
+	// name the effect the journal correlation found.
+	CompleteCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, completion Completion) error
 
-	// FinalizeCommand performs the terminal CAS. THERE IS NO due_at PARAMETER,
-	// and that is how §10.4's "terminal records become not_due" is held on this
-	// side of the seam: the same revision that commits the terminal state sets
-	// due_at=not_due, and no caller can ask for anything else.
-	FinalizeCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, epoch uint64, result Result) error
+	// RejectCommand settles a command with a durable typed reason. It is
+	// admitted only where the journal proves no effect committed, and for an
+	// applying record only to a strictly later epoch that the journal has fenced
+	// the applier out under.
+	RejectCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, rejection Rejection) error
+}
+
+// JournalWrites is the one journal append an applier makes.
+//
+// It is a SEPARATE seam from InboxWrites because it is a different durable
+// object with a different writer: the inbox record is a keyed CAS, and this is
+// an append to the session's own stream under the journal fence. Both are
+// fenced, and both are covered by the same structural guard, which is what the
+// naming convention buys — a second write seam needed no edit to the guard.
+type JournalWrites interface {
+	// AppendApplicationPrefix commits the private correlation record before the
+	// runtime-visible effect begins. The lease epoch is the writer's own and is
+	// not a parameter; see Prefix.
+	AppendApplicationPrefix(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, prefix Prefix) error
 }
 
 // ---------------------------------------------------------------------------
@@ -330,19 +467,18 @@ type InboxWrites interface {
 // finish a command. It is a code rather than a sentence for the reason
 // PageProblem is.
 //
-// A REFUSAL IS NOT A REJECTION. Every value here leaves the durable record
-// where it was and blocks the pass at that command, which the consumer names in
-// PassResult.Blocked. The one durable rejection this package writes is
-// gate_not_resumable, and it is a Result rather than a refusal.
+// A REFUSAL IS NOT A REJECTION. Every value here leaves the durable record where
+// it was and blocks the pass at that command, which the consumer names in
+// PassResult.Blocked. The durable rejections this package writes are Rejection
+// values, not refusals.
 type ApplyRefusal string
 
 const (
-	// RefusalStaleEpoch reports a record already claimed under an epoch later
-	// than this applier's, which means this Host no longer owns the session.
+	// RefusalStaleEpoch reports a record or a prefix under an epoch later than
+	// this applier's, which means this Host no longer owns the session.
 	RefusalStaleEpoch ApplyRefusal = "stale_epoch"
 
-	// RefusalClaimHeld reports another epoch's unexpired claim. §10.4 lets an
-	// unexpired claim win.
+	// RefusalClaimHeld reports another epoch's unexpired claim.
 	RefusalClaimHeld ApplyRefusal = "claim_held"
 
 	// RefusalDeadlinePassed reports a new claim refused at or after the apply
@@ -361,18 +497,53 @@ const (
 	// not this session's.
 	RefusalForeignRecord ApplyRefusal = "foreign_record"
 
-	// RefusalCorrelation reports a record or prefix whose identities do not
-	// correlate: an unallocated RuntimeCommandID, or a prefix naming a
-	// different command or runtime command.
+	// RefusalCorrelation reports identities that do not correlate: an
+	// unallocated RuntimeCommandID, a journal prefix naming another runtime
+	// command, or a committed effect against a record that never entered
+	// applying.
 	RefusalCorrelation ApplyRefusal = "correlation_mismatch"
 
-	// RefusalMissingPayload reports a kind whose private payload is required
-	// and absent.
+	// RefusalUnresolvedApplication reports an application whose outcome the
+	// journal cannot yet decide. Neither settlement is safe and the answer may
+	// become readable later, so the pass stops rather than guessing.
+	RefusalUnresolvedApplication ApplyRefusal = "unresolved_application"
+
+	// RefusalUnfencedApplier reports an abandoned-looking application whose
+	// writer the journal has not yet fenced out. Only the fence proves the
+	// applier can no longer commit the effect a rejection would orphan.
+	RefusalUnfencedApplier ApplyRefusal = "unfenced_applier"
+
+	// RefusalMissingPayload reports a kind whose private payload is required and
+	// absent, or a payload the store's own one-of-two invariant refuses.
 	RefusalMissingPayload ApplyRefusal = "missing_payload"
 
-	// RefusalInvalidResult reports a terminal result that is not exactly one of
-	// the two terminal states.
-	RefusalInvalidResult ApplyRefusal = "invalid_result"
+	// RefusalUnreadableGateResponse reports a gate response whose private body
+	// this Host cannot read the gate identity out of, so §9.4's recheck cannot
+	// be run.
+	RefusalUnreadableGateResponse ApplyRefusal = "unreadable_gate_response"
+
+	// RefusalReferencedGateResponse reports a gate response whose body is
+	// stored behind an object reference this Host does not dereference.
+	//
+	// IT IS NOT THE SAME FINDING as an unreadable body, though both stop the
+	// same check, and giving them one code made the difference unobservable:
+	// deleting the reference branch left the JSON decode to fail on empty bytes
+	// with the same code, so the whole branch was an equivalent mutant. The
+	// repairs differ — a malformed body is corruption or a Factory bug, and a
+	// referenced one is a body over its inline threshold plus a Host that
+	// deliberately cannot fetch it — and an operator reading "not a Core
+	// gate-response request" about a perfectly well-formed spilled body is
+	// being misdirected.
+	RefusalReferencedGateResponse ApplyRefusal = "referenced_gate_response"
+
+	// RefusalInvalidEffect reports a terminal application that names no durable
+	// event.
+	RefusalInvalidEffect ApplyRefusal = "invalid_effect"
+
+	// RefusalNoCommittedEffect reports a runtime call that returned while the
+	// journal shows no committed effect for the command. Nothing was applied, so
+	// nothing may be recorded as applied.
+	RefusalNoCommittedEffect ApplyRefusal = "no_committed_effect"
 
 	// RefusalStore reports an ambiguous durable-store failure.
 	RefusalStore ApplyRefusal = "store_failure"
@@ -417,34 +588,35 @@ type ApplierOptions struct {
 	// LeaseEpoch is the grant every durable write is stamped with.
 	LeaseEpoch uint64
 
-	Records CommandRecords
-	Writes  InboxWrites
-	Gates   Gates
+	Records      CommandRecords
+	Applications Applications
+	Gates        Gates
+	Writes       InboxWrites
+	Journal      JournalWrites
 
-	// Runtime is Host's control path into the resident runtime. Its argument
-	// type is the mechanism behind step 4: a CommandEnvelope has nowhere to put
-	// a private payload.
+	// Runtime is Host's control path into the resident runtime.
 	Runtime department.CommandApplier
 
 	// Fence is the lease-epoch guard. AN APPLIER HAS ITS OWN, and that is the
-	// answer to the hand-off O4.1 left on Processor: the applier's claim,
-	// prefix and terminal CAS are fenced writes, and they are fenced by the
-	// same one mechanism the cursor write goes through rather than by a second
-	// discipline.
+	// answer to the hand-off O4.1 left on Processor: the applier's transitions
+	// are fenced writes, and they are fenced by the same one mechanism the
+	// cursor write goes through rather than by a second discipline.
 	Fence Fence
 }
 
-// Applier claims, applies, recovers and finalizes one command at a time. It is
-// the Processor the consumer hands non-terminal records to.
+// Applier claims, applies, recovers and settles one command at a time. It is the
+// Processor the consumer hands non-terminal records to.
 type Applier struct {
-	host    *host.Host
-	key     registry.Key
-	epoch   uint64
-	records CommandRecords
-	writes  InboxWrites
-	gates   Gates
-	runtime department.CommandApplier
-	fence   Fence
+	host         *host.Host
+	key          registry.Key
+	epoch        uint64
+	records      CommandRecords
+	applications Applications
+	gates        Gates
+	writes       InboxWrites
+	journal      JournalWrites
+	runtime      department.CommandApplier
+	fence        Fence
 }
 
 // The applier is the seam O4.1 declared.
@@ -455,10 +627,10 @@ func NewApplier(options ApplierOptions) (*Applier, error) {
 	if options.Host == nil {
 		return nil, &InvalidConsumerOptionsError{Field: "Host", Reason: "must be set; the clock, the claim TTL and this Host's identity all come from it"}
 	}
-	// THE ACCESSORS THIS TYPE READS, AND ONLY THOSE. Same reason NewConsumer
-	// has its own list: &host.Host{} compiles from any package and has none of
-	// them set, so a nil check alone accepts a Host with a nil clock and a zero
-	// claim TTL — and a zero TTL claims a command that has already expired.
+	// THE ACCESSORS THIS TYPE READS, AND ONLY THOSE. Same reason NewConsumer has
+	// its own list: &host.Host{} compiles from any package and has none of them
+	// set, so a nil check alone accepts a Host with a nil clock and a zero claim
+	// TTL — and a zero TTL claims a command that has already expired.
 	var unusable []string
 	if options.Host.Clock() == nil {
 		unusable = append(unusable, "Clock")
@@ -483,8 +655,10 @@ func NewApplier(options ApplierOptions) (*Applier, error) {
 		present bool
 	}{
 		{"Records", options.Records != nil},
-		{"Writes", options.Writes != nil},
+		{"Applications", options.Applications != nil},
 		{"Gates", options.Gates != nil},
+		{"Writes", options.Writes != nil},
+		{"Journal", options.Journal != nil},
 		{"Runtime", options.Runtime != nil},
 		{"Fence", options.Fence != nil},
 	} {
@@ -493,23 +667,34 @@ func NewApplier(options ApplierOptions) (*Applier, error) {
 		}
 	}
 	return &Applier{
-		host:    options.Host,
-		key:     options.Key,
-		epoch:   options.LeaseEpoch,
-		records: options.Records,
-		writes:  options.Writes,
-		gates:   options.Gates,
-		runtime: options.Runtime,
-		fence:   options.Fence,
+		host:         options.Host,
+		key:          options.Key,
+		epoch:        options.LeaseEpoch,
+		records:      options.Records,
+		applications: options.Applications,
+		gates:        options.Gates,
+		writes:       options.Writes,
+		journal:      options.Journal,
+		runtime:      options.Runtime,
+		fence:        options.Fence,
 	}, nil
 }
 
-// Process claims, applies, recovers or finalizes one command.
+// Process claims, applies, recovers or settles one command.
 //
-// IT READS THE RECORD FRESH. The Command it is handed is the ordering
-// decision's three fields, taken from a page that may be a whole pass old; a
-// claim is a compare-and-swap against the record as it is now, and a deadline
-// is compared against the clock as it is now.
+// IT READS THE RECORD FRESH, AND THEN THE JOURNAL. The Command it is handed is
+// the ordering decision's three fields, taken from a page that may be a whole
+// pass old; every transition below is a compare-and-swap against the record as
+// it is now, and every settlement is decided against what the journal proves
+// rather than against what the record's state suggests.
+//
+// EVERY KIND IS DRIVEN INTO THE RUNTIME, including create and restore. An
+// earlier version settled those two as applied on the ground that residency is
+// their consequence and had already happened — which was sound about the
+// consequence and skipped the question of what the durable record may legally
+// say. It may say applied only from applying, and only naming a committed
+// journal effect; a Host's knowledge that a runtime exists is neither. There is
+// no shortcut to write.
 func (a *Applier) Process(ctx context.Context, command Command) (Outcome, error) {
 	record, err := a.records.LoadCommand(ctx, a.key.TenantID, a.key.SessionID, command.CommandID)
 	if err != nil {
@@ -524,32 +709,42 @@ func (a *Applier) Process(ctx context.Context, command Command) (Outcome, error)
 		return Outcome{State: command.State}, problem
 	}
 	// A RECORD THAT IS ALREADY TERMINAL IS REPORTED, NOT WRITTEN. The page said
-	// it was not, which means somebody finished it in between — a predecessor
+	// it was not, which means somebody settled it in between — a predecessor
 	// Host, or Factory's deadline reconciler. §10.4 never re-opens a terminal
 	// record, so the only thing left is to tell the consumer what it became.
 	if record.State.Terminal() {
 		return Outcome{State: record.State}, nil
 	}
 
-	prefix, owned, err := a.records.LoadApplicationPrefix(ctx, a.key.TenantID, a.key.SessionID, record.CommandID)
+	application, err := a.applications.FindApplication(ctx, a.key.TenantID, a.key.SessionID, record.CommandID)
 	if err != nil {
 		return Outcome{State: record.State}, &ApplyError{
 			Refusal:   RefusalStore,
 			CommandID: record.CommandID,
-			Reason:    "the application prefix could not be read, so it is unknown whether an effect already began",
+			Reason:    "the journal correlation could not be read, so it is unknown whether an effect already committed",
 			Cause:     err,
 		}
 	}
 
-	step, err := a.plan(record, prefix, owned, a.now())
+	step, err := a.plan(record, application, a.now())
 	if err != nil {
-		return Outcome{State: record.State}, err
+		return Outcome{State: record.State, PrefixOwned: application.hasPrefix()}, err
 	}
 	switch step {
-	case stepFinishPrefix:
-		return a.finishPrefix(ctx, record)
+	case stepComplete:
+		return a.complete(ctx, record, record.Revision, application)
+	case stepReject:
+		return a.reject(ctx, record, record.Revision, sessionwire.ErrorDetail{
+			Code:      sessionwire.ErrorCodeCommandRejected,
+			Message:   "the application was abandoned by a superseded lease and no effect committed",
+			Retryable: true,
+		})
+	case stepApplyUnderHeldClaim:
+		return a.apply(ctx, record, record.Revision)
+	case stepDriveApplyingRecord:
+		return a.drive(ctx, record, record.Revision)
 	default:
-		return a.applyFresh(ctx, record)
+		return a.claimThenApply(ctx, record)
 	}
 }
 
@@ -591,23 +786,25 @@ func (a *Applier) checkRecord(record Record, command Command) error {
 		return &ApplyError{
 			Refusal:   RefusalCorrelation,
 			CommandID: command.CommandID,
-			Reason:    "the record allocated no RuntimeCommandID, so no application prefix could correlate an effect with it",
+			Reason:    "the record allocated no RuntimeCommandID, so nothing could correlate an effect with it and the runtime would be handed no mapping",
 		}
 	default:
 		return nil
 	}
 }
 
-// applyFresh runs the whole protocol for a command no effect has begun for.
-func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error) {
+// claimThenApply takes a claim and runs the rest of the protocol.
+func (a *Applier) claimThenApply(ctx context.Context, record Record) (Outcome, error) {
 	claim := Claim{
-		ExpectedState:      record.State,
-		ExpectedClaimEpoch: record.ClaimEpoch,
-		Epoch:              a.epoch,
-		ExpiresAt:          a.now().Add(a.host.ClaimTTL()),
+		ExpectedRevision: record.Revision,
+		Epoch:            a.epoch,
+		ExpiresAt:        a.now().Add(a.host.ClaimTTL()),
 	}
+	var revision uint64
 	if err := a.fence.Write(func() error {
-		return a.writes.ClaimCommand(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, claim)
+		claimed, err := a.writes.ClaimCommand(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, claim)
+		revision = claimed
+		return err
 	}); err != nil {
 		return Outcome{State: record.State}, &ApplyError{
 			Refusal:   RefusalStore,
@@ -616,7 +813,15 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 			Cause:     err,
 		}
 	}
+	return a.apply(ctx, record, revision)
+}
 
+// apply revalidates a claimed command, enters applying, and drives it.
+//
+// It runs with a LIVE CLAIM AT THIS APPLIER'S EPOCH and nothing here re-takes
+// one: a claim cannot be renewed, and a caller that needs more time has exactly
+// one move, which is to enter applying before its claim lapses.
+func (a *Applier) apply(ctx context.Context, record Record, revision uint64) (Outcome, error) {
 	// AFTER THE CLAIM, AND ONLY AFTER IT. Step 4 in one line: the private
 	// payload is loaded from SessionStore once this applier owns the command,
 	// and it is never carried to it by whatever asked for the work.
@@ -629,7 +834,7 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 			Cause:     err,
 		}
 	}
-	if err := requiresPayload(record.Kind, payload); err != nil {
+	if err := checkPayload(record, payload); err != nil {
 		return Outcome{State: StateClaimed}, err
 	}
 
@@ -637,31 +842,25 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 	// concrete case for: a gate response that lost the release race is durably
 	// rejected here rather than driven into a runtime that cannot resume it.
 	if record.Kind == KindGateResponse {
-		gate, found, err := a.gates.LoadGate(ctx, a.key.TenantID, a.key.SessionID, payload.GateID)
+		detail, err := a.gateRejection(ctx, record, payload)
 		if err != nil {
-			return Outcome{State: StateClaimed}, &ApplyError{
-				Refusal:   RefusalStore,
-				CommandID: record.CommandID,
-				Reason:    "the durable gate could not be read, so the release race could not be decided",
-				Cause:     err,
-			}
+			return Outcome{State: StateClaimed}, err
 		}
-		if reason, resumable := a.gateResumable(gate, found); !resumable {
-			return a.finalize(ctx, record, Rejected(sessionwire.ErrorCodeGateNotResumable, reason), false)
+		if detail != nil {
+			return a.reject(ctx, record, revision, *detail)
 		}
 	}
 
-	// A CREATE OR RESTORE IS SATISFIED BY RESIDENCY. Nothing is driven into the
-	// runtime, so no runtime-visible effect begins, so there is no prefix to
-	// correlate one with and no `applying` state to enter: the record goes
-	// straight to the terminal CAS from `claimed`, which is the same transition
-	// the rejection arm above takes.
-	if !record.Kind.drivesRuntime() {
-		return a.finalize(ctx, record, Applied(), false)
+	applying := Applying{
+		ExpectedRevision: revision,
+		Epoch:            a.epoch,
+		ExpiresAt:        a.now().Add(a.host.ClaimTTL()),
 	}
-
+	var applyingRevision uint64
 	if err := a.fence.Write(func() error {
-		return a.writes.BeginApplying(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, a.epoch, claim.ExpiresAt)
+		next, err := a.writes.BeginApplying(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, applying)
+		applyingRevision = next
+		return err
 	}); err != nil {
 		return Outcome{State: StateClaimed}, &ApplyError{
 			Refusal:   RefusalStore,
@@ -670,14 +869,39 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 			Cause:     err,
 		}
 	}
+	return a.driveWithPayload(ctx, record, applyingRevision, payload)
+}
+
+// drive continues an APPLYING record this applier already owns: it reloads the
+// private payload and drives the runtime without re-entering applying, which is
+// a transition the store admits only from claimed.
+func (a *Applier) drive(ctx context.Context, record Record, revision uint64) (Outcome, error) {
+	payload, err := a.records.LoadPayload(ctx, a.key.TenantID, a.key.SessionID, record.CommandID)
+	if err != nil {
+		return Outcome{State: StateApplying}, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the private payload could not be loaded",
+			Cause:     err,
+		}
+	}
+	if err := checkPayload(record, payload); err != nil {
+		return Outcome{State: StateApplying}, err
+	}
+	return a.driveWithPayload(ctx, record, revision, payload)
+}
+
+// driveWithPayload appends the correlation, drives the runtime, and settles the
+// command on what the journal then proves.
+func (a *Applier) driveWithPayload(ctx context.Context, record Record, revision uint64, payload Payload) (Outcome, error) {
 	// BEFORE THE EFFECT, NOT AFTER IT. A prefix written after the runtime call
 	// would be exactly the correlation §10.4 needs and would be missing in the
 	// only case it exists for: a crash during the call.
 	if err := a.fence.Write(func() error {
-		return a.writes.RecordApplicationPrefix(ctx, a.key.TenantID, a.key.SessionID, Prefix{
+		return a.journal.AppendApplicationPrefix(ctx, a.key.TenantID, a.key.SessionID, Prefix{
 			CommandID:        record.CommandID,
 			RuntimeCommandID: record.RuntimeCommandID,
-			LeaseEpoch:       a.epoch,
+			Kind:             record.Kind,
 		})
 	}); err != nil {
 		return Outcome{State: StateApplying}, &ApplyError{
@@ -693,8 +917,8 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 	// can refuse; the runtime call is not, and it is the one step no successor
 	// can undo. A grant that ended between the prefix and here means this Host
 	// no longer owns the session, so it stops rather than driving a runtime it
-	// is about to lose — and the prefix it already committed is exactly what
-	// lets whoever owns the session next finish the command.
+	// is about to lose — and the prefix it already committed is exactly what lets
+	// whoever owns the session next finish the command.
 	if err := a.fence.Held(); err != nil {
 		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
 			Refusal:   RefusalStaleEpoch,
@@ -704,18 +928,21 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 		}
 	}
 
-	if err := a.runtime.ApplyCommand(ctx, sessionwire.CommandEnvelope{
-		Version:   sessionwire.CurrentWireVersion,
-		CommandID: record.CommandID,
+	// THE MAPPING AND THE BODY BOTH CROSS. §16 forwards the RuntimeCommandID
+	// into the Harness API, and the body travels with it because SessionStore's
+	// inbox payload is private to Factory and Host: a runtime handed a bare
+	// public identity has no way to obtain what it is being asked to apply.
+	if err := a.runtime.ApplyCommand(ctx, department.RuntimeCommand{
+		CommandID:        record.CommandID,
+		RuntimeCommandID: record.RuntimeCommandID,
+		Kind:             string(record.Kind),
+		Payload:          payload.Body,
+		PayloadRef:       payload.Ref,
 	}); err != nil {
-		// THE PREFIX IS COMMITTED, so this is reported as an owned prefix and
-		// as a failure at the same time, and both halves are true. Past this
-		// point a failure is indistinguishable from a crash — that is what the
-		// prefix exists to say — so §10.4's answer applies to both: the next
-		// pass finishes the durable prefix rather than driving the runtime
-		// again. What is NOT the same is that this one has a cause, and the
-		// consumer carries it into PassResult.Blocked where an operator reads
-		// it.
+		// THE PREFIX IS COMMITTED, so this is reported as an owned prefix and as
+		// a failure at the same time, and both halves are true. Past this point
+		// what happened is a question for the journal rather than for this
+		// call's return value, and the next pass asks it.
 		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
 			Refusal:   RefusalRuntime,
 			CommandID: record.CommandID,
@@ -723,7 +950,117 @@ func (a *Applier) applyFresh(ctx context.Context, record Record) (Outcome, error
 			Cause:     err,
 		}
 	}
-	return a.finalize(ctx, record, Applied(), true)
+
+	// THE EVIDENCE, NOT THE RETURN VALUE. A terminal application records the
+	// journal event that carried the effect, and this applier does not have one
+	// until it reads the correlation back. A runtime call that returned while
+	// committing nothing leaves the command unapplied, and saying so is what
+	// keeps a durable no-op from being recorded as success.
+	settled, err := a.applications.FindApplication(ctx, a.key.TenantID, a.key.SessionID, record.CommandID)
+	if err != nil {
+		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the journal correlation could not be read back, so the effect this command committed cannot be named",
+			Cause:     err,
+		}
+	}
+	if settled.Outcome != ApplicationCommitted {
+		return Outcome{State: StateApplying, PrefixOwned: settled.hasPrefix()}, &ApplyError{
+			Refusal:   RefusalNoCommittedEffect,
+			CommandID: record.CommandID,
+			Reason: "the runtime returned but the journal reports the application as " + strconv.Quote(string(settled.Outcome)) +
+				", so no effect exists to record",
+		}
+	}
+	return a.complete(ctx, record, revision, settled)
+}
+
+// checkPayload refuses a payload the command cannot be applied without, and one
+// whose two forms disagree.
+func checkPayload(record Record, payload Payload) error {
+	if !payload.wellFormed() {
+		return &ApplyError{
+			Refusal:   RefusalMissingPayload,
+			CommandID: record.CommandID,
+			Reason:    "the payload carries both an inline body and an object reference, and at most one of the two is ever set",
+		}
+	}
+	switch record.Kind {
+	case KindInput, KindGateResponse:
+		if !payload.present() {
+			return &ApplyError{
+				Refusal:   RefusalMissingPayload,
+				CommandID: record.CommandID,
+				Reason:    "a " + string(record.Kind) + " command carries no private payload, so the runtime would be asked to apply nothing",
+			}
+		}
+	}
+	return nil
+}
+
+// gateRejection runs §9.4's release-race backstop and returns the durable
+// rejection to write, or nil when the gate is still resumable here.
+func (a *Applier) gateRejection(ctx context.Context, record Record, payload Payload) (*sessionwire.ErrorDetail, error) {
+	gate, err := gateResponseTarget(record, payload)
+	if err != nil {
+		return nil, err
+	}
+	durable, found, err := a.gates.LoadGate(ctx, a.key.TenantID, a.key.SessionID, gate)
+	if err != nil {
+		return nil, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the durable gate could not be read, so the release race could not be decided",
+			Cause:     err,
+		}
+	}
+	reason, resumable := a.gateResumable(durable, found)
+	if resumable {
+		return nil, nil
+	}
+	return &sessionwire.ErrorDetail{Code: sessionwire.ErrorCodeGateNotResumable, Message: reason}, nil
+}
+
+// gateResponseTarget reads the gate a response answers out of its private body.
+//
+// HOST DECODES ONE RECORD AND NO MORE. The body of a gate response is Core's own
+// GateResponseRequest — a public wire record this module already depends on —
+// and §9.4 requires Host to repeat Factory's gate/owner check, which is not
+// possible without the gate's identity. Nothing else about the body is read:
+// Harness remains the semantic validator, and every other kind's body travels
+// opaque.
+//
+// A REFERENCED BODY IS REFUSED RATHER THAN FETCHED. Host does not dereference a
+// private object — that is the runtime's read — so a gate response large enough
+// to have been spilled is one this backstop cannot decide, and it says so
+// instead of guessing that the gate is fine.
+func gateResponseTarget(record Record, payload Payload) (sessionwire.GateID, error) {
+	if len(payload.Body) == 0 {
+		return "", &ApplyError{
+			Refusal:   RefusalReferencedGateResponse,
+			CommandID: record.CommandID,
+			Reason:    "the gate response's private body is stored behind an object reference, which this Host does not dereference",
+		}
+	}
+	var request sessionwire.GateResponseRequest
+	if err := json.Unmarshal(payload.Body, &request); err != nil {
+		return "", &ApplyError{
+			Refusal:   RefusalUnreadableGateResponse,
+			CommandID: record.CommandID,
+			Reason:    "the gate response's private body is not a Core gate-response request",
+			Cause:     err,
+		}
+	}
+	if request.CommandID != record.CommandID || request.SessionID != record.SessionID {
+		return "", &ApplyError{
+			Refusal:   RefusalCorrelation,
+			CommandID: record.CommandID,
+			Reason: "the gate response's body names (" + strconv.Quote(string(request.SessionID)) + ", " + strconv.Quote(string(request.CommandID)) +
+				"), which is not the record it is stored under",
+		}
+	}
+	return request.GateID, nil
 }
 
 // gateResumable applies §9.4's backstop and reports why it did not.
@@ -742,60 +1079,76 @@ func (a *Applier) gateResumable(gate Gate, found bool) (string, bool) {
 	}
 }
 
-// requiresPayload refuses a kind whose private payload is required and absent.
-func requiresPayload(kind Kind, payload Payload) error {
-	switch kind {
-	case KindInput:
-		if len(payload.Body) == 0 {
-			return &ApplyError{Refusal: RefusalMissingPayload, Reason: "an input command carries no private payload"}
-		}
-	case KindGateResponse:
-		if payload.GateID == "" {
-			return &ApplyError{Refusal: RefusalMissingPayload, Reason: "a gate response names no gate, so the release race cannot be decided"}
-		}
-		if len(payload.Body) == 0 {
-			return &ApplyError{Refusal: RefusalMissingPayload, Reason: "a gate response carries no private payload"}
-		}
-	}
-	return nil
-}
-
-// finalize performs the terminal CAS and reports what the consumer may
-// conclude.
+// complete settles an applying command as applied, naming the correlated effect.
 //
-// prefixOwned decides what an AMBIGUOUS store failure means, and the two
-// answers are different in kind. With a prefix committed, the command is
-// recoverable by whoever holds the lease next whether or not this CAS landed,
-// which is exactly Outcome.PrefixOwned's meaning, so the pass may pass it. With
-// no prefix — a create, a restore, a gate rejection — nothing correlates
-// anything, so the pass stops and the next one re-derives the same conclusion
-// from the same durable state.
+// THE EFFECT IS VALIDATED BEFORE IT IS WRITTEN, and the case that reaches it is
+// a store contradicting itself: an outcome of committed carries an event and a
+// sequence by construction, so a committed correlation with neither is the same
+// class of defect CursorRegressionError refuses. Writing it would spend a fenced
+// round-trip to be told the result is malformed, and reading it back would leave
+// an applied command pointing at nothing.
+//
+// AN AMBIGUOUS FAILURE HERE IS REPORTED AS AN OWNED PREFIX rather than as an
+// error. The effect is durable in the journal whether or not this CAS landed,
+// which is exactly Outcome.PrefixOwned's meaning, so the pass may pass it and a
+// later one — this Host's or a successor's — records the same effect from the
+// same evidence.
 //
 // A REFUSED FENCED WRITE LANDS HERE TOO, and reporting an owned prefix for it is
-// still true: the prefix is committed whatever the reason the terminal CAS did
-// not. It does not let a pass carry on under a lease it has lost, because that
-// is not this function's to enforce and is enforced twice over — the consumer
-// consults the fence between records, and its own cursor write goes through the
-// same fence, so nothing durable moves.
-func (a *Applier) finalize(ctx context.Context, record Record, result Result, prefixOwned bool) (Outcome, error) {
-	if err := result.Validate(); err != nil {
-		return Outcome{State: record.State}, err
+// still true. It does not let a pass carry on under a lease it has lost, because
+// that is enforced twice over elsewhere: the consumer consults the fence between
+// records, and its own cursor write goes through the same fence.
+func (a *Applier) complete(ctx context.Context, record Record, revision uint64, application Application) (Outcome, error) {
+	effect := application.effect(a.now())
+	if err := effect.Validate(); err != nil {
+		return Outcome{State: StateApplying, PrefixOwned: true}, err
 	}
 	if err := a.fence.Write(func() error {
-		return a.writes.FinalizeCommand(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, a.epoch, result)
+		return a.writes.CompleteCommand(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, Completion{
+			ExpectedRevision: revision,
+			Epoch:            a.epoch,
+			Effect:           effect,
+		})
 	}); err != nil {
-		if prefixOwned {
-			return Outcome{State: StateApplying, PrefixOwned: true}, nil
-		}
+		return Outcome{State: StateApplying, PrefixOwned: true}, nil
+	}
+	return Outcome{State: StateApplied}, nil
+}
+
+// reject settles a command with a durable typed reason.
+//
+// UNLIKE A COMPLETION, AN AMBIGUOUS FAILURE HERE IS AN ERROR. A rejection rests
+// on the journal proving that NO effect committed, so there is no durable
+// correlation for a later pass to recover from — nothing would make the command
+// recoverable, and reporting an owned prefix would advance the consumer's cursor
+// past a command no evidence can settle. The pass stops instead, and the next
+// one re-derives the same conclusion from the same durable state.
+func (a *Applier) reject(ctx context.Context, record Record, revision uint64, detail sessionwire.ErrorDetail) (Outcome, error) {
+	if err := detail.Validate(); err != nil {
 		return Outcome{State: record.State}, &ApplyError{
 			Refusal:   RefusalStore,
 			CommandID: record.CommandID,
-			Reason:    "the terminal compare-and-swap was refused",
+			Reason:    "the rejection carries no stable typed code, and §10.4 makes the reason part of the terminal state",
 			Cause:     err,
 		}
 	}
-	return Outcome{State: result.State()}, nil
+	if err := a.fence.Write(func() error {
+		return a.writes.RejectCommand(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, Rejection{
+			ExpectedRevision: revision,
+			Epoch:            a.epoch,
+			Detail:           detail,
+		})
+	}); err != nil {
+		return Outcome{State: record.State}, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the terminal rejection was refused",
+			Cause:     err,
+		}
+	}
+	return Outcome{State: StateRejected}, nil
 }
 
-// now is the clock the deadline and the claim TTL are read against.
+// now is the clock the deadline, the claim TTL and a completion instant are read
+// against.
 func (a *Applier) now() time.Time { return a.host.Clock().Now() }

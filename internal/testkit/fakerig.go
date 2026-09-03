@@ -191,11 +191,11 @@ func (p *subscriberPart) SubscribedAfter() []sessionwire.EventID {
 
 type applierPart struct {
 	mu      sync.Mutex
-	applied []sessionwire.CommandEnvelope
+	applied []department.RuntimeCommand
 }
 
 // ApplyCommand records the command it was asked to apply.
-func (p *applierPart) ApplyCommand(_ context.Context, command sessionwire.CommandEnvelope) error {
+func (p *applierPart) ApplyCommand(_ context.Context, command department.RuntimeCommand) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.applied = append(p.applied, command)
@@ -203,10 +203,10 @@ func (p *applierPart) ApplyCommand(_ context.Context, command sessionwire.Comman
 }
 
 // Applied reports every command this session was asked to apply.
-func (p *applierPart) Applied() []sessionwire.CommandEnvelope {
+func (p *applierPart) Applied() []department.RuntimeCommand {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]sessionwire.CommandEnvelope(nil), p.applied...)
+	return append([]department.RuntimeCommand(nil), p.applied...)
 }
 
 // FullSession has every capability Host requires.

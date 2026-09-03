@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -19,6 +20,7 @@ import (
 	"github.com/looprig/core/uuid"
 
 	"github.com/looprig/host"
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -47,10 +49,20 @@ const (
 	// assert nothing.
 	testClaimTTL      = 11 * time.Second
 	testApplyDeadline = 47 * time.Second
+
+	// testRevision is the revision the fixture's record is read at. It is
+	// deliberately neither zero nor one, so a transition that named a constant
+	// or forgot to carry the previous CAS's answer is visible.
+	testRevision uint64 = 12
+
+	// testEffectSeq and testEffectEventID are the journal effect the fixture's
+	// runtime commits.
+	testEffectSeq     uint64 = 907
+	testEffectEventID        = sessionwire.EventID("event-effect-907")
 )
 
 // testRuntimeCommandID is the once-allocated RuntimeCommandID the winning
-// CreateOrdered record carries. Nothing in production mints one.
+// acceptance record carries. Nothing in production mints one.
 var testRuntimeCommandID = uuid.MustParse("6f1b0f8e-4f1a-4f7e-9b2a-2f3c4d5e6f70")
 
 // testOtherRuntimeCommandID is a DIFFERENT allocation, for the correlation
@@ -60,44 +72,83 @@ var testOtherRuntimeCommandID = uuid.MustParse("11111111-2222-3333-4444-55555555
 // errTestRuntime is what the fake runtime fails a command with.
 var errTestRuntime = errors.New("commands_test: the runtime refused the command")
 
+// The refusals the tightened fake store answers with, one per precondition the
+// released sessionstore actually enforces. They are separate values because a
+// test that could not tell a revision conflict from a state conflict could not
+// tell a transition that was refused for the right reason from one that was
+// refused for any reason at all.
+var (
+	errTestRevisionConflict = errors.New("commands_test: the expected revision is not the record's")
+	errTestStateConflict    = errors.New("commands_test: the record is not in a state this transition is admitted from")
+	errTestEpochFenced      = errors.New("commands_test: the epoch is below the record's high-water mark")
+	errTestClaimHeld        = errors.New("commands_test: a live claim holds this command")
+	errTestClaimLost        = errors.New("commands_test: the claim is not this caller's, or is no longer live")
+	errTestDeadlinePassed   = errors.New("commands_test: the apply deadline has passed")
+	errTestNoEvidence       = errors.New("commands_test: the journal does not support this settlement")
+	errTestInvalidResult    = errors.New("commands_test: the terminal result is not usable")
+)
+
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
 
-// storedCommand is one durable inbox record as the fake store holds it,
-// including the due_at flag §10.4's terminal CAS clears.
+// storedCommand is one durable inbox record as the fake store holds it: the
+// record, its private body, the due_at flag §10.4's terminal writes clear, and
+// what the session's journal proves about it.
 type storedCommand struct {
-	record  Record
-	payload Payload
-	due     bool
+	record      Record
+	payload     Payload
+	due         bool
+	application Application
 }
 
-// finalCall records one terminal CAS.
-type finalCall struct {
+// completeCall and rejectCall record one terminal settlement each. They are two
+// types because the two settlements are two methods carrying different
+// evidence, which is the mechanism behind "applied and rejected are mutually
+// exclusive": no value and no call can be both.
+type completeCall struct {
 	CommandID sessionwire.CommandID
+	Revision  uint64
 	Epoch     uint64
-	Result    Result
+	Effect    Effect
 }
 
-// fakeStore is CommandRecords, Gates and InboxWrites over one map.
+type rejectCall struct {
+	CommandID sessionwire.CommandID
+	Revision  uint64
+	Epoch     uint64
+	Detail    sessionwire.ErrorDetail
+}
+
+// fakeStore is CommandRecords, Applications, Gates, InboxWrites and
+// JournalWrites over one map.
 //
-// IT IS ONE FAKE FOR THREE SEAMS ON PURPOSE: they are three views of one
-// durable aggregate, and a fake that let a claim and a load disagree about the
-// record would make the exactly-once assertions vacuous.
+// IT ENFORCES THE PRECONDITIONS THE RELEASED STORE ENFORCES, and that is the
+// whole reason it is this long. A fake more permissive than the implementation
+// it stands for converts a contract violation into a passing test: the previous
+// one accepted a terminal write from any non-terminal state and needed no
+// result, so a `claimed -> applied` transition that sessionstore v0.1.0 refuses
+// outright — CompleteCommand admits only StateApplying, and requires a result
+// naming a durable journal event — read as green. Every refusal below is a rule
+// in inbox_claim.go, not a rule this test bench invented.
 type fakeStore struct {
-	mu sync.Mutex
+	mu    sync.Mutex
+	clock *manualClock
 
 	commands map[sessionwire.CommandID]*storedCommand
-	prefixes map[sessionwire.CommandID]Prefix
 	gates    map[sessionwire.GateID]Gate
+
+	// journalEpoch is the lease epoch the journal writer stamps onto an
+	// appended prefix. It is the WRITER's, never the caller's.
+	journalEpoch uint64
 
 	// errs maps an operation name to the error it fails with.
 	errs map[string]error
 
-	// after maps an operation name to a hook run once it has been recorded.
-	// IT IS HOW A GRANT ENDS MID-PROTOCOL: the durable writes of one
-	// application are separated by instants, and the fence must be consulted at
-	// each of them rather than once at the top.
+	// after maps an operation name to a hook run once it has been recorded. IT
+	// IS HOW A GRANT ENDS MID-PROTOCOL: the durable writes of one application
+	// are separated by instants, and the fence must be consulted at each of
+	// them rather than once at the top.
 	after map[string]func()
 
 	// calls is every operation in order, which is what the ordering assertions
@@ -105,18 +156,21 @@ type fakeStore struct {
 	calls []string
 
 	claims     []Claim
-	writtenPre []Prefix
-	finalized  []finalCall
+	applyings  []Applying
+	prefixes   []Prefix
+	completed  []completeCall
+	rejections []rejectCall
 }
 
-// newFakeStore returns an empty store.
-func newFakeStore() *fakeStore {
+// newFakeStore returns an empty store on a clock.
+func newFakeStore(clock *manualClock) *fakeStore {
 	return &fakeStore{
-		commands: map[sessionwire.CommandID]*storedCommand{},
-		prefixes: map[sessionwire.CommandID]Prefix{},
-		gates:    map[sessionwire.GateID]Gate{},
-		errs:     map[string]error{},
-		after:    map[string]func(){},
+		clock:        clock,
+		commands:     map[sessionwire.CommandID]*storedCommand{},
+		gates:        map[sessionwire.GateID]Gate{},
+		journalEpoch: testEpoch,
+		errs:         map[string]error{},
+		after:        map[string]func(){},
 	}
 }
 
@@ -127,6 +181,11 @@ func (s *fakeStore) record(op string) error {
 		hook()
 	}
 	return s.errs[op]
+}
+
+// claimLive mirrors the store's own liveness test, against the store's clock.
+func (s *fakeStore) claimLive(stored *storedCommand) bool {
+	return s.clock.Now().Before(stored.record.ClaimExpiresAt)
 }
 
 // LoadCommand returns the durable record.
@@ -157,15 +216,18 @@ func (s *fakeStore) LoadPayload(_ context.Context, _ sessionwire.TenantID, _ ses
 	return stored.payload, nil
 }
 
-// LoadApplicationPrefix reports the durable correlation record.
-func (s *fakeStore) LoadApplicationPrefix(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID) (Prefix, bool, error) {
+// FindApplication reports what the journal proves about a command.
+func (s *fakeStore) FindApplication(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID) (Application, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.record("LoadApplicationPrefix"); err != nil {
-		return Prefix{}, false, err
+	if err := s.record("FindApplication"); err != nil {
+		return Application{}, err
 	}
-	prefix, ok := s.prefixes[command]
-	return prefix, ok, nil
+	stored, ok := s.commands[command]
+	if !ok {
+		return Application{}, errors.New("commands_test: no such command")
+	}
+	return stored.application, nil
 }
 
 // LoadGate returns the durable gate.
@@ -179,81 +241,210 @@ func (s *fakeStore) LoadGate(_ context.Context, _ sessionwire.TenantID, _ sessio
 	return found, ok, nil
 }
 
-// ClaimCommand CASes the record into claimed, refusing a claim whose expected
-// state or claim epoch no longer matches.
-func (s *fakeStore) ClaimCommand(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, claim Claim) error {
+// AppendApplicationPrefix appends the correlation record to the journal.
+//
+// THE EPOCH IS THE WRITER'S. The caller supplies no lease epoch and could not:
+// the released journal writer refuses a record that names one and stamps its
+// own grant instead. A prefix whose runtime identity is not the record's breaks
+// the durable mapping, which is what the conflicted outcome reports.
+func (s *fakeStore) AppendApplicationPrefix(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, prefix Prefix) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.record("AppendApplicationPrefix"); err != nil {
+		return err
+	}
+	s.prefixes = append(s.prefixes, prefix)
+	stored, ok := s.commands[prefix.CommandID]
+	if !ok {
+		return errors.New("commands_test: no such command")
+	}
+	stored.application.CommandID = prefix.CommandID
+	stored.application.RuntimeCommandID = prefix.RuntimeCommandID
+	stored.application.PrefixEpoch = s.journalEpoch
+	if prefix.RuntimeCommandID != stored.record.RuntimeCommandID {
+		stored.application.Outcome = ApplicationConflicted
+		return nil
+	}
+	// A prefix at the tip with its writer possibly alive is exactly what the
+	// journal cannot yet resolve. It becomes committed when the effect lands.
+	stored.application.Outcome = ApplicationUnresolved
+	return nil
+}
+
+// commitEffect is what the RUNTIME does: it appends the public event that
+// carried the command's effect, which turns the correlation committed.
+func (s *fakeStore) commitEffect(command sessionwire.CommandID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok := s.commands[command]
+	if !ok {
+		return
+	}
+	stored.application.Outcome = ApplicationCommitted
+	stored.application.EffectEventID = testEffectEventID
+	stored.application.EffectSeq = testEffectSeq
+}
+
+// ClaimCommand CASes a record into claimed. Its refusals are inbox_claim.go's,
+// in the order that file states them.
+func (s *fakeStore) ClaimCommand(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, claim Claim) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.record("ClaimCommand"); err != nil {
-		return err
+		return 0, err
 	}
 	s.claims = append(s.claims, claim)
 	stored, ok := s.commands[command]
 	if !ok {
-		return errors.New("commands_test: no such command")
+		return 0, errors.New("commands_test: no such command")
 	}
-	if stored.record.State != claim.ExpectedState || stored.record.ClaimEpoch != claim.ExpectedClaimEpoch {
-		return errTestClaimConflict
+	switch {
+	case stored.record.Revision != claim.ExpectedRevision:
+		return 0, errTestRevisionConflict
+	case stored.record.State.Terminal():
+		return 0, errTestStateConflict
+	// An applying command is not claimable AT ANY EPOCH: resuming one is
+	// continuation, not a claim.
+	case stored.record.State == StateApplying:
+		return 0, errTestStateConflict
+	case claim.Epoch < stored.record.ClaimEpoch:
+		return 0, errTestEpochFenced
+	case !s.clock.Now().Before(stored.record.ApplyDeadline):
+		return 0, errTestDeadlinePassed
+	// A CLAIM CANNOT BE RENEWED: an equal epoch may not take a live claim.
+	case s.claimLive(stored) && claim.Epoch == stored.record.ClaimEpoch:
+		return 0, errTestClaimHeld
 	}
 	stored.record.State = StateClaimed
 	stored.record.ClaimEpoch = claim.Epoch
 	stored.record.ClaimExpiresAt = claim.ExpiresAt
-	return nil
+	stored.record.Revision++
+	return stored.record.Revision, nil
 }
 
-// BeginApplying CASes a claimed record into applying.
-func (s *fakeStore) BeginApplying(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, epoch uint64, expiresAt time.Time) error {
+// BeginApplying CASes a claimed record into applying. Only the holder of a LIVE
+// claim at the claim's own epoch may make it.
+func (s *fakeStore) BeginApplying(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, applying Applying) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.record("BeginApplying"); err != nil {
-		return err
+		return 0, err
 	}
+	s.applyings = append(s.applyings, applying)
 	stored, ok := s.commands[command]
 	if !ok {
-		return errors.New("commands_test: no such command")
+		return 0, errors.New("commands_test: no such command")
 	}
-	if stored.record.State != StateClaimed || stored.record.ClaimEpoch != epoch {
-		return errTestClaimConflict
+	switch {
+	case stored.record.Revision != applying.ExpectedRevision:
+		return 0, errTestRevisionConflict
+	case stored.record.State != StateClaimed:
+		return 0, errTestStateConflict
+	case applying.Epoch != stored.record.ClaimEpoch:
+		return 0, errTestClaimLost
+	case !s.claimLive(stored):
+		return 0, errTestClaimLost
 	}
 	stored.record.State = StateApplying
-	stored.record.ClaimExpiresAt = expiresAt
-	return nil
+	stored.record.ClaimExpiresAt = applying.ExpiresAt
+	stored.record.Revision++
+	return stored.record.Revision, nil
 }
 
-// RecordApplicationPrefix commits the private correlation record.
-func (s *fakeStore) RecordApplicationPrefix(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, prefix Prefix) error {
+// CompleteCommand settles an applying command as applied.
+//
+// THREE PRECONDITIONS, AND THE FIRST IS THE ONE THAT WAS MISSING: the record
+// must be APPLYING, so `claimed -> applied` is refused here as the released
+// store refuses it. The result must name a durable journal event, and a caller
+// whose epoch is not the claim's must name the event the correlation found
+// rather than any event it preferred.
+func (s *fakeStore) CompleteCommand(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, completion Completion) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.record("RecordApplicationPrefix"); err != nil {
+	if err := s.record("CompleteCommand"); err != nil {
 		return err
 	}
-	s.writtenPre = append(s.writtenPre, prefix)
-	s.prefixes[prefix.CommandID] = prefix
-	return nil
-}
-
-// FinalizeCommand performs the terminal CAS, which is the ONLY thing in this
-// fake that clears due_at.
-func (s *fakeStore) FinalizeCommand(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, epoch uint64, result Result) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.record("FinalizeCommand"); err != nil {
-		return err
-	}
-	s.finalized = append(s.finalized, finalCall{CommandID: command, Epoch: epoch, Result: result})
-	if err := result.Validate(); err != nil {
-		return err
-	}
+	s.completed = append(s.completed, completeCall{
+		CommandID: command, Revision: completion.ExpectedRevision, Epoch: completion.Epoch, Effect: completion.Effect,
+	})
 	stored, ok := s.commands[command]
 	if !ok {
 		return errors.New("commands_test: no such command")
 	}
-	if stored.record.State.Terminal() {
-		return errTestClaimConflict
+	switch {
+	case stored.record.Revision != completion.ExpectedRevision:
+		return errTestRevisionConflict
+	case completion.Effect.CompletedAt.IsZero() || completion.Effect.EventID == "" || completion.Effect.JournalSeq == 0:
+		return errTestInvalidResult
+	case stored.record.State != StateApplying:
+		return errTestStateConflict
+	case completion.Epoch < stored.record.ClaimEpoch:
+		return errTestEpochFenced
+	case completion.Epoch != stored.record.ClaimEpoch && !namesEffect(stored.application, completion.Effect):
+		return errTestNoEvidence
 	}
-	stored.record.State = result.State()
+	stored.record.State = StateApplied
+	stored.record.Revision++
 	stored.due = false
 	return nil
+}
+
+// RejectCommand settles a command with a durable typed reason.
+func (s *fakeStore) RejectCommand(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, rejection Rejection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.record("RejectCommand"); err != nil {
+		return err
+	}
+	s.rejections = append(s.rejections, rejectCall{
+		CommandID: command, Revision: rejection.ExpectedRevision, Epoch: rejection.Epoch, Detail: rejection.Detail,
+	})
+	stored, ok := s.commands[command]
+	if !ok {
+		return errors.New("commands_test: no such command")
+	}
+	if stored.record.Revision != rejection.ExpectedRevision {
+		return errTestRevisionConflict
+	}
+	if err := rejection.Detail.Validate(); err != nil {
+		return errTestInvalidResult
+	}
+	if stored.record.State.Terminal() {
+		return errTestStateConflict
+	}
+	if rejection.Epoch != 0 && rejection.Epoch < stored.record.ClaimEpoch {
+		return errTestEpochFenced
+	}
+	recovering := false
+	switch {
+	case s.claimLive(stored):
+		if rejection.Epoch != stored.record.ClaimEpoch {
+			return errTestClaimHeld
+		}
+	case stored.record.State == StateApplying:
+		if rejection.Epoch <= stored.record.ClaimEpoch {
+			return errTestClaimLost
+		}
+		recovering = true
+	}
+	if !stored.application.provesNoEffect() {
+		return errTestNoEvidence
+	}
+	if recovering && !stored.application.fences(stored.record.ClaimEpoch) {
+		return errTestNoEvidence
+	}
+	stored.record.State = StateRejected
+	stored.record.Revision++
+	stored.due = false
+	return nil
+}
+
+// namesEffect is the store's successor rule: the outcome must be committed and
+// the result must be the correlated event.
+func namesEffect(application Application, effect Effect) bool {
+	return application.Outcome == ApplicationCommitted &&
+		effect.EventID == application.EffectEventID &&
+		effect.JournalSeq == application.EffectSeq
 }
 
 // operations returns the operation log.
@@ -271,44 +462,57 @@ func (s *fakeStore) stateOf(command sessionwire.CommandID) (State, bool) {
 	return stored.record.State, stored.due
 }
 
-// terminalResults returns every terminal CAS the store accepted.
-func (s *fakeStore) terminalResults() []finalCall {
+// completions and settledRejections return the terminal settlements the store
+// ACCEPTED, as distinct from the ones it was asked for.
+func (s *fakeStore) completions() []completeCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]finalCall(nil), s.finalized...)
+	return append([]completeCall(nil), s.completed...)
 }
 
-// errTestClaimConflict is a refused compare-and-swap.
-var errTestClaimConflict = errors.New("commands_test: the compare-and-swap was refused")
+func (s *fakeStore) settledRejections() []rejectCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]rejectCall(nil), s.rejections...)
+}
 
 // fakeRuntime is department.CommandApplier, recording exactly what crossed the
 // seam.
+//
+// onApply is what makes this bench honest: a real runtime's application ENDS IN
+// A DURABLE JOURNAL EFFECT, and a command is applied because that event exists
+// rather than because a method returned nil. A test that wants a runtime which
+// commits nothing clears it.
 type fakeRuntime struct {
-	mu        sync.Mutex
-	envelopes []sessionwire.CommandEnvelope
-	err       error
-
-	// before runs at the start of the call, which is the only place a test can
-	// stand between the application prefix and the terminal CAS.
-	before func()
+	mu      sync.Mutex
+	applied []department.RuntimeCommand
+	err     error
+	before  func()
+	onApply func(sessionwire.CommandID)
 }
 
-// ApplyCommand records the envelope and returns the scripted error.
-func (r *fakeRuntime) ApplyCommand(_ context.Context, envelope sessionwire.CommandEnvelope) error {
+// ApplyCommand records the command and returns the scripted error.
+func (r *fakeRuntime) ApplyCommand(_ context.Context, command department.RuntimeCommand) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.before != nil {
 		r.before()
 	}
-	r.envelopes = append(r.envelopes, envelope)
-	return r.err
+	r.applied = append(r.applied, command)
+	if r.err != nil {
+		return r.err
+	}
+	if r.onApply != nil {
+		r.onApply(command.CommandID)
+	}
+	return nil
 }
 
-// applied returns every envelope the runtime was driven with.
-func (r *fakeRuntime) applied() []sessionwire.CommandEnvelope {
+// commands returns every command the runtime was driven with.
+func (r *fakeRuntime) commands() []department.RuntimeCommand {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]sessionwire.CommandEnvelope(nil), r.envelopes...)
+	return append([]department.RuntimeCommand(nil), r.applied...)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,25 +539,28 @@ func newApplierFixture(t *testing.T, configure ...func(*applierFixture)) *applie
 	f := &applierFixture{
 		t:       t,
 		clock:   clock,
-		store:   newFakeStore(),
+		store:   newFakeStore(clock),
 		runtime: &fakeRuntime{},
 		fence:   newFakeFence(),
 		epoch:   testEpoch,
 	}
+	f.runtime.onApply = f.store.commitEffect
 	f.host = newTestHost(t, clock)
 	f.put(KindInput, StatePending)
 	for _, apply := range configure {
 		apply(f)
 	}
 	applier, err := NewApplier(ApplierOptions{
-		Host:       f.host,
-		Key:        registry.Key{TenantID: testTenant, SessionID: testSession},
-		LeaseEpoch: f.epoch,
-		Records:    f.store,
-		Writes:     f.store,
-		Gates:      f.store,
-		Runtime:    f.runtime,
-		Fence:      f.fence,
+		Host:         f.host,
+		Key:          registry.Key{TenantID: testTenant, SessionID: testSession},
+		LeaseEpoch:   f.epoch,
+		Records:      f.store,
+		Applications: f.store,
+		Gates:        f.store,
+		Writes:       f.store,
+		Journal:      f.store,
+		Runtime:      f.runtime,
+		Fence:        f.fence,
 	})
 	if err != nil {
 		t.Fatalf("NewApplier: %v", err)
@@ -363,7 +570,7 @@ func newApplierFixture(t *testing.T, configure ...func(*applierFixture)) *applie
 }
 
 // put stores the fixture's single command at acceptance order 1, in a kind and
-// a state, with a due deadline and a payload.
+// a state, due, with a private body and no journal correlation.
 func (f *applierFixture) put(kind Kind, state State) *storedCommand {
 	stored := &storedCommand{
 		record: Record{
@@ -374,17 +581,38 @@ func (f *applierFixture) put(kind Kind, state State) *storedCommand {
 			Kind:             kind,
 			State:            state,
 			AcceptedOrder:    1,
+			Revision:         testRevision,
 			ApplyDeadline:    testClockAt.Add(testApplyDeadline),
 		},
-		payload: Payload{Body: []byte(`{"blocks":[]}`)},
-		due:     true,
+		payload:     Payload{Body: []byte(`{"blocks":[]}`)},
+		due:         true,
+		application: Application{Outcome: ApplicationAbsent},
 	}
 	if kind == KindGateResponse {
-		stored.payload.GateID = testGate
+		stored.payload = Payload{Body: gateResponseBody(f.t, testGate)}
 		f.store.gates[testGate] = Gate{GateID: testGate, Open: true, OwnerHostID: testHostID, OwnerEpoch: testEpoch}
 	}
 	f.store.commands[commandID(1)] = stored
 	return stored
+}
+
+// gateResponseBody is the private body of a gate response: Core's own
+// GateResponseRequest, which is the record §9.4's backstop reads the gate
+// identity out of.
+func gateResponseBody(t *testing.T, gate sessionwire.GateID) []byte {
+	t.Helper()
+	body, err := json.Marshal(sessionwire.GateResponseRequest{
+		CommandEnvelope:     sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: commandID(1)},
+		SessionID:           testSession,
+		GateID:              gate,
+		Action:              "approve",
+		Values:              map[string]json.RawMessage{"choice": json.RawMessage(`"allow"`)},
+		ExpectedOpenEventID: sessionwire.EventID("event-gate-open-1"),
+	})
+	if err != nil {
+		t.Fatalf("marshal the gate response body: %v", err)
+	}
+	return body
 }
 
 // stored returns the fixture's single command record.
@@ -396,7 +624,7 @@ func (f *applierFixture) process() (Outcome, error) {
 	return f.applier.Process(context.Background(), command(1, f.stored().record.State))
 }
 
-// refusal returns the ApplyRefusal an error carries, or "".
+// refusalOf returns the ApplyRefusal an error carries, or "".
 func refusalOf(err error) ApplyRefusal {
 	var apply *ApplyError
 	if errors.As(err, &apply) {
@@ -417,16 +645,18 @@ func TestNewApplierRefusesAnIncompleteComposition(t *testing.T) {
 
 	complete := func(t *testing.T) ApplierOptions {
 		t.Helper()
-		store := newFakeStore()
+		store := newFakeStore(newManualClock(testClockAt))
 		return ApplierOptions{
-			Host:       newTestHost(t, newManualClock(testClockAt)),
-			Key:        registry.Key{TenantID: testTenant, SessionID: testSession},
-			LeaseEpoch: testEpoch,
-			Records:    store,
-			Writes:     store,
-			Gates:      store,
-			Runtime:    &fakeRuntime{},
-			Fence:      newFakeFence(),
+			Host:         newTestHost(t, newManualClock(testClockAt)),
+			Key:          registry.Key{TenantID: testTenant, SessionID: testSession},
+			LeaseEpoch:   testEpoch,
+			Records:      store,
+			Applications: store,
+			Gates:        store,
+			Writes:       store,
+			Journal:      store,
+			Runtime:      &fakeRuntime{},
+			Fence:        newFakeFence(),
 		}
 	}
 	if _, err := NewApplier(complete(t)); err != nil {
@@ -442,8 +672,10 @@ func TestNewApplierRefusesAnIncompleteComposition(t *testing.T) {
 		{"no session", func(o *ApplierOptions) { o.Key.SessionID = "" }, "Key"},
 		{"a zero epoch", func(o *ApplierOptions) { o.LeaseEpoch = 0 }, "LeaseEpoch"},
 		{"no records", func(o *ApplierOptions) { o.Records = nil }, "Records"},
-		{"no writes", func(o *ApplierOptions) { o.Writes = nil }, "Writes"},
+		{"no applications", func(o *ApplierOptions) { o.Applications = nil }, "Applications"},
 		{"no gates", func(o *ApplierOptions) { o.Gates = nil }, "Gates"},
+		{"no writes", func(o *ApplierOptions) { o.Writes = nil }, "Writes"},
+		{"no journal", func(o *ApplierOptions) { o.Journal = nil }, "Journal"},
 		{"no runtime", func(o *ApplierOptions) { o.Runtime = nil }, "Runtime"},
 		{"no fence", func(o *ApplierOptions) { o.Fence = nil }, "Fence"},
 	} {
@@ -470,22 +702,25 @@ func TestNewApplierRefusesAnIncompleteComposition(t *testing.T) {
 // NewConsumer holds, for the accessors an APPLIER reads.
 //
 // ENUMERATE CONSTRUCTIONS, NOT INTENTIONS: &host.Host{} compiles from any
-// package however unexported its fields are, and it yields a nil Clock, an
-// empty ID and a ZERO ClaimTTL — and a zero claim TTL claims a command whose
-// claim has already expired, so the next reader takes it over mid-application.
+// package however unexported its fields are, and it yields a nil Clock, an empty
+// ID and a ZERO ClaimTTL — and a zero claim TTL takes a claim that has already
+// expired, which the store then refuses to let this applier begin applying
+// under.
 func TestNewApplierRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 	t.Parallel()
 
-	store := newFakeStore()
+	store := newFakeStore(newManualClock(testClockAt))
 	applier, err := NewApplier(ApplierOptions{
-		Host:       &host.Host{},
-		Key:        registry.Key{TenantID: testTenant, SessionID: testSession},
-		LeaseEpoch: testEpoch,
-		Records:    store,
-		Writes:     store,
-		Gates:      store,
-		Runtime:    &fakeRuntime{},
-		Fence:      newFakeFence(),
+		Host:         &host.Host{},
+		Key:          registry.Key{TenantID: testTenant, SessionID: testSession},
+		LeaseEpoch:   testEpoch,
+		Records:      store,
+		Applications: store,
+		Gates:        store,
+		Writes:       store,
+		Journal:      store,
+		Runtime:      &fakeRuntime{},
+		Fence:        newFakeFence(),
 	})
 	if applier != nil {
 		t.Fatal("an applier was built over a Host with no clock, no identity and a zero claim TTL")
@@ -504,16 +739,17 @@ func TestNewApplierRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 // The whole protocol
 // ---------------------------------------------------------------------------
 
-// TestAnInputCommandIsClaimedAppliedAndFinalized asserts §10.4's protocol in
-// the order it is written: claim, then the private payload, then applying, then
-// the correlation, then the runtime, then the terminal CAS.
+// TestAnInputCommandIsClaimedAppliedAndCompleted asserts §10.4's protocol in the
+// order it is written: the record, then the journal, then the claim, then the
+// private payload, then applying, then the correlation, then the runtime, then
+// the journal again, then the terminal completion.
 //
-// THE ORDER IS THE ASSERTION. Every pair in this sequence has a crash between
-// it and its neighbour that the recovery rules answer differently, so a
-// reordering is not a style change: a payload loaded before the claim is work
-// done for a command another Host owns, and a prefix written after the runtime
-// call is missing in the one case it exists for.
-func TestAnInputCommandIsClaimedAppliedAndFinalized(t *testing.T) {
+// THE ORDER IS THE ASSERTION. Every pair in this sequence has a crash between it
+// and its neighbour that the recovery rules answer differently, so a reordering
+// is not a style change: a payload loaded before the claim is work done for a
+// command another Host owns, and a prefix appended after the runtime call is
+// missing in the one case it exists for.
+func TestAnInputCommandIsClaimedAppliedAndCompleted(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
@@ -526,21 +762,16 @@ func TestAnInputCommandIsClaimedAppliedAndFinalized(t *testing.T) {
 	}
 	want := []string{
 		"LoadCommand",
-		"LoadApplicationPrefix",
+		"FindApplication",
 		"ClaimCommand",
 		"LoadPayload",
 		"BeginApplying",
-		"RecordApplicationPrefix",
-		"FinalizeCommand",
+		"AppendApplicationPrefix",
+		"FindApplication",
+		"CompleteCommand",
 	}
 	if got := f.store.operations(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("the durable protocol ran as %v, want %v", got, want)
-	}
-	if applied := f.runtime.applied(); len(applied) != 1 || applied[0].CommandID != commandID(1) {
-		t.Fatalf("the runtime was driven with %v, want exactly one envelope for %q", applied, commandID(1))
-	}
-	if version := f.runtime.applied()[0].Version; version != sessionwire.CurrentWireVersion {
-		t.Errorf("the envelope carries wire version %q, want %q", version, sessionwire.CurrentWireVersion)
 	}
 	if claims := f.store.claims; len(claims) != 1 {
 		t.Fatalf("the record was claimed %d times, want once", len(claims))
@@ -552,70 +783,200 @@ func TestAnInputCommandIsClaimedAppliedAndFinalized(t *testing.T) {
 	if want := testClockAt.Add(testClaimTTL); !claim.ExpiresAt.Equal(want) {
 		t.Errorf("the claim expires at %v, want now plus the Host's claim TTL %v", claim.ExpiresAt, want)
 	}
-	if claim.ExpectedState != StatePending || claim.ExpectedClaimEpoch != 0 {
-		t.Errorf("the claim expected (%q, %d), want the record as it was read (%q, 0); a claim that expects nothing cannot be refused, and two Hosts would both apply", claim.ExpectedState, claim.ExpectedClaimEpoch, StatePending)
+	if prefixes := f.store.prefixes; len(prefixes) != 1 ||
+		prefixes[0] != (Prefix{CommandID: commandID(1), RuntimeCommandID: testRuntimeCommandID, Kind: KindInput}) {
+		t.Errorf("the application prefix is %+v, want one correlating this command with its own runtime allocation", prefixes)
 	}
-	if prefixes := f.store.writtenPre; len(prefixes) != 1 || prefixes[0] != (Prefix{CommandID: commandID(1), RuntimeCommandID: testRuntimeCommandID, LeaseEpoch: testEpoch}) {
-		t.Errorf("the application prefix is %v, want one correlating both identities with the lease epoch", prefixes)
+	completions := f.store.completions()
+	if len(completions) != 1 {
+		t.Fatalf("the command was completed %d times, want once", len(completions))
+	}
+	// THE EFFECT COMES FROM THE JOURNAL. A completion names the durable event
+	// that carried the command's effect; one composed by the applier would be a
+	// claim that something happened with nothing to point at, and the store
+	// refuses it.
+	wantEffect := Effect{CompletedAt: testClockAt, EventID: testEffectEventID, JournalSeq: testEffectSeq}
+	if completions[0].Effect != wantEffect {
+		t.Errorf("the completion recorded %+v, want the correlated effect %+v", completions[0].Effect, wantEffect)
+	}
+	if completions[0].Epoch != testEpoch {
+		t.Errorf("the completion was stamped with epoch %d, want %d", completions[0].Epoch, testEpoch)
 	}
 }
 
-// TestTheClaimNeverExtendsTheApplyDeadline holds §10.4's sentence: a claim has
-// a bounded TTL of its own and the command's outer bound does not move.
-func TestTheClaimNeverExtendsTheApplyDeadline(t *testing.T) {
+// TestEveryTransitionNamesTheRevisionItRead asserts each compare-and-swap names
+// the revision the caller decided on — the record's for the claim, and each
+// previous CAS's answer for the ones after it.
+//
+// A TRANSITION THAT NAMED NO REVISION WOULD BE A BLIND WRITE dressed as a CAS,
+// and two Hosts that both read a pending record would both succeed. Carrying the
+// answer forward is the half that is easy to lose: an applier that re-used the
+// record's original revision for every step would be refused by the store on its
+// second write, and by nothing here before this test existed.
+func TestEveryTransitionNamesTheRevisionItRead(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
-	before := f.stored().record.ApplyDeadline
 	if _, err := f.process(); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if after := f.stored().record.ApplyDeadline; !after.Equal(before) {
-		t.Errorf("the apply deadline moved from %v to %v", before, after)
+	if len(f.store.claims) != 1 || len(f.store.applyings) != 1 || len(f.store.completed) != 1 {
+		t.Fatalf("the protocol ran as %v, which is not one of each transition", f.store.operations())
 	}
-	if len(f.store.claims) != 1 {
-		t.Fatalf("the record was claimed %d times, want once", len(f.store.claims))
+	if got := f.store.claims[0].ExpectedRevision; got != testRevision {
+		t.Errorf("the claim named revision %d, want the revision the record was read at %d", got, testRevision)
 	}
-	if claim := f.store.claims[0]; !claim.ExpiresAt.Before(before) {
-		t.Errorf("the claim expires at %v, which is not inside the apply deadline %v", claim.ExpiresAt, before)
+	if got := f.store.applyings[0].ExpectedRevision; got != testRevision+1 {
+		t.Errorf("BeginApplying named revision %d, want the claim's answer %d", got, testRevision+1)
+	}
+	if got := f.store.completed[0].Revision; got != testRevision+2 {
+		t.Errorf("the completion named revision %d, want BeginApplying's answer %d", got, testRevision+2)
 	}
 }
 
-// TestAnInterruptCommandIsAppliedWithoutAPayload asserts the kind whose whole
-// content is its identity still reaches the runtime.
-func TestAnInterruptCommandIsAppliedWithoutAPayload(t *testing.T) {
+// TestTheRuntimeReceivesTheMappingAndTheBody is blocking finding 1's regression
+// test, and it is a whole-value comparison for the reason department's own
+// restore test is: an assertion on one field passes against a seam that carries
+// only that field.
+//
+// The previous seam took sessionwire.CommandEnvelope, which released Core
+// defines as exactly a wire version and a public CommandID. So the
+// RuntimeCommandID §16 requires Host to forward was loaded, used in the local
+// prefix, and never sent; and the command's substance could not be sent either,
+// because the inbox payload is private to Factory and Host and SessionStore
+// imports only Core and storage. Harness received a bare identity for an input
+// command and had no way to obtain the blocks.
+func TestTheRuntimeReceivesTheMappingAndTheBody(t *testing.T) {
 	t.Parallel()
 
-	f := newApplierFixture(t, func(f *applierFixture) {
-		stored := f.put(KindInterrupt, StatePending)
-		stored.payload = Payload{}
-	})
-	outcome, err := f.process()
-	if err != nil {
+	f := newApplierFixture(t)
+	body := f.stored().payload.Body
+	if _, err := f.process(); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if outcome.State != StateApplied {
-		t.Errorf("outcome state = %q, want %q", outcome.State, StateApplied)
+	driven := f.runtime.commands()
+	if len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once", len(driven))
 	}
-	if applied := f.runtime.applied(); len(applied) != 1 {
-		t.Fatalf("the runtime was driven %d times, want once", len(applied))
+	want := department.RuntimeCommand{
+		CommandID:        commandID(1),
+		RuntimeCommandID: testRuntimeCommandID,
+		Kind:             string(KindInput),
+		Payload:          body,
+	}
+	if !reflect.DeepEqual(driven[0], want) {
+		t.Errorf("the runtime received %+v, want %+v", driven[0], want)
 	}
 }
 
-// TestACreateOrRestoreIsSatisfiedByResidency asserts the two kinds whose
-// consequence is the runtime's existence are finalized WITHOUT driving it.
+// TestTheRuntimeCommandCarriesEverythingARuntimeNeeds pins the SHAPE of the
+// seam, which the value comparison above cannot.
 //
-// A Host consumes a session's inbox only while it holds that session's runtime,
-// so a create or restore that reaches here has already had its consequence.
-// Driving it into the runtime would ask a live session to be created again, and
-// entering `applying` would claim an effect that never begins.
-func TestACreateOrRestoreIsSatisfiedByResidency(t *testing.T) {
+// A test that only compares values agrees with any seam wide enough to hold
+// them; what made the old seam wrong was its type. This fails if a member is
+// removed — which is exactly how the mapping and the body stopped crossing —
+// and it fails if one is added, which is the prompt to decide whether Host
+// should be filling it.
+func TestTheRuntimeCommandCarriesEverythingARuntimeNeeds(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []Kind{KindCreate, KindRestore} {
+	command := reflect.TypeOf(department.RuntimeCommand{})
+	var members []string
+	for index := 0; index < command.NumField(); index++ {
+		members = append(members, command.Field(index).Name)
+	}
+	want := []string{"CommandID", "RuntimeCommandID", "Kind", "Payload", "PayloadRef"}
+	if !reflect.DeepEqual(members, want) {
+		t.Errorf("department.RuntimeCommand carries %v, want %v", members, want)
+	}
+}
+
+// TestAReferencedBodyCrossesAsAReference asserts Host passes an object
+// reference on rather than dereferencing it.
+//
+// §10.1 gives a private body an independent immutable object reference once it
+// exceeds its inline threshold, and the runtime resolves it through its own
+// object read. Host has no object seam at all — which is the mechanism, since a
+// dereference it cannot perform is one it cannot accidentally add — so what this
+// asserts is that the reference is not silently dropped on the way.
+func TestAReferencedBodyCrossesAsAReference(t *testing.T) {
+	t.Parallel()
+
+	reference := sessionwire.ObjectReference{ObjectID: "object-77f"}
+	f := newApplierFixture(t, func(f *applierFixture) {
+		f.stored().payload = Payload{Ref: reference}
+	})
+	if _, err := f.process(); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	driven := f.runtime.commands()
+	if len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once", len(driven))
+	}
+	if driven[0].PayloadRef != reference {
+		t.Errorf("the runtime received the reference %+v, want %+v", driven[0].PayloadRef, reference)
+	}
+	if len(driven[0].Payload) != 0 {
+		t.Errorf("the runtime received %d inline bytes beside a reference, and at most one of the two is ever set", len(driven[0].Payload))
+	}
+}
+
+// TestACommandTheRuntimeCommittedNothingForIsNotApplied is the other half of
+// blocking finding 1, and the one that makes the seam's correctness observable
+// rather than merely asserted.
+//
+// A command is applied because a durable journal effect exists, not because a
+// method returned nil. The runtime here returns success while committing
+// nothing — which is exactly what the old two-field seam produced for every
+// input command, since Harness could not obtain the blocks — and the applier
+// must refuse to record it, leaving the command applying and DUE for a later
+// pass.
+func TestACommandTheRuntimeCommittedNothingForIsNotApplied(t *testing.T) {
+	t.Parallel()
+
+	f := newApplierFixture(t, func(f *applierFixture) { f.runtime.onApply = nil })
+	outcome, err := f.process()
+	if refusalOf(err) != RefusalNoCommittedEffect {
+		t.Fatalf("got %v, want a %q refusal", err, RefusalNoCommittedEffect)
+	}
+	if completions := f.store.completions(); len(completions) != 0 {
+		t.Errorf("the command was completed as %+v with no effect in the journal", completions)
+	}
+	state, due := f.store.stateOf(commandID(1))
+	if state != StateApplying {
+		t.Errorf("the record is %q, want %q", state, StateApplying)
+	}
+	if !due {
+		t.Error("the record is no longer due, so no reconciler will ever finish it")
+	}
+	if !outcome.PrefixOwned {
+		t.Error("PrefixOwned = false, though a correlated prefix was appended before the call")
+	}
+}
+
+// TestEveryKindIsDrivenIntoTheRuntime replaces a deviation that was refused by
+// the store this runs on.
+//
+// An earlier version settled create and restore as applied WITHOUT driving the
+// runtime, on the ground that residency is their consequence and had already
+// happened. That was sound about the consequence and skipped what the durable
+// record may legally say: `claimed -> applied` is not an edge — §10.4 writes the
+// chain through applying, and sessionstore's CompleteCommand admits only an
+// applying record and requires a result naming the journal event that carried
+// the effect. For a create settled by residency alone no such event exists, so
+// no adapter could have supplied one.
+func TestEveryKindIsDrivenIntoTheRuntime(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []Kind{KindCreate, KindRestore, KindInput, KindInterrupt} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
-			f := newApplierFixture(t, func(f *applierFixture) { f.put(kind, StatePending) })
+			f := newApplierFixture(t, func(f *applierFixture) {
+				stored := f.put(kind, StatePending)
+				if kind != KindInput {
+					stored.payload = Payload{}
+				}
+			})
 			outcome, err := f.process()
 			if err != nil {
 				t.Fatalf("Process: %v", err)
@@ -623,24 +984,23 @@ func TestACreateOrRestoreIsSatisfiedByResidency(t *testing.T) {
 			if outcome.State != StateApplied {
 				t.Errorf("outcome state = %q, want %q", outcome.State, StateApplied)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v for a command its own existence satisfied", applied)
+			driven := f.runtime.commands()
+			if len(driven) != 1 {
+				t.Fatalf("the runtime was driven %d times, want once", len(driven))
 			}
-			for _, operation := range f.store.operations() {
-				if operation == "RecordApplicationPrefix" || operation == "BeginApplying" {
-					t.Errorf("%s ran for a command that drives no runtime, so it correlates an effect that never begins", operation)
-				}
+			if driven[0].Kind != string(kind) {
+				t.Errorf("the runtime received kind %q, want %q", driven[0].Kind, kind)
 			}
-			if results := f.store.terminalResults(); len(results) != 1 || results[0].Result.State() != StateApplied {
-				t.Errorf("the terminal results are %v, want one applied", results)
+			if completions := f.store.completions(); len(completions) != 1 {
+				t.Errorf("the command was completed %d times, want once", len(completions))
 			}
 		})
 	}
 }
 
-// TestAResidentGateResponseIsApplied asserts the ordinary gate case: the
-// durable gate is open and still names this Host and this residency, so the
-// response is driven into the runtime like any other command.
+// TestAResidentGateResponseIsApplied asserts the ordinary gate case: the durable
+// gate is open and still names this Host and this residency, so the response is
+// driven into the runtime like any other command.
 func TestAResidentGateResponseIsApplied(t *testing.T) {
 	t.Parallel()
 
@@ -652,8 +1012,8 @@ func TestAResidentGateResponseIsApplied(t *testing.T) {
 	if outcome.State != StateApplied {
 		t.Errorf("outcome state = %q, want %q", outcome.State, StateApplied)
 	}
-	if applied := f.runtime.applied(); len(applied) != 1 {
-		t.Fatalf("the runtime was driven %d times, want once", len(applied))
+	if driven := f.runtime.commands(); len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once", len(driven))
 	}
 	operations := f.store.operations()
 	claim, gate := indexOf(operations, "ClaimCommand"), indexOf(operations, "LoadGate")
@@ -665,12 +1025,12 @@ func TestAResidentGateResponseIsApplied(t *testing.T) {
 // TestAGateResponseThatLostTheReleaseRaceIsRejectedAsNotResumable is §9.4's
 // backstop.
 //
-// FACTORY NORMALLY REJECTS A COLD RESPONSE BEFORE THE INBOX EXISTS, so every
-// row here is a RACE: the gate was resumable when Factory admitted the command
-// and is not by the time this Host claims it. The rejection is durable and
-// typed, and the runtime is never driven — a runtime that was released and
-// relaunched cannot resume what the gate suspended, because continuation is not
-// implemented.
+// FACTORY NORMALLY REJECTS A COLD RESPONSE BEFORE THE INBOX EXISTS, so every row
+// here is a RACE: the gate was resumable when Factory admitted the command and is
+// not by the time this Host claims it. The rejection is durable and typed, the
+// runtime is never driven, and no application prefix is appended — a rejection
+// rests on the journal proving that no effect committed, so a correlation
+// appended first would make the settlement it needs impossible.
 func TestAGateResponseThatLostTheReleaseRaceIsRejectedAsNotResumable(t *testing.T) {
 	t.Parallel()
 
@@ -720,111 +1080,208 @@ func TestAGateResponseThatLostTheReleaseRaceIsRejectedAsNotResumable(t *testing.
 			if outcome.State != StateRejected {
 				t.Fatalf("outcome state = %q, want %q", outcome.State, StateRejected)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v for a gate it cannot resume", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v for a gate it cannot resume", driven)
 			}
-			results := f.store.terminalResults()
-			if len(results) != 1 {
-				t.Fatalf("the terminal CAS ran %d times, want once", len(results))
+			if prefixes := f.store.prefixes; len(prefixes) != 0 {
+				t.Errorf("an application prefix %+v was appended for a command that is being rejected", prefixes)
 			}
-			reason, _, rejected := results[0].Result.Rejection()
-			if !rejected {
-				t.Fatalf("the terminal result is %q, want a rejection", results[0].Result.State())
+			rejections := f.store.settledRejections()
+			if len(rejections) != 1 {
+				t.Fatalf("the command was rejected %d times, want once", len(rejections))
 			}
-			if reason != sessionwire.ErrorCodeGateNotResumable {
-				t.Errorf("the rejection reason is %q, want %q", reason, sessionwire.ErrorCodeGateNotResumable)
+			if code := rejections[0].Detail.Code; code != sessionwire.ErrorCodeGateNotResumable {
+				t.Errorf("the rejection code is %q, want %q", code, sessionwire.ErrorCodeGateNotResumable)
+			}
+			if rejections[0].Detail.Message == "" {
+				t.Error("the rejection carries no message, so an operator cannot tell which of the four races was lost")
 			}
 		})
 	}
 }
 
-// TestAppliedAndRejectedAreMutuallyExclusive holds step 5's first half as a
-// property of the VALUE, not of the code paths that build one.
+// TestAGateResponseThisHostCannotReadIsRefused asserts §9.4's backstop refuses
+// rather than guesses.
 //
-// The claim is exactly its enumeration: a Result carries one state, so no
-// value of the type can report both — and the two constructors are the only way
-// to set that state from outside this package. What a caller CAN build is
-// Result{}, because an empty composite literal compiles however unexported the
-// fields are, so the zero value is refused rather than defaulted.
-func TestAppliedAndRejectedAreMutuallyExclusive(t *testing.T) {
+// Host reads ONE record out of a private body — Core's own GateResponseRequest,
+// because the gate's identity is not a member of the inbox record and the check
+// is impossible without it. A body it cannot read that record out of, or one
+// stored behind an object reference it does not dereference, leaves the check
+// undecidable; assuming the gate is fine would drive a response into a runtime
+// that cannot resume it.
+func TestAGateResponseThisHostCannotReadIsRefused(t *testing.T) {
 	t.Parallel()
 
-	applied := Applied()
-	if applied.State() != StateApplied {
-		t.Errorf("Applied().State() = %q, want %q", applied.State(), StateApplied)
-	}
-	if _, _, rejected := applied.Rejection(); rejected {
-		t.Error("an applied result reports a rejection as well, so the two are not exclusive")
-	}
-	if err := applied.Validate(); err != nil {
-		t.Errorf("Applied() is invalid: %v", err)
-	}
-
-	rejection := Rejected(sessionwire.ErrorCodeGateNotResumable, "the gate is gone")
-	if rejection.State() != StateRejected {
-		t.Errorf("Rejected().State() = %q, want %q", rejection.State(), StateRejected)
-	}
-	reason, message, rejected := rejection.Rejection()
-	if !rejected || reason != sessionwire.ErrorCodeGateNotResumable || message != "the gate is gone" {
-		t.Errorf("Rejected() reports (%q, %q, %v)", reason, message, rejected)
-	}
-
 	for _, testCase := range []struct {
-		name   string
-		result Result
+		name    string
+		payload func(*testing.T) Payload
+		refusal ApplyRefusal
 	}{
-		{"the zero value", Result{}},
-		{"a rejection with no typed reason", Rejected("", "")},
+		{
+			name:    "a body behind an object reference",
+			payload: func(*testing.T) Payload { return Payload{Ref: sessionwire.ObjectReference{ObjectID: "object-1"}} },
+			refusal: RefusalReferencedGateResponse,
+		},
+		{
+			name:    "a body that is not a gate response",
+			payload: func(*testing.T) Payload { return Payload{Body: []byte(`{"blocks":[]}`)} },
+			refusal: RefusalUnreadableGateResponse,
+		},
+		{
+			name: "a body naming another command",
+			payload: func(t *testing.T) Payload {
+				body, err := json.Marshal(sessionwire.GateResponseRequest{
+					CommandEnvelope:     sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: commandID(9)},
+					SessionID:           testSession,
+					GateID:              testGate,
+					Action:              "approve",
+					Values:              map[string]json.RawMessage{"choice": json.RawMessage(`"allow"`)},
+					ExpectedOpenEventID: sessionwire.EventID("event-gate-open-1"),
+				})
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				return Payload{Body: body}
+			},
+			refusal: RefusalCorrelation,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			if err := testCase.result.Validate(); err == nil {
-				t.Fatal("Validate accepted a result that is not one of the two terminal states")
+			f := newApplierFixture(t, func(f *applierFixture) {
+				stored := f.put(KindGateResponse, StatePending)
+				stored.payload = testCase.payload(t)
+			})
+			_, err := f.process()
+			if refusalOf(err) != testCase.refusal {
+				t.Fatalf("got %v, want a %q refusal", err, testCase.refusal)
+			}
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v", driven)
+			}
+			if rejections := f.store.settledRejections(); len(rejections) != 0 {
+				t.Errorf("the command was durably rejected as %+v for a check this Host could not run", rejections)
 			}
 		})
 	}
 }
 
-// TestAnInvalidResultIsRefusedBeforeItIsWritten asserts the validation above
-// has a reader in the write path: finalization refuses rather than committing a
-// terminal state the store would have to interpret.
-func TestAnInvalidResultIsRefusedBeforeItIsWritten(t *testing.T) {
+// TestAnEffectMustNameADurableEvent covers Effect.Validate over every way an
+// effect can fail to name one.
+//
+// IT IS TESTED DIRECTLY BECAUSE THE TYPE IS EXPORTED. Effect{} compiles from any
+// package, and the adapter that will map a store's own result type into this one
+// is exactly the caller that can build a partial value — so the invariant is a
+// property of the type rather than of the one path inside this package that
+// happens to fill every member. Routing every row through Process would also
+// have hidden two of them: the first failing member returns, so a value missing
+// all three exercises one arm.
+func TestAnEffectMustNameADurableEvent(t *testing.T) {
 	t.Parallel()
 
-	f := newApplierFixture(t)
-	outcome, err := f.applier.finalize(context.Background(), f.stored().record, Result{}, false)
-	if refusalOf(err) != RefusalInvalidResult {
-		t.Fatalf("got %v, want a %q refusal", err, RefusalInvalidResult)
+	whole := Effect{CompletedAt: testClockAt, EventID: testEffectEventID, JournalSeq: testEffectSeq}
+	if err := whole.Validate(); err != nil {
+		t.Fatalf("a complete effect was refused: %v", err)
 	}
-	if outcome.State == StateApplied || outcome.State == StateRejected {
-		t.Errorf("outcome state = %q, which reports a terminal state nothing committed", outcome.State)
-	}
-	if results := f.store.terminalResults(); len(results) != 0 {
-		t.Errorf("the store was asked to commit %v", results)
-	}
-	if writes := f.fence.fencedWrites(); writes != 0 {
-		t.Errorf("%d fenced writes were spent on a result that could not be committed", writes)
+	for _, testCase := range []struct {
+		name   string
+		effect Effect
+	}{
+		{"no completion instant", Effect{EventID: testEffectEventID, JournalSeq: testEffectSeq}},
+		{"no public event", Effect{CompletedAt: testClockAt, JournalSeq: testEffectSeq}},
+		{"an invalid public event", Effect{CompletedAt: testClockAt, EventID: sessionwire.EventID(strings.Repeat("e", 4096)), JournalSeq: testEffectSeq}},
+		{"no journal sequence", Effect{CompletedAt: testClockAt, EventID: testEffectEventID}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			err := testCase.effect.Validate()
+			if refusalOf(err) != RefusalInvalidEffect {
+				t.Fatalf("got %v, want a %q refusal", err, RefusalInvalidEffect)
+			}
+		})
 	}
 }
 
-// TestATerminalCommandBecomesNotDue holds step 5's second half. A record that
-// is still being worked on stays due, because a due page is what a reconciler
-// finds outstanding work in; the terminal CAS is the one write that clears it,
-// which is why FinalizeCommand takes no due_at.
+// TestAppliedAndRejectedAreMutuallyExclusive holds step 5 as TWO MECHANISMS
+// rather than a value shape.
+//
+// The first is the seam: applied and rejected are separate methods carrying
+// different evidence — a journal effect for one, a stable typed code for the
+// other — so no single call can commit both. An earlier version made this a
+// property of one Result value with an unexported state field, which was true
+// and much weaker, because it said nothing about what the store would accept.
+// The second is the record: a settled command is terminal, and the store refuses
+// the other settlement against it. Both directions are asserted, because a guard
+// that only refused a second write of the same kind would let a completed
+// command be rejected.
+func TestAppliedAndRejectedAreMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a completed command cannot then be rejected", func(t *testing.T) {
+		t.Parallel()
+		f := newApplierFixture(t)
+		if _, err := f.process(); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		record := f.stored().record
+		if record.State != StateApplied {
+			t.Fatalf("the record is %q, want %q", record.State, StateApplied)
+		}
+		_, err := f.applier.reject(context.Background(), record, record.Revision,
+			sessionwire.ErrorDetail{Code: sessionwire.ErrorCodeCommandRejected, Message: "late"})
+		if !errors.Is(err, errTestStateConflict) {
+			t.Fatalf("rejecting an applied command reported %v, want the store's state conflict", err)
+		}
+		if state, _ := f.store.stateOf(commandID(1)); state != StateApplied {
+			t.Errorf("the record is now %q; a terminal state was overwritten", state)
+		}
+	})
+
+	t.Run("a rejected command cannot then be completed", func(t *testing.T) {
+		t.Parallel()
+		f := newApplierFixture(t, func(f *applierFixture) {
+			f.put(KindGateResponse, StatePending)
+			delete(f.store.gates, testGate)
+		})
+		if _, err := f.process(); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		record := f.stored().record
+		if record.State != StateRejected {
+			t.Fatalf("the record is %q, want %q", record.State, StateRejected)
+		}
+		_, err := f.applier.complete(context.Background(), record, record.Revision, Application{
+			Outcome: ApplicationCommitted, EffectEventID: testEffectEventID, EffectSeq: testEffectSeq,
+		})
+		// A refused completion with an owned prefix is reported as recoverable
+		// rather than as an error — that is complete's documented rule — so what
+		// this asserts is the RECORD, which is the thing that must not move.
+		if err != nil {
+			t.Fatalf("complete reported %v", err)
+		}
+		if state, _ := f.store.stateOf(commandID(1)); state != StateRejected {
+			t.Errorf("the record is now %q; a terminal state was overwritten", state)
+		}
+	})
+}
+
+// TestATerminalCommandBecomesNotDue holds step 5's second half. A record still
+// being worked on stays due, because a due page is what a reconciler finds
+// outstanding work in; a terminal settlement is the write that clears it.
 func TestATerminalCommandBecomesNotDue(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
-	f.store.errs["FinalizeCommand"] = errTestStore
+	f.store.errs["CompleteCommand"] = errTestStore
 	if _, err := f.process(); err != nil {
-		t.Fatalf("the pass reported %v, and an owned prefix is not a failure", err)
+		t.Fatalf("the pass reported %v, and a committed effect is not a failure", err)
 	}
 	if _, due := f.store.stateOf(commandID(1)); !due {
-		t.Fatal("a command whose terminal CAS did not commit is no longer due, so no reconciler will ever finish it")
+		t.Fatal("a command whose terminal write did not commit is no longer due, so no reconciler will ever finish it")
 	}
 
 	f.store.mu.Lock()
-	delete(f.store.errs, "FinalizeCommand")
+	delete(f.store.errs, "CompleteCommand")
 	f.store.mu.Unlock()
 	if _, err := f.process(); err != nil {
 		t.Fatalf("the recovery pass reported %v", err)
@@ -838,15 +1295,10 @@ func TestATerminalCommandBecomesNotDue(t *testing.T) {
 	}
 }
 
-// TestThePrivatePayloadIsLoadedAfterTheClaimAndNeverReachesTheRuntime holds
-// step 4 in both of its halves.
-//
-// The first half is an ORDER: the payload is loaded from SessionStore once this
-// applier owns the command. The second is a TYPE: what crosses into the runtime
-// is a sessionwire.CommandEnvelope, and the reflection below is what keeps that
-// an argument rather than an assertion — the day Core adds a body-bearing
-// member to the envelope, this test says so before somebody fills it in.
-func TestThePrivatePayloadIsLoadedAfterTheClaimAndNeverReachesTheRuntime(t *testing.T) {
+// TestThePrivatePayloadIsLoadedAfterTheClaim holds step 4's first half: the
+// payload is loaded from SessionStore once this applier owns the command, so a
+// Host does not read a command another Host is working on.
+func TestThePrivatePayloadIsLoadedAfterTheClaim(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
@@ -859,17 +1311,7 @@ func TestThePrivatePayloadIsLoadedAfterTheClaimAndNeverReachesTheRuntime(t *test
 		t.Fatalf("the operations ran as %v, which contains no claim or no payload load", operations)
 	}
 	if payload < claim {
-		t.Errorf("the operations ran as %v; the private payload is loaded AFTER the claim, so a Host does not read another Host's command", operations)
-	}
-
-	envelope := reflect.TypeOf(sessionwire.CommandEnvelope{})
-	var members []string
-	for index := 0; index < envelope.NumField(); index++ {
-		members = append(members, envelope.Field(index).Name)
-	}
-	want := []string{"Version", "CommandID"}
-	if !reflect.DeepEqual(members, want) {
-		t.Errorf("sessionwire.CommandEnvelope now carries %v, want %v; the runtime seam takes this type BECAUSE it has nowhere to put a private payload, and a new member ends that argument", members, want)
+		t.Errorf("the operations ran as %v; the private payload is loaded AFTER the claim", operations)
 	}
 }
 
@@ -880,7 +1322,7 @@ func TestThePrivatePayloadIsLoadedAfterTheClaimAndNeverReachesTheRuntime(t *test
 func TestTheRuntimeCommandIDComesFromTheWinningRecord(t *testing.T) {
 	t.Parallel()
 
-	t.Run("the prefix carries the record's allocation", func(t *testing.T) {
+	t.Run("the prefix and the runtime both carry the record's allocation", func(t *testing.T) {
 		t.Parallel()
 		f := newApplierFixture(t, func(f *applierFixture) {
 			f.stored().record.RuntimeCommandID = testOtherRuntimeCommandID
@@ -888,8 +1330,11 @@ func TestTheRuntimeCommandIDComesFromTheWinningRecord(t *testing.T) {
 		if _, err := f.process(); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
-		if prefixes := f.store.writtenPre; len(prefixes) != 1 || prefixes[0].RuntimeCommandID != testOtherRuntimeCommandID {
-			t.Errorf("the prefix correlates %v, want the record's own allocation %v", prefixes, testOtherRuntimeCommandID)
+		if prefixes := f.store.prefixes; len(prefixes) != 1 || prefixes[0].RuntimeCommandID != testOtherRuntimeCommandID {
+			t.Errorf("the prefix correlates %+v, want the record's own allocation %v", prefixes, testOtherRuntimeCommandID)
+		}
+		if driven := f.runtime.commands(); len(driven) != 1 || driven[0].RuntimeCommandID != testOtherRuntimeCommandID {
+			t.Errorf("the runtime received %+v, want the record's own allocation %v", driven, testOtherRuntimeCommandID)
 		}
 	})
 
@@ -938,8 +1383,8 @@ func TestProcessRefusesARecordThatIsNotTheOneItAskedFor(t *testing.T) {
 			if writes := f.fence.fencedWrites(); writes != 0 {
 				t.Errorf("%d durable writes were made against a record this applier refused", writes)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v", driven)
 			}
 		})
 	}
@@ -947,9 +1392,7 @@ func TestProcessRefusesARecordThatIsNotTheOneItAskedFor(t *testing.T) {
 
 // TestAnAlreadyTerminalRecordIsReportedWithoutWriting asserts the case the page
 // cannot see: the record was non-terminal when the page was listed and somebody
-// — a predecessor, or Factory's deadline reconciler — finished it in between.
-// §10.4 never re-opens a terminal record, so the only thing left is to tell the
-// consumer what it became, which is what lets its cursor pass.
+// — a predecessor, or Factory's deadline reconciler — settled it in between.
 func TestAnAlreadyTerminalRecordIsReportedWithoutWriting(t *testing.T) {
 	t.Parallel()
 
@@ -968,30 +1411,30 @@ func TestAnAlreadyTerminalRecordIsReportedWithoutWriting(t *testing.T) {
 			if writes := f.fence.fencedWrites(); writes != 0 {
 				t.Errorf("%d durable writes were made against a terminal record", writes)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v for a command that is already terminal", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v for a command that is already terminal", driven)
 			}
 		})
 	}
 }
 
-// TestAMissingPrivatePayloadIsRefused asserts a kind whose payload is required
-// does not reach the runtime without one.
-func TestAMissingPrivatePayloadIsRefused(t *testing.T) {
+// TestAPayloadTheCommandCannotBeAppliedWithoutIsRefused covers both halves of
+// the payload check: a kind whose body is required and absent, and a payload
+// whose two forms disagree with the store's own one-of-two invariant.
+func TestAPayloadTheCommandCannotBeAppliedWithoutIsRefused(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name    string
 		prepare func(*applierFixture)
 	}{
-		{"input with no body", func(f *applierFixture) { f.put(KindInput, StatePending).payload = Payload{} }},
-		{"a gate response with no gate", func(f *applierFixture) {
-			stored := f.put(KindGateResponse, StatePending)
-			stored.payload.GateID = ""
-		}},
-		{"a gate response with no body", func(f *applierFixture) {
-			stored := f.put(KindGateResponse, StatePending)
-			stored.payload.Body = nil
+		{"input with no body at all", func(f *applierFixture) { f.put(KindInput, StatePending).payload = Payload{} }},
+		{"a gate response with no body at all", func(f *applierFixture) { f.put(KindGateResponse, StatePending).payload = Payload{} }},
+		{"a body and a reference at once", func(f *applierFixture) {
+			f.put(KindInput, StatePending).payload = Payload{
+				Body: []byte(`{"blocks":[]}`),
+				Ref:  sessionwire.ObjectReference{ObjectID: "object-2"},
+			}
 		}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1001,11 +1444,11 @@ func TestAMissingPrivatePayloadIsRefused(t *testing.T) {
 			if refusalOf(err) != RefusalMissingPayload {
 				t.Fatalf("got %v, want a %q refusal", err, RefusalMissingPayload)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v", driven)
 			}
-			if results := f.store.terminalResults(); len(results) != 0 {
-				t.Errorf("the command was made terminal as %v, and a payload this Host could not read is not evidence about the command", results)
+			if completions := f.store.completions(); len(completions) != 0 {
+				t.Errorf("the command was completed as %+v", completions)
 			}
 		})
 	}
@@ -1017,7 +1460,7 @@ func TestAMissingPrivatePayloadIsRefused(t *testing.T) {
 func TestAStoreFailureStopsTheProtocolWhereItHappened(t *testing.T) {
 	t.Parallel()
 
-	for _, operation := range []string{"LoadCommand", "LoadApplicationPrefix", "ClaimCommand", "LoadPayload", "BeginApplying", "RecordApplicationPrefix"} {
+	for _, operation := range []string{"LoadCommand", "FindApplication", "ClaimCommand", "LoadPayload", "BeginApplying", "AppendApplicationPrefix"} {
 		t.Run(operation, func(t *testing.T) {
 			t.Parallel()
 			f := newApplierFixture(t)
@@ -1029,17 +1472,17 @@ func TestAStoreFailureStopsTheProtocolWhereItHappened(t *testing.T) {
 			if refusalOf(err) != RefusalStore {
 				t.Errorf("the refusal is %q, want %q", refusalOf(err), RefusalStore)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v after %s failed", applied, operation)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v after %s failed", driven, operation)
 			}
 		})
 	}
 }
 
-// TestALostGrantStopsTheApplicationBeforeItClaims asserts the fence is
-// consulted by the applier's own writes and not only by the consumer's cursor
-// write: an applier whose grant ended claims nothing, because a claim under a
-// lease a successor holds is work taken away from the Host that owns it.
+// TestALostGrantStopsTheApplicationBeforeItClaims asserts the fence is consulted
+// by the applier's own writes and not only by the consumer's cursor write: an
+// applier whose grant ended claims nothing, because a claim under a lease a
+// successor holds is work taken away from the Host that owns it.
 func TestALostGrantStopsTheApplicationBeforeItClaims(t *testing.T) {
 	t.Parallel()
 
@@ -1059,10 +1502,10 @@ func TestALostGrantStopsTheApplicationBeforeItClaims(t *testing.T) {
 				t.Fatalf("got %v, want the grant-gone cause", err)
 			}
 			if claims := f.store.claims; len(claims) != 0 {
-				t.Errorf("the command was claimed %v under a grant already known to be gone", claims)
+				t.Errorf("the command was claimed %+v under a grant already known to be gone", claims)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v", driven)
 			}
 		})
 	}
@@ -1071,39 +1514,55 @@ func TestALostGrantStopsTheApplicationBeforeItClaims(t *testing.T) {
 // TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt asserts the fence is
 // consulted at EVERY durable write of one application, not once at the top.
 //
-// THE STRUCTURAL GUARD IS NOT ENOUGH ON ITS OWN, and measuring it is what
-// showed that: unfencing BeginApplying, the application prefix or the terminal
-// CAS one at a time was killed by TestEveryDurableWriteGoesThroughTheFence and
-// by NOTHING ELSE, because the only behavioural lost-grant test loses the grant
-// before the first write and never reaches the later three. A guard whose
-// subject is a naming convention is exactly the guard that stops covering a
-// write the day somebody renames a seam, so each write now has a behavioural
-// kill of its own as well.
+// THE STRUCTURAL GUARD IS NOT ENOUGH ON ITS OWN, and measuring it is what showed
+// that: unfencing a write one at a time was killed by
+// TestEveryDurableWriteGoesThroughTheFence and by NOTHING ELSE, because the only
+// behavioural lost-grant test loses the grant before the first write and never
+// reaches the later ones. A guard whose subject is a naming convention is exactly
+// the guard that stops covering a write the day somebody renames a seam.
 //
 // THE GRANT ENDS THE WAY A SELECT CANNOT SEE — a store refusing a write under a
 // superseded epoch, which closes no channel — because that is the path a
 // mid-protocol loss actually arrives on.
 //
-// THE TERMINAL CAS IS NOT A ROW HERE, AND THE REASON IS THE POINT. It was one,
-// and the row was VACUOUS: with the grant ending after the prefix, the check
-// before the runtime call returns first, so the terminal CAS is never attempted
-// for a reason that has nothing to do with its fencing — the assertion passed
-// against a build whose terminal CAS was unfenced. Its own test stands where
-// nothing else can return first, which is inside the runtime call.
+// THE TERMINAL WRITES ARE NOT ROWS HERE, AND THE REASON IS THE POINT. A row for
+// the terminal write was VACUOUS: with the grant ending after the prefix, the
+// check before the runtime call returns first, so the settlement is never
+// attempted for a reason that has nothing to do with its fencing — the assertion
+// passed against a build whose terminal write was unfenced. Each has its own test
+// standing where nothing else can return first.
 func TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name      string
+		prepare   func(*applierFixture)
 		ends      string
 		forbidden string
 	}{
-		{"before the record enters applying", "ClaimCommand", "BeginApplying"},
-		{"before the application prefix", "BeginApplying", "RecordApplicationPrefix"},
+		{name: "before the record enters applying", ends: "ClaimCommand", forbidden: "BeginApplying"},
+		{name: "before the application prefix", ends: "BeginApplying", forbidden: "AppendApplicationPrefix"},
+		{
+			// The rejection's own row. It is reachable only on the gate path,
+			// because that is the one place this applier decides to settle a
+			// command without applying it — and without it, the terminal
+			// rejection had no behavioural cover at all.
+			name: "before a terminal rejection",
+			prepare: func(f *applierFixture) {
+				f.put(KindGateResponse, StatePending)
+				delete(f.store.gates, testGate)
+			},
+			ends:      "LoadGate",
+			forbidden: "RejectCommand",
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			f := newApplierFixture(t)
+			var prepare []func(*applierFixture)
+			if testCase.prepare != nil {
+				prepare = append(prepare, testCase.prepare)
+			}
+			f := newApplierFixture(t, prepare...)
 			f.store.after[testCase.ends] = func() { f.fence.end() }
 			_, err := f.process()
 			if !errors.Is(err, errTestGrantGone) {
@@ -1116,8 +1575,8 @@ func TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt(t *testing.T) {
 			if indexOf(operations, testCase.forbidden) >= 0 {
 				t.Errorf("the operations ran as %v; %s committed under a grant that had already ended", operations, testCase.forbidden)
 			}
-			if applied := f.runtime.applied(); len(applied) != 0 {
-				t.Errorf("the runtime was driven with %v under a grant that had already ended", applied)
+			if driven := f.runtime.commands(); len(driven) != 0 {
+				t.Errorf("the runtime was driven with %+v under a grant that had already ended", driven)
 			}
 		})
 	}
@@ -1127,51 +1586,48 @@ func TestEachFencedWriteIsRefusedWhenTheGrantEndsBeforeIt(t *testing.T) {
 // path that is not a write.
 //
 // Every other step is a durable write the fence refuses on this Host's behalf.
-// The runtime call is not: it is the one step no successor can undo, so the
-// grant is consulted immediately before it and a Host that has lost the session
-// stops rather than driving a runtime it is about to lose. The prefix it
-// already committed is what lets the next owner finish the command.
+// The runtime call is not: it is the one step no successor can undo, so the grant
+// is consulted immediately before it and a Host that has lost the session stops
+// rather than driving a runtime it is about to lose. The prefix it already
+// appended is what lets the next owner finish the command.
 //
-// THE ASSERTION IS THE RUNTIME AND NOT THE TERMINAL CAS. The CAS is also absent
-// on this path, and asserting it here would assert nothing: this check returns
-// first, so the CAS is unreached whether or not it is fenced. That version of
-// this test passed against a build whose terminal CAS was unfenced, which is a
-// proof it was vacuous rather than a reason to keep it.
+// THE ASSERTION IS THE RUNTIME AND NOT THE SETTLEMENT. The settlement is also
+// absent on this path, and asserting it here would assert nothing: this check
+// returns first, so it is unreached whether or not it is fenced.
 func TestTheRuntimeIsNotDrivenAfterTheGrantEnds(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
-	f.store.after["RecordApplicationPrefix"] = func() { f.fence.end() }
+	f.store.after["AppendApplicationPrefix"] = func() { f.fence.end() }
 	outcome, err := f.process()
 	if !errors.Is(err, errTestGrantGone) {
 		t.Fatalf("got %v, want the grant-gone cause", err)
 	}
 	operations := f.store.operations()
-	if indexOf(operations, "RecordApplicationPrefix") < 0 {
-		t.Fatalf("the operations ran as %v, which never committed a prefix, so this test asserts nothing", operations)
+	if indexOf(operations, "AppendApplicationPrefix") < 0 {
+		t.Fatalf("the operations ran as %v, which never appended a prefix, so this test asserts nothing", operations)
 	}
-	if applied := f.runtime.applied(); len(applied) != 0 {
-		t.Errorf("the runtime was driven with %v under a grant that had already ended", applied)
+	if driven := f.runtime.commands(); len(driven) != 0 {
+		t.Errorf("the runtime was driven with %+v under a grant that had already ended", driven)
 	}
 	if !outcome.PrefixOwned {
-		t.Error("PrefixOwned = false, though the prefix was committed and is what the next owner finishes from")
+		t.Error("PrefixOwned = false, though the prefix was appended and is what the next owner finishes from")
 	}
 }
 
-// TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall is the row
-// its table sibling cannot hold.
+// TestTheCompletionIsRefusedWhenTheGrantEndsDuringTheRuntimeCall is the row its
+// table sibling cannot hold.
 //
 // The grant ends INSIDE the runtime call, which is the only instant between the
-// application prefix and the terminal CAS at which nothing else returns first:
-// the check before the call has already passed, and the effect has already been
-// driven. What the fence must still refuse is the terminal CAS.
+// application prefix and the settlement at which nothing else returns first: the
+// check before the call has already passed, and the effect has already been
+// driven. What the fence must still refuse is the terminal write.
 //
 // THE PASS REPORTS NO ERROR, and that is the documented behaviour rather than a
-// hole. The prefix is committed, so the command is recoverable whatever the
-// reason the CAS did not land, which is exactly Outcome.PrefixOwned's meaning;
-// nothing durable moves under the lost grant either way, because the consumer
-// consults the fence between records and its own cursor write goes through it.
-func TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.T) {
+// hole. The effect is durable in the journal, so the command is recoverable
+// whatever the reason the completion did not land, which is exactly
+// Outcome.PrefixOwned's meaning.
+func TestTheCompletionIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.T) {
 	t.Parallel()
 
 	f := newApplierFixture(t)
@@ -1180,14 +1636,14 @@ func TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if applied := f.runtime.applied(); len(applied) != 1 {
-		t.Fatalf("the runtime was driven %d times, want once: the grant was held when the call began, and this test asserts nothing if it never ran", len(applied))
+	if driven := f.runtime.commands(); len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once: the grant was held when the call began, and this test asserts nothing if it never ran", len(driven))
 	}
-	if operations := f.store.operations(); indexOf(operations, "FinalizeCommand") >= 0 {
-		t.Errorf("the operations ran as %v; the terminal compare-and-swap committed under a grant that had ended", operations)
+	if completions := f.store.completions(); len(completions) != 0 {
+		t.Errorf("the completion %+v committed under a grant that had ended", completions)
 	}
 	if !outcome.PrefixOwned {
-		t.Error("PrefixOwned = false, though the correlation was committed before the call")
+		t.Error("PrefixOwned = false, though the effect is durable in the journal")
 	}
 	if outcome.State.Terminal() {
 		t.Errorf("outcome state = %q, which reports a terminal state no store acknowledged", outcome.State)
@@ -1210,32 +1666,12 @@ func TestTheTerminalCASIsRefusedWhenTheGrantEndsDuringTheRuntimeCall(t *testing.
 func TestTheApplierIsTheSeamTheConsumerConsumes(t *testing.T) {
 	t.Parallel()
 
-	clock := newManualClock(testClockAt)
-	built := newTestHost(t, clock)
-	store := newFakeStore()
-	store.commands[commandID(1)] = &storedCommand{
-		record: Record{
-			TenantID: testTenant, SessionID: testSession, CommandID: commandID(1),
-			RuntimeCommandID: testRuntimeCommandID, Kind: KindInput, State: StatePending,
-			AcceptedOrder: 1, ApplyDeadline: testClockAt.Add(testApplyDeadline),
-		},
-		payload: Payload{Body: []byte(`{"blocks":[]}`)},
-		due:     true,
-	}
-	fence := newFakeFence()
-	runtime := &fakeRuntime{}
-	applier, err := NewApplier(ApplierOptions{
-		Host: built, Key: registry.Key{TenantID: testTenant, SessionID: testSession},
-		LeaseEpoch: testEpoch, Records: store, Writes: store, Gates: store, Runtime: runtime, Fence: fence,
-	})
-	if err != nil {
-		t.Fatalf("NewApplier: %v", err)
-	}
+	f := newApplierFixture(t)
 	inbox := &fakeInbox{pages: [][]Command{{command(1, StatePending)}}}
 	cursors := &fakeCursors{}
 	consumer, err := NewConsumer(Options{
-		Host: built, Key: registry.Key{TenantID: testTenant, SessionID: testSession},
-		LeaseEpoch: testEpoch, Inbox: inbox, Cursors: cursors, Processor: applier, Fence: fence,
+		Host: f.host, Key: registry.Key{TenantID: testTenant, SessionID: testSession},
+		LeaseEpoch: testEpoch, Inbox: inbox, Cursors: cursors, Processor: f.applier, Fence: f.fence,
 	})
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
@@ -1253,8 +1689,8 @@ func TestTheApplierIsTheSeamTheConsumerConsumes(t *testing.T) {
 	if result.Cursor != 1 {
 		t.Errorf("the cursor advanced to %d, want the applied command's acceptance order 1", result.Cursor)
 	}
-	if applied := runtime.applied(); len(applied) != 1 {
-		t.Errorf("the runtime was driven %d times, want once", len(applied))
+	if driven := f.runtime.commands(); len(driven) != 1 {
+		t.Errorf("the runtime was driven %d times, want once", len(driven))
 	}
 }
 
@@ -1267,29 +1703,27 @@ func TestTheApplierIsTheSeamTheConsumerConsumes(t *testing.T) {
 // that used to cover SaveCursor in one file.
 //
 // THE SEVENTH CALLER IS WHAT IT IS FOR. O4.1 recorded that a Processor's claim
-// and terminal CAS would arrive OUTSIDE the old guard; they now go through the
+// and terminal write would arrive OUTSIDE the old guard; they now go through the
 // same Fence.Write the cursor does, and this is what keeps them there when the
-// eighth write is added by somebody who never read that note.
+// next write is added by somebody who never read that note.
 //
 // THE SUBJECT IS DERIVED, NOT LISTED. The guard collects the methods of every
 // interface declared in a production file of this package whose name ends in
 // "Writes", and requires every call to one of those names, in any production
-// file, to be lexically inside a call to Write. So a method added to InboxWrites
-// or CursorWrites is covered the moment it is declared, with no list to update
-// — which is the failure mode a list has.
+// file, to be lexically inside a call to Write. A method added to InboxWrites is
+// covered the moment it is declared, and JournalWrites — a whole second write
+// seam, over a different durable object — needed no edit here at all, which is
+// what the convention buys.
 //
-// THE CLAIM IS EXACTLY THAT ENUMERATION AND NO WIDER. A durable write declared
-// on an interface named otherwise is not covered, and neither is a write
-// smuggled through a function value assigned elsewhere. The naming convention is
-// what makes the guard extend itself, and it is stated on InboxWrites where
-// somebody adding a seam will read it.
+// THE CLAIM IS EXACTLY THAT ENUMERATION AND NO WIDER. A durable write declared on
+// an interface named otherwise is not covered, and neither is a write smuggled
+// through a function value assigned elsewhere.
 //
-// THAT LIMIT WAS MEASURED, and what it costs was measured with it. Renaming
-// InboxWrites out of the convention SURVIVES this guard — the methods leave its
-// subject and it goes on passing. What that no longer costs is today's writes:
-// each of the four has a behavioural kill of its own as well, so the rename
-// alone unfences nothing that any test would miss. What it does cost is the
-// forward claim, which is the whole reason a structural guard exists: the NEXT
+// THAT LIMIT WAS MEASURED, and what it costs was measured with it. Renaming a
+// write seam out of the convention SURVIVES this guard. What that no longer costs
+// is today's writes: each has a behavioural kill of its own as well, so the
+// rename alone unfences nothing any test would miss. What it does cost is the
+// forward claim, which is the whole reason a structural guard exists — the NEXT
 // write added to a renamed seam would be unguarded and this test would not say
 // so. That is the residual, and it is a rename in a diff rather than a silent
 // omission.
@@ -1344,15 +1778,21 @@ func TestEveryDurableWriteGoesThroughTheFence(t *testing.T) {
 		}{
 			{
 				name:    "an interface named …Writes",
-				source:  "package p\ntype InboxWrites interface {\n\tClaimCommand(int) error\n\tFinalizeCommand(int) error\n}\n",
+				source:  "package p\ntype InboxWrites interface {\n\tClaimCommand(int) error\n\tCompleteCommand(int) error\n}\n",
 				seams:   []string{"InboxWrites"},
-				methods: []string{"ClaimCommand", "FinalizeCommand"},
+				methods: []string{"ClaimCommand", "CompleteCommand"},
 			},
 			{
 				name:    "a reading seam beside it",
 				source:  "package p\ntype InboxReads interface{ LoadCommand(int) error }\ntype InboxWrites interface{ ClaimCommand(int) error }\n",
 				seams:   []string{"InboxWrites"},
 				methods: []string{"ClaimCommand"},
+			},
+			{
+				name:    "two write seams",
+				source:  "package p\ntype InboxWrites interface{ ClaimCommand(int) error }\ntype JournalWrites interface{ AppendApplicationPrefix(int) error }\n",
+				seams:   []string{"InboxWrites", "JournalWrites"},
+				methods: []string{"AppendApplicationPrefix", "ClaimCommand"},
 			},
 			{
 				name:    "an embedded write seam contributes its own name only",

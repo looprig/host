@@ -61,7 +61,7 @@ func (stubRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (<-c
 	return nil, nil
 }
 
-func (stubRuntime) ApplyCommand(context.Context, sessionwire.CommandEnvelope) error { return nil }
+func (stubRuntime) ApplyCommand(context.Context, department.RuntimeCommand) error { return nil }
 
 // testClock is a manually advanced time source.
 type testClock struct {
