@@ -1035,6 +1035,37 @@ func (f *fixture) requestFor(session sessionwire.SessionID, mode Mode) Request {
 // assertNothingHeld is the NEGATIVE assertion every failure row makes. The
 // interesting half of this task is here: not that an error was returned, but
 // that nothing survived it.
+// assertRouteRemoved holds the two clauses about the DURABLE ROUTE: nothing is
+// left live, and a route that was published was removed by a tombstone rather
+// than by erasure.
+//
+// IT IS SEPARATE FROM THE MAIN HELPER BECAUSE ONE ROW LEGITIMATELY DIFFERS,
+// and the earlier remedy for that row — skipping the whole helper — silently
+// dropped seven checks it passes. An opt-out that takes unrelated coverage with
+// it is how a row stops asserting things nobody notices. A failure whose grant
+// was superseded must NOT tombstone: the write would be one from a holder that
+// no longer owns the record, so the route is deliberately left to expire and
+// named in Unreleased instead. That row asserts everything else, and asserts
+// the naming in place of these two.
+func (f *fixture) assertRouteRemoved(t *testing.T) {
+	t.Helper()
+	if live := f.locations.live(); len(live) != 0 {
+		t.Errorf("%d durable residency projection(s) still live after a failed attach; want a tombstone instead", len(live))
+	}
+	if published, tombstones := f.locations.publishedAll(), f.locations.tombstones(); len(published) > 0 && len(tombstones) == 0 {
+		t.Errorf("%d projection(s) were published and none tombstoned; §10.1 removes a route with an EXPIRED epoch-fenced tombstone rather than by erasing the fencing high-water mark", len(published))
+	}
+}
+
+// assertNothingHeld is the NEGATIVE assertion every failure row makes: not that
+// an error came back, but that nothing survived it.
+//
+// It covers the lease grants, the admission charge, the local registry entry,
+// the watcher, the runtime's exactly-one nonterminal release and never-terminal
+// teardown, the workspace materialization balance, the launched context's
+// cancellation, and the count of rollback calls made on a context that was
+// already done. The durable route is assertRouteRemoved's, and the split is
+// explained there.
 func (f *fixture) assertNothingHeld(t *testing.T) {
 	t.Helper()
 	if held := f.leases.heldCount(); held != 0 {
@@ -1049,9 +1080,6 @@ func (f *fixture) assertNothingHeld(t *testing.T) {
 	if running := f.ownership.runningCount(); running != 0 {
 		t.Errorf("%d ownership(s) still running after a failed attach; a failed attach starts no watcher", running)
 	}
-	if live := f.locations.live(); len(live) != 0 {
-		t.Errorf("%d durable residency projection(s) still live after a failed attach; want a tombstone instead", len(live))
-	}
 	for i, runtime := range f.target.producedRuntimes() {
 		released, shutdowns := runtime.counts()
 		if released != 1 {
@@ -1060,9 +1088,6 @@ func (f *fixture) assertNothingHeld(t *testing.T) {
 		if shutdowns != 0 {
 			t.Errorf("runtime %d was shut down %d times; residency release is NONTERMINAL and must never reach a terminal teardown", i, shutdowns)
 		}
-	}
-	if published, tombstones := f.locations.publishedAll(), f.locations.tombstones(); len(published) > 0 && len(tombstones) == 0 {
-		t.Errorf("%d projection(s) were published and none tombstoned; §10.1 removes a route with an EXPIRED epoch-fenced tombstone rather than by erasing the fencing high-water mark", len(published))
 	}
 	ensured, released := f.workspaces.counts()
 	if ensured != released {
@@ -1723,6 +1748,7 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 				}
 			}
 			f.assertNothingHeld(t)
+			f.assertRouteRemoved(t)
 			if _, live := f.manager.SessionContext(f.key()); live {
 				t.Error("a session context survives a failed attach")
 			}
@@ -1751,6 +1777,7 @@ func TestRollbackDoesNotRunOnTheRequestContext(t *testing.T) {
 		}
 	}
 	f.assertNothingHeld(t)
+	f.assertRouteRemoved(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -2215,6 +2242,7 @@ func TestAttachRefusesAnInvalidRequestBeforeTakingAnything(t *testing.T) {
 				t.Errorf("a refused request reached %v; step 1 precedes every collaborator", steps)
 			}
 			f.assertNothingHeld(t)
+			f.assertRouteRemoved(t)
 		})
 	}
 }
@@ -2416,6 +2444,7 @@ func TestARuntimeWithoutNonterminalReleaseIsRefusedBeforeInstallation(t *testing
 		t.Errorf("the incapable runtime reached the registry at %d", at)
 	}
 	f.assertNothingHeld(t)
+	f.assertRouteRemoved(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -2574,6 +2603,7 @@ func TestNothingIsReportableAsAttachedInsideTheInstallWindow(t *testing.T) {
 		t.Error("a session context was reportable inside the install window")
 	}
 	f.assertNothingHeld(t)
+	f.assertRouteRemoved(t)
 }
 
 // TestAttachReadsResidencyOnlyThroughTheAttachedPredicate states the rule over
@@ -3322,6 +3352,7 @@ func TestClosingTheManagerDuringAnAttachStillRollsItBack(t *testing.T) {
 		t.Errorf("closing the manager mid-attach left %v unreleased; the rollback must not depend on this process still running", attach.Unreleased)
 	}
 	f.assertNothingHeld(t)
+	f.assertRouteRemoved(t)
 }
 
 // TestACompensationThatReportsItDidNothingIsNamed covers the two rungs whose
@@ -3559,6 +3590,7 @@ func TestAJournalFenceRefusedByALaterOwnerEndsTheAttach(t *testing.T) {
 		t.Errorf("the failure %v does not unwrap to ErrFenceConflict", err)
 	}
 	f.assertNothingHeld(t)
+	f.assertRouteRemoved(t)
 
 	// THE DISCRIMINATOR: a fence refused by a LATER OWNER must be classified,
 	// so nothing later in this attach writes under the stale epoch. Reaching a
@@ -3670,12 +3702,17 @@ func TestTheHeartbeatsFenceIsTheAttachsFence(t *testing.T) {
 	default:
 	}
 
-	// assertNothingHeld is NOT used here, and the reason is the point rather
-	// than an exemption. It requires a published projection to be tombstoned,
-	// which is right on every other failure path — and wrong on this one, where
-	// refusing the tombstone is the correct act and the route is deliberately
-	// left to expire. What must hold instead is that the route left behind is
-	// REPORTED, and everything that is this attach's to give back is given back.
+	// THIS ROW ASSERTS EVERYTHING assertNothingHeld ASSERTS, and swaps only the
+	// two clauses about the route. assertRouteRemoved is the pair that cannot
+	// hold here — refusing the tombstone is the correct act, so the route is
+	// deliberately left to expire — and the naming assertion below stands in
+	// for them. An earlier version skipped the whole helper for that reason and
+	// silently dropped seven checks this row passes: the watcher count, the
+	// runtime released-once and never-shut-down counts, the workspace balance,
+	// the launched-context cancellation, and the rollback-on-a-dead-context
+	// count. A hand-rolled substitute is not the same thing as the helper, and
+	// the difference is invisible until somebody looks.
+	f.assertNothingHeld(t)
 	var attach *AttachError
 	if !errors.As(err, &attach) {
 		t.Fatalf("error is %T, want *AttachError", err)
@@ -3688,15 +3725,6 @@ func TestTheHeartbeatsFenceIsTheAttachsFence(t *testing.T) {
 	}
 	if !named {
 		t.Errorf("a route was left live and unnamed: %v; §18.2 leaves it to registry expiry, and an operator must be told which", attach.Unreleased)
-	}
-	if consumed := f.publisher.ConsumedWeight(); consumed != 0 {
-		t.Errorf("the ledger still charges %d", consumed)
-	}
-	if held := f.leases.heldCount(); held != 0 {
-		t.Errorf("%d lease grant(s) are still held", held)
-	}
-	if _, held := f.registry.Get(f.key()); held {
-		t.Error("the local registry still holds the residency")
 	}
 	if _, live := f.manager.SessionContext(f.key()); live {
 		t.Error("a session context survives a failed attach")

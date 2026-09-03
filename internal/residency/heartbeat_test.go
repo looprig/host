@@ -2224,10 +2224,27 @@ func fencedWrites(file *ast.File) (int, []string) {
 // an *epochFence named otherwise is a false positive, and a non-fence spelled
 // `fence` is a false NEGATIVE, which is the unsafe one.
 //
-// So this pins the biconditional over the package's own declarations. Every
-// *epochFence binding is spelled `fence`, and nothing else is — which makes
-// "receiver spelled fence" equivalent to "receiver is an *epochFence" without
-// a type checker.
+// So this pins the biconditional over the package's own declarations, and the
+// claim is EXACTLY AS WIDE AS THE ENUMERATION AND NO WIDER — which is this
+// lane's recurring defect applied to the mechanism built to end it. What
+// fenceBindings enumerates is three binding forms: struct FIELDS, function
+// PARAMETERS, and short variable declarations from newEpochFence. So the claim
+// is "every field, parameter and newEpochFence local of type *epochFence is
+// spelled fence, and nothing of those three forms is spelled fence without
+// being one". It is not a claim about bindings in general.
+//
+// THREE FORMS ESCAPE IT, measured at zero violations detected: a package-level
+// `var guard *epochFence`, a named result `func mk() (guard *epochFence)`, and
+// an ALIAS `guard := h.fence` — the last being the most plausible edit by some
+// distance, since it needs no new declaration style at all. The unsafe
+// direction has a corner too: a package-level `var fence *sync.Mutex` satisfies
+// this vacuously and would be read as a fence by the write guard.
+//
+// The detector is deliberately NOT widened. The floor below and the probe rows
+// bound what a miss can cost, and a guard that grows a case per syntax form is
+// one nobody can say the reach of. A reader who adds one of those three forms
+// should extend the enumeration; a reader who trusts this sentence beyond the
+// three forms it names has been told not to.
 func TestFenceIsTheOnlyThingSpelledFence(t *testing.T) {
 	files := parseProductionFiles(t)
 	bindings := 0
@@ -2242,8 +2259,10 @@ func TestFenceIsTheOnlyThingSpelledFence(t *testing.T) {
 			}
 		}
 	}
-	// FLOORED: the field on Heartbeat, the local in attach, and the field on
-	// OwnershipRequest at least.
+	// FLOORED over the three forms enumerated above: the field on Heartbeat,
+	// the local in attach, and the field on OwnershipRequest at least. A floor
+	// is what keeps a detector that stopped matching from passing silently; it
+	// is not evidence that the enumeration is complete.
 	if bindings < 3 {
 		t.Fatalf("%d bindings were examined, want at least the three this package declares", bindings)
 	}
