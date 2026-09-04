@@ -1579,15 +1579,24 @@ func TestOneLinkMayHoldMoreChannelsThanCentrifugeAllowsByDefault(t *testing.T) {
 // Unbind and dispatch edges
 // ---------------------------------------------------------------------------
 
-// TestUnbindReportsAForeignTenantOrHost pins two checks whose value is
-// DIAGNOSIS rather than protection, which is worth saying plainly.
+// TestUnbindReportsAForeignTenantOrHost pins two checks that are NOT the same
+// kind of thing, and an earlier version of this comment got that wrong by
+// offering one justification for both.
 //
-// Neither check is what stops a foreign unbind removing somebody's route:
-// ChannelFor is injective, so a request naming another tenant computes a
-// channel this link cannot be holding, and the removal would be a no-op with
-// the checks deleted. What the checks buy is that a Factory pointed at the
-// wrong tenant or the wrong Host is TOLD so, instead of watching its unbinds
-// silently succeed forever.
+// The TENANT check is equivalent for EFFECT. ChannelFor is injective over
+// (TenantID, SessionID), so a request naming another tenant computes a channel
+// this link cannot be holding, and with that check alone deleted the removal is
+// a measured no-op. What it buys is that a Factory pointed at the wrong tenant
+// is TOLD so, instead of watching its unbinds silently succeed forever.
+//
+// The HOST check is LOAD-BEARING for the removal, and injectivity says nothing
+// about it: the addressed Host is not a component of registry.Key and so not a
+// component of the channel. With that check alone deleted, an unbind addressed
+// to another Host REMOVES this Host's route — measured, the held route falls
+// from 1 to 0 — and the reader of the difference is the removal itself. That
+// property is asserted below AHEAD of the refusal, because inspecting the
+// refusal first stops the test at the missing error and never reaches the
+// routing table, which is how the false claim above survived.
 func TestUnbindReportsAForeignTenantOrHost(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -1600,7 +1609,13 @@ func TestUnbindReportsAForeignTenantOrHost(t *testing.T) {
 	}
 	foreignHost := unbindRequest(testSession)
 	foreignHost.HostID = "host-beta"
-	if refusal := refusalOf(t, f.mux.Unbind(linkA, foreignHost)); refusal.Refusal != hostlink.RefusalForeignHost {
+	foreignHostErr := f.mux.Unbind(linkA, foreignHost)
+	// Ahead of the refusal, deliberately: this is the load-bearing half, and a
+	// refusal assertion first would stop here and never reach the table.
+	if got := f.mux.Len(); got != 1 {
+		t.Fatalf("Len = %d after an unbind addressed to another Host, want the route still held", got)
+	}
+	if refusal := refusalOf(t, foreignHostErr); refusal.Refusal != hostlink.RefusalForeignHost {
 		t.Fatalf("refusal = %q, want %q", refusal.Refusal, hostlink.RefusalForeignHost)
 	}
 	malformed := unbindRequest(testSession)
