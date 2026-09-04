@@ -49,6 +49,7 @@ var publishedLooprigVersions = map[string]string{
 	"sessionstore": "v0.1.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
+	"harness":      "v0.31.0",
 }
 
 // ---------------------------------------------------------------------------
