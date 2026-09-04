@@ -205,14 +205,32 @@ func (a *Adapter) bind(
 	// released harness code, and rig.newSession is the canonical typed-nil
 	// producer — it assigns a concrete *sessionruntime.Session and widens it to
 	// the interface on return, so a lifecycle that reported success with no
-	// session hands back a non-nil interface holding a nil pointer.
+	// session hands back a non-nil interface holding a nil pointer. A bare
+	// `== nil` walks straight past that.
 	//
-	// A bare `== nil` walks straight past that, and everything downstream then
-	// SUCCEEDS: all four capability assertions hold on a typed nil, bind returns
-	// a boundSession, Host publishes the residency route, and the panic arrives
-	// at the first ID() call with a resident session already advertised. That is
-	// the failure ErrNoSession exists to prevent, arriving by the path a real
-	// implementation takes rather than the one a test double does.
+	// WHAT HAPPENS NEXT DEPENDS ON THE CONTROLLER, and the two cases are worth
+	// separating because an earlier version of this comment described only the
+	// second and attributed it to the first.
+	//
+	//   - A *sessionruntime.Session typed nil PANICS INSIDE bind, at the fourth
+	//     gate below. The first three gates are type assertions, which a typed
+	//     nil passes without running anything; the fourth CALLS
+	//     CommittedPublicEvents, and that method reads s.hub — a struct field —
+	//     so the nil receiver is dereferenced there. Nothing is published: the
+	//     crash is inside Host's launch path, before any route exists.
+	//   - A controller whose capability ANSWERS WITHOUT DEREFERENCING passes all
+	//     four gates, and that is not a hypothetical shape — it is any forwarding
+	//     wrapper, which harness's own capability docs warn callers to expect
+	//     around a live session. bind then returns a usable-looking boundSession,
+	//     Host publishes the residency route, and the panic arrives at the first
+	//     ID() call with a resident session already advertised.
+	//
+	// So the guard is load-bearing in both cases and for different reasons: it
+	// turns a nil dereference inside the launch path into a typed refusal, and it
+	// is the only thing standing between a wrapped typed nil and a published
+	// route. TestBindRefusesEveryWayALaunchHandsBackNoSession exercises the
+	// second case, because it is the one a test can construct and the one whose
+	// consequence outlives the call.
 	if isNil(controller) {
 		return nil, ErrNoSession
 	}

@@ -345,12 +345,27 @@ func (*nilSessionController) RestoreWorkspace(context.Context, workspacestore.Re
 }
 func (*nilSessionController) Shutdown(context.Context) error { return errNotImplemented }
 
-// The four capabilities, so a typed nil reaches bind looking fully capable.
+// The four capabilities, so a typed nil passes every gate in bind.
+//
+// THE FOURTH ONE ANSWERS, and that is the difference between demonstrating the
+// mechanism and tripping an earlier check. bind's first three gates are type
+// assertions, which a typed nil satisfies without any method running; the fourth
+// one CALLS the provider and reads both of its results. A fixture answering
+// (nil, false) there is refused as INCAPABLE, so a bind missing its typed-nil
+// guard would still fail — but naming a missing capability rather than an absent
+// session, and the row would pass while proving nothing about the guard it
+// exists for.
+//
+// It answers because that is the REACHABLE half of the real hazard. A
+// *sessionruntime.Session typed nil panics at this gate, because the released
+// method reads the hub struct field; a controller whose
+// capability answers without dereferencing — which is any forwarding wrapper —
+// passes all four gates and is bound. See the comment on bind.
 func (*nilSessionController) WaitIdle(context.Context) error         { return errNotImplemented }
 func (*nilSessionController) Done() <-chan struct{}                  { return nil }
 func (*nilSessionController) ReleaseResidency(context.Context) error { return errNotImplemented }
 func (*nilSessionController) CommittedPublicEvents() (session.CommittedPublicEventSource, bool) {
-	return nil, false
+	return committedPart{}, true
 }
 
 var (

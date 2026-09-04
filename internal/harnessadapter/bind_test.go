@@ -290,11 +290,22 @@ func TestBindRefusesEveryWayALaunchHandsBackNoSession(t *testing.T) {
 	}
 }
 
-// THE PREMISE OF THE TYPED-NIL ROW, asserted rather than assumed. If the fixture
-// did not satisfy all four capabilities the row would pass for the wrong reason
-// — bind would refuse it as incapable rather than as absent — and the guard it
-// exists to hold could be deleted without the row noticing.
-func TestATypedNilControllerSatisfiesEveryCapabilityAssertion(t *testing.T) {
+// TestATypedNilControllerPassesEveryGateInBind is the premise of the typed-nil
+// row, asserted rather than assumed.
+//
+// IT CHECKS THE FOURTH GATE BY CALLING IT, and an earlier version did not — it
+// checked four type ASSERTIONS, and bind's fourth gate is not one. That gap was
+// not theoretical: the fixture answered (nil, false), so under the mutation the
+// row was meant to kill, bind refused the typed nil as INCAPABLE and the failure
+// message named a missing capability rather than an absent session. The mutant
+// died for the wrong reason and the one test written to exclude that could not
+// see it, because it never ran the call bind runs.
+//
+// So the assertions and the capability are checked separately below. If either
+// stops holding, the typed-nil row stops proving anything about isNil and this
+// says so directly instead of leaving it to be inferred from a message nobody
+// reads.
+func TestATypedNilControllerPassesEveryGateInBind(t *testing.T) {
 	// THE VALUE ARRIVES THROUGH A SLICE so its concrete type is not statically
 	// known at the comparison. Written as a direct assignment the compiler folds
 	// `controller == nil` to false and staticcheck reports the comparison as
@@ -317,6 +328,22 @@ func TestATypedNilControllerSatisfiesEveryCapabilityAssertion(t *testing.T) {
 		if !satisfied {
 			t.Fatalf("a typed nil does not satisfy %s, so bind would refuse it as incapable rather than as absent", name)
 		}
+	}
+
+	// THE FOURTH GATE, RUN THE WAY bind RUNS IT. Satisfying
+	// CommittedPublicEventProvider is not enough: bind calls the method and
+	// refuses on either result, so a fixture that asserts but answers
+	// (nil, false) fails at this gate and never reaches the guard under test.
+	provider, ok := controller.(session.CommittedPublicEventProvider)
+	if !ok {
+		t.Fatal("the fixture does not provide committed public events")
+	}
+	source, available := provider.CommittedPublicEvents()
+	if !available {
+		t.Fatal("the fixture reports committed public events unavailable, so bind refuses it as incapable and the typed-nil row proves nothing about isNil")
+	}
+	if source == nil {
+		t.Fatal("the fixture reports the capability available with a nil source, which bind refuses for the same reason")
 	}
 }
 
