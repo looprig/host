@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -2013,5 +2014,284 @@ func writeFixture(t *testing.T, root, relative, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write fixture %q: %v", relative, err)
+	}
+}
+
+// citedTestDirectories are the module directories whose comments must cite only
+// tests that exist.
+//
+// IT IS A SCOPE AND NOT A PREFERENCE, and the reason is measured rather than
+// chosen. Run module-wide, this check reports three violations that predate it,
+// and two of them sit in directories O3.3 must leave byte-for-byte:
+// internal/registry/registry_test.go:104 opens a doc comment
+// "TestTwoTenantsMaySharaASessionID" against the real
+// TestTwoTenantsMayShareASessionID, and internal/commands/consumer_test.go:1099
+// cites TestEveryDurableCursorWriteGoesThroughTheFence for the real
+// TestEveryDurableWriteGoesThroughTheFence. The third is this file's own
+// deliberate example of a misspelling, quoted as prose a few hundred lines
+// above. WIDENING IS THEREFORE A TWO-LINE EDIT PLUS TWO SPELLING FIXES, not a
+// redesign, and it should happen the moment those directories are writable —
+// the registry one is the very failure the note above
+// TestDocCommentsNameTheirOwnDeclaration records as invisible to that check.
+var citedTestDirectories = []string{
+	"internal/harnessadapter",
+	"internal/sessionstoreadapter",
+}
+
+// TestCommentsCiteTestsThatExist holds the F and H finding inventories to the
+// suite.
+//
+// THE INVENTORY IS THE ARTIFACT O3.3 IS SCORED ON, and it cites tests by name as
+// the evidence for each row. A citation naming a test that does not exist is a
+// row with no evidence that reads exactly like a row with evidence; two rounds
+// of this task shipped one. Nothing else in the module notices —
+// TestDocCommentsNameTheirOwnDeclaration checks whether a comment names the
+// declaration it is ATTACHED to, which is a different question and stays silent
+// here.
+//
+// A WRAPPED NAME IS NOT A VIOLATION, and handling it is what makes this usable
+// on prose. gofmt reflows doc comments, so a long test name is routinely split
+// across two comment lines and the natural reading of the group yields a
+// truncated candidate that resolves to nothing. THE RULE IS EXACT: a candidate
+// is accepted when the candidate CONCATENATED WITH THE WORD IMMEDIATELY
+// FOLLOWING IT is a declared test. That is the wrap and nothing else.
+//
+// TWO WEAKER RULES WERE WRITTEN AND BOTH WERE MEASURED WRONG BEFORE THIS ONE.
+// "Accept any proper prefix of a declared name" accepts a citation of TestFoo
+// when only TestFooBar exists, which is the misdirection this check is for.
+// "Accept a prefix whose full name appears anywhere in the group" fails the same
+// way whenever the group cites the full name on another line — probed with
+// "Proved by TestApplierRuns and nothing else." beside a row that already cited
+// TestApplierRunsTheWholeProtocolAgainstTheReleasedStore, and it passed.
+func TestCommentsCiteTestsThatExist(t *testing.T) {
+	t.Parallel()
+
+	files, err := modfiles.Files(".")
+	if err != nil {
+		t.Fatalf("enumerate module files: %v", err)
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve the module root: %v", err)
+	}
+
+	// THE DECLARED SET IS MODULE-WIDE even though the cited set is not. A
+	// finding in one package legitimately cites a test in another — the H9 rows
+	// point across the two adapters in both directions — and a per-package
+	// declared set would report those as missing.
+	declared := map[string]bool{}
+	type citation struct {
+		name      string
+		file      string
+		line      int
+		following string
+	}
+	var citations []citation
+
+	fset := token.NewFileSet()
+	inScope := 0
+	for _, file := range files {
+		parsed, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if ok && function.Recv == nil && strings.HasPrefix(function.Name.Name, "Test") {
+				declared[function.Name.Name] = true
+			}
+		}
+
+		relative, err := filepath.Rel(root, file)
+		if err != nil {
+			t.Fatalf("relativize %s: %v", file, err)
+		}
+		relative = filepath.ToSlash(relative)
+		if !slices.ContainsFunc(citedTestDirectories, func(dir string) bool {
+			return strings.HasPrefix(relative, dir+"/")
+		}) {
+			continue
+		}
+		inScope++
+
+		for _, group := range parsed.Comments {
+			text := joinComment(group)
+			for _, span := range testCitationPattern.FindAllStringIndex(text, -1) {
+				citations = append(citations, citation{
+					name:      text[span[0]:span[1]],
+					file:      relative,
+					line:      fset.Position(group.Pos()).Line,
+					following: firstWord(text[span[1]:]),
+				})
+			}
+		}
+	}
+
+	// NON-VACUITY IN BOTH DIMENSIONS. Zero files in scope means the directory
+	// list has drifted; zero citations means the inventory stopped citing
+	// anything, which is the state this check exists to make impossible.
+	if inScope == 0 {
+		t.Fatalf("no files matched %v, so this check inspected nothing", citedTestDirectories)
+	}
+	if len(citations) == 0 {
+		t.Fatal("no comment in the adapter packages cites a test, so this check is vacuous")
+	}
+	if len(declared) == 0 {
+		t.Fatal("no test functions were found at all")
+	}
+
+	for _, cited := range citations {
+		if citationResolves(cited.name, cited.following, declared) {
+			continue
+		}
+		t.Errorf("%s:%d cites %q, which is not a test in this module; a finding that names its evidence must name evidence that exists",
+			cited.file, cited.line, cited.name)
+	}
+}
+
+// citationResolves reports whether one cited name names a real test, allowing
+// for gofmt having wrapped that name across two comment lines.
+//
+// following is the word immediately after the candidate in the comment's natural
+// reading, or "" when the candidate ends the comment. It is the ONLY repair
+// applied: nothing else about the surrounding prose can make an unresolved name
+// resolve. Both arms are exercised by TestCitationResolutionAcceptsAWrapAndNothingWider,
+// which is where they are killable — whether a real comment in the guarded
+// packages happens to wrap today is a property of gofmt's line breaking, not of
+// this rule, and a branch held only by that would stop being tested the next
+// time a sentence was reworded.
+func citationResolves(candidate, following string, declared map[string]bool) bool {
+	if declared[candidate] {
+		return true
+	}
+	return following != "" && declared[candidate+following]
+}
+
+// testCitationPattern matches a Go test function name as written in prose.
+var testCitationPattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*`)
+
+// joinComment renders a comment group the way it reads: its lines stripped of
+// their markers and separated by a single space.
+func joinComment(group *ast.CommentGroup) string {
+	lines := make([]string, 0, len(group.List))
+	for _, line := range group.List {
+		text := strings.TrimPrefix(line.Text, "//")
+		text = strings.TrimPrefix(text, "/*")
+		text = strings.TrimSuffix(text, "*/")
+		lines = append(lines, strings.TrimSpace(text))
+	}
+	return strings.Join(lines, " ")
+}
+
+// firstWord returns the leading run of identifier characters in rest, which is
+// the word a wrapped name's tail would be.
+func firstWord(rest string) string {
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if c == '_' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
+			end++
+			continue
+		}
+		break
+	}
+	return rest[:end]
+}
+
+// TestCitationResolutionAcceptsAWrapAndNothingWider holds the one repair
+// TestCommentsCiteTestsThatExist applies to a cited name.
+//
+// IT IS TESTED HERE RATHER THAN THROUGH A REAL COMMENT, and that is the whole
+// reason it exists as its own function. Whether some doc comment in the guarded
+// packages happens to wrap a test name today is a property of gofmt's line
+// breaking; removing the repair while none does changes no result, so the branch
+// would be unkillable and would silently stop being covered the next time a
+// sentence was reworded. Driving the rule directly makes both arms killable and
+// keeps them killable.
+func TestCitationResolutionAcceptsAWrapAndNothingWider(t *testing.T) {
+	t.Parallel()
+
+	declared := map[string]bool{
+		"TestAvailableCapacityTracksAdmissionAtThreeScales":      true,
+		"TestApplierRunsTheWholeProtocolAgainstTheReleasedStore": true,
+	}
+
+	for _, tt := range []struct {
+		name      string
+		candidate string
+		following string
+		want      bool
+		why       string
+	}{
+		{
+			name:      "a whole name resolves",
+			candidate: "TestAvailableCapacityTracksAdmissionAtThreeScales",
+			following: "holds",
+			want:      true,
+		},
+		{
+			name:      "a name gofmt wrapped resolves",
+			candidate: "TestAvailableCapacityTracks",
+			following: "AdmissionAtThreeScales",
+			want:      true,
+			why:       "gofmt splits a long name across two comment lines and the natural reading truncates it",
+		},
+		{
+			// THE MEASURED FAILURE OF THE PREVIOUS RULE. A citation naming a
+			// proper prefix of a real test, with the real test's own name
+			// elsewhere in the same comment, passed. It must not.
+			name:      "a bare prefix does not resolve",
+			candidate: "TestApplierRuns",
+			following: "and",
+			want:      false,
+			why:       "TestApplierRuns names no test; citing it is the misdirection this guard exists for",
+		},
+		{
+			name:      "a prefix at the end of a comment does not resolve",
+			candidate: "TestApplierRuns",
+			following: "",
+			want:      false,
+		},
+		{
+			name:      "an invented name does not resolve",
+			candidate: "TestThisTestDoesNotExistAnywhere",
+			following: "in",
+			want:      false,
+		},
+		{
+			// THE OTHER DIRECTION ON THE WRAP ARM: concatenation is not a
+			// licence to glue any two words together into a pass.
+			name:      "a wrong tail does not resolve",
+			candidate: "TestAvailableCapacityTracks",
+			following: "AdmissionAtFourScales",
+			want:      false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := citationResolves(tt.candidate, tt.following, declared); got != tt.want {
+				t.Fatalf("citationResolves(%q, %q) = %t, want %t; %s", tt.candidate, tt.following, got, tt.want, tt.why)
+			}
+		})
+	}
+}
+
+// firstWord's contract is the tail of a wrapped identifier and nothing else, so
+// it stops at the first character an identifier cannot contain.
+func TestFirstWordStopsAtTheEndOfAnIdentifier(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct{ rest, want string }{
+		{rest: " holds the admission", want: ""},
+		{rest: "AdmissionAtThreeScales holds", want: "AdmissionAtThreeScales"},
+		{rest: ", which is not a test", want: ""},
+		{rest: "", want: ""},
+		{rest: "Tail_2 rest", want: "Tail_2"},
+		{rest: ".Method", want: ""},
+	} {
+		t.Run(strconv.Quote(tt.rest), func(t *testing.T) {
+			if got := firstWord(tt.rest); got != tt.want {
+				t.Fatalf("firstWord(%q) = %q, want %q", tt.rest, got, tt.want)
+			}
+		})
 	}
 }

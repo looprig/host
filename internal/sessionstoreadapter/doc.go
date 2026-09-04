@@ -203,4 +203,20 @@
 //     rather than reported it, so this package does not have one.
 //   - hostlink's seams stand in for nothing durable, so there is nothing to
 //     rebind: see the paragraph on composition seams above.
+//
+// # Two properties of this package's own tests, stated rather than assumed
+//
+// THE FINDING ROWS CITE TESTS BY NAME AND THE CITATIONS ARE GUARDED.
+// TestCommentsCiteTestsThatExist in the root package resolves every Test…
+// identifier appearing in a comment in this package and in harnessadapter
+// against the module's real test functions. It exists because two rounds of this
+// task shipped a row whose evidence did not exist, and because nothing else
+// notices: TestDocCommentsNameTheirOwnDeclaration asks whether a comment names
+// the declaration it is ATTACHED to, which is a different question.
+//
+// PublishResidency IS THE ONE PLACE THIS PACKAGE IS NOT PURELY MECHANICAL.
+// Every other method here delegates; that one adds a refusal of its own for
+// F14's member, because delegating it would be strictly looser than the seam.
+// It is called out here so "the adapters are mechanical" is not read as covering
+// this file without qualification.
 package sessionstoreadapter

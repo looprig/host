@@ -223,7 +223,17 @@ type fakeLauncher struct {
 	restored *[]uuid.UUID
 }
 
+// BOTH METHODS ARE NIL-RECEIVER-SAFE, and that is a property of the FIXTURE
+// rather than of the subject. The typed-nil row hands a (*fakeLauncher)(nil)
+// to the adapter; if isNil ever stopped catching it the call would land here,
+// and a receiver that dereferenced a field would die by SIGSEGV — a kill by
+// panic, which is not an assertion kill, and which aborts the binary so every
+// remaining test in the package goes unrun. Returning an error instead lets the
+// same mutation fail on `errors.Is(err, ErrNoRig)` and leaves the suite intact.
 func (l *fakeLauncher) NewSession(context.Context, ...rig.SessionOption) (session.SessionController, error) {
+	if l == nil {
+		return nil, errNilLauncher
+	}
 	if l.created != nil {
 		*l.created++
 	}
@@ -234,6 +244,9 @@ func (l *fakeLauncher) NewSession(context.Context, ...rig.SessionOption) (sessio
 }
 
 func (l *fakeLauncher) RestoreSession(_ context.Context, id uuid.UUID) (session.SessionController, error) {
+	if l == nil {
+		return nil, errNilLauncher
+	}
 	if l.restored != nil {
 		*l.restored = append(*l.restored, id)
 	}
@@ -242,6 +255,12 @@ func (l *fakeLauncher) RestoreSession(_ context.Context, id uuid.UUID) (session.
 	}
 	return l.controller, nil
 }
+
+// errNilLauncher is what a typed-nil launcher answers instead of panicking. It
+// is deliberately NOT ErrNoRig: the test asserts the adapter's own refusal, so a
+// fixture answering with the same sentinel would make the assertion pass for the
+// wrong reason.
+var errNilLauncher = errors.New("harnessadapter_test: this launcher is a typed nil and should never have been called")
 
 // The fake is the same seam the released rig satisfies.
 var _ Launcher = (*fakeLauncher)(nil)
@@ -277,3 +296,67 @@ type nilSourceProvider struct{}
 func (nilSourceProvider) CommittedPublicEvents() (session.CommittedPublicEventSource, bool) {
 	return nil, true
 }
+
+// nilSessionController is a controller whose only instance is a typed nil.
+//
+// Every method has a POINTER receiver and none of them dereferences it, so a
+// (*nilSessionController)(nil) satisfies session.SessionController and all four
+// capability interfaces while being nothing at all. That is exactly the value
+// rig.newSession produces if its lifecycle ever reports success with no session,
+// and it is the only construction that can tell a nil-interface check apart from
+// a real one.
+type nilSessionController struct{}
+
+func (*nilSessionController) SessionID() uuid.UUID    { return uuid.UUID{} }
+func (*nilSessionController) ActiveLoop() loop.Handle { return nil }
+func (*nilSessionController) Loop(uuid.UUID) (loop.Handle, bool) {
+	return nil, false
+}
+func (*nilSessionController) Submit(context.Context, []content.Block) (uuid.UUID, error) {
+	return uuid.UUID{}, errNotImplemented
+}
+func (*nilSessionController) SubmitToLoop(context.Context, uuid.UUID, []content.Block) (uuid.UUID, error) {
+	return uuid.UUID{}, errNotImplemented
+}
+func (*nilSessionController) Compact(context.Context) (uuid.UUID, error) {
+	return uuid.UUID{}, errNotImplemented
+}
+func (*nilSessionController) CompactToLoop(context.Context, uuid.UUID) (uuid.UUID, error) {
+	return uuid.UUID{}, errNotImplemented
+}
+func (*nilSessionController) SubscribeEvents(event.EventFilter) (event.Subscription, error) {
+	return nil, errNotImplemented
+}
+func (*nilSessionController) RespondGate(context.Context, gate.GateResponse) error {
+	return errNotImplemented
+}
+func (*nilSessionController) Interrupt(context.Context) (bool, error) {
+	return false, errNotImplemented
+}
+func (*nilSessionController) SetActiveLoop(context.Context, uuid.UUID) error {
+	return errNotImplemented
+}
+func (*nilSessionController) LoopController(uuid.UUID) (loop.Controller, bool) { return nil, false }
+func (*nilSessionController) CheckpointWorkspace(context.Context) (workspacestore.Ref, error) {
+	return "", errNotImplemented
+}
+func (*nilSessionController) RestoreWorkspace(context.Context, workspacestore.Ref) error {
+	return errNotImplemented
+}
+func (*nilSessionController) Shutdown(context.Context) error { return errNotImplemented }
+
+// The four capabilities, so a typed nil reaches bind looking fully capable.
+func (*nilSessionController) WaitIdle(context.Context) error         { return errNotImplemented }
+func (*nilSessionController) Done() <-chan struct{}                  { return nil }
+func (*nilSessionController) ReleaseResidency(context.Context) error { return errNotImplemented }
+func (*nilSessionController) CommittedPublicEvents() (session.CommittedPublicEventSource, bool) {
+	return nil, false
+}
+
+var (
+	_ session.SessionController            = (*nilSessionController)(nil)
+	_ session.IdleWaiter                   = (*nilSessionController)(nil)
+	_ session.Liveness                     = (*nilSessionController)(nil)
+	_ session.Releaser                     = (*nilSessionController)(nil)
+	_ session.CommittedPublicEventProvider = (*nilSessionController)(nil)
+)

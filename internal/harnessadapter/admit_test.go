@@ -46,10 +46,15 @@ func TestAdmitRefusesWithoutABoundLeaseEpoch(t *testing.T) {
 // with no counterpart are refused HERE, before the durable prefix is written,
 // rather than by Admitted.Validate after it.
 func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
-	// THE SPACE IS DERIVED FROM HOST'S OWN VOCABULARY, not picked: every kind
-	// commands declares is admitted here and classified by whether
-	// runtimecommand.Kind names it. A kind added to either side lands in the
-	// right arm without an edit.
+	// THE LIST IS A COPY OF commands.Kind's five constants AND THE DUPLICATION IS
+	// FORCED, which is worth saying rather than dressing up as derivation. This
+	// package cannot import internal/commands — that is Host's inbox vocabulary
+	// and this is the harness edge — so there is nothing to enumerate from, and
+	// these are string literals that must be re-checked by hand when either
+	// vocabulary moves. What IS derived is the classification: each kind is sent
+	// down the accept or refuse arm by runtimecommand.Kind.Valid rather than by a
+	// second list here, so a kind harness starts applying changes arm without an
+	// edit. Only the SPACE is hand-written; the expectation is not.
 	for _, kind := range []string{"create", "restore", "input", "interrupt", "gate_response"} {
 		t.Run(kind, func(t *testing.T) {
 			bound := &boundSession{

@@ -259,10 +259,79 @@ func TestBindNamesEveryMissingCapabilityAtOnce(t *testing.T) {
 	}
 }
 
-func TestBindRefusesANilController(t *testing.T) {
-	adapter := newAdapter(t, stubRigs{})
-	if _, err := adapter.bind(nil, testTenant, testSession); !errors.Is(err, ErrNoSession) {
-		t.Fatalf("bind(nil) = %v, want ErrNoSession", err)
+// BOTH WAYS A LAUNCH CAN HAND BACK NO SESSION, and the typed nil is the one the
+// released rig actually produces: rig.newSession assigns a concrete
+// *sessionruntime.Session and widens it on return, so a lifecycle reporting
+// success with no session yields a non-nil interface holding a nil pointer.
+//
+// THE TYPED-NIL ROW IS NOT ABOUT A NICER ERROR. Every capability assertion below
+// SUCCEEDS on a typed nil — a nil *nilSessionController satisfies each interface
+// — so a bind that only compared against nil would return a usable-looking
+// boundSession, Host would publish the residency route, and the panic would
+// arrive at the first ID() call against a session it had already advertised.
+func TestBindRefusesEveryWayALaunchHandsBackNoSession(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		controller session.SessionController
+	}{
+		{name: "nil interface", controller: nil},
+		{name: "typed nil", controller: (*nilSessionController)(nil)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := newAdapter(t, stubRigs{})
+			bound, err := adapter.bind(tt.controller, testTenant, testSession)
+			if !errors.Is(err, ErrNoSession) {
+				t.Fatalf("bind(%s) = (%v, %v), want ErrNoSession", tt.name, bound, err)
+			}
+			if bound != nil {
+				t.Fatalf("bind(%s) returned a session alongside its refusal", tt.name)
+			}
+		})
+	}
+}
+
+// THE PREMISE OF THE TYPED-NIL ROW, asserted rather than assumed. If the fixture
+// did not satisfy all four capabilities the row would pass for the wrong reason
+// — bind would refuse it as incapable rather than as absent — and the guard it
+// exists to hold could be deleted without the row noticing.
+func TestATypedNilControllerSatisfiesEveryCapabilityAssertion(t *testing.T) {
+	// THE VALUE ARRIVES THROUGH A SLICE so its concrete type is not statically
+	// known at the comparison. Written as a direct assignment the compiler folds
+	// `controller == nil` to false and staticcheck reports the comparison as
+	// never true (SA4023) — which is correct about the code and wrong about the
+	// point: the property under test is precisely that a non-nil INTERFACE can
+	// hold a nil pointer, and it has to be evaluated rather than constant-folded.
+	controller := []session.SessionController{(*nilSessionController)(nil)}[0]
+	if controller == nil {
+		t.Fatal("the fixture is a nil interface, so it cannot show what a bare comparison misses")
+	}
+	for name, satisfied := range map[string]bool{
+		"session.IdleWaiter": func() bool { _, ok := controller.(session.IdleWaiter); return ok }(),
+		"session.Liveness":   func() bool { _, ok := controller.(session.Liveness); return ok }(),
+		"session.Releaser":   func() bool { _, ok := controller.(session.Releaser); return ok }(),
+		"session.CommittedPublicEventProvider": func() bool {
+			_, ok := controller.(session.CommittedPublicEventProvider)
+			return ok
+		}(),
+	} {
+		if !satisfied {
+			t.Fatalf("a typed nil does not satisfy %s, so bind would refuse it as incapable rather than as absent", name)
+		}
+	}
+}
+
+// A LAUNCH THAT PRODUCES A TYPED NIL IS REFUSED BEFORE ANYTHING IS PUBLISHED.
+// This is the same guard reached through the seam a real rig arrives on, rather
+// than by calling bind directly.
+func TestLaunchRefusesARigThatReturnsATypedNilSession(t *testing.T) {
+	launcher := &fakeLauncher{controller: (*nilSessionController)(nil)}
+	adapter := newAdapter(t, stubRigs{launcher: launcher})
+
+	if _, err := adapter.NewSession(t.Context(), department.RigCreateRequest{}); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("NewSession = %v, want ErrNoSession", err)
+	}
+	if _, err := adapter.RestoreSession(t.Context(), uuid.UUID{}, department.RigRestoreRequest{}); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("RestoreSession = %v, want ErrNoSession", err)
 	}
 }
 
@@ -466,12 +535,17 @@ func TestPumpDropsEveryDeliveryThatIsNotACommittedPublication(t *testing.T) {
 	// An enduring delivery from a hub whose appender cannot report the stored
 	// bytes: sequenced, but with none of the three publication members.
 	subscription.deliveries <- event.Delivery{JournalSeq: 11}
-	// A committed publication.
+	// A committed publication. THE TWO SEQUENCES DIFFER DELIBERATELY. Harness
+	// documents CoveredThrough as equal to this append's own JournalSeq, so a
+	// realistic fixture makes the two indistinguishable and either could be
+	// carried into the other's field undetected — measured: both swaps survived.
+	// A consumer joining a durable tail to this live stream branches on the pair,
+	// so they are given different values here and asserted separately.
 	subscription.deliveries <- event.Delivery{
 		JournalSeq:     12,
 		EventID:        "event-12",
 		PublicBody:     []byte(`{"type":"step_done"}`),
-		CoveredThrough: 12,
+		CoveredThrough: 11,
 	}
 
 	select {
@@ -479,8 +553,12 @@ func TestPumpDropsEveryDeliveryThatIsNotACommittedPublication(t *testing.T) {
 		if publication.EventID != sessionwire.EventID("event-12") {
 			t.Fatalf("the first publication is %q, want the committed one; an uncommitted delivery crossed", publication.EventID)
 		}
-		if publication.JournalSeq != 12 || publication.CoveredThrough != 12 {
-			t.Fatalf("publication sequences are %d/%d, want 12/12", publication.JournalSeq, publication.CoveredThrough)
+		if publication.JournalSeq != 12 {
+			t.Fatalf("publication JournalSeq = %d, want 12", publication.JournalSeq)
+		}
+		if publication.CoveredThrough != 11 {
+			t.Fatalf("publication CoveredThrough = %d, want 11; it is a separate member and must not be taken from JournalSeq",
+				publication.CoveredThrough)
 		}
 		if publication.TenantID != testTenant || publication.SessionID != testSession {
 			t.Fatalf("publication identities are %q/%q, want the bound pair", publication.TenantID, publication.SessionID)

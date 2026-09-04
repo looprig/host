@@ -26,9 +26,17 @@ import (
 // held by prose alone. The mapping is a pure function of an exported error
 // type, so it is tested as one.
 //
-// EVERY ARM IS ENUMERATED FROM THE RELEASED VOCABULARY, not sampled: the tables
-// below walk the store's own code constants, so a code added upstream lands in
-// the default row and is reported as unmapped rather than silently classified.
+// EVERY ARM IS ENUMERATED BY HAND, AND THE TABLES ARE COMPLETE AS OF
+// sessionstore v0.1.0 — 10 JournalErrorCode, 19 InboxErrorCode and 13
+// RegistryErrorCode constants, of which 12 are passthrough and one, epoch, is
+// mapped; plus 5 InboxState and 5 CommandApplicationOutcome.
+//
+// THEY DO NOT WALK ANYTHING, and saying they did would be worse than saying
+// nothing. Go cannot enumerate a package's constants at run time, so these are
+// literal slices: a code added upstream is not defaulted, not reported and not
+// classified — it is simply ABSENT AND UNTESTED until somebody extends the
+// table. The completeness above is a measurement against one pinned version and
+// it goes stale the moment that pin moves; re-count on every sessionstore bump.
 
 func TestClassifyJournalMapsEveryOwnershipCode(t *testing.T) {
 	for _, tt := range []struct {

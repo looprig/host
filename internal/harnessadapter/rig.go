@@ -200,7 +200,20 @@ func (a *Adapter) bind(
 	tenant sessionwire.TenantID,
 	sessionID sessionwire.SessionID,
 ) (department.RigSession, error) {
-	if controller == nil {
+	// BOTH WAYS, AND THIS IS THE MORE REACHABLE OF THE TWO SITES. A Launcher is
+	// something the composition root constructs; a CONTROLLER arrives through
+	// released harness code, and rig.newSession is the canonical typed-nil
+	// producer — it assigns a concrete *sessionruntime.Session and widens it to
+	// the interface on return, so a lifecycle that reported success with no
+	// session hands back a non-nil interface holding a nil pointer.
+	//
+	// A bare `== nil` walks straight past that, and everything downstream then
+	// SUCCEEDS: all four capability assertions hold on a typed nil, bind returns
+	// a boundSession, Host publishes the residency route, and the panic arrives
+	// at the first ID() call with a resident session already advertised. That is
+	// the failure ErrNoSession exists to prevent, arriving by the path a real
+	// implementation takes rather than the one a test double does.
+	if isNil(controller) {
 		return nil, ErrNoSession
 	}
 	bound := &boundSession{
