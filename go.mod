@@ -6,6 +6,9 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/looprig/core v0.7.0
+	github.com/looprig/harness v0.31.0
+	github.com/looprig/sessionstore v0.1.0
+	github.com/looprig/storage v0.6.0
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/mod v0.40.0
 )
@@ -19,6 +22,7 @@ require (
 	github.com/gammazero/deque v0.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
+	github.com/looprig/inference v0.12.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/maypok86/otter v1.2.4 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

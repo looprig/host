@@ -50,6 +50,16 @@ var publishedLooprigVersions = map[string]string{
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
 	"harness":      "v0.31.0",
+
+	// inference is here because HARNESS PULLS IT IN, not because Host imports
+	// it: no file in this repository names github.com/looprig/inference, and
+	// the import guard is therefore silent about it by construction. harness
+	// v0.31.0 requires inference v0.12.0, so binding to harness names it in
+	// go.mod whether or not Host wanted a decision about it — which is exactly
+	// the indirect arrival the comment on requireViolations describes, and the
+	// reason that check consults this map rather than the import set. The
+	// version is the one harness v0.31.0 pins and is published.
+	"inference": "v0.12.0",
 }
 
 // ---------------------------------------------------------------------------
@@ -589,8 +599,8 @@ func TestReplaceViolations(t *testing.T) {
 		},
 		{
 			name:   "versioned replacement onto an unreleased module",
-			source: "module m\n\ngo 1.26.6\n\nreplace github.com/looprig/core => github.com/looprig/harness v0.30.2\n",
-			want:   []string{`with github.com/looprig/harness at v0.30.2; Host has no released version of that module to name`},
+			source: "module m\n\ngo 1.26.6\n\nreplace github.com/looprig/core => github.com/looprig/drain v0.1.0\n",
+			want:   []string{`with github.com/looprig/drain at v0.1.0; Host has no released version of that module to name`},
 		},
 		{
 			name:   "versioned replacement onto a non-looprig fork is unconstrained",
@@ -646,8 +656,8 @@ func TestRequireViolations(t *testing.T) {
 		},
 		{
 			name:   "unreleased module",
-			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/harness v0.30.2\n",
-			want:   []string{`requires github.com/looprig/harness at v0.30.2; Host has no released version of that module to name`},
+			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/drain v0.1.0\n",
+			want:   []string{`requires github.com/looprig/drain at v0.1.0; Host has no released version of that module to name`},
 		},
 		{
 			name:   "pseudo-version",
@@ -676,10 +686,10 @@ func TestRequireViolations(t *testing.T) {
 		},
 		{
 			name:   "several at once, in file order",
-			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/factory v0.1.0\n\tgithub.com/looprig/harness v0.30.2\n)\n",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/factory v0.1.0\n\tgithub.com/looprig/drain v0.1.0\n)\n",
 			want: []string{
 				`github.com/looprig/factory at v0.1.0; Host is consumed by Factory`,
-				`github.com/looprig/harness at v0.30.2; Host has no released version`,
+				`github.com/looprig/drain at v0.1.0; Host has no released version`,
 			},
 		},
 	}
