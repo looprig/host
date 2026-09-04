@@ -594,11 +594,18 @@ func writeConnect(t *testing.T, connection *websocket.Conn, token string, reques
 	}
 }
 
-// assertTerminalDisconnect pins both halves of a HostLink rejection: the exact
-// disconnect code, which is what tells the two failures apart, and separately
-// its membership of Centrifuge's 4500-4999 application terminal range, which is
-// the dependency contract that makes the code terminal at all. The codes are
-// unexported and this test is external, so they are written out here.
+// assertTerminalDisconnect pins the exact disconnect code, which is what tells
+// the two HostLink rejections apart. The codes are unexported and this test is
+// external, so they are written out here.
+//
+// The 4500-4999 range check below it is DEAD AGAINST TODAY'S PRODUCTION and is
+// kept anyway, which is worth stating rather than leaving to be rediscovered.
+// Both call sites pass a literal, and the exact-code check fatals first, so
+// deleting the range assertion changes no outcome: it does not pin production's
+// membership of Centrifuge's application terminal range, and no test here does.
+// What it does stop is a coordinated future edit that moves a constant and both
+// literals together onto a reconnectable code, which is the shape a mistake
+// here would actually take.
 func assertTerminalDisconnect(t *testing.T, disconnect *websocket.CloseError, code int, reason string) {
 	t.Helper()
 	if disconnect.Code != code {

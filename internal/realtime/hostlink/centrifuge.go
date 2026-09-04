@@ -16,9 +16,11 @@ import (
 // disconnectAuthentication and disconnectUnsupportedVersion are the two
 // terminal HostLink disconnect codes. Both sit in 4500-4999, documented by
 // centrifuge@v0.38.0 disconnect.go:26 as an application terminal range in
-// which a client performs no automatic reconnect. The codes are distinct because they
-// distinguish two different failures to the Factory client, and the tests
-// assert each exact value rather than only the range.
+// which a client should perform no automatic reconnect — that line states a
+// convention for client implementations, not a behaviour this server enforces.
+// The codes are distinct because they distinguish two different failures to the
+// Factory client, and the tests assert each exact value rather than only the
+// range.
 const (
 	disconnectAuthentication     uint32 = 4500
 	disconnectUnsupportedVersion uint32 = 4501
@@ -59,12 +61,27 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		return nil, errors.New("hostlink: pong timeout must be shorter than ping interval")
 	}
 
-	registry := prometheus.NewRegistry()
-	node, err := centrifuge.New(centrifuge.Config{
+	metrics := prometheus.NewRegistry()
+	nodeConfig := centrifuge.Config{
 		Name:    "looprig-hostlink",
 		Version: "v1",
-		Metrics: centrifuge.MetricsConfig{RegistererGatherer: registry},
-	})
+		Metrics: centrifuge.MetricsConfig{RegistererGatherer: metrics},
+		// Centrifuge would otherwise default this to 255 and refuse a channel
+		// two maximum-length Core identifiers mint. MaxChannelBytes is derived
+		// from the encoding, so this ceiling moves with it rather than being a
+		// number somebody chose.
+		ChannelMaxLength: MaxChannelBytes,
+	}
+	if config.Multiplexer != nil {
+		// ONE budget, not two. Centrifuge defaults ClientChannelLimit to 128
+		// (centrifuge@v0.38.0 node.go:135-137), which would be a second and
+		// silently different answer to "how many sessions may one link hold" —
+		// and the transport's refusal would arrive at subscribe, after the
+		// Multiplexer had already accepted the bind. Taking the limit from the
+		// Multiplexer leaves no_capacity decided in exactly one place.
+		nodeConfig.ClientChannelLimit = config.Multiplexer.perLink
+	}
+	node, err := centrifuge.New(nodeConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +122,9 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		}
 		return reply, nil
 	})
+	if config.Multiplexer != nil {
+		node.OnConnect(config.Multiplexer.install)
+	}
 	if err := node.Run(); err != nil {
 		return nil, err
 	}
@@ -143,14 +163,19 @@ func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shut
 // obliges re-reading handler_websocket.go's key list.
 //
 // Policy. The result is an AND over every signal that was supplied and an OR
-// over their presence — selected does double duty as "nothing invalid seen so
-// far" and "something explicit was seen at all" — so an absent selector is a
-// rejection, not a default. Where the two differ, HostLink is deliberately
-// stricter than Centrifuge: Centrifuge reads only the first value of each key
-// via query.Get, while this rejects if any value of any supplied key is not
-// "json", and it rejects a repeated physical Sec-WebSocket-Protocol field
-// outright because gorilla's Subprotocols reads only the first such field
-// (websocket@v1.5.3 server.go:311-321) and would silently ignore the rest.
+// over their presence — every rejection leaves through an early return, and
+// selected records only that something explicit was seen at all — so an absent
+// selector is a rejection, not a default. Where the two differ, HostLink is
+// deliberately stricter than Centrifuge: Centrifuge reads only the first value
+// of each key via query.Get, while this rejects a supplied key with any value
+// other than "json", and it rejects a repeated physical
+// Sec-WebSocket-Protocol field outright because gorilla's Subprotocols reads
+// only the first such field (websocket@v1.5.3 server.go:311-321) and would
+// silently ignore the rest.
+//
+// The heartbeat mechanism is HostLink's and not the client's, which is why
+// cf_ws_frame_ping_pong is rejected on PRESENCE rather than on value. See
+// rejectedTransportQueryKeys.
 func selectsJSONProtocol(request *http.Request) bool {
 	selected := false
 	headerValues := request.Header.Values("Sec-WebSocket-Protocol")
@@ -167,6 +192,11 @@ func selectsJSONProtocol(request *http.Request) bool {
 	}
 
 	query := request.URL.Query()
+	for _, key := range rejectedTransportQueryKeys {
+		if _, supplied := query[key]; supplied {
+			return false
+		}
+	}
 	for _, key := range []string{"format", "cf_protocol"} {
 		values, supplied := query[key]
 		if !supplied {
@@ -181,3 +211,31 @@ func selectsJSONProtocol(request *http.Request) bool {
 	}
 	return selected
 }
+
+// rejectedTransportQueryKeys are query keys that reconfigure the TRANSPORT
+// rather than select a protocol, and that HostLink refuses outright.
+//
+// There is one, and O5.1 handed it over undecided. centrifuge@v0.38.0
+// handler_websocket.go:142 reads query.Get("cf_ws_frame_ping_pong") == "true"
+// and, when it is set, gives the transport a PingPongConfig of {-1,-1}. A
+// zero-configured HostLink sends no PingPongConfig of its own, so on that path
+// the transport's wins and the connect reply carries no ping or pong field at
+// all: a CLIENT would have chosen the Host's liveness mechanism. It is not a
+// liveness hole — the WebSocket frame defaults are also 25s/10s — but a
+// heartbeat an operator configured and a heartbeat a client asked for are
+// different facts, and the second must not be able to impersonate the first.
+//
+// The asymmetry is the reason this is a rejection and not a defaulting. When
+// PingInterval and PongTimeout ARE configured the reply's PingPongConfig wins
+// over the transport, so only the zero-config Host is influenceable; answering
+// it by always emitting a PingPongConfig would mean restating Centrifuge's own
+// 25s/10s defaults in Host and owning them forever. Refusing the key leaves
+// exactly one authority for the heartbeat and adds no constant to keep in
+// sync.
+//
+// The gate is on PRESENCE, not on the value "true", and that is deliberate:
+// value-sensitivity would mirror the dependency's parsing a second time, which
+// is the fragile coupling the provenance note above already warns about. A
+// Factory has no reason to send the key at either value, so a 400 for
+// cf_ws_frame_ping_pong=false costs nothing and cannot drift.
+var rejectedTransportQueryKeys = []string{"cf_ws_frame_ping_pong"}

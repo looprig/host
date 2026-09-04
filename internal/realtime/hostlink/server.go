@@ -25,13 +25,22 @@ type Config struct {
 
 	// PingInterval and PongTimeout are optional but must be supplied together:
 	// setting one without the other is rejected. When both are zero HostLink
-	// sends no PingPongConfig at all, so the transport inherits Centrifuge's
-	// own defaults of 25s ping and 10s pong (centrifuge@v0.38.0 config.go:218
-	// and config.go:224) — zero does not mean "no heartbeat". When supplied,
-	// PingInterval must be at least one second and PongTimeout must be
-	// strictly shorter than PingInterval.
+	// sends no PingPongConfig at all and the heartbeat falls to Centrifuge's
+	// own application-level defaults of 25s ping and 10s pong
+	// (centrifuge@v0.38.0 config.go:218 and config.go:224) — zero does not mean
+	// "no heartbeat". That route held one exception until O5.2 removed it:
+	// cf_ws_frame_ping_pong would have moved a zero-configured link onto
+	// WebSocket frame ping instead, and rejectedTransportQueryKeys now refuses
+	// the key before the upgrade. When supplied, PingInterval must be at least
+	// one second and PongTimeout must be strictly shorter than PingInterval.
 	PingInterval time.Duration
 	PongTimeout  time.Duration
+
+	// Multiplexer is the routing table this server's links bind through. It is
+	// optional: a server built without one still authenticates, negotiates and
+	// heartbeats, and answers every RPC and subscribe with Centrifuge's own
+	// unhandled-command refusal.
+	Multiplexer *Multiplexer
 }
 
 // Server is an embedded HostLink transport, mounted at the Host's private
