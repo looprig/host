@@ -19,25 +19,25 @@
 // any row became false.
 //
 //	LOCAL SEAM                          RELEASED COUNTERPART
-//	host.SessionStore.LoadSession       Store.GetCatalogEntry            (F1)
+//	host.SessionStore.LoadSession       Store.GetCatalogEntry            (F1, F13)
 //	residency.SessionLeases.Acquire…    Store.OpenJournal                (F2, fused)
 //	residency.Lease.Epoch               JournalWriter.Epoch
 //	residency.Lease.Lost                none                             (F3)
 //	residency.Lease.Release             JournalWriter.Close
 //	residency.JournalFencer.Commit…     Store.OpenJournal                (F2, fused)
-//	residency.DurableStore.LoadSess…    Store.GetCatalogEntry            (F4, F5)
+//	residency.DurableStore.LoadSess…    Store.GetCatalogEntry            (F4, F5, F13)
 //	residency.Workspaces.Ensure/Rel…    none                             (F6)
 //	host.WorkspaceProvider.Ensure…      none                             (F6)
-//	residency.Locations.PublishResi…    Store.PutHostRegistration
+//	residency.Locations.PublishResi…    Store.PutHostRegistration        (F14)
 //	residency.Locations.TombstoneRe…    Store.ClearHostRegistration
 //	commands.Inbox.ListOrdered          none                             (F7)
 //	commands.Cursors.LoadCursor         none                             (F8)
 //	commands.CursorWrites.SaveCursor    none                             (F8)
-//	commands.CommandRecords.LoadCom…    Store.GetCommand
+//	commands.CommandRecords.LoadCom…    Store.GetCommand                 (F11)
 //	commands.CommandRecords.LoadPay…    Store.GetCommand                 (F9)
 //	commands.Applications.FindAppli…    Store.FindCommandApplication
 //	commands.Gates.LoadGate             Store.ReadGates                  (F10)
-//	commands.InboxWrites.ClaimComma…    Store.ClaimCommand
+//	commands.InboxWrites.ClaimComma…    Store.ClaimCommand               (F12)
 //	commands.InboxWrites.BeginApply…    Store.BeginApplyingCommand
 //	commands.InboxWrites.CompleteCo…    Store.CompleteCommand
 //	commands.InboxWrites.RejectComm…    Store.RejectCommand
@@ -138,6 +138,52 @@
 // and no owning Host and no lease epoch. The adapter therefore CANNOT answer
 // LoadGate soundly and refuses rather than answering with zero owners, which
 // would read as "owned by no Host" and make every gate response resumable.
+//
+// F11. THE STORE IMPOSES NO UUID GRAMMAR ON THE RUNTIME COMMAND IDENTITY.
+// sessionstore.RuntimeCommandID is validated as bounded opaque UTF-8, and the
+// package says why: a grammar check would be a second statement of a rule it
+// does not own. commands.Record and department.RuntimeCommand both declare
+// uuid.UUID, so a durable record written by an allocator that is not Harness
+// cannot be represented in Host at all. Measured in
+// TestLoadCommandRefusesARuntimeIdentityThatIsNotAUUID, which first admits such
+// a record through the store and only then finds the adapter refusing it.
+//
+// F12. A LOST COMPARE-AND-SWAP IS INDISTINGUISHABLE FROM A STORE FAULT.
+// commands.ApplyRefusal declares RefusalClaimHeld and RefusalDeadlinePassed, and
+// the applier reaches both from its OWN precondition checks against a record it
+// has read; the store's claim_held, deadline and terminal codes arrive after
+// that decision and reach the applier as RefusalStore. classifyInbox promotes
+// only InboxErrorEpoch, which is an ownership statement, and leaves the other
+// eighteen alone — asserted in both directions by
+// TestClassifyInboxReportsASupersededEpochAsTheSentinel and
+// TestClassifyInboxLeavesEveryOtherCodeAlone. THE DEFERRAL IS DELIBERATE:
+// commands/apply.go wraps a store failure with its Cause preserved, so the code
+// stays recoverable by errors.As and only the label is coarse; promoting one
+// would make a lost race indistinguishable from a precondition the applier
+// evaluated, which is the identical-error mask. Whether a lost race should be
+// separately diagnosable is O5/O6's decision, not this adapter's.
+//
+// F13. A SESSION THAT NEVER EXISTED IS NOT A CATALOG ERROR. GetCatalogEntry for
+// a session with no scope binding fails at the KEYSPACE, with
+// *KeyspaceError{binding_not_found}, before the catalog is consulted at all. An
+// adapter matching only CatalogErrorNotFound and CatalogErrorDeleted therefore
+// reports the commonest case — a brand new session on the create path — as a
+// store failure. This was found by running the create path against the store and
+// could not have been found against residency's fakeDurable, which answers
+// SessionState{Exists:false} and has no error to classify. All three arms are
+// asserted, in both directions, by
+// TestIsCatalogAbsentAdmitsEveryWayTheStoreSaysThereIsNoRecord and
+// TestIsCatalogAbsentRefusesEveryFailureThatIsNotAbsence.
+//
+// F14. THE DURABLE HOST ROUTE CARRIES NO WIRE VERSION.
+// sessionwire.HostLinkRegistryObservation has a Version whose own Validate
+// refuses an unsupported value; PutHostRegistrationRequest has no version member
+// at all, and the store stamps CurrentWireVersion when it projects the record
+// back. So a wholly delegating PublishResidency would be LOOSER than the seam it
+// satisfies for exactly one member — it would write an observation Core refuses
+// and read it back as current. PublishResidency checks that member rather than
+// delegating it; see UnsupportedWireVersionError.
+//
 // # What step 4 could run against the adapter, and what it could not
 //
 // The instruction is to run the residency, commands and hostlink suites against

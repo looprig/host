@@ -13,34 +13,24 @@ import (
 	"github.com/looprig/host/department"
 )
 
-// The four capabilities Host requires that session.SessionController does not
-// declare. Each is spelled with the released method's own signature, so a
-// harness change that moves one is a compile failure here rather than a
-// capability that quietly stops being discovered.
-type (
-	idleWaiter interface {
-		WaitIdle(context.Context) error
-	}
-	liveness interface {
-		Done() <-chan struct{}
-	}
-	releaser interface {
-		ReleaseResidency(context.Context) error
-	}
-	committedSubscriber interface {
-		SubscribeCommittedPublicEvents(event.EventFilter) (event.Subscription, error)
-	}
-)
-
 // boundSession is one launched harness session, expressed as the capabilities
 // Host consumes.
+//
+// EVERY CAPABILITY IS A PUBLISHED HARNESS INTERFACE, held by the fields below,
+// and none of them is spelled again here. Declaring a private structural twin
+// would have been the weaker of the two available things: a private interface
+// cannot produce a compile failure against a foreign type, so a harness change
+// that moved a method would arrive as a silent ok == false and an
+// IncapableSessionError at run time. Naming session.IdleWaiter and its siblings
+// makes the same change a build failure, which is the property this package
+// claims and now has.
 type boundSession struct {
 	controller session.SessionController
 
-	idle      idleWaiter
-	live      liveness
-	releaser  releaser
-	committed committedSubscriber
+	idle      session.IdleWaiter
+	live      session.Liveness
+	releaser  session.Releaser
+	committed session.CommittedPublicEventSource
 
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
@@ -55,7 +45,7 @@ func (s *boundSession) ID() uuid.UUID { return s.controller.SessionID() }
 // WaitIdle blocks until the runtime has no work in flight.
 func (s *boundSession) WaitIdle(ctx context.Context) error { return s.idle.WaitIdle(ctx) }
 
-// Done closes once the runtime has stopped answering.
+// Done closes once the runtime has begun tearing down.
 func (s *boundSession) Done() <-chan struct{} { return s.live.Done() }
 
 // ReleaseResidency releases residency without terminating the session.
@@ -101,8 +91,8 @@ func (s *boundSession) SubscribeCommitted(
 // pump translates deliveries into publications until the subscription or the
 // caller's context ends.
 //
-// IT DROPS A DELIVERY THAT IS NOT A COMMITTED PUBLICATION, and that is the
-// contract rather than a filter. event.Delivery's three publication members are
+// IT DROPS A DELIVERY THAT IS NOT A COMMITTED PUBLICATION, and that is finding
+// H4 rather than a filter. event.Delivery's three publication members are
 // populated only for a live delivery whose durable append both committed a frame
 // and stored a canonical public body; an ephemeral or private delivery has them
 // at their zero values, and a zero EventID is not a publication Core would

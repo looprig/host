@@ -133,8 +133,17 @@ func (g *Grant) AppendApplicationPrefix(
 	// store publishes no ownership signal, so a fenced write is the single
 	// observation this adapter gets. Deleting it would leave residency's
 	// heartbeat and drain supervisor selecting on a channel that never closes at
-	// all. What holds it meanwhile is classifyJournal's own arms, which ARE
-	// killable (see the lease_held and epoch mutations recorded for O3.3).
+	// all.
+	//
+	// WHAT HOLDS IT MEANWHILE ARE THE TWO ARMS THIS LINE ACTUALLY READS, and
+	// naming any others here would be a citation that does not cover the code:
+	// the condition tests ErrEpochSuperseded and ErrFenceConflict, which
+	// classifyJournal produces from the store's lease_lost and fenced codes, and
+	// TestClassifyJournalMapsEveryOwnershipCode kills both by assertion over a
+	// constructed store error. The lease_held arm is killable through the store
+	// (TestOpenSessionRefusesASecondGrantAtTheLease) and is NOT one of the two;
+	// an earlier version of this comment cited it, which pointed a reader at the
+	// one arm this line never sees.
 	if errors.Is(classified, residency.ErrEpochSuperseded) || errors.Is(classified, residency.ErrFenceConflict) {
 		g.end()
 	}

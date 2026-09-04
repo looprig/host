@@ -172,9 +172,17 @@ func newApplierHost(t *testing.T) *host.Host {
 // returns, exactly as testkit's fake does, and against the released modules the
 // real runtime would be no better — harness commits its own records under
 // ("local", <harness uuid>) and not under Host's (TenantID, SessionID). See
-// harnessadapter's TestHarnessAndHostDoNotShareASessionScope. So the durable
-// evidence the settlement requires cannot exist, and RefusalNoCommittedEffect is
-// the correct answer to a real question rather than a fixture artefact.
+// harnessadapter's TestHostCannotOpenABackendHarnessInitialized.
+//
+// THE MEASURED OUTCOME IS "unresolved", NOT "absent", and the difference decides
+// what happens next. Host writes its application prefix BEFORE driving the
+// runtime, so Host's scope always holds a prefix; the store's walk finds it, can
+// see neither the effect nor a superseding fence behind it, and reports
+// unresolved — which refuses BOTH settlements. The command is therefore stuck in
+// applying, completable by nobody and rejectable by nobody, and the second pass
+// below measures that rather than asserting it. That is a stronger consequence
+// than a lost rejection: under the released modules the apply path does not
+// terminate at all.
 func TestApplierRunsTheWholeProtocolAgainstTheReleasedStore(t *testing.T) {
 	released, adapted := openStore(t)
 	createSession(t, released)
@@ -243,7 +251,36 @@ func TestApplierRunsTheWholeProtocolAgainstTheReleasedStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindApplication: %v", err)
 	}
-	if application.Outcome == commands.ApplicationAbsent {
-		t.Fatal("the journal reports no prefix for a command the applier drove")
+	if application.Outcome != commands.ApplicationUnresolved {
+		t.Fatalf("the journal reports %q, want %q; see this test's doc for why the distinction decides the consequence",
+			application.Outcome, commands.ApplicationUnresolved)
+	}
+	if application.PrefixEpoch != grant.Epoch() {
+		t.Fatalf("the prefix is at epoch %d, want this grant's %d", application.PrefixEpoch, grant.Epoch())
+	}
+
+	// A SECOND PASS DOES NOT TERMINATE IT EITHER. Nothing changed durably, so
+	// the correlation is still unresolved, both settlements still refuse, and the
+	// record is still applying. A negative claim after one attempt would assert
+	// nothing; this is the steady state.
+	outcome, err = applier.Process(t.Context(), commands.Command{
+		TenantID:      testTenant,
+		SessionID:     testSession,
+		CommandID:     "command-a",
+		AcceptedOrder: 1,
+		State:         commands.StateApplying,
+	})
+	if err == nil {
+		t.Fatal("the second pass settled a command whose effect the journal cannot see")
+	}
+	if outcome.State.Terminal() {
+		t.Fatalf("the second pass reported %q, and no durable evidence licenses a terminal state", outcome.State)
+	}
+	record, err = adapted.LoadCommand(t.Context(), testTenant, testSession, "command-a")
+	if err != nil {
+		t.Fatalf("LoadCommand after the second pass: %v", err)
+	}
+	if record.State != commands.StateApplying {
+		t.Fatalf("durable state = %q after two passes, want applying; the command is settleable by neither side", record.State)
 	}
 }

@@ -7,21 +7,36 @@
 //	department.Rig.NewSession               rig.Rig.NewSession          (H1, H2)
 //	department.Rig.RestoreSession           rig.Rig.RestoreSession      (H2)
 //	department.RigSession.ID                session.Session.SessionID
-//	department.IdleWaiter.WaitIdle          Session.WaitIdle
-//	department.Liveness.Done                Session.Done
-//	department.Releaser.ReleaseResidency    Session.ReleaseResidency
-//	department.PublicationSubscriber.Sub…   Session.SubscribeCommittedPublicEvents (H3, H4)
-//	department.CommandApplier.ApplyCommand  runtimecommand.Applier      (H5, H6, H7, H8)
+//	department.IdleWaiter.WaitIdle          session.IdleWaiter          (H0)
+//	department.Liveness.Done                session.Liveness            (H0)
+//	department.Releaser.ReleaseResidency    session.Releaser            (H0)
+//	department.PublicationSubscriber.Sub…   session.CommittedPublicEvent…
+//	                                          …Provider/Source          (H0, H3, H4)
+//	department.CommandApplier.ApplyCommand  runtimecommand.Provider/Applier
+//	                                          (H0, H5, H6, H7, H8)
 //
-// THREE OF THOSE ARE NOT ON A PUBLISHED INTERFACE. session.SessionController —
-// the type rig.NewSession and rig.RestoreSession return — declares neither
-// WaitIdle, nor Done, nor ReleaseResidency, nor a committed-public subscription,
-// nor a command applier. Each is a method on harness's internal concrete
-// session, reached by type assertion, exactly as department.adaptRigSession
-// already reaches Host's. That is workable and it is also unenforced: nothing in
-// the released API says a SessionController has them, so a future harness
-// composition that returns a different implementation breaks Host at run time
-// rather than at compile time.
+// NONE OF THE FIVE IS ON SessionController, AND ALL FIVE ARE PUBLISHED. That
+// distinction is the whole of H0 and an earlier version of this file got it
+// wrong. session.SessionController — the type rig.NewSession and
+// rig.RestoreSession return — declares neither WaitIdle, nor Done, nor
+// ReleaseResidency, nor a committed-public subscription, nor a command applier.
+// But harness SEGREGATES them rather than omitting them: session.IdleWaiter,
+// session.Liveness, session.Releaser, session.CommittedPublicEventSource with
+// its session.CommittedPublicEventProvider, and runtimecommand.Applier with its
+// runtimecommand.Provider are all exported, and each documents the assertion as
+// the way a caller is meant to discover it.
+//
+// SO THIS PACKAGE ASSERTS ON HARNESS'S OWN NAMES, never on a private structural
+// twin. A private interface cannot produce a compile failure against a foreign
+// type — a released signature change would arrive as a silent ok == false and an
+// IncapableSessionError at run time, which is the opposite of the guard such a
+// declaration appears to offer.
+//
+// WHAT REMAINS UNENFORCED IS NARROWER, AND IT IS HARNESS'S OWN STATED HAZARD:
+// the assertion is on the DYNAMIC type, so a wrapper that fails to forward a
+// method silently opts its session out. session.IdleWaiter's doc says exactly
+// that, and adds that nothing pins rig to keep returning the runtime type
+// unwrapped.
 //
 // # Findings — the both-directions audit of step 2
 //
@@ -83,14 +98,39 @@
 // records it.
 //
 // H9. HARNESS WRITES THE APPLICATION PREFIX ITSELF, AND WRITES IT UNDER ITS OWN
-// SESSION SCOPE. See the package test TestHarnessAndHostDoNotShareASessionScope,
-// which measures it: harness/pkg/sessionstore opens the released store with
+// SESSION SCOPE. harness/pkg/sessionstore opens the released store with
 // WithLegacySingleTenant("local") and derives the session id from the Harness
 // UUID, so every record a session commits — the opening fence, the public
 // events, and the EnvelopeKindApplicationPrefix that Applier.ApplyRuntimeCommand
-// writes — lands under ("local", <uuid>) and not under Host's (TenantID,
-// SessionID). commands.Applier appends its OWN prefix under Host's scope and
-// then asks Host's scope for the correlation, so against the released modules
-// the correlation can only ever report absent. Nothing in this package can fix
-// that; it is a release owed.
+// writes before each effect — lands under ("local", <uuid>) and not under Host's
+// (TenantID, SessionID). The two layouts are MUTUALLY EXCLUSIVE at the backend:
+// whichever store initializes one first, the other refuses it with
+// KeyspaceError{layout_mismatch}. Measured in both directions by
+// TestHostCannotOpenABackendHarnessInitialized and
+// TestHarnessCannotOpenABackendHostInitialized.
+//
+// THE CONSEQUENCE IS NOT "the correlation reports absent". It cannot:
+// commands.Applier appends its own prefix under Host's scope BEFORE driving the
+// runtime, so Host's scope always holds a prefix and the walk always finds one.
+// The two states it does reach are these, and they are different failures.
+//
+//   - IN THE LIVE PATH THE OUTCOME IS "unresolved": the walk finds the prefix,
+//     and behind it neither the effect — which harness committed in its own
+//     scope — nor a superseding fence. Unresolved refuses BOTH settlements, so
+//     the command is stuck in applying, completable by nobody and rejectable by
+//     nobody. Under the released modules the apply path does not terminate at
+//     all. Measured by sessionstoreadapter's
+//     TestApplierRunsTheWholeProtocolAgainstTheReleasedStore, which drives two
+//     passes and finds the record still applying after both.
+//   - AFTER A TAKEOVER THE OUTCOME IS "abandoned": a successor Host's
+//     OpenJournal commits an opening fence above the prefix's epoch, which is
+//     precisely the shape the walk reports as abandoned.
+//     commands.Application.provesNoEffect admits abandoned, so the settlement
+//     that licenses a REJECTION opens over a command whose effect harness
+//     durably committed. That is a rejection written over a committed effect,
+//     and it is reached by crash-and-takeover rather than in steady state.
+//
+// Nothing in this package can fix either. Harness must accept Host's
+// (TenantID, SessionID) and file its records under them, or SessionStore must
+// offer a way for two stores to share a keyspace. It is a release owed.
 package harnessadapter

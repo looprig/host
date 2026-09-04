@@ -3,6 +3,7 @@ package harnessadapter
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -25,14 +26,32 @@ import (
 // assembles per launch. A shared rig is still expressible — return the same
 // pointer — and the difference is then visible rather than assumed.
 type Rigs interface {
-	// RigForCreate assembles the rig a new session launches on.
-	RigForCreate(context.Context, department.RigCreateRequest) (*rig.Rig, error)
+	// RigForCreate assembles the launcher a new session launches on.
+	RigForCreate(context.Context, department.RigCreateRequest) (Launcher, error)
 
-	// RigForRestore assembles the rig a restored session relaunches on. The UUID
-	// is Harness's identity for the session and is passed so an assembly can
+	// RigForRestore assembles the launcher a restored session relaunches on. The
+	// UUID is Harness's identity for the session and is passed so an assembly can
 	// refuse a session it has no state for.
-	RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (*rig.Rig, error)
+	RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (Launcher, error)
 }
+
+// Launcher is the pair of released rig methods this adapter calls.
+//
+// It is an interface over *rig.Rig rather than the concrete type, and the
+// assertion below is what makes that safe rather than merely convenient: the
+// released type must satisfy it or this package does not build, so the seam
+// cannot drift away from the API it stands for. What it buys is that every path
+// through NewSession, RestoreSession and bind is reachable from a test, which
+// *rig.Rig is not — assembling one needs loops, primers and a model adapter that
+// no unit test can supply, and 460 lines went untested behind exactly that.
+type Launcher interface {
+	NewSession(context.Context, ...rig.SessionOption) (session.SessionController, error)
+	RestoreSession(context.Context, uuid.UUID) (session.SessionController, error)
+}
+
+// The released rig is the launcher. A drift here is a build failure rather than
+// a seam that quietly stops describing anything.
+var _ Launcher = (*rig.Rig)(nil)
 
 // Adapter is a department.Rig over the released rig API.
 type Adapter struct {
@@ -103,7 +122,7 @@ func (a *Adapter) NewSession(ctx context.Context, request department.RigCreateRe
 	if err != nil {
 		return nil, err
 	}
-	if assembled == nil {
+	if isNil(assembled) {
 		return nil, ErrNoRig
 	}
 	controller, err := assembled.NewSession(ctx)
@@ -129,7 +148,7 @@ func (a *Adapter) RestoreSession(
 	if err != nil {
 		return nil, err
 	}
-	if assembled == nil {
+	if isNil(assembled) {
 		return nil, ErrNoRig
 	}
 	controller, err := assembled.RestoreSession(ctx, id)
@@ -144,13 +163,38 @@ func (a *Adapter) RestoreSession(
 // the same reason: a nil rig would otherwise be dereferenced by NewSession.
 var ErrNoRig = errors.New("harnessadapter: the rig resolver reported success and returned no rig")
 
+// isNil reports whether an interface value holds nothing, in either of the two
+// ways Go allows.
+//
+// BOTH WAYS, for department.isNilSession's measured reason. A nil INTERFACE is
+// what a `return nil, nil` produces; a TYPED NIL — a non-nil Launcher holding a
+// nil *rig.Rig — is what the commonest bug in the language produces, and a bare
+// `== nil` walks straight past it into the dereference the guard exists to
+// prevent. That defect was found by test in department and would have been
+// reintroduced here the moment Rigs stopped returning a concrete pointer.
+func isNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
 // bind discovers the capabilities Host requires on a launched controller and
 // refuses one short of any of them.
 //
 // IT REPORTS EVERY MISSING CAPABILITY rather than the first, for
-// department.adaptRigSession's reason, and it discovers them the same way
-// department does — by assertion — because finding H0 is that none of the four
-// is on session.SessionController.
+// department.adaptRigSession's reason, and it discovers them by assertion
+// because that is what harness prescribes: session.IdleWaiter, Liveness and
+// Releaser each document the assertion in their own doc comment, and each warns
+// that a wrapper failing to forward the method silently opts its session out.
+// The names asserted on are HARNESS'S, so a released signature change is a build
+// failure here rather than a run-time IncapableSessionError.
 func (a *Adapter) bind(
 	controller session.SessionController,
 	tenant sessionwire.TenantID,
@@ -167,26 +211,44 @@ func (a *Adapter) bind(
 		decode:     a.decode,
 	}
 	var missing []string
-	if capability, ok := controller.(idleWaiter); ok {
+	if capability, ok := controller.(session.IdleWaiter); ok {
 		bound.idle = capability
 	} else {
-		missing = append(missing, "WaitIdle")
+		missing = append(missing, "session.IdleWaiter")
 	}
-	if capability, ok := controller.(liveness); ok {
+	if capability, ok := controller.(session.Liveness); ok {
 		bound.live = capability
 	} else {
-		missing = append(missing, "Done")
+		missing = append(missing, "session.Liveness")
 	}
-	if capability, ok := controller.(releaser); ok {
+	if capability, ok := controller.(session.Releaser); ok {
 		bound.releaser = capability
 	} else {
-		missing = append(missing, "ReleaseResidency")
+		missing = append(missing, "session.Releaser")
 	}
-	if capability, ok := controller.(committedSubscriber); ok {
-		bound.committed = capability
+
+	// THE TWO-RESULT FORM, AND NOT A BARE ASSERTION ON THE SOURCE. Harness
+	// publishes both session.CommittedPublicEventSource and the
+	// session.CommittedPublicEventProvider that reports whether the source will
+	// work, and its doc says why: the capability is a property of the session's
+	// PERSISTENCE and not of its Go type, so ok is false for a headless session
+	// and for one over a journal predating the committed-bytes seam. The live
+	// runtime declares SubscribeCommittedPublicEvents unconditionally, so an
+	// assertion on the SOURCE succeeds for every real session and never asks the
+	// question — Host would publish the residency route, a client would attach
+	// and start advancing a cursor, and only then would the subscription fail.
+	// That is verbatim the shape of failure harness says this capability exists
+	// to prevent, and it is why ApplyCommand consults runtimecommand.Provider the
+	// same way rather than asserting on the Applier.
+	provider, ok := controller.(session.CommittedPublicEventProvider)
+	if !ok {
+		missing = append(missing, "session.CommittedPublicEventProvider")
+	} else if source, available := provider.CommittedPublicEvents(); !available || source == nil {
+		missing = append(missing, "committed public events (the session reports no committed-bytes persistence)")
 	} else {
-		missing = append(missing, "SubscribeCommittedPublicEvents")
+		bound.committed = source
 	}
+
 	if len(missing) > 0 {
 		return nil, &IncapableSessionError{Missing: missing}
 	}

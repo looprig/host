@@ -91,7 +91,16 @@ func TestHarnessCannotOpenABackendHostInitialized(t *testing.T) {
 		t.Fatalf("create Host's catalog record: %v", err)
 	}
 
-	if _, err := harnessstore.Open(backend); err == nil {
-		t.Fatal("harness opened a backend Host had already initialized in the multi-tenant layout")
+	// THE CODE, NOT MERELY AN ERROR. An assertion on err != nil would pass for
+	// an unrelated *InvalidBackendError and would keep passing if the layouts
+	// ever became compatible for a different reason, which is the one outcome
+	// this test exists to detect a change in.
+	_, err = harnessstore.Open(backend)
+	var keyspaceErr *sessionstore.KeyspaceError
+	if !errors.As(err, &keyspaceErr) {
+		t.Fatalf("harness Open over a Host-initialized backend = %v, want a KeyspaceError", err)
+	}
+	if keyspaceErr.Code != sessionstore.KeyspaceLayoutMismatch {
+		t.Fatalf("keyspace code = %q, want layout_mismatch", keyspaceErr.Code)
 	}
 }

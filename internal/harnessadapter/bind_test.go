@@ -1,0 +1,558 @@
+package harnessadapter
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/session"
+
+	"github.com/looprig/host/department"
+)
+
+const (
+	testTenant  = sessionwire.TenantID("tenant-a")
+	testSession = sessionwire.SessionID("session-a")
+)
+
+// capabilities is what department.adaptRigSession discovers on a RigSession by
+// assertion. Asserting the bound value against it here is the same question
+// department will ask, spelled once.
+type capabilities interface {
+	department.RigSession
+	department.IdleWaiter
+	department.Liveness
+	department.Releaser
+	department.PublicationSubscriber
+	department.CommandApplier
+}
+
+// The bound session carries every capability department discovers, so a rig
+// session adapted here reaches department.Runtime rather than being refused with
+// IncapableRuntimeError. This is a build failure if a method is dropped.
+var _ capabilities = (*boundSession)(nil)
+
+func newAdapter(t *testing.T, rigs Rigs, options ...Option) *Adapter {
+	t.Helper()
+	adapted, err := New(rigs, options...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return adapted
+}
+
+// ---------------------------------------------------------------------------
+// bind
+// ---------------------------------------------------------------------------
+
+// A session carrying every capability binds, and each capability is REACHED
+// rather than merely discovered: the test drives all four through the bound
+// value, so a bind that stored the wrong field would fail here.
+func TestBindReachesEveryDiscoveredCapability(t *testing.T) {
+	released := 0
+	var filters []event.EventFilter
+	subscription := newFakeSubscription(nil)
+	controller := newFullController(subscription, &filters, &released)
+
+	adapter := newAdapter(t, stubRigs{})
+	bound, err := adapter.bind(controller, testTenant, testSession)
+	if err != nil {
+		t.Fatalf("bind a fully capable session: %v", err)
+	}
+
+	if bound.ID() != controller.SessionID() {
+		t.Fatalf("ID = %v, want the controller's %v", bound.ID(), controller.SessionID())
+	}
+
+	// EVERY FIELD IS ASSERTED BEFORE IT IS DEREFERENCED, and that is discipline
+	// rather than belt-and-braces. A bind that stopped populating one leaves a
+	// nil capability, and the drive-through below would then die by PANIC — which
+	// is not an assertion kill, and which aborts the package so the sibling test
+	// that WOULD have caught it never runs. Measured: removing bind's idle arm
+	// panicked here and masked two real assertion kills.
+	adapted, ok := bound.(*boundSession)
+	if !ok {
+		t.Fatalf("bind returned %T, want *boundSession", bound)
+	}
+	for name, populated := range map[string]bool{
+		"idle":      adapted.idle != nil,
+		"live":      adapted.live != nil,
+		"releaser":  adapted.releaser != nil,
+		"committed": adapted.committed != nil,
+	} {
+		if !populated {
+			t.Fatalf("bind left the %s capability nil on a fully capable session", name)
+		}
+	}
+
+	runtime, ok := bound.(capabilities)
+	if !ok {
+		t.Fatalf("the bound session is %T, which department could not adapt", bound)
+	}
+	if err := runtime.WaitIdle(t.Context()); err != nil {
+		t.Fatalf("WaitIdle: %v", err)
+	}
+	select {
+	case <-runtime.Done():
+		t.Fatal("Done was already closed")
+	default:
+	}
+	if err := runtime.ReleaseResidency(t.Context()); err != nil {
+		t.Fatalf("ReleaseResidency: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("ReleaseResidency reached the controller %d times, want once", released)
+	}
+	if _, err := runtime.SubscribeCommitted(t.Context(), ""); err != nil {
+		t.Fatalf("SubscribeCommitted: %v", err)
+	}
+	if len(filters) != 1 {
+		t.Fatalf("the controller saw %d subscriptions, want one", len(filters))
+	}
+}
+
+// EACH CAPABILITY IS INDEPENDENTLY REQUIRED, and the space is derived from the
+// composition rather than picked: a controller is assembled from the base plus
+// every part EXCEPT one, and the omitted part is the one that must be named.
+func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
+	for _, tt := range []struct {
+		omit    string
+		build   func() session.SessionController
+		missing string
+	}{
+		{
+			omit:    "WaitIdle",
+			missing: "session.IdleWaiter",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					livenessPart
+					releaserPart
+					committedPart
+				}{committedPart: committedPart{available: true}}
+			},
+		},
+		{
+			omit:    "Done",
+			missing: "session.Liveness",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					releaserPart
+					committedPart
+				}{committedPart: committedPart{available: true}}
+			},
+		},
+		{
+			omit:    "ReleaseResidency",
+			missing: "session.Releaser",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					livenessPart
+					committedPart
+				}{committedPart: committedPart{available: true}}
+			},
+		},
+		{
+			omit:    "CommittedPublicEvents",
+			missing: "session.CommittedPublicEventProvider",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					livenessPart
+					releaserPart
+				}{}
+			},
+		},
+	} {
+		t.Run(tt.omit, func(t *testing.T) {
+			adapter := newAdapter(t, stubRigs{})
+			_, err := adapter.bind(tt.build(), testTenant, testSession)
+			var incapable *IncapableSessionError
+			if !errors.As(err, &incapable) {
+				t.Fatalf("bind without %s = %v, want IncapableSessionError", tt.omit, err)
+			}
+			if !slices.Contains(incapable.Missing, tt.missing) {
+				t.Fatalf("Missing = %v, want it to name %q", incapable.Missing, tt.missing)
+			}
+			if len(incapable.Missing) != 1 {
+				t.Fatalf("Missing = %v, want exactly the omitted capability", incapable.Missing)
+			}
+		})
+	}
+}
+
+// M1's SECOND HALF, AND THE REASON THE TWO-RESULT FORM IS NOT A STYLE CHOICE.
+// A session that declares SubscribeCommittedPublicEvents but reports the
+// capability unavailable is exactly harness's headless case, and the live
+// runtime declares that method unconditionally — so a bare assertion on
+// session.CommittedPublicEventSource is vacuously true for every real session
+// and this refusal never happens. It must happen at bind, before Host publishes
+// a residency route a client would then attach to.
+func TestBindRefusesASessionWhoseCommittedEventsAreUnavailable(t *testing.T) {
+	controller := &struct {
+		controllerBase
+		idlePart
+		livenessPart
+		releaserPart
+		committedPart
+	}{committedPart: committedPart{available: false}}
+
+	// THE CONTROL: the same value DOES satisfy the source interface, so an
+	// adapter asserting on the source would have bound it.
+	if _, ok := session.SessionController(controller).(session.CommittedPublicEventSource); !ok {
+		t.Fatal("the fixture does not satisfy CommittedPublicEventSource, so it cannot show what a bare assertion would accept")
+	}
+
+	adapter := newAdapter(t, stubRigs{})
+	_, err := adapter.bind(controller, testTenant, testSession)
+	var incapable *IncapableSessionError
+	if !errors.As(err, &incapable) {
+		t.Fatalf("bind of a headless session = %v, want IncapableSessionError", err)
+	}
+	if len(incapable.Missing) != 1 || !strings.Contains(incapable.Missing[0], "committed public events") {
+		t.Fatalf("Missing = %v, want the unavailable committed-event capability", incapable.Missing)
+	}
+}
+
+// A provider that reports available and hands back a nil source is refused too.
+// The two results are independent and a caller that trusted only the boolean
+// would dereference nothing on the first subscribe.
+func TestBindRefusesANilCommittedEventSource(t *testing.T) {
+	controller := &struct {
+		controllerBase
+		idlePart
+		livenessPart
+		releaserPart
+		nilSourceProvider
+	}{}
+
+	adapter := newAdapter(t, stubRigs{})
+	if _, err := adapter.bind(controller, testTenant, testSession); err == nil {
+		t.Fatal("bind accepted a provider that reported available with a nil source")
+	}
+}
+
+// A session short of everything names everything, rather than the first thing.
+func TestBindNamesEveryMissingCapabilityAtOnce(t *testing.T) {
+	adapter := newAdapter(t, stubRigs{})
+	_, err := adapter.bind(controllerBase{}, testTenant, testSession)
+	var incapable *IncapableSessionError
+	if !errors.As(err, &incapable) {
+		t.Fatalf("bind of a bare controller = %v, want IncapableSessionError", err)
+	}
+	if len(incapable.Missing) != 4 {
+		t.Fatalf("Missing = %v, want all four capabilities", incapable.Missing)
+	}
+	if !strings.Contains(incapable.Error(), "session.IdleWaiter") {
+		t.Fatalf("Error() = %q, want it to name the missing capabilities", incapable.Error())
+	}
+}
+
+func TestBindRefusesANilController(t *testing.T) {
+	adapter := newAdapter(t, stubRigs{})
+	if _, err := adapter.bind(nil, testTenant, testSession); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("bind(nil) = %v, want ErrNoSession", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NewSession and RestoreSession
+// ---------------------------------------------------------------------------
+
+func TestNewSessionResolvesLaunchesAndBinds(t *testing.T) {
+	created := 0
+	var creates []department.RigCreateRequest
+	launcher := &fakeLauncher{controller: newFullController(newFakeSubscription(nil), nil, nil), created: &created}
+	adapter := newAdapter(t, stubRigs{launcher: launcher, creates: &creates})
+
+	request := department.RigCreateRequest{
+		TenantID:      testTenant,
+		SessionID:     testSession,
+		AgentID:       sessionwire.AgentID("agent-a"),
+		Placement:     sessionwire.HostPlacementPooled,
+		WorkspaceRoot: "/w/a",
+		Storage:       department.StorageContext{Namespace: "objects/a"},
+	}
+	launched, err := adapter.NewSession(t.Context(), request)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if launched == nil {
+		t.Fatal("NewSession returned no session")
+	}
+	if created != 1 {
+		t.Fatalf("the launcher was called %d times, want once", created)
+	}
+	// H1: the whole request reaches the RESOLVER, which is the only seam that
+	// can honour a workspace root or a storage namespace, because rig.NewSession
+	// accepts neither.
+	if len(creates) != 1 || creates[0] != request {
+		t.Fatalf("the resolver saw %+v, want the whole request %+v", creates, request)
+	}
+}
+
+func TestRestoreSessionForwardsTheHarnessIdentityAndTheWholeRequest(t *testing.T) {
+	var restored []uuid.UUID
+	var restores []department.RigRestoreRequest
+	launcher := &fakeLauncher{controller: newFullController(newFakeSubscription(nil), nil, nil), restored: &restored}
+	adapter := newAdapter(t, stubRigs{launcher: launcher, restores: &restores})
+
+	id := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	request := department.RigRestoreRequest{
+		TenantID:      testTenant,
+		SessionID:     testSession,
+		AgentID:       sessionwire.AgentID("agent-a"),
+		WorkspaceRoot: "/w/a",
+		Storage:       department.StorageContext{Namespace: "objects/a"},
+	}
+	if _, err := adapter.RestoreSession(t.Context(), id, request); err != nil {
+		t.Fatalf("RestoreSession: %v", err)
+	}
+	if len(restored) != 1 || restored[0] != id {
+		t.Fatalf("the launcher restored %v, want %v", restored, id)
+	}
+	// H2: the request reaches the resolver and NOTHING past it. That is the drop
+	// this adapter reports rather than hides.
+	if len(restores) != 1 || restores[0] != request {
+		t.Fatalf("the resolver saw %+v, want the whole request", restores)
+	}
+}
+
+func TestLaunchReportsAResolverFailure(t *testing.T) {
+	sentinel := errors.New("no rig for this agent")
+	adapter := newAdapter(t, stubRigs{err: sentinel})
+
+	if _, err := adapter.NewSession(t.Context(), department.RigCreateRequest{}); !errors.Is(err, sentinel) {
+		t.Fatalf("NewSession = %v, want the resolver's error", err)
+	}
+	if _, err := adapter.RestoreSession(t.Context(), uuid.UUID{}, department.RigRestoreRequest{}); !errors.Is(err, sentinel) {
+		t.Fatalf("RestoreSession = %v, want the resolver's error", err)
+	}
+}
+
+// BOTH WAYS A RESOLVER CAN HAND BACK NOTHING. The typed nil is the one a real
+// implementation produces and the one a bare `== nil` walks past.
+func TestLaunchRefusesAResolverThatReportsSuccessWithNoRig(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		launcher Launcher
+	}{
+		{name: "nil interface", launcher: nil},
+		{name: "typed nil", launcher: (*fakeLauncher)(nil)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := newAdapter(t, stubRigs{launcher: tt.launcher})
+			if _, err := adapter.NewSession(t.Context(), department.RigCreateRequest{}); !errors.Is(err, ErrNoRig) {
+				t.Fatalf("NewSession = %v, want ErrNoRig", err)
+			}
+			if _, err := adapter.RestoreSession(t.Context(), uuid.UUID{}, department.RigRestoreRequest{}); !errors.Is(err, ErrNoRig) {
+				t.Fatalf("RestoreSession = %v, want ErrNoRig", err)
+			}
+		})
+	}
+}
+
+func TestLaunchReportsALaunchFailure(t *testing.T) {
+	sentinel := errors.New("the rig refused to launch")
+	adapter := newAdapter(t, stubRigs{launcher: &fakeLauncher{err: sentinel}})
+
+	if _, err := adapter.NewSession(t.Context(), department.RigCreateRequest{}); !errors.Is(err, sentinel) {
+		t.Fatalf("NewSession = %v, want the launch error", err)
+	}
+	if _, err := adapter.RestoreSession(t.Context(), uuid.UUID{}, department.RigRestoreRequest{}); !errors.Is(err, sentinel) {
+		t.Fatalf("RestoreSession = %v, want the launch error", err)
+	}
+}
+
+func TestLaunchRefusesARigThatReportsSuccessAndReturnsNoSession(t *testing.T) {
+	adapter := newAdapter(t, stubRigs{launcher: &fakeLauncher{controller: nil}})
+	if _, err := adapter.NewSession(t.Context(), department.RigCreateRequest{}); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("NewSession = %v, want ErrNoSession", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SubscribeCommitted and pump
+// ---------------------------------------------------------------------------
+
+func boundFor(t *testing.T, controller session.SessionController, options ...Option) capabilities {
+	t.Helper()
+	adapter := newAdapter(t, stubRigs{}, options...)
+	launched, err := adapter.bind(controller, testTenant, testSession)
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	runtime, ok := launched.(capabilities)
+	if !ok {
+		t.Fatalf("the bound session is %T, which department could not adapt", launched)
+	}
+	return runtime
+}
+
+// H3, MEASURED. A positioned resume is refused rather than silently served from
+// the live tail, and the refusal happens BEFORE any subscription is opened —
+// otherwise the caller would be charged for a stream it cannot use.
+func TestSubscribeCommittedRefusesAPositionedResume(t *testing.T) {
+	var filters []event.EventFilter
+	controller := newFullController(newFakeSubscription(nil), &filters, nil)
+	runtime := boundFor(t, controller)
+
+	published, err := runtime.SubscribeCommitted(t.Context(), sessionwire.EventID("event-7"))
+	if !errors.Is(err, ErrResumeUnsupported) {
+		t.Fatalf("SubscribeCommitted after an event = %v, want ErrResumeUnsupported", err)
+	}
+	if published != nil {
+		t.Fatal("a refused subscription returned a channel")
+	}
+	if len(filters) != 0 {
+		t.Fatalf("a refused subscription still opened %d streams", len(filters))
+	}
+
+	// THE OTHER DIRECTION: the empty resume point is served.
+	if _, err := runtime.SubscribeCommitted(t.Context(), ""); err != nil {
+		t.Fatalf("SubscribeCommitted from the live tail: %v", err)
+	}
+	if len(filters) != 1 {
+		t.Fatalf("the live subscription opened %d streams, want one", len(filters))
+	}
+	if !filters[0].Enduring.All {
+		t.Fatalf("the filter is %+v, want every loop's enduring events", filters[0])
+	}
+}
+
+func TestSubscribeCommittedReportsASubscribeFailure(t *testing.T) {
+	sentinel := errors.New("the hub cannot serve committed public events")
+	controller := &struct {
+		controllerBase
+		idlePart
+		livenessPart
+		releaserPart
+		committedPart
+	}{committedPart: committedPart{available: true, subscribeErr: sentinel}}
+
+	runtime := boundFor(t, controller)
+	if _, err := runtime.SubscribeCommitted(t.Context(), ""); !errors.Is(err, sentinel) {
+		t.Fatalf("SubscribeCommitted = %v, want the hub's error", err)
+	}
+}
+
+// H4, MEASURED. A delivery that is not a committed publication is DROPPED, and
+// the discriminator is a delivery that would otherwise arrive with a zero
+// EventID — a value Core's EnduringPublication does not accept. The committed
+// one that follows it proves the pump did not simply stop.
+func TestPumpDropsEveryDeliveryThatIsNotACommittedPublication(t *testing.T) {
+	subscription := newFakeSubscription(nil)
+	controller := newFullController(subscription, nil, nil)
+	runtime := boundFor(t, controller)
+
+	published, err := runtime.SubscribeCommitted(t.Context(), "")
+	if err != nil {
+		t.Fatalf("SubscribeCommitted: %v", err)
+	}
+
+	// An ephemeral delivery: never persisted, never sequenced, no public body.
+	subscription.deliveries <- event.Delivery{}
+	// An enduring delivery from a hub whose appender cannot report the stored
+	// bytes: sequenced, but with none of the three publication members.
+	subscription.deliveries <- event.Delivery{JournalSeq: 11}
+	// A committed publication.
+	subscription.deliveries <- event.Delivery{
+		JournalSeq:     12,
+		EventID:        "event-12",
+		PublicBody:     []byte(`{"type":"step_done"}`),
+		CoveredThrough: 12,
+	}
+
+	select {
+	case publication := <-published:
+		if publication.EventID != sessionwire.EventID("event-12") {
+			t.Fatalf("the first publication is %q, want the committed one; an uncommitted delivery crossed", publication.EventID)
+		}
+		if publication.JournalSeq != 12 || publication.CoveredThrough != 12 {
+			t.Fatalf("publication sequences are %d/%d, want 12/12", publication.JournalSeq, publication.CoveredThrough)
+		}
+		if publication.TenantID != testTenant || publication.SessionID != testSession {
+			t.Fatalf("publication identities are %q/%q, want the bound pair", publication.TenantID, publication.SessionID)
+		}
+		if string(publication.Body) != `{"type":"step_done"}` {
+			t.Fatalf("publication body = %q, want the committed bytes", publication.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no publication arrived")
+	}
+}
+
+// The pump ends with the subscription, closes the channel it owns, and closes
+// the subscription it was handed. A consumer selecting on the channel learns the
+// stream ended rather than blocking forever.
+func TestPumpEndsAndClosesWhenTheSubscriptionEnds(t *testing.T) {
+	closed := 0
+	subscription := newFakeSubscription(&closed)
+	runtime := boundFor(t, newFullController(subscription, nil, nil))
+
+	published, err := runtime.SubscribeCommitted(t.Context(), "")
+	if err != nil {
+		t.Fatalf("SubscribeCommitted: %v", err)
+	}
+	close(subscription.deliveries)
+
+	select {
+	case _, open := <-published:
+		if open {
+			t.Fatal("a publication arrived from a closed stream")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the publication channel did not close when the stream ended")
+	}
+	waitFor(t, func() bool { return closed == 1 })
+}
+
+// The caller's context ends the pump, which is the only bound on it when a hub
+// keeps a stream open forever.
+func TestPumpEndsWhenTheCallersContextIsDone(t *testing.T) {
+	closed := 0
+	subscription := newFakeSubscription(&closed)
+	runtime := boundFor(t, newFullController(subscription, nil, nil))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	published, err := runtime.SubscribeCommitted(ctx, "")
+	if err != nil {
+		t.Fatalf("SubscribeCommitted: %v", err)
+	}
+	cancel()
+
+	select {
+	case _, open := <-published:
+		if open {
+			t.Fatal("a publication arrived after the context ended")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the publication channel did not close when the context ended")
+	}
+	waitFor(t, func() bool { return closed == 1 })
+}
+
+// waitFor polls a condition the pump goroutine satisfies, because a goroutine's
+// last act is not ordered against the channel close a consumer observes.
+func waitFor(t *testing.T, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if done() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the condition was not reached before the deadline")
+}
