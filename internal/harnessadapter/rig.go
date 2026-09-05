@@ -218,19 +218,28 @@ func (a *Adapter) bind(
 	//     CommittedPublicEvents, and that method reads s.hub — a struct field —
 	//     so the nil receiver is dereferenced there. Nothing is published: the
 	//     crash is inside Host's launch path, before any route exists.
-	//   - A controller whose capability ANSWERS WITHOUT DEREFERENCING passes all
-	//     four gates, and that is not a hypothetical shape — it is any forwarding
-	//     wrapper, which harness's own capability docs warn callers to expect
-	//     around a live session. bind then returns a usable-looking boundSession,
-	//     Host publishes the residency route, and the panic arrives at the first
-	//     ID() call with a resident session already advertised.
+	//   - A controller whose capability answer NEVER TOUCHES THE RECEIVER passes
+	//     all four gates. The shape that does this is one returning itself
+	//     unconditionally — `return w, true` — which is the released session's
+	//     own shape minus the s.hub read; a constant answer does it too. bind
+	//     then returns a usable-looking boundSession, Host publishes the
+	//     residency route, and the panic arrives at the first ID() call with a
+	//     resident session already advertised.
+	//
+	// WHICH SHAPES FALL WHICH WAY IS MEASURED, NOT REASONED, and the measurement
+	// is TestOnlyAReceiverFreeAnswerSurvivesTheFourthGate. It matters because the
+	// obvious answer is wrong: an earlier version of this comment said the
+	// surviving shape was "any forwarding wrapper", and a forwarding wrapper is
+	// exactly one that CANNOT survive — it must read its own field to forward, so
+	// it dies in gate 4 alongside the released session. Wrapping is not the
+	// property; touching the receiver is.
 	//
 	// So the guard is load-bearing in both cases and for different reasons: it
 	// turns a nil dereference inside the launch path into a typed refusal, and it
-	// is the only thing standing between a wrapped typed nil and a published
-	// route. TestBindRefusesEveryWayALaunchHandsBackNoSession exercises the
-	// second case, because it is the one a test can construct and the one whose
-	// consequence outlives the call.
+	// is the only thing standing between a receiver-free typed nil and a
+	// published route. TestBindRefusesEveryWayALaunchHandsBackNoSession exercises
+	// the second case — its fixture answers from a constant — because that is the
+	// case whose consequence outlives the call.
 	if isNil(controller) {
 		return nil, ErrNoSession
 	}
