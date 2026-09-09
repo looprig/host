@@ -134,6 +134,14 @@
 // which really does want a UUID — but the refusal has to be Host's, stated, and
 // reached before the launch rather than at a parse deep inside it.
 //
+// RELATED TO, AND NOT THE SAME AS, H9's COST 2 in internal/harnessadapter. They
+// point in OPPOSITE directions over DIFFERENT subjects: this row is Host's seam
+// being too narrow for a durable value the store will hand it, and Cost 2 is
+// Harness's keyspace being too narrow for the identity Factory admitted. They
+// are recorded separately because either could be fixed alone. But ONE decision
+// about whether a Host session identity is a UUID probably settles both, so a
+// reader resolving one should look at the other rather than assume it followed.
+//
 // F6. NO RELEASED CALL MATERIALIZES A WORKSPACE BY TENANT AND SESSION. Harness's
 // workspacestore is content-addressed — Materialize(ctx, Ref, dest) — and picks
 // neither the destination nor the pairing. EnsureWorkspace/ReleaseWorkspace are
@@ -221,11 +229,25 @@
 // grant in a session's bound agent journal" — and forbids the identification in
 // terms. Neither released type satisfies residency.Lease alone: ResidencyGrant
 // has Lost() and an epoch that must not stamp a journal fence, JournalWriter has
-// the journal epoch and no Lost(). THE FAKES DO NOT EXPRESS THIS AND CANNOT BE
-// MADE TO BY A FIXTURE — fakeLease hands out one uint64 that plays both roles,
-// which is a state production has no way to produce. Whether Host tracks two
-// grants or drops one is a design decision, not a rebind, and it is left to
-// O5.3 rather than guessed at here.
+// the journal epoch and no Lost().
+//
+// THE BOUND MATTERS AND AN EARLIER VERSION OF THIS ROW GOT IT WRONG. It said the
+// fakes' single uint64 "is a state production has no way to produce". That is
+// FALSE IN LEGACY MODE, which is the mode Host is bound to today: Grant.Epoch in
+// journal.go returns JournalWriter.Epoch, residency's manager takes that one
+// uint64 at manager.go:986 and both stamps the opening fence with it and
+// publishes it as the registry observation's lease_epoch. So in legacy mode the
+// RELEASED STORE genuinely produces one number playing every role, and fakeLease
+// models it correctly.
+//
+// F15 IS A DISPOSITION-MODE FINDING. The conflation becomes wrong exactly where
+// v0.6.0 introduced the split, and it has two live readers there: a disposition
+// attempt records JournalEpoch and ResidencyEpoch as separate members, and the
+// settlement fence orders AuthorJournalEpoch against AttemptJournalEpoch. A Host
+// that copied its residency epoch into JournalEpoch would make a disposition
+// command UNSETTLEABLE FOREVER. So the finding stands and is booked as O3.4;
+// what was wrong was its scope, not its existence. Whether Host tracks two
+// grants or one remains a design decision rather than a rebind.
 //
 // F16. THE RESIDENCY GRANT IS ADMITTED ONLY FOR A DISPOSITION-MODE SESSION, AND
 // A FAILED ACQUISITION CAN STILL OWE A RELEASE. Two properties of

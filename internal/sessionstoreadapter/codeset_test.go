@@ -59,14 +59,18 @@ import (
 // match.
 //
 // UNIT OF ANALYSIS: a package-level `const` whose ValueSpec carries an explicit
-// type name and a string literal value, in a non-test .go file in the module
-// ROOT directory. WHAT IT CANNOT SEE: constants in subdirectories or in
-// internal/ (none of these three vocabularies live there, checked); a constant
-// whose type is inherited from an earlier spec in the same block rather than
-// restated; a code the module produces without declaring a constant for it; and
-// — most importantly — whether Host's classification of any code is SEMANTICALLY
-// right. It establishes that every declared code has a decision, never that the
-// decision is correct.
+// type name and a string BasicLit value, in a non-test .go file in the module
+// ROOT directory. WHAT IT CANNOT SEE — FIVE THINGS, and the count is stated
+// because an earlier version of this comment said four and was missing the one a
+// gate found: constants in subdirectories or in internal/ (none of these five
+// vocabularies live there, checked); a constant whose type is inherited from an
+// earlier spec in the same block rather than restated; A CONSTANT WHOSE VALUE IS
+// NOT A PLAIN STRING LITERAL — a concatenation or a conversion is dropped
+// SILENTLY, because the walk requires an *ast.BasicLit; a code the module
+// produces without declaring a constant for it; and — most importantly —
+// whether Host's classification of any code is SEMANTICALLY right. It
+// establishes that every declared code has a decision, never that the decision
+// is correct.
 //
 // The derivation fails rather than skips when it cannot reach the source: a
 // guard whose subject is absent must not report success, and an empty derived
@@ -576,5 +580,90 @@ func TestUnconsideredCodesIsSilentOnAnExactMatch(t *testing.T) {
 	derived = append(derived, journalPassthrough...)
 	if unknown, stale := unconsideredCodes(derived, journalMapped, journalPassthrough); len(unknown) != 0 || len(stale) != 0 {
 		t.Fatalf("an exact match reported unknown=%v stale=%v", unknown, stale)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The other two vocabularies Host reads
+// ---------------------------------------------------------------------------
+//
+// THE FIRST VERSION OF THIS FILE COVERED THREE OF FIVE. classifyJournal,
+// classifyInbox and classifyRegistry were closed over their derived sets while
+// isCatalogAbsent in durable.go matched Catalog and Keyspace codes by literal
+// with no guard at all — the identical gap, left open in the same edit that
+// closed the others. These two close it.
+//
+// THE SHAPE IS DIFFERENT AND SO IS THE CHECK. isCatalogAbsent is a PREDICATE,
+// not a mapping onto a sentinel, so there is no classifier to run
+// undecidedCodes over. What is asserted is the same property in the same two
+// directions: every declared code is accounted for, and the predicate answers
+// true for exactly the codes named as absence.
+
+var (
+	catalogAbsent = map[string]error{
+		string(sessionstore.CatalogErrorNotFound): nil,
+		string(sessionstore.CatalogErrorDeleted):  nil,
+	}
+	catalogNotAbsent = []string{
+		string(sessionstore.CatalogErrorInvalid),
+		string(sessionstore.CatalogErrorCursor),
+		string(sessionstore.CatalogErrorIdentity),
+		string(sessionstore.CatalogErrorEpoch),
+		string(sessionstore.CatalogErrorSequence),
+		string(sessionstore.CatalogErrorTooSoon),
+		string(sessionstore.CatalogErrorConflict),
+		string(sessionstore.CatalogErrorUnknown),
+		string(sessionstore.CatalogErrorBackend),
+		string(sessionstore.CatalogErrorMalformed),
+		string(sessionstore.CatalogErrorVersion),
+		string(sessionstore.CatalogErrorTooLarge),
+	}
+
+	keyspaceAbsent = map[string]error{
+		string(sessionstore.KeyspaceBindingNotFound): nil,
+	}
+	keyspaceNotAbsent = []string{
+		string(sessionstore.KeyspaceBackend),
+		string(sessionstore.KeyspaceMarkerMalformed),
+		string(sessionstore.KeyspaceLayoutMismatch),
+		string(sessionstore.KeyspaceMarkerAmbiguous),
+		string(sessionstore.KeyspaceBindingAmbiguous),
+		string(sessionstore.KeyspaceScopeInvalid),
+		string(sessionstore.KeyspaceHashCollision),
+		string(sessionstore.KeyspaceLegacyTenant),
+		string(sessionstore.KeyspaceLegacySession),
+	}
+)
+
+// TestEveryDeclaredCatalogCodeIsConsidered closes isCatalogAbsent's catalog arm
+// over the derived set, in both directions.
+func TestEveryDeclaredCatalogCodeIsConsidered(t *testing.T) {
+	codes := declaredCodes(t, pinnedSessionstoreDir(t), "CatalogErrorCode")
+	requireDerivedSet(t, "CatalogErrorCode", codes, string(sessionstore.CatalogErrorNotFound))
+	requireConsidered(t, "CatalogErrorCode", codes, catalogAbsent, catalogNotAbsent)
+
+	for _, code := range codes {
+		_, wantAbsent := catalogAbsent[code]
+		got := isCatalogAbsent(&sessionstore.CatalogError{Code: sessionstore.CatalogErrorCode(code)})
+		if got != wantAbsent {
+			t.Fatalf("isCatalogAbsent(catalog %q) = %v, want %v", code, got, wantAbsent)
+		}
+	}
+}
+
+// TestEveryDeclaredKeyspaceCodeIsConsidered closes the keyspace arm. F13 is the
+// reason this arm exists at all: a session that never existed fails at the
+// KEYSPACE, before the catalog is consulted.
+func TestEveryDeclaredKeyspaceCodeIsConsidered(t *testing.T) {
+	codes := declaredCodes(t, pinnedSessionstoreDir(t), "KeyspaceErrorCode")
+	requireDerivedSet(t, "KeyspaceErrorCode", codes, string(sessionstore.KeyspaceBindingNotFound))
+	requireConsidered(t, "KeyspaceErrorCode", codes, keyspaceAbsent, keyspaceNotAbsent)
+
+	for _, code := range codes {
+		_, wantAbsent := keyspaceAbsent[code]
+		got := isCatalogAbsent(&sessionstore.KeyspaceError{Code: sessionstore.KeyspaceErrorCode(code)})
+		if got != wantAbsent {
+			t.Fatalf("isCatalogAbsent(keyspace %q) = %v, want %v", code, got, wantAbsent)
+		}
 	}
 }

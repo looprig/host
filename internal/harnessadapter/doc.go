@@ -15,6 +15,18 @@
 //	department.CommandApplier.ApplyCommand  runtimecommand.Provider/Applier
 //	                                          (H0, H5, H6, H7, H8)
 //
+// SEAMS NOT IN THE TABLE ABOVE, stated because the sessionstore side states its
+// exclusions and an inventory without one cannot be read as complete.
+// department.Runtime, department.Department, department.Target and
+// department.CompatibilityID are Host types describing what Host requires of a
+// runtime; they stand in for no released type and binding them here would invent
+// a dependency rather than record one. department.RigCreateRequest and
+// department.RigRestoreRequest are the arguments to the two rows that ARE bound,
+// not seams of their own. The Harness identities Host cannot adopt —
+// core/uuid.UUID against the opaque sessionwire strings — are the subject of
+// CLAUDE.md's paragraph on why an adapter is mandatory, not a row that could be
+// bound differently.
+//
 // NONE OF THE FIVE IS ON SessionController, AND ALL FIVE ARE PUBLISHED. That
 // distinction is the whole of H0 and an earlier version of this file got it
 // wrong. session.SessionController — the type rig.NewSession and
@@ -135,6 +147,13 @@
 // Both costs are asserted, not described. What remains owed is no longer "a way
 // for two stores to share a keyspace" — that exists — but Harness ceasing to
 // impose its own identity grammar on the shared one.
+//
+// COST 2 IS RELATED TO, AND NOT THE SAME AS, sessionstoreadapter's F5. That row
+// is Host's uuid.UUID seam being too narrow for an opaque value the store will
+// hand it; this is Harness's keyspace being too narrow for the opaque identity
+// Factory admitted. Opposite directions, different subjects, separately
+// fixable — but one decision about whether a Host session identity is a UUID
+// probably settles both, so do not fix one and assume the other went with it.
 //
 // THE CONSEQUENCE IS NOT "the correlation reports absent". It cannot:
 // commands.Applier appends its own prefix under Host's scope BEFORE driving the

@@ -182,12 +182,41 @@ func TestHostAndHarnessCanShareABackendOnTheLegacyLayout(t *testing.T) {
 
 		// AND THE ADDRESS RESOLVES, not merely the Open. An Open that succeeded
 		// while every read missed would be the same defect one layer down.
-		if _, err := hostSide.ReadPublicJournal(t.Context(), sessionstore.ReadPublicJournalRequest{
+		//
+		// THE ASSERTION IS ON CapturedTip, NOT ON err == nil, and the difference
+		// is the whole finding. ReadPublicJournal answers an EMPTY PAGE without
+		// error for a session that does not exist in this scope, so a nil error
+		// says only that the request was well formed. An earlier version of this
+		// test checked the error alone and therefore passed when pointed at a
+		// canonical UUID no harness store had ever created — it asserted exactly
+		// nothing about the address resolving, which is the one thing it exists
+		// to establish.
+		page, err := hostSide.ReadPublicJournal(t.Context(), sessionstore.ReadPublicJournalRequest{
 			TenantID:  sharedTenant,
 			SessionID: sessionwire.SessionID(rigSessionID.String()),
 			Limit:     10,
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("Host's read of harness's session scope: %v", err)
+		}
+		if page.CapturedTip == 0 {
+			t.Fatalf("Host read harness's session scope and found an empty journal (CapturedTip=0); the Open succeeded but the address did not resolve")
+		}
+
+		// THE CONTROL, IN THE SAME TEST. A session identity nothing created must
+		// come back with a tip of zero. Without it, "CapturedTip > 0" could be
+		// satisfied by a store that answered every address alike, and the
+		// assertion above would be measuring the wrong thing while passing.
+		bogus, err := hostSide.ReadPublicJournal(t.Context(), sessionstore.ReadPublicJournalRequest{
+			TenantID:  sharedTenant,
+			SessionID: sessionwire.SessionID("99999999-9999-9999-9999-999999999999"),
+			Limit:     10,
+		})
+		if err != nil {
+			t.Fatalf("reading a session identity nothing created: %v", err)
+		}
+		if bogus.CapturedTip != 0 {
+			t.Fatalf("a session identity nothing created reported CapturedTip=%d, so the tip does not distinguish scopes and the assertion above proves nothing", bogus.CapturedTip)
 		}
 	})
 
