@@ -128,7 +128,7 @@ type rejectCall struct {
 // whole reason it is this long. A fake more permissive than the implementation
 // it stands for converts a contract violation into a passing test: the previous
 // one accepted a terminal write from any non-terminal state and needed no
-// result, so a `claimed -> applied` transition that sessionstore v0.1.0 refuses
+// result, so a `claimed -> applied` transition that sessionstore v0.6.0 refuses
 // outright — CompleteCommand admits only StateApplying, and requires a result
 // naming a durable journal event — read as green. Every refusal below is a rule
 // in inbox_claim.go, not a rule this test bench invented.

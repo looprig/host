@@ -12,7 +12,7 @@
 //
 // THE SEAMS ARE NARROW LOCAL INTERFACES OVER METHODS THAT EXIST. That is worth
 // stating precisely, because an earlier version of this file claimed the
-// opposite. sessionstore v0.1.0 HAS all of them — GetCommand, the inbox record's
+// opposite. sessionstore v0.6.0 HAS all of them — GetCommand, the inbox record's
 // private Payload/PayloadRef with GetObject behind a reference,
 // FindCommandApplication, ReadGates, ClaimCommand, BeginApplyingCommand,
 // CompleteCommand, RejectCommand, and the journal's application-prefix envelope

@@ -26,17 +26,22 @@ import (
 // held by prose alone. The mapping is a pure function of an exported error
 // type, so it is tested as one.
 //
-// EVERY ARM IS ENUMERATED BY HAND, AND THE TABLES ARE COMPLETE AS OF
-// sessionstore v0.1.0 — 10 JournalErrorCode, 19 InboxErrorCode and 13
+// EVERY ARM BELOW IS ENUMERATED BY HAND, AND THE TABLES REMAIN COMPLETE AS OF
+// sessionstore v0.6.0 — 10 JournalErrorCode, 19 InboxErrorCode and 13
 // RegistryErrorCode constants, of which 12 are passthrough and one, epoch, is
-// mapped; plus 5 InboxState and 5 CommandApplicationOutcome.
+// mapped; plus 5 InboxState and 5 CommandApplicationOutcome. The O3.3 rebind
+// re-counted these against v0.6.0 and none of the three vocabularies grew.
 //
-// THEY DO NOT WALK ANYTHING, and saying they did would be worse than saying
-// nothing. Go cannot enumerate a package's constants at run time, so these are
-// literal slices: a code added upstream is not defaulted, not reported and not
-// classified — it is simply ABSENT AND UNTESTED until somebody extends the
-// table. The completeness above is a measurement against one pinned version and
-// it goes stale the moment that pin moves; re-count on every sessionstore bump.
+// THESE SLICES STILL DO NOT WALK ANYTHING, and saying they did would be worse
+// than saying nothing: Go cannot enumerate a package's constants at run time, so
+// a code added upstream is absent from a literal slice rather than reported by
+// it. What has changed is that the COMPLETENESS is no longer a human's promise.
+// codeset_test.go derives all three sets from the pinned module's own source and
+// asserts the classification over the derived set, with a positive control over
+// a deliberately wrong classifier. These tables are kept because they are
+// readable and because they name the intent arm by arm; the for-all they were
+// reaching for is held there. Do not re-add a "re-count on every bump" note —
+// that obligation is what codeset_test.go replaced.
 
 func TestClassifyJournalMapsEveryOwnershipCode(t *testing.T) {
 	for _, tt := range []struct {

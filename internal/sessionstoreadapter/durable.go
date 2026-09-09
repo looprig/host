@@ -38,7 +38,7 @@ func (e *UnavailableMemberError) Error() string {
 //
 // IT IS A PARAMETER RATHER THAN A DELEGATION BECAUSE F4 SAYS IT HAS TO BE.
 // residency.SessionState documents Namespace as read from the store "because the
-// layout is SessionStore's", and sessionstore v0.1.0 publishes no layout,
+// layout is SessionStore's", and sessionstore v0.6.0 publishes no layout,
 // prefix or namespace accessor — the keyspace derivation is unexported. So the
 // adapter cannot answer this member by delegating, and it will not answer it by
 // inventing one either: a prefix chosen here would be a second authority for a

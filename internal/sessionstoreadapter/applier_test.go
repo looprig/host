@@ -27,7 +27,7 @@ import (
 // answered rather than discharged. O7.1 asks for a mechanical Fence adapter
 // because residency.epochFence's methods are unexported, and offers O3.3 the
 // option of discharging it "by delegating both to sessionstore". THAT OPTION IS
-// NOT AVAILABLE: sessionstore v0.1.0 publishes no ownership signal to delegate
+// NOT AVAILABLE: sessionstore v0.6.0 publishes no journal ownership signal to delegate
 // to — the grant's Lost channel here is the adapter's own, closed by a write
 // this Host made (finding F3) — so a Fence delegating to the released store
 // would report ownership loss strictly later than epochFence does, and never at
@@ -163,7 +163,7 @@ func newApplierHost(t *testing.T) *host.Host {
 
 // THIS IS THE TEST O3.3 EXISTS FOR. commands.Applier's every durable step —
 // the record read, the claim, the payload load, the applying transition and the
-// application prefix — runs against sessionstore v0.1.0 rather than a fake, and
+// application prefix — runs against sessionstore v0.6.0 rather than a fake, and
 // each one is exercised in the order §10.4 fixes.
 //
 // IT ENDS IN A REFUSAL, AND THE REFUSAL IS THE FINDING. The applier settles a

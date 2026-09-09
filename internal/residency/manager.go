@@ -55,10 +55,16 @@ import (
 // Each is a NARROW LOCAL interface, for the reason department.Rig and
 // host.SessionStore are: naming a looprig module in go.mod is the same decision
 // as depending on it, and publishedLooprigVersions is where that decision is
-// recorded. Released harness v0.30.2 has none of H4.1's capabilities, and
-// sessionstore v0.1.0 implements neither the epoch-fenced projection nor the
-// in-stream journal fence this package needs. These describe what Host
-// requires; the concrete edges are later tasks.
+// recorded. THE REASON IS THE go.mod DECISION, NOT AN ABSENCE UPSTREAM, and an
+// earlier version of this comment gave the wrong one: it said released harness
+// v0.30.2 "has none of H4.1's capabilities", which was already false when
+// harnessadapter bound to v0.31.0 — session.IdleWaiter, session.Liveness and
+// session.Releaser are all exported and are asserted on by name there.
+// sessionstore v0.6.0 does publish a residency grant with Epoch, Lost and
+// Release, but in a SEPARATE epoch domain that must not stamp a journal fence,
+// and JournalWriter still exposes no loss channel; see findings F3 and F15 in
+// internal/sessionstoreadapter. So no released type satisfies Lease as declared
+// below. These describe what Host requires; the concrete edges are later tasks.
 
 // Lease is one granted, epoch-fenced session lease.
 type Lease interface {

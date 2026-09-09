@@ -15,17 +15,23 @@ import (
 // and restores one. It is a LOCAL interface, and that is a decision worth its
 // paragraph rather than a shrug.
 //
-// Host does not import github.com/looprig/harness, for two independent reasons
-// either of which would be sufficient. First, the published harness (v0.30.2)
-// does not have H4.1's capabilities at all — no WaitIdle, no Done, no
-// ReleaseResidency — so naming it would buy an adapter over a type that cannot
-// satisfy Runtime. Second, naming a looprig module in go.mod is the same
-// decision as depending on it, and publishedLooprigVersions has no harness
-// entry; adding one is a release-ordering commitment, not an import.
+// THIS PACKAGE does not import github.com/looprig/harness, and the reason is a
+// layering one. An earlier version of this paragraph gave a different reason —
+// that "the published harness (v0.30.2) does not have H4.1's capabilities at
+// all — no WaitIdle, no Done, no ReleaseResidency" — and that was already false
+// when internal/harnessadapter bound to harness v0.31.0: session.IdleWaiter,
+// session.Liveness and session.Releaser are exported and are asserted on by
+// name there. It is recorded rather than quietly deleted because a stale
+// justification for a live decision is the failure the paragraph above this one
+// exists to stop.
 //
-// So this follows the pattern CLAUDE.md already prescribes for drain: a narrow
-// local interface plus a fake, with the concrete edge deferred until the
-// module and the capability both exist. What is narrow here is deliberate —
+// The standing reason is that the concrete edge is internal/harnessadapter's,
+// not department's: department declares WHAT Host requires of a runtime in
+// Host's own identities, and the adapter is where a released type is made to
+// satisfy it. CLAUDE.md's paragraph on this is the authority — an adapter is
+// mandatory whatever H4.1 names, because Harness identifies a session with a
+// core/uuid.UUID and these identify a runtime with the opaque sessionwire
+// strings Host and Factory exchange. What is narrow here is deliberate —
 // rig.Rig's real NewSession takes variadic SessionOption and returns
 // session.SessionController, and Host wants neither. Host wants a session it
 // can identify and interrogate.

@@ -67,10 +67,14 @@ func (g *Grant) Epoch() uint64 { return g.writer.Epoch() }
 
 // Lost closes when this grant is known to be gone.
 //
-// IT IS NOT THE STORE'S SIGNAL, AND THERE IS NO STORE SIGNAL — finding F3. The
-// released module exposes no lease-loss channel and no renewal callback; a
-// JournalWriter learns it lost the stream by latching the failure of an append
-// IT made. So this channel closes when a call THROUGH THIS ADAPTER classified as
+// IT IS NOT THE STORE'S SIGNAL, AND THERE IS NO SIGNAL ON THIS GRANT — finding
+// F3. The claim is bounded to the JOURNAL grant deliberately, because at
+// sessionstore v0.6.0 it is no longer true of the module as a whole: a
+// ResidencyGrant from Store.AcquireResidency does publish Lost(). It is a
+// different lease in a different epoch domain and this type does not hold one
+// (see F15). JournalWriter, which it does hold, exposes Epoch, Sequence, Append
+// and Close and no loss channel or renewal callback; it learns it lost the
+// stream by latching the failure of an append IT made. So this channel closes when a call THROUGH THIS ADAPTER classified as
 // a lost or fenced grant, and it is SILENT FOR AN IDLE SESSION: a Host that
 // stops writing stops learning. residency.Lease.Lost documents itself as "the
 // FAST guard only" with the non-rebasing journal CAS as the hard backstop, and
@@ -130,8 +134,9 @@ func (g *Grant) AppendApplicationPrefix(
 	//
 	// It is kept rather than deleted because it is the ONLY thing that would
 	// ever close Lost against a real provider: finding F3 is that the released
-	// store publishes no ownership signal, so a fenced write is the single
-	// observation this adapter gets. Deleting it would leave residency's
+	// store publishes no ownership signal ON THE JOURNAL GRANT — v0.6.0's
+	// ResidencyGrant.Lost is a different lease this type does not hold — so a
+	// fenced write is the single observation this adapter gets. Deleting it would leave residency's
 	// heartbeat and drain supervisor selecting on a channel that never closes at
 	// all.
 	//

@@ -127,7 +127,7 @@ type Command struct {
 // Each is a NARROW LOCAL interface, for the reason department.Rig and
 // host.SessionStore are: naming a looprig module in go.mod is the same decision
 // as depending on it, and publishedLooprigVersions is where that decision is
-// recorded. sessionstore v0.1.0 implements neither OrderedIndex's ListOrdered
+// recorded. sessionstore v0.6.0 implements neither OrderedIndex's ListOrdered
 // nor a per-session consumption cursor. These describe what Host requires; the
 // concrete edges are later tasks.
 

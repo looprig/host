@@ -1,5 +1,5 @@
 // Package sessionstoreadapter binds Host's narrow local store seams to the
-// released github.com/looprig/sessionstore v0.1.0 Store.
+// released github.com/looprig/sessionstore v0.6.0 Store.
 //
 // EVERY ADAPTER HERE DELEGATES. Where residency and commands describe a concept
 // the released module owns — the epoch fence, the inbox compare-and-swap, the
@@ -94,17 +94,45 @@
 // — and why O7.1's Fence adapter cannot be discharged by delegation; see the
 // grantFence comment in applier_test.go.
 //
+// F3 AT v0.6.0 — PARTIALLY DISCHARGED, AND NOT THE PART THIS SEAM NEEDS. The
+// rebind re-ran this row against the released module and the answer changed
+// without the finding going away, so it is recorded rather than deleted.
+// v0.6.0 adds Store.AcquireResidency returning a *ResidencyGrant with exactly
+// Epoch(), Lost() and Release() — the shape residency.Lease declares, and the
+// loss channel this row said was owed. But it is a DIFFERENT LEASE. The grant
+// is taken in the session's ".../residency/lease" namespace, its epoch is the
+// distinct type ResidencyEpoch whose own doc says it "must never be compared
+// with, or used as, a journal epoch", and the type states that "residency loss
+// does not fence a journal: a successor must independently acquire the journal
+// grant before application". JournalWriter — the object Grant below actually
+// wraps — still publishes Epoch, Sequence, Append and Close and NO Lost. So the
+// journal grant's loss is still unobservable, this package's Lost() is still
+// the adapter's own signal, and everything above about idle silence still holds.
+//
 // F4. THE DURABLE STATE CARRIES NO NAMESPACE. residency.SessionState.Namespace
 // is required whether or not the session exists, and is documented as read from
-// the store "because the layout is SessionStore's". sessionstore v0.1.0 exposes
+// the store "because the layout is SessionStore's". sessionstore v0.6.0 exposes
 // no object namespace, prefix or layout accessor at all; the layout is internal.
 // The adapter cannot answer this member from the store, so it is Host's to
 // derive or SessionStore's to publish. Reported, not papered over.
 //
-// F5. THE DURABLE STATE CARRIES NO RIG SESSION ID. residency.SessionState
-// .RigSessionID is Harness's UUID, which Host "recorded at create and cannot
-// derive". CatalogRecord has no member for it and no SessionPointerKind names
-// one. A restore has nothing to restore from until something durable holds it.
+// F5. THE DURABLE STATE CARRIES NO RIG SESSION ID — SUPERSEDED AT v0.6.0, AND
+// REPLACED BY THE OPPOSITE DEFECT. As written against v0.1.0 this said
+// CatalogRecord had no member for residency.SessionState.RigSessionID and no
+// SessionPointerKind named one. v0.6.0 adds SessionBinding, immutable at
+// creation and carried on CatalogRecord, whose RuntimeSessionID is exactly that
+// durable member and is reachable through the GetCatalogEntry this package
+// already calls. The store no longer has nothing to restore from.
+//
+// What replaces the finding is F11's shape in the other direction.
+// SessionBinding.RuntimeSessionID is a bounded opaque UTF-8 string, validated by
+// validateOpaque and by nothing else, and residency.SessionState.RigSessionID is
+// a uuid.UUID. HOST'S SEAM IS THEREFORE TIGHTER THAN THE STORE: a binding
+// written by an allocator that is not Harness is durable, readable and valid to
+// the store, and cannot be represented in Host at all. That is not a reason to
+// widen the seam blind — Host's restore really does hand the value to Harness,
+// which really does want a UUID — but the refusal has to be Host's, stated, and
+// reached before the launch rather than at a parse deep inside it.
 //
 // F6. NO RELEASED CALL MATERIALIZES A WORKSPACE BY TENANT AND SESSION. Harness's
 // workspacestore is content-addressed — Materialize(ctx, Ref, dest) — and picks
@@ -184,12 +212,46 @@
 // and read it back as current. PublishResidency checks that member rather than
 // delegating it; see UnsupportedWireVersionError.
 //
+// F15. THE ONE LEASE HOST DECLARES IS TWO GRANTS IN THE RELEASED MODULE, IN TWO
+// EPOCH DOMAINS. residency.Lease fuses them: Epoch() is documented as the value
+// Core publishes as the registry observation's lease_epoch, and the SAME value
+// is what JournalFencer.CommitOpeningFence stamps into the in-stream fence.
+// v0.6.0 splits the two deliberately and gives them distinct types —
+// ResidencyEpoch, the Host's orchestration grant, and JournalEpoch, "a runtime
+// grant in a session's bound agent journal" — and forbids the identification in
+// terms. Neither released type satisfies residency.Lease alone: ResidencyGrant
+// has Lost() and an epoch that must not stamp a journal fence, JournalWriter has
+// the journal epoch and no Lost(). THE FAKES DO NOT EXPRESS THIS AND CANNOT BE
+// MADE TO BY A FIXTURE — fakeLease hands out one uint64 that plays both roles,
+// which is a state production has no way to produce. Whether Host tracks two
+// grants or drops one is a design decision, not a rebind, and it is left to
+// O5.3 rather than guessed at here.
+//
+// F16. THE RESIDENCY GRANT IS ADMITTED ONLY FOR A DISPOSITION-MODE SESSION, AND
+// A FAILED ACQUISITION CAN STILL OWE A RELEASE. Two properties of
+// AcquireResidency that no fake in this module produces. First, it refuses any
+// session whose immutable catalog binding is not ProtocolModeDisposition, with
+// catalogInvalid("binding.protocol_mode"), and binds the session scope mode as a
+// side effect; residency.SessionLeases.AcquireSessionLease grants
+// unconditionally in every fake here. Host does not create catalog records — it
+// only reads them — so WHICH protocol mode Host's sessions carry is decided by
+// their creator and is a question for the program, not a defect in this module;
+// it is recorded because a Host bound to AcquireResidency against legacy-mode
+// sessions would fail at every attach with a validation error and no fake would
+// have predicted it. Second, ResidencyAcquireCleanupError is an error that
+// returns no grant AND leaves a provider lease and a Store admission held,
+// obliging the caller to retry Release until it succeeds or Store.Close times
+// out. AcquireSessionLease's (Lease, error) signature cannot represent "refused,
+// and you still owe a release": every fake here treats a non-nil error as
+// nothing acquired. THE FAKE IS LOOSER THAN THE DEPENDENCY in the way that leaks
+// rather than the way that fails.
+//
 // # What step 4 could run against the adapter, and what it could not
 //
 // The instruction is to run the residency, commands and hostlink suites against
 // both the fakes and the adapters. Which of them CAN run is itself a result:
 //
-//   - commands' APPLY path runs, end to end, against sessionstore v0.1.0 over
+//   - commands' APPLY path runs, end to end, against sessionstore v0.6.0 over
 //     Storage's memory provider. TestApplierRunsTheWholeProtocolAgainstTheReleasedStore
 //     drives commands.Applier.Process through the record read, the claim, the
 //     payload load, the applying transition and the journal application prefix,

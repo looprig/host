@@ -1,5 +1,5 @@
 // Package harnessadapter binds Host's department seams to the released
-// github.com/looprig/harness v0.31.0 rig and session API.
+// github.com/looprig/harness v0.32.0 rig and session API.
 //
 // # Step-1 inventory
 //
