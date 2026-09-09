@@ -97,17 +97,44 @@
 // object reader, so a referenced payload is refused. The fake accepts one and
 // records it.
 //
-// H9. HARNESS WRITES THE APPLICATION PREFIX ITSELF, AND WRITES IT UNDER ITS OWN
-// SESSION SCOPE. harness/pkg/sessionstore opens the released store with
-// WithLegacySingleTenant("local") and derives the session id from the Harness
-// UUID, so every record a session commits — the opening fence, the public
-// events, and the EnvelopeKindApplicationPrefix that Applier.ApplyRuntimeCommand
-// writes before each effect — lands under ("local", <uuid>) and not under Host's
-// (TenantID, SessionID). The two layouts are MUTUALLY EXCLUSIVE at the backend:
-// whichever store initializes one first, the other refuses it with
-// KeyspaceError{layout_mismatch}. Measured in both directions by
+// H9. HARNESS WRITES THE APPLICATION PREFIX ITSELF, AND BY DEFAULT WRITES IT
+// UNDER ITS OWN SESSION SCOPE. harness/pkg/sessionstore opens the released store
+// with WithLegacySingleTenant and derives the session id from the Harness UUID,
+// so every record a session commits — the opening fence, the public events, and
+// the EnvelopeKindApplicationPrefix that Applier.ApplyRuntimeCommand writes
+// before each effect — lands under (<tenant>, <uuid>) rather than under Host's
+// (TenantID, SessionID). ON THE DEFAULTS the two layouts are mutually exclusive
+// at the backend: whichever store initializes one first, the other refuses it
+// with KeyspaceError{layout_mismatch}. Measured in both directions by
 // TestHostCannotOpenABackendHarnessInitialized and
-// TestHarnessCannotOpenABackendHostInitialized.
+// TestHarnessCannotOpenABackendHostInitialized, both of which still pass because
+// the defaults did not move.
+//
+// H9 AT harness v0.32.0 — THE TENANT HALF IS DISCHARGED, THE IDENTITY HALF IS
+// NOT. The paragraph that used to close this finding said Host and its runtime
+// "cannot share one storage backend AT ALL", that "nothing in this package can
+// fix" it, and that it was "a release owed". The first two are now FALSE and the
+// third is narrower than it was. v0.32.0's only production change is
+// pkg/sessionstore, and it adds WithTenant, which replaces the hardcoded "local"
+// so a Store files under the tenant it is opened with. The rebind measured the
+// consequence rather than trusting the doc: see
+// TestHostAndHarnessCanShareABackendOnTheLegacyLayout, which opens ONE backend
+// from both sides, in both initialization orders, and reads harness's session
+// scope through Host's store.
+//
+// IT IS A PARTIAL DISCHARGE AND THE TWO COSTS ARE THE FINDING. First, sharing
+// requires Host to open with WithLegacySingleTenant; Host's native multi-tenant
+// open over a harness-initialized backend still fails layout_mismatch, so a Host
+// that shares a backend with its runtime is a single-tenant Host for it. Second
+// — and this is what is still owed — the legacy layout addresses a session by
+// the UUID's canonical rendering and refuses anything else with
+// KeyspaceError{legacy_session}, while Host's SessionID is the opaque
+// sessionwire identity Factory admitted the session under, which CLAUDE.md
+// states is NOT a UUID by contract. Sharing therefore works exactly when Host's
+// session identity happens to be the rig's UUID, which Host does not control.
+// Both costs are asserted, not described. What remains owed is no longer "a way
+// for two stores to share a keyspace" — that exists — but Harness ceasing to
+// impose its own identity grammar on the shared one.
 //
 // THE CONSEQUENCE IS NOT "the correlation reports absent". It cannot:
 // commands.Applier appends its own prefix under Host's scope BEFORE driving the
@@ -130,7 +157,10 @@
 //     durably committed. That is a rejection written over a committed effect,
 //     and it is reached by crash-and-takeover rather than in steady state.
 //
-// Nothing in this package can fix either. Harness must accept Host's
-// (TenantID, SessionID) and file its records under them, or SessionStore must
-// offer a way for two stores to share a keyspace. It is a release owed.
+// THE TWO OUTCOMES ABOVE REMAIN REACHABLE, as a configuration rather than as a
+// wall: they are what happens when the two sides do NOT share a scope, which is
+// still the default and is still the only option when Host's session identity is
+// not the rig's UUID. Closing them needs the identity half of H9 above. This
+// package cannot fix that alone; what changed is that it is no longer the whole
+// of the finding.
 package harnessadapter

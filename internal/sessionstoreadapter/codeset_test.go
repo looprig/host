@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,12 +40,33 @@ import (
 // now appears in the derived set on the next bump and is asserted whether or
 // not anybody extended a table.
 //
-// WHAT THIS DOES NOT DO. It does not check that Host's classification of a NEW
-// code is correct — nothing can, because correctness is a judgement about what
-// the code means. It checks that every code the pinned module declares gets a
-// classification Host has DECIDED, and that a code Host has not considered is
-// visible rather than silently defaulted. That is the property the literal
-// tables were reaching for.
+// HOW IT FAILS CLOSED, AND WHY THAT TOOK TWO ATTEMPTS. The first version of
+// this file derived the code set and then iterated it against a LITERAL
+// expectation map. That does not deliver the property above: an upstream code
+// nobody had considered was absent from the map, took the "not mapped" branch,
+// was asserted to pass through unchanged — which it does — and reported clean.
+// The derivation moved one axis and the expectation stayed a fixture, so a new
+// code was still silently defaulted. A mutation adding a code to a copy of the
+// module source passed all five tests.
+//
+// So the expectation is now CLOSED rather than defaulted. Each vocabulary names
+// its mapped codes AND its passthrough codes, and unconsideredCodes requires the
+// derived set and that union to be EQUAL. A code upstream adds is in neither
+// list and fails; a code upstream removes is in a list and no longer derived,
+// and fails too. THE TWO LISTS ARE STILL LITERALS — that is said plainly rather
+// than implied away — but a literal that must account for every derived member
+// is a different object from one that is consulted only when it happens to
+// match.
+//
+// UNIT OF ANALYSIS: a package-level `const` whose ValueSpec carries an explicit
+// type name and a string literal value, in a non-test .go file in the module
+// ROOT directory. WHAT IT CANNOT SEE: constants in subdirectories or in
+// internal/ (none of these three vocabularies live there, checked); a constant
+// whose type is inherited from an earlier spec in the same block rather than
+// restated; a code the module produces without declaring a constant for it; and
+// — most importantly — whether Host's classification of any code is SEMANTICALLY
+// right. It establishes that every declared code has a decision, never that the
+// decision is correct.
 //
 // The derivation fails rather than skips when it cannot reach the source: a
 // guard whose subject is absent must not report success, and an empty derived
@@ -179,10 +201,18 @@ func declaredCodes(t *testing.T, dir, typeName string) []string {
 
 // requireDerivedSet floors the derivation and proves it reached its subject.
 //
-// The floor is the vacuous-pass guard: zero codes would make every assertion
-// below pass without examining anything. The known member is the positive
-// control over the PARSE — a derivation that silently matched nothing, or
-// matched a different type, fails here rather than reporting a clean sweep.
+// The KNOWN MEMBER is what does the work: it is the positive control over the
+// parse, and a derivation that silently matched nothing, or matched a different
+// type, fails on it rather than reporting a clean sweep.
+//
+// THE ZERO FLOOR BELOW IT IS STRICTLY REDUNDANT, and that is recorded because an
+// earlier version of this file claimed otherwise. Removing the floor AND
+// emptying the derivation still fails, on the known-member check, with "derived
+// 0 JournalErrorCode constants but not the known member". A mutation that
+// deleted only the floor therefore survives — not because the floor is dormant
+// and needed, which is what was first reported, but because nothing depends on
+// it. It is kept for its clearer message on the commonest failure, not for
+// coverage it does not add.
 func requireDerivedSet(t *testing.T, typeName string, codes []string, knownMember string) {
 	t.Helper()
 
@@ -234,6 +264,112 @@ func undecidedCodes(classify func(error) error, codes []string, construct func(s
 	return findings
 }
 
+// unconsideredCodes compares the DERIVED set against the codes Host has
+// actually considered, in both directions.
+//
+// unknown is every derived code named by neither list: upstream declares it and
+// Host has never made a decision about it. stale is every listed code that is no
+// longer derived: Host holds an opinion about something upstream has dropped.
+// Returning both is what makes this a closed expectation rather than a default,
+// and it is a pure function of its inputs so that the controls below can hand it
+// a set with a known answer.
+func unconsideredCodes(derived []string, mapped map[string]error, passthrough []string) (unknown, stale []string) {
+	considered := make(map[string]bool, len(mapped)+len(passthrough))
+	for code := range mapped {
+		considered[code] = true
+	}
+	for _, code := range passthrough {
+		considered[code] = true
+	}
+	seen := make(map[string]bool, len(derived))
+	for _, code := range derived {
+		seen[code] = true
+		if !considered[code] {
+			unknown = append(unknown, code)
+		}
+	}
+	for code := range considered {
+		if !seen[code] {
+			stale = append(stale, code)
+		}
+	}
+	sort.Strings(unknown)
+	sort.Strings(stale)
+	return unknown, stale
+}
+
+// requireConsidered fails with the decision the maintainer has to make, rather
+// than with a diff.
+func requireConsidered(t *testing.T, typeName string, derived []string, mapped map[string]error, passthrough []string) {
+	t.Helper()
+	unknown, stale := unconsideredCodes(derived, mapped, passthrough)
+	if len(unknown) != 0 {
+		t.Fatalf("%s: the pinned module declares %v, which Host has never classified. Decide whether each is an ownership statement and add it to the mapped or the passthrough list in this file.", typeName, unknown)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("%s: this file still names %v, which the pinned module no longer declares. Remove them.", typeName, stale)
+	}
+}
+
+// THE LITERAL LISTS. These are literals, said plainly. Their job is not to be
+// the set — declaredCodes derives that — but to force a human decision for every
+// member of it. Splitting them by vocabulary keeps each one next to the switch
+// it describes in store.go.
+var (
+	journalMapped = map[string]error{
+		string(sessionstore.JournalErrorLeaseHeld): residency.ErrLeaseHeld,
+		string(sessionstore.JournalErrorFenced):    residency.ErrFenceConflict,
+		string(sessionstore.JournalErrorLeaseLost): residency.ErrEpochSuperseded,
+	}
+	journalPassthrough = []string{
+		string(sessionstore.JournalErrorInvalid),
+		string(sessionstore.JournalErrorUnknown),
+		string(sessionstore.JournalErrorClosed),
+		string(sessionstore.JournalErrorBackend),
+		string(sessionstore.JournalErrorIntegrity),
+		string(sessionstore.JournalErrorTooLarge),
+		string(sessionstore.JournalErrorCursor),
+	}
+
+	inboxMapped      = map[string]error{string(sessionstore.InboxErrorEpoch): residency.ErrEpochSuperseded}
+	inboxPassthrough = []string{
+		string(sessionstore.InboxErrorInvalid),
+		string(sessionstore.InboxErrorCursor),
+		string(sessionstore.InboxErrorCommandMismatch),
+		string(sessionstore.InboxErrorNotFound),
+		string(sessionstore.InboxErrorDeleted),
+		string(sessionstore.InboxErrorIdentity),
+		string(sessionstore.InboxErrorConflict),
+		string(sessionstore.InboxErrorClaimHeld),
+		string(sessionstore.InboxErrorClaimLost),
+		string(sessionstore.InboxErrorDeadline),
+		string(sessionstore.InboxErrorState),
+		string(sessionstore.InboxErrorEvidence),
+		string(sessionstore.InboxErrorTerminal),
+		string(sessionstore.InboxErrorUnknown),
+		string(sessionstore.InboxErrorBackend),
+		string(sessionstore.InboxErrorMalformed),
+		string(sessionstore.InboxErrorVersion),
+		string(sessionstore.InboxErrorTooLarge),
+	}
+
+	registryMapped      = map[string]error{string(sessionstore.RegistryErrorEpoch): residency.ErrEpochSuperseded}
+	registryPassthrough = []string{
+		string(sessionstore.RegistryErrorInvalid),
+		string(sessionstore.RegistryErrorNotFound),
+		string(sessionstore.RegistryErrorExpired),
+		string(sessionstore.RegistryErrorReleased),
+		string(sessionstore.RegistryErrorDeleted),
+		string(sessionstore.RegistryErrorIdentity),
+		string(sessionstore.RegistryErrorConflict),
+		string(sessionstore.RegistryErrorUnknown),
+		string(sessionstore.RegistryErrorBackend),
+		string(sessionstore.RegistryErrorMalformed),
+		string(sessionstore.RegistryErrorVersion),
+		string(sessionstore.RegistryErrorTooLarge),
+	}
+)
+
 var residencySentinels = []error{residency.ErrLeaseHeld, residency.ErrFenceConflict, residency.ErrEpochSuperseded}
 
 // TestEveryDeclaredJournalCodeIsClassifiedDeliberately asserts the mapping over
@@ -242,17 +378,15 @@ func TestEveryDeclaredJournalCodeIsClassifiedDeliberately(t *testing.T) {
 	codes := declaredCodes(t, pinnedSessionstoreDir(t), "JournalErrorCode")
 	requireDerivedSet(t, "JournalErrorCode", codes, string(sessionstore.JournalErrorFenced))
 
+	requireConsidered(t, "JournalErrorCode", codes, journalMapped, journalPassthrough)
+
 	findings := undecidedCodes(
 		classifyJournal,
 		codes,
 		func(code string) error {
 			return &sessionstore.JournalError{Code: sessionstore.JournalErrorCode(code), Field: "lease"}
 		},
-		map[string]error{
-			string(sessionstore.JournalErrorLeaseHeld): residency.ErrLeaseHeld,
-			string(sessionstore.JournalErrorFenced):    residency.ErrFenceConflict,
-			string(sessionstore.JournalErrorLeaseLost): residency.ErrEpochSuperseded,
-		},
+		journalMapped,
 		residencySentinels,
 	)
 	if len(findings) != 0 {
@@ -266,13 +400,15 @@ func TestEveryDeclaredInboxCodeIsClassifiedDeliberately(t *testing.T) {
 	codes := declaredCodes(t, pinnedSessionstoreDir(t), "InboxErrorCode")
 	requireDerivedSet(t, "InboxErrorCode", codes, string(sessionstore.InboxErrorEpoch))
 
+	requireConsidered(t, "InboxErrorCode", codes, inboxMapped, inboxPassthrough)
+
 	findings := undecidedCodes(
 		classifyInbox,
 		codes,
 		func(code string) error {
 			return &sessionstore.InboxError{Code: sessionstore.InboxErrorCode(code), Field: "lease_epoch"}
 		},
-		map[string]error{string(sessionstore.InboxErrorEpoch): residency.ErrEpochSuperseded},
+		inboxMapped,
 		residencySentinels,
 	)
 	if len(findings) != 0 {
@@ -286,13 +422,15 @@ func TestEveryDeclaredRegistryCodeIsClassifiedDeliberately(t *testing.T) {
 	codes := declaredCodes(t, pinnedSessionstoreDir(t), "RegistryErrorCode")
 	requireDerivedSet(t, "RegistryErrorCode", codes, string(sessionstore.RegistryErrorEpoch))
 
+	requireConsidered(t, "RegistryErrorCode", codes, registryMapped, registryPassthrough)
+
 	findings := undecidedCodes(
 		classifyRegistry,
 		codes,
 		func(code string) error {
 			return &sessionstore.RegistryError{Code: sessionstore.RegistryErrorCode(code), Field: "lease_epoch"}
 		},
-		map[string]error{string(sessionstore.RegistryErrorEpoch): residency.ErrEpochSuperseded},
+		registryMapped,
 		residencySentinels,
 	)
 	if len(findings) != 0 {
@@ -311,11 +449,7 @@ func TestUndecidedCodesReportsAClassifierThatIsWrongInEitherDirection(t *testing
 	construct := func(code string) error {
 		return &sessionstore.JournalError{Code: sessionstore.JournalErrorCode(code)}
 	}
-	expectation := map[string]error{
-		string(sessionstore.JournalErrorLeaseHeld): residency.ErrLeaseHeld,
-		string(sessionstore.JournalErrorFenced):    residency.ErrFenceConflict,
-		string(sessionstore.JournalErrorLeaseLost): residency.ErrEpochSuperseded,
-	}
+	expectation := journalMapped
 
 	// TOO LOOSE: a classifier that surrenders ownership for every failure. This
 	// is the direction that makes a Host stop writing to a session it holds.
@@ -338,5 +472,109 @@ func TestUndecidedCodesReportsAClassifierThatIsWrongInEitherDirection(t *testing
 func TestDeclaredCodesFindsNothingForATypeThatDoesNotExist(t *testing.T) {
 	if codes := declaredCodes(t, pinnedSessionstoreDir(t), "NoSuchErrorCode"); len(codes) != 0 {
 		t.Fatalf("declaredCodes matched %d constants for a type sessionstore does not declare: %v", len(codes), codes)
+	}
+}
+
+// M-A, THE MUTATION THAT DEFEATED THE FIRST VERSION OF THIS FILE, KEPT AS A
+// TEST. It copies the pinned module's root .go files to a temporary directory,
+// appends a JournalErrorCode nobody has considered, and runs the REAL derivation
+// over it. The old expectation reported that set clean because an unnamed code
+// takes the passthrough branch; the closed one must report it.
+//
+// It exercises declaredCodes itself rather than hand-building a slice, so a
+// derivation that stopped seeing added constants would fail here too.
+func TestAnUpstreamCodeNobodyConsideredIsReported(t *testing.T) {
+	source := pinnedSessionstoreDir(t)
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		t.Fatalf("reading %s: %v", source, err)
+	}
+	staged := t.TempDir()
+	copied := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(source, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(staged, name), body, 0o600); err != nil {
+			t.Fatalf("staging %s: %v", name, err)
+		}
+		copied++
+	}
+	if copied == 0 {
+		t.Fatal("staged no files, so the mutation would be applied to nothing")
+	}
+
+	const invented = "quarantined_by_a_future_release"
+	addition := "\n\nconst JournalErrorQuarantined JournalErrorCode = \"" + invented + "\"\n"
+	if err := os.WriteFile(filepath.Join(staged, "zz_added_code.go"), []byte("package sessionstore"+addition), 0o600); err != nil {
+		t.Fatalf("writing the added code: %v", err)
+	}
+
+	codes := declaredCodes(t, staged, "JournalErrorCode")
+
+	// The derivation must SEE it, or the control is testing nothing.
+	found := false
+	for _, code := range codes {
+		if code == invented {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the derivation did not pick up the added code; it saw %v", codes)
+	}
+
+	// The closed expectation must REPORT it. This is the assertion that fails
+	// on the first version of this file.
+	unknown, _ := unconsideredCodes(codes, journalMapped, journalPassthrough)
+	if len(unknown) != 1 || unknown[0] != invented {
+		t.Fatalf("unconsideredCodes reported %v, want exactly [%s]", unknown, invented)
+	}
+
+	// And for contrast: the behaviour check alone passes it, which is precisely
+	// why the behaviour check is not sufficient on its own.
+	findings := undecidedCodes(
+		classifyJournal,
+		codes,
+		func(code string) error {
+			return &sessionstore.JournalError{Code: sessionstore.JournalErrorCode(code)}
+		},
+		journalMapped,
+		residencySentinels,
+	)
+	if len(findings) != 0 {
+		t.Fatalf("undecidedCodes unexpectedly reported the added code: %v; the contrast this control draws no longer holds", findings)
+	}
+}
+
+// The other direction of the closed expectation: a code this file names that
+// upstream has dropped must be reported as stale, or the lists would silently
+// accumulate opinions about codes that no longer exist.
+func TestACodeThisFileNamesThatUpstreamDroppedIsReported(t *testing.T) {
+	derived := []string{string(sessionstore.JournalErrorLeaseHeld)}
+	unknown, stale := unconsideredCodes(derived, journalMapped, journalPassthrough)
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %v, want none", unknown)
+	}
+	if len(stale) != len(journalMapped)+len(journalPassthrough)-1 {
+		t.Fatalf("stale = %v, want every listed code but the one derived", stale)
+	}
+}
+
+// The known-answer control on the comparison itself, in the direction that
+// matters most: an exactly-matching set reports nothing, so the two findings
+// above are not an artefact of a function that always reports something.
+func TestUnconsideredCodesIsSilentOnAnExactMatch(t *testing.T) {
+	var derived []string
+	for code := range journalMapped {
+		derived = append(derived, code)
+	}
+	derived = append(derived, journalPassthrough...)
+	if unknown, stale := unconsideredCodes(derived, journalMapped, journalPassthrough); len(unknown) != 0 || len(stale) != 0 {
+		t.Fatalf("an exact match reported unknown=%v stale=%v", unknown, stale)
 	}
 }

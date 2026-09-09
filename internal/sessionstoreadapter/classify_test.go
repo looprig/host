@@ -35,13 +35,18 @@ import (
 // THESE SLICES STILL DO NOT WALK ANYTHING, and saying they did would be worse
 // than saying nothing: Go cannot enumerate a package's constants at run time, so
 // a code added upstream is absent from a literal slice rather than reported by
-// it. What has changed is that the COMPLETENESS is no longer a human's promise.
-// codeset_test.go derives all three sets from the pinned module's own source and
-// asserts the classification over the derived set, with a positive control over
-// a deliberately wrong classifier. These tables are kept because they are
-// readable and because they name the intent arm by arm; the for-all they were
-// reaching for is held there. Do not re-add a "re-count on every bump" note —
-// that obligation is what codeset_test.go replaced.
+// it. The tables are kept because they are readable and because they name the
+// intent arm by arm.
+//
+// THE RE-COUNT OBLIGATION IS DISCHARGED IN codeset_test.go, AND ONLY BECAUSE
+// THAT FILE FAILS CLOSED. Its first version merely derived the code set and
+// iterated it against a literal expectation, which left an unconsidered upstream
+// code taking the passthrough branch and reporting clean — the obligation was
+// deleted and not replaced. It now requires the derived set and the union of its
+// mapped and passthrough lists to be EQUAL, so an added or removed upstream code
+// fails the build and forces the decision a human used to have to remember. If
+// that property is ever weakened, this note stops being true and the re-count
+// obligation comes back with it; the two are not independent.
 
 func TestClassifyJournalMapsEveryOwnershipCode(t *testing.T) {
 	for _, tt := range []struct {
