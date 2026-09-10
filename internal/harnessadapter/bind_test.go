@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -660,4 +661,101 @@ func waitFor(t *testing.T, done func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("the condition was not reached before the deadline")
+}
+
+// TestThePumpAbsorbsABurstThenGivesUpRatherThanBlockingItsProducer holds the
+// bound on Host's own egress, and it is a fix rather than a description: the
+// pump published into an UNBUFFERED channel with a blocking send, so a Host
+// consumer that paused for one instant stopped the pump, and a stopped pump is
+// the only reader of the hub's 256-slot egress buffer. The cost was not Host's
+// to pay — the hub's class-aware policy would eventually fail the subscription
+// for an enduring overflow, so a momentary Host pause was charged as a LOST
+// TAIL, attributed to the hub, with no record on Host's side of what happened.
+//
+// THE SET OF CLASSES HERE IS ONE, DERIVED. The hub applies drop-ephemeral /
+// fail-enduring, but nothing ephemeral can reach this channel: the committed
+// stream skips an ephemeral event outright (hub.go:653-660), the filter this
+// adapter opens is enduring-only, and pump forwards only a delivery that
+// answers Delivery.Committed. So the only policy this buffer can implement is
+// the enduring one — absorb, then terminate — and there is no droppable case to
+// write. That is why overflow ends the pump instead of skipping a publication.
+//
+// WHAT THE ASSERTIONS ARE. The producer completing is asserted against a
+// DEADLINE rather than by simply running, because the defect's signature is a
+// blocked send and a test that blocked would be killed by timeout — which is
+// not an assertion kill and reports nothing. The count of absorbed publications
+// is the value assertion: it must be exactly the buffer, so neither a smaller
+// buffer nor an unbounded one passes.
+func TestThePumpAbsorbsABurstThenGivesUpRatherThanBlockingItsProducer(t *testing.T) {
+	closed := 0
+	// UNBUFFERED, so every send measures the pump's own absorption and nothing
+	// else. A buffered fixture would credit the pump with the fixture's slack.
+	subscription := &fakeSubscription{deliveries: make(chan event.Delivery), closed: &closed}
+	runtime := boundFor(t, newFullController(subscription, nil, nil))
+
+	published, err := runtime.SubscribeCommitted(t.Context(), "")
+	if err != nil {
+		t.Fatalf("SubscribeCommitted: %v", err)
+	}
+
+	// NOBODY READS published. That is the whole fixture: a Host consumer that
+	// has stopped taking publications.
+	const burst = committedEgressBuffer + 2
+	sent := make(chan int, 1)
+	go func() {
+		count := 0
+		for i := 1; i <= burst; i++ {
+			select {
+			case subscription.deliveries <- event.Delivery{
+				JournalSeq:     uint64(i),
+				EventID:        "event-" + strconv.Itoa(i),
+				PublicBody:     []byte(`{"type":"step_done"}`),
+				CoveredThrough: uint64(i),
+			}:
+				count++
+			case <-time.After(5 * time.Second):
+				sent <- count
+				return
+			}
+		}
+		sent <- count
+	}()
+
+	// THE EXPECTED COUNT IS DERIVED, and it is neither the burst nor the
+	// buffer. The pump takes one delivery out of the stream BEFORE it discovers
+	// its own buffer is full, so exactly buffer+1 sends are taken; the next one
+	// has no reader at all, because a pump that has given up must stop reading.
+	// Stating it exactly is what separates the fix from the defect: the blocking
+	// build takes 1.
+	const taken = committedEgressBuffer + 1
+	select {
+	case count := <-sent:
+		if count != taken {
+			t.Fatalf("the producer placed %d of %d deliveries before it stopped being taken, want %d; the pump blocked its producer", count, burst, taken)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the producer never finished")
+	}
+
+	// The pump gave up rather than blocking: the channel it owns closes and the
+	// subscription it was handed is closed, which is what tells the consumer the
+	// tail is over and obliges a durable reset.
+	absorbed := 0
+	deadline := time.After(10 * time.Second)
+	for open := true; open; {
+		select {
+		case _, more := <-published:
+			if more {
+				absorbed++
+				continue
+			}
+			open = false
+		case <-deadline:
+			t.Fatalf("the publication channel never closed after %d publications; the pump is still holding the tail open", absorbed)
+		}
+	}
+	if absorbed != committedEgressBuffer {
+		t.Fatalf("the pump absorbed %d publications, want exactly the %d-slot egress buffer", absorbed, committedEgressBuffer)
+	}
+	waitFor(t, func() bool { return closed == 1 })
 }

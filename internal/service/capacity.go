@@ -1,9 +1,18 @@
-// Package service derives what a Host publishes about itself.
+// Package service derives what a Host publishes about itself, and relays what
+// its resident sessions have already committed.
 //
-// Today that is the TARGET DIRECTORY of spec §15: one advertisement per
+// The first is the TARGET DIRECTORY of spec §15: one advertisement per
 // Department LaunchTarget, describing what this Host can launch and how much
 // room it has left. Factory pages these to choose a placement candidate and
 // aggregates them into `/v1/agents`.
+//
+// The second is the LIVE TAIL of one resident session (events.go): the events
+// its runtime has durably appended, relayed byte-for-byte onto that session's
+// HostLink channel. It is the opposite kind of thing to an advertisement — it
+// is DERIVED FROM NOTHING, because nothing here decides what a public event is
+// or what its body says. Every whitelist below is about the advertisement half
+// and says so; a Tail cannot express an Advertisement, which is what keeps the
+// two halves from becoming one surface.
 //
 // WHAT THIS PACKAGE DOES NOT DO, because §15 says Factory must not find it
 // here: it publishes NO SECOND CATALOGUE and COPIES NO RIG SUBAGENT ENTRY.

@@ -83,10 +83,20 @@ func (s *boundSession) SubscribeCommitted(
 		return nil, err
 	}
 
-	published := make(chan sessionwire.EnduringPublication)
+	published := make(chan sessionwire.EnduringPublication, committedEgressBuffer)
 	go s.pump(ctx, subscription, published)
 	return published, nil
 }
+
+// committedEgressBuffer is how many publications this adapter will hold for a
+// Host consumer that has stopped taking them.
+//
+// IT IS HARNESS'S OWN NUMBER, not one chosen here: hub.defaultEgressBuffer is
+// 256 and is the capacity of the buffer on the other side of this pump, whose
+// doc says "one slow subscriber must never block a publisher or another
+// subscriber". Matching it means Host adds one buffer of the same depth rather
+// than a second, differently-sized answer to the same question.
+const committedEgressBuffer = 256
 
 // pump translates deliveries into publications until the subscription or the
 // caller's context ends.
@@ -126,10 +136,26 @@ func (s *boundSession) pump(
 				CoveredThrough: delivery.CoveredThrough,
 				Body:           delivery.PublicBody,
 			}
+			// A NON-BLOCKING SEND, AND THE OVERFLOW ENDS THE PUMP. See
+			// committedEgressBuffer and
+			// TestThePumpAbsorbsABurstThenGivesUpRatherThanBlockingItsProducer.
+			// A blocking send made this goroutine — the hub's only reader —
+			// stop reading, which spends the hub's own egress budget and gets
+			// the subscription failed there instead of here.
+			//
+			// THERE IS NO DROP BRANCH BECAUSE THERE IS NOTHING DROPPABLE. The
+			// hub's class-aware policy drops Ephemeral and fails Enduring; the
+			// committed stream never carries an Ephemeral delivery, the filter
+			// opened above is enduring-only, and Delivery.Committed has already
+			// excluded everything else. Every publication reaching this send is
+			// enduring, so the only conforming policy is to stop — a skipped
+			// one would leave the consumer a hole in coverage it is about to
+			// persist as a cursor, which is the failure the committed stream
+			// exists to prevent.
 			select {
-			case <-ctx.Done():
-				return
 			case published <- publication:
+			default:
+				return
 			}
 		}
 	}

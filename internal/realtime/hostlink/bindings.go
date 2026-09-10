@@ -582,6 +582,43 @@ func (m *Multiplexer) CloseLink(link LinkID) []Binding {
 	return sortedBindings(bindings)
 }
 
+// InvalidateSession drops every link's route to ONE session and returns them,
+// ordered by link.
+//
+// IT IS THE SESSION-SCOPED SIBLING OF CloseLink AND TOUCHES AS LITTLE. The
+// residency is not released, the runtime is not stopped, no other session's
+// route on any of these links is affected, and the physical connections stay
+// up: what disappears is the routing this Host can no longer serve a live tail
+// over, which is exactly what obliges a Factory to reset durably rather than
+// keep advancing a cursor it is no longer being fed.
+//
+// THE SESSION SCOPE IS WHY IT IS NOT CloseLink. A tail lost for one session
+// says nothing about the other sessions a Factory replica routes over the same
+// physical link, and closing the link would invalidate all of them — turning a
+// one-session durable reset into a whole-replica one. The transport has its own
+// per-connection failure (a slow client's queue), and that one IS link-scoped
+// because it is the connection that failed; this one is not.
+func (m *Multiplexer) InvalidateSession(key registry.Key) []Binding {
+	channel := ChannelFor(key)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var dropped []Binding
+	for link, bindings := range m.links {
+		binding, bound := bindings[channel]
+		if !bound {
+			continue
+		}
+		dropped = append(dropped, binding)
+		delete(bindings, channel)
+		m.count--
+		if len(bindings) == 0 {
+			delete(m.links, link)
+		}
+	}
+	sort.Slice(dropped, func(i, j int) bool { return dropped[i].Link < dropped[j].Link })
+	return dropped
+}
+
 // LinkBindings returns the routes one link holds, ordered by channel.
 func (m *Multiplexer) LinkBindings(link LinkID) []Binding {
 	m.mu.Lock()

@@ -1185,6 +1185,88 @@ func TestClosingOneLinkLeavesItsOtherSessionsAlone(t *testing.T) {
 	mustBind(t, f.mux, "link-c", otherSession)
 }
 
+// TestInvalidatingOneSessionDropsEveryReplicaOfItAndNothingElse holds the
+// session-scoped invalidation a lost live tail performs.
+//
+// The two claims are opposite and are asserted separately, because one of them
+// is a negative made after a state-destroying action and would pass against a
+// build that never installed the route it claims survived. So the SURVIVAL
+// claims are positive and end-to-end — the surviving routes still wake their
+// consumers, from a counter that was zero — and the closing control at the end
+// shows the delivery assertion can fail at all.
+func TestInvalidatingOneSessionDropsEveryReplicaOfItAndNothingElse(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	a := mustBind(t, f.mux, linkA, testSession)
+	b := mustBind(t, f.mux, linkB, testSession)
+	sameLink := mustBind(t, f.mux, linkA, otherSession)
+	if got := f.mux.Len(); got != 3 {
+		t.Fatalf("Len before invalidation = %d, want 3", got)
+	}
+
+	dropped := f.mux.InvalidateSession(residencyKey(testSession))
+	if !slices.Equal(dropped, []hostlink.Binding{a, b}) {
+		t.Fatalf("InvalidateSession returned %#v, want both replicas of the session in link order", dropped)
+	}
+	if got := f.mux.Replicas(residencyKey(testSession)); got != nil {
+		t.Fatalf("Replicas after invalidation = %v, want none", got)
+	}
+	if got := f.mux.Len(); got != 1 {
+		t.Fatalf("Len after invalidation = %d, want only the untouched session's route", got)
+	}
+
+	// POSITIVE: the SAME LINK's route to a DIFFERENT session still works. This
+	// is the claim that separates invalidating a session from closing a link.
+	other := f.consumers.consumers[residencyKey(otherSession)]
+	if got := other.recorded(); len(got) != 0 {
+		t.Fatalf("the untouched session's consumer was already woken: %v", got)
+	}
+	deliver(t, f.mux, linkA, sameLink.Channel, "still-routed")
+	if got := other.recorded(); !slices.Equal(got, []sessionwire.CommandID{"still-routed"}) {
+		t.Fatalf("hints on the untouched session = %v, want one wake", got)
+	}
+
+	// The invalidated routes are gone on BOTH links, not just the first one the
+	// map iteration happened to reach.
+	if refusal := refusalOf(t, f.mux.Deliver(linkA, a.Channel, sessionwire.HostLinkCommandDelivery{CommandID: "ignored"})); refusal.Refusal != hostlink.RefusalNotBound {
+		t.Fatalf("delivery on link A's invalidated route = %q, want %q", refusal.Refusal, hostlink.RefusalNotBound)
+	}
+	if refusal := refusalOf(t, f.mux.Deliver(linkB, b.Channel, sessionwire.HostLinkCommandDelivery{CommandID: "ignored"})); refusal.Refusal != hostlink.RefusalNotBound {
+		t.Fatalf("delivery on link B's invalidated route = %q, want %q", refusal.Refusal, hostlink.RefusalNotBound)
+	}
+	// The residency is untouched: this package can only read it, and a tail
+	// that stopped being deliverable is not a session that stopped existing.
+	entry, held := f.registry.Get(residencyKey(testSession))
+	if !held || entry.State != registry.StateResident {
+		t.Fatalf("residency after invalidation = %#v, want the resident row unchanged", entry)
+	}
+	// Rebinding is how a replica comes back, which is what makes this a reset
+	// rather than a revocation.
+	mustBind(t, f.mux, linkA, testSession)
+
+	// Repeating it is safe, and a session nobody routes to invalidates nothing.
+	f.mux.InvalidateSession(residencyKey(testSession))
+	if got := f.mux.InvalidateSession(residencyKey(testSession)); got != nil {
+		t.Fatalf("re-invalidating = %#v, want nothing", got)
+	}
+	if got := f.mux.InvalidateSession(residencyKey(thirdSession)); got != nil {
+		t.Fatalf("invalidating an unrouted session = %#v, want nothing", got)
+	}
+
+	// The control for the positive survival assertion above.
+	f.mux.InvalidateSession(residencyKey(otherSession))
+	if refusal := refusalOf(t, f.mux.Deliver(linkA, sameLink.Channel, sessionwire.HostLinkCommandDelivery{CommandID: "ignored"})); refusal.Refusal != hostlink.RefusalNotBound {
+		t.Fatalf("delivery after invalidating the other session = %q, want %q; the survival assertion above would pass vacuously", refusal.Refusal, hostlink.RefusalNotBound)
+	}
+	if got := other.recorded(); len(got) != 1 {
+		t.Fatalf("hints = %v, want still exactly one; a refused delivery must wake nothing", got)
+	}
+	if got := f.mux.Len(); got != 0 {
+		t.Fatalf("Len = %d, want 0; every route was invalidated", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Over the wire
 // ---------------------------------------------------------------------------

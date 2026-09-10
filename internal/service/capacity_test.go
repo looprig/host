@@ -1399,6 +1399,35 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"AdvertisementError.Unwrap":          true,
 		"InvalidCapacityOptionsError.Error":  true,
 		"InvalidCapacityOptionsError.Unwrap": true,
+
+		// events.go, O5.3. THE LIVE TAIL IS NOT A SECOND CATALOGUE and this
+		// enumeration is where that is decided rather than assumed: a Tail
+		// carries one session's committed journal events onto one HostLink
+		// channel and cannot express an Advertisement at all — Publish returns
+		// *Tail, and the publishing assertion below is what checks that rather
+		// than this list. Listing them is the visible diff the guard exists to
+		// force.
+		"Publications":                  true,
+		"Routes":                        true,
+		"TailOptions":                   true,
+		"InvalidTailOptionsError":       true,
+		"InvalidTailOptionsError.Error": true,
+		"Tails":                         true,
+		"Tails.Publish":                 true,
+		"NewTails":                      true,
+		"TailEnd":                       true,
+		"TailEndRunning":                true,
+		"TailEndStopped":                true,
+		"TailEndLost":                   true,
+		"TailEndRefused":                true,
+		"Tail":                          true,
+		"Tail.Key":                      true,
+		"Tail.Channel":                  true,
+		"Tail.Done":                     true,
+		"Tail.Stop":                     true,
+		"Tail.End":                      true,
+		"Tail.Published":                true,
+		"ErrForeignPublication":         true,
 	}
 
 	// The FILE SET is enumerated too, and that is not tidiness. A probe measured
@@ -1407,8 +1436,8 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 	// below, while the identical payload in capacity.go was caught. A whitelist
 	// that names its own subject is the fix.
 	files := packageFiles(t, false)
-	if !slices.Equal(files, []string{"capacity.go"}) {
-		t.Errorf("this package's production files are %v, want exactly [capacity.go]: a second file is a second place to publish from, and everything below reads only the enumerated ones", files)
+	if !slices.Equal(files, []string{"capacity.go", "events.go"}) {
+		t.Errorf("this package's production files are %v, want exactly [capacity.go events.go]: a second file is a second place to publish from, and everything below reads only the enumerated ones", files)
 	}
 
 	var found, publishing []string
@@ -1583,14 +1612,21 @@ func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 	// guard that depends on a neighbouring guard's assertion reverts silently
 	// when that one is relaxed, and the diff would be at the other site.
 	files := packageFiles(t, false)
-	if !slices.Equal(files, []string{"capacity.go"}) {
-		t.Fatalf("this package's production files are %v, want exactly [capacity.go]", files)
+	if !slices.Equal(files, []string{"capacity.go", "events.go"}) {
+		t.Fatalf("this package's production files are %v, want exactly [capacity.go events.go]", files)
 	}
 	fileSet := token.NewFileSet()
-	parsed, err := parser.ParseFile(fileSet, files[0], nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parsing %s: %v", files[0], err)
+	var structs []string
+	parsedFiles := make([]*ast.File, 0, len(files))
+	for _, name := range files {
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		parsedFiles = append(parsedFiles, parsed)
+		structs = append(structs, exportedStructNames(t, parsed)...)
 	}
+	slices.Sort(structs)
 	want := map[string][]string{
 		"Advertisement":               {"DueAt", "Namespace", "Rank", "Ranked", "RankingScope", "Report", "StableKey", "Tombstone"},
 		"CapacityOptions":             {"Host", "HostGeneration"},
@@ -1599,31 +1635,53 @@ func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 		"AdmissionConflictError":      {"Admitted", "Key", "Requested"},
 		"AdvertisementError":          {"AgentID", "Cause", "Reason"},
 		"InvalidCapacityOptionsError": {"Cause", "Field", "Reason"},
+
+		// events.go, O5.3. Tails and Tail carry NO exported field on purpose:
+		// a Tail is a handle, and an exported field on one would be a second,
+		// unsynchronized way to read state its own accessors take a lock for.
+		"TailOptions":             {"Publications", "Routes"},
+		"InvalidTailOptionsError": {"Field", "Reason"},
+		"Tails":                   nil,
+		"Tail":                    nil,
 	}
 
-	structs := exportedStructNames(t, parsed)
 	if !slices.Equal(structs, slices.Sorted(maps.Keys(want))) {
 		t.Errorf("this package's exported structs are %v, want exactly %v", structs, slices.Sorted(maps.Keys(want)))
+	}
+	// fieldsOf searches EVERY parsed file for the named struct, because the
+	// struct set is now drawn from more than one and looking in only the file a
+	// loop happens to hold would report an empty field list for every type
+	// declared in the other one — which reads exactly like "exports nothing".
+	fieldsOf := func(name string) []string {
+		for _, parsed := range parsedFiles {
+			if slices.Contains(exportedStructNames(t, parsed), name) {
+				return structFieldNames(t, parsed, name)
+			}
+		}
+		t.Fatalf("%s is enumerated but is declared in none of %v", name, files)
+		return nil
 	}
 	for _, name := range structs {
 		enumerated, listed := want[name]
 		if !listed {
 			continue
 		}
-		if name == "CapacityPublisher" {
-			// Its fields are all unexported, so structFieldNames reports them
-			// and the enumeration would have to track private state. What
-			// matters about this one is that it exports NOTHING, which is a
-			// stronger statement and the one asserted.
-			for _, field := range structFieldNames(t, parsed, name) {
+		fields := fieldsOf(name)
+		if enumerated == nil {
+			// A nil enumeration means "exports NOTHING", which is stronger than
+			// a list and is why these entries are not spelled out: their fields
+			// are private state, and enumerating private state would make the
+			// whitelist track every refactor of it. CapacityPublisher, Tails and
+			// Tail are all in this class.
+			for _, field := range fields {
 				if field != "" && field[0] >= 'A' && field[0] <= 'Z' {
-					t.Errorf("CapacityPublisher exports field %s; its state is not part of what this package publishes", field)
+					t.Errorf("%s exports field %s; its state is not part of what this package publishes", name, field)
 				}
 			}
 			continue
 		}
-		if got := structFieldNames(t, parsed, name); !slices.Equal(got, enumerated) {
-			t.Errorf("%s fields = %v, want exactly %v", name, got, enumerated)
+		if !slices.Equal(fields, enumerated) {
+			t.Errorf("%s fields = %v, want exactly %v", name, fields, enumerated)
 		}
 	}
 }
@@ -2330,33 +2388,81 @@ func TestPublishConsultsOnlyTheClocksNow(t *testing.T) {
 	}
 }
 
-// TestNothingInThisPackageSleepsOrPolls holds the structural half of the same
-// property over every file of this package.
+// waitPolicy is how much of the no-waiting ban one file is held to.
+type waitPolicy uint8
+
+const (
+	// banEverything forbids real-time calls, select statements and channel
+	// receives alike. It is the advertisement half's policy: a fake clock
+	// removes the wait by construction, so there is nothing left to receive.
+	banEverything waitPolicy = iota
+
+	// banRealTimeOnly forbids the real-time calls and permits select and
+	// receive. It is the LIVE TAIL's policy, and the narrowing is a statement
+	// about what that code IS rather than a concession: relaying a live stream
+	// is receiving from a channel, so banning the receive would ban the
+	// feature. What must still never appear there is a TIMER — a tail that
+	// slept, ticked or timed out would be inventing a schedule of its own on
+	// top of a stream whose pace is the runtime's.
+	banRealTimeOnly
+
+	// noBan holds a file to nothing. Only the live tail's TEST is in this
+	// class: every deadline in it is a bounded assertion that replaces a
+	// construct which would otherwise HANG, and a hang is not an assertion
+	// failure — it reports nothing and takes the package's other tests with it.
+	noBan
+)
+
+// TestFilesSleepOrPollExactlyWhereTheyAreAllowedTo holds the structural half of
+// the same property, per file, over every file of this package.
 //
-// It bans, by parsed structure and not by text search, every construct through
-// which a wait could enter: time.Sleep, time.After, time.Tick, time.NewTicker,
-// runtime.Gosched, any select statement, and any channel receive. A fake clock
-// removes the race by construction, and needing any of these back would be a
-// design signal rather than a test-tuning problem.
+// It bans, by parsed structure and not by text search, the constructs through
+// which a wait can enter: time.Sleep, time.After, time.Tick, time.NewTicker,
+// time.AfterFunc, runtime.Gosched, any select statement, and any channel
+// receive.
+//
+// IT IS PER-FILE BECAUSE THE PACKAGE HAS TWO HALVES AND THEY ARE OPPOSITE. The
+// advertisement half derives a record from an injected clock and never waits;
+// the live tail (events.go, O5.3) relays a stream, which is a channel receive by
+// definition. A single blanket ban would have to be either wrong for one half or
+// absent for both, and the version of this guard that predated the tail was the
+// first — it failed on events.go the moment the file existed.
+//
+// THE EXCLUSION IS ITSELF TESTED, which is the rule this repository has twice
+// been bitten for skipping: policies is a total map over the file set, asserted
+// equal to it, so a NEW file lands in no class and fails here rather than
+// inheriting the loosest one. The narrowing is per file and per construct, so
+// events.go is still held to the timer ban that matters for it.
 //
 // WHAT IT DOES NOT COVER: a wait reached through a helper in another PACKAGE,
-// and a busy loop that spins on a value without receiving. Neither is present
-// today and neither is detectable here. The file set is enumerated, so a new
-// file of this package fails rather than escaping — which it did before the
-// enumeration was added, measured by probe.
-func TestNothingInThisPackageSleepsOrPolls(t *testing.T) {
+// and a busy loop that spins on a value without receiving.
+func TestFilesSleepOrPollExactlyWhereTheyAreAllowedTo(t *testing.T) {
 	t.Parallel()
 
 	banned := map[string]bool{
 		"time.Sleep": true, "time.After": true, "time.Tick": true,
 		"time.NewTicker": true, "time.AfterFunc": true, "runtime.Gosched": true,
 	}
+	policies := map[string]waitPolicy{
+		"capacity.go":      banEverything,
+		"capacity_test.go": banEverything,
+		"events.go":        banRealTimeOnly,
+		"events_test.go":   noBan,
+	}
 	files := packageFiles(t, true)
-	if !slices.Equal(files, []string{"capacity.go", "capacity_test.go"}) {
-		t.Errorf("this package's files are %v, want exactly [capacity.go capacity_test.go]: a construct banned here is banned in this package, and the ban reaches only the files it names", files)
+	if !slices.Equal(files, slices.Sorted(maps.Keys(policies))) {
+		t.Fatalf("this package's files are %v, want exactly %v: every file is held to a named policy, and a file in none of them would be held to nothing by accident", files, slices.Sorted(maps.Keys(policies)))
 	}
 	inspected := 0
+	strictFiles := 0
 	for _, name := range files {
+		policy := policies[name]
+		if policy == banEverything {
+			strictFiles++
+		}
+		if policy == noBan {
+			continue
+		}
 		fileSet := token.NewFileSet()
 		parsed, err := parser.ParseFile(fileSet, name, nil, parser.SkipObjectResolution)
 		if err != nil {
@@ -2375,12 +2481,14 @@ func TestNothingInThisPackageSleepsOrPolls(t *testing.T) {
 					return true
 				}
 				if qualified := pkg.Name + "." + selector.Sel.Name; banned[qualified] {
-					t.Errorf("%s calls %s at %s: nothing in this package waits on real time", name, qualified, fileSet.Position(typed.Pos()))
+					t.Errorf("%s calls %s at %s: nothing in this file waits on real time", name, qualified, fileSet.Position(typed.Pos()))
 				}
 			case *ast.SelectStmt:
-				t.Errorf("%s has a select statement at %s: the one coin-flip test this program has shipped was a select with two ready cases", name, fileSet.Position(typed.Pos()))
+				if policy == banEverything {
+					t.Errorf("%s has a select statement at %s: the one coin-flip test this program has shipped was a select with two ready cases", name, fileSet.Position(typed.Pos()))
+				}
 			case *ast.UnaryExpr:
-				if typed.Op == token.ARROW {
+				if typed.Op == token.ARROW && policy == banEverything {
 					t.Errorf("%s receives from a channel at %s: a fake clock removes the wait, so there is nothing to receive", name, fileSet.Position(typed.Pos()))
 				}
 			}
@@ -2389,6 +2497,12 @@ func TestNothingInThisPackageSleepsOrPolls(t *testing.T) {
 	}
 	if inspected == 0 {
 		t.Fatal("no call expression was inspected, so this guard reached nothing")
+	}
+	// The floor for the loosest class: at least one file is still held to the
+	// whole ban. Without it, moving every file to noBan would leave this test
+	// green while asserting nothing at all.
+	if strictFiles == 0 {
+		t.Fatal("no file is held to the full ban, so this guard permits everything it was written to forbid")
 	}
 }
 
