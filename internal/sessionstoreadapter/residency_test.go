@@ -241,3 +241,51 @@ func TestARefusedAcquisitionCarriesItsCleanupObligation(t *testing.T) {
 		_ = regained.Release(context.WithoutCancel(t.Context()))
 	})
 }
+
+// TestTheResidencyEpochIsTheProvidersNumberUnmodified is the value assertion the
+// rest of this file was missing, and its absence was a real hole: the only thing
+// asserted anywhere about ResidencyLease.Epoch was `!= 0`, so returning
+// `grant.Epoch() + 1` survived the whole module. That is this lane's own rule —
+// mutate the VALUE, not the mechanism — failing on the single value-producing
+// method of the file it was added with.
+//
+// THE ANCHOR IS A DOCUMENTED PROVIDER FACT, not a coincidence, and the difference
+// matters enough to write down. memstore's Leaser gives each name an independent,
+// strictly increasing counter that advances on every grant, and its own tests pin
+// the first grant's epoch at 1. So the two rows below are 1 and 2 by the
+// PROVIDER's contract, and this test asserts that the adapter reports those
+// numbers UNMODIFIED — an off-by-one reports 2 and 3, a doubling reports 2 and 4,
+// and both die here. It does mean this test would have to move if the memory
+// provider's base changed; that is the cost of anchoring a value assertion to
+// something real instead of to itself.
+//
+// IT IS NOT A CLAIM THAT 1 IS A RESIDENCY EPOCH ANYWHERE ELSE. residency's fakes
+// deliberately mint from 1000 precisely so that the provider's 1 cannot be
+// confused with anything; here the 1 is the subject, not the fixture.
+func TestTheResidencyEpochIsTheProvidersNumberUnmodified(t *testing.T) {
+	released, adapted := openStore(t)
+	createDispositionSession(t, released)
+
+	first, err := adapted.AcquireSessionLease(t.Context(), testTenant, testSession)
+	if err != nil {
+		t.Fatalf("first AcquireSessionLease: %v", err)
+	}
+	if got := first.Epoch(); got != 1 {
+		t.Errorf("the first grant reports residency epoch %d, want the provider's 1", got)
+	}
+	if err := first.Release(context.WithoutCancel(t.Context())); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// THE SECOND ROW IS WHAT MAKES THE FIRST AN ASSERTION ABOUT THE PROVIDER'S
+	// COUNTER rather than about a constant: a method returning a hard-coded 1
+	// passes the row above and fails this one.
+	second, err := adapted.AcquireSessionLease(t.Context(), testTenant, testSession)
+	if err != nil {
+		t.Fatalf("second AcquireSessionLease: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Release(context.WithoutCancel(t.Context())) })
+	if got := second.Epoch(); got != 2 {
+		t.Errorf("the regranted lease reports residency epoch %d, want the provider's 2", got)
+	}
+}

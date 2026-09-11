@@ -87,8 +87,21 @@ func (l *ResidencyLease) Lost() <-chan struct{} { return l.grant.Lost() }
 //
 // Failure is retryable and does not pretend cleanup completed: until a release
 // succeeds the Store admission is retained and Close may time out.
+//
+// IT DOES NOT GO THROUGH classifyResidency, AND THE OMISSION IS THE DECISION.
+// That classifier exists to turn an ACQUISITION vocabulary into Host's ownership
+// sentinels, and neither of its arms is a statement a release can make: you cannot
+// lose contention to another holder by handing a grant back, so ErrLeaseHeld here
+// would tell residency's fence this grant was superseded when it merely could not
+// be returned — and ResidencyAcquireCleanupError is raised inside AcquireResidency
+// and never by Release. Wrapping the call was a no-op on every input this method
+// can produce, which measured as an unkillable mutation; a transformation that
+// cannot fire is worse than none, because it reads as a rule being applied. The
+// store's own error therefore survives verbatim, and the caller that owns it is
+// residency's unwinder, which reports a failed release in AttachError.Unreleased
+// rather than classifying it.
 func (l *ResidencyLease) Release(ctx context.Context) error {
-	return classifyResidency(l.grant.Release(ctx))
+	return l.grant.Release(ctx)
 }
 
 // classifyResidency maps a residency failure onto Host's sentinels and, for the

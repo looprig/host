@@ -603,6 +603,18 @@ func (r *fakeRuntime) LeaseEpoch() (uint64, bool) {
 	return r.journalEpoch, r.journalHeld
 }
 
+// setJournalEpoch moves the runtime's reported grant, which is how a test
+// distinguishes a LIVE read from a value cached at attach time. The runtime's
+// journal lease really does move under a resident session — a successor acquires
+// the journal grant independently of Host's residency grant, which is the whole
+// reason the two are separate — so this is modelling the dependency, not inventing
+// a knob.
+func (r *fakeRuntime) setJournalEpoch(epoch uint64, held bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.journalEpoch, r.journalHeld = epoch, held
+}
+
 // journalEpochReads reports how many times the runtime was asked for its grant.
 func (r *fakeRuntime) journalEpochReads() int {
 	r.mu.Lock()
@@ -4068,5 +4080,114 @@ func TestAPlainLeaseRefusalOwesNoRelease(t *testing.T) {
 	}
 	if len(attach.Unreleased) != 0 {
 		t.Errorf("a refusal that took nothing reports %v as still held", attach.Unreleased)
+	}
+}
+
+// TestTheWarmPathReadsTheJournalEpochLiveFromTheResidentRuntime is the WARM half
+// of O3.4, and it exists because its absence was a hole rather than an omission.
+//
+// EVERY OTHER JournalEpoch ASSERTION IN THIS PACKAGE RUNS THROUGH AN ATTACH THAT
+// RETURNS Attached: true. Nothing read the warm return at all, so
+// existingResidency could be reverted to `journalEpoch, journalHeld :=
+// entry.LeaseEpoch, true` — the exact fusion this task removes, restored on the
+// already-resident path — and the whole module stayed green. Measured: that
+// mutation exited 0 across GOWORK=off go test ./... before this test existed. The
+// rule was defended only by the comment above the line, which is precisely the
+// "a rule you can forget" shape this package argues against elsewhere.
+//
+// THE GRANT IS MOVED BETWEEN THE TWO ATTACHES, which is what makes this a LIVE
+// read rather than a propagation check. A warm path that cached the cold path's
+// answer reports the epoch the runtime held at launch; one that read the registry
+// entry reports Host's RESIDENCY epoch, which is a different number again. The
+// three fixture values are 1000, 3 and 58, so all three wrong answers are
+// separately visible.
+func TestTheWarmPathReadsTheJournalEpochLiveFromTheResidentRuntime(t *testing.T) {
+	const warmJournalEpoch uint64 = 58
+
+	f := newFixture(t)
+	first, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("first Attach: %v", err)
+	}
+	if first.JournalEpoch != JournalEpoch(testJournalEpoch) {
+		t.Fatalf("the cold attach reported journal epoch %d, want %d; the fixture is wrong before the warm path is even reached", first.JournalEpoch, testJournalEpoch)
+	}
+
+	runtimes := f.target.producedRuntimes()
+	if len(runtimes) != 1 {
+		t.Fatalf("the target produced %d runtimes, want 1", len(runtimes))
+	}
+	runtimes[0].setJournalEpoch(warmJournalEpoch, true)
+
+	warm, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("warm Attach: %v", err)
+	}
+	if warm.Attached {
+		t.Fatal("the second attach reports Attached true, so this is not the warm path")
+	}
+	if !warm.JournalEpochHeld {
+		t.Error("the warm attach reports no journal grant and the resident runtime holds one")
+	}
+	if warm.JournalEpoch != JournalEpoch(warmJournalEpoch) {
+		t.Errorf("the warm attach reported journal epoch %d, want the runtime's current %d", warm.JournalEpoch, warmJournalEpoch)
+	}
+	// THE TWO WRONG ANSWERS, NAMED SEPARATELY, because "not the right number" is
+	// not a diagnosis. A cached cold-path value and Host's own residency grant
+	// are different defects with different fixes.
+	if warm.JournalEpoch == JournalEpoch(testJournalEpoch) {
+		t.Error("the warm attach reported the epoch the runtime held at LAUNCH, so the journal grant is cached rather than read")
+	}
+	if uint64(warm.JournalEpoch) == uint64(warm.LeaseEpoch) {
+		t.Errorf("the warm attach reported Host's residency epoch %d as the runtime's journal epoch", warm.LeaseEpoch)
+	}
+	// The residency epoch is unchanged and still comes from the registry entry:
+	// it is Host's grant and is fixed for the life of the residency.
+	if warm.LeaseEpoch != first.LeaseEpoch {
+		t.Errorf("the warm attach reported residency epoch %d and the cold one %d", warm.LeaseEpoch, first.LeaseEpoch)
+	}
+}
+
+// TestTheWarmPathReportsARuntimeThatHasLOSTItsJournalGrant is the `held` half,
+// and it is the control that keeps the test above from passing on a warm path
+// that hard-codes true.
+//
+// IT IS ALSO THE CASE THAT MATTERS OPERATIONALLY. harness gates its report on the
+// lease still being Valid, so a resident runtime whose journal grant was taken by
+// a successor answers (0, false) while Host's own residency grant is untouched —
+// residency loss does not fence a journal and journal loss does not end residency.
+// A warm attach that answered `true` here would hand a caller a dead epoch to
+// stamp, which is exactly what the two-result form exists to prevent.
+func TestTheWarmPathReportsARuntimeThatHasLOSTItsJournalGrant(t *testing.T) {
+	f := newFixture(t)
+	first, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("first Attach: %v", err)
+	}
+
+	runtimes := f.target.producedRuntimes()
+	if len(runtimes) != 1 {
+		t.Fatalf("the target produced %d runtimes, want 1", len(runtimes))
+	}
+	runtimes[0].setJournalEpoch(0, false)
+
+	warm, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("warm Attach refused a runtime that has lost its journal grant: %v", err)
+	}
+	if warm.Attached {
+		t.Fatal("the second attach reports Attached true, so this is not the warm path")
+	}
+	if warm.JournalEpochHeld {
+		t.Error("the warm attach reports a journal grant the resident runtime says it no longer holds")
+	}
+	if warm.JournalEpoch != 0 {
+		t.Errorf("the warm attach reported journal epoch %d, want 0 when no grant is held", warm.JournalEpoch)
+	}
+	// HOST'S OWN GRANT IS UNAFFECTED, which is the half that makes this two
+	// domains rather than one: residency loss does not fence a journal and
+	// journal loss does not end residency.
+	if warm.LeaseEpoch != first.LeaseEpoch || warm.LeaseEpoch == 0 {
+		t.Errorf("the residency epoch moved to %d when the journal grant was lost; it was %d", warm.LeaseEpoch, first.LeaseEpoch)
 	}
 }
