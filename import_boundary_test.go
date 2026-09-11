@@ -50,16 +50,16 @@ var publishedLooprigVersions = map[string]string{
 	"sessionstore": "v0.6.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
-	"harness":      "v0.32.0",
+	"harness":      "v0.33.0",
 
 	// inference is here because HARNESS PULLS IT IN, not because Host imports
 	// it: no file in this repository names github.com/looprig/inference, and
 	// the import guard is therefore silent about it by construction. harness
-	// v0.32.0 requires inference v0.12.0, so binding to harness names it in
+	// v0.33.0 requires inference v0.12.0, so binding to harness names it in
 	// go.mod whether or not Host wanted a decision about it — which is exactly
 	// the indirect arrival the comment on requireViolations describes, and the
 	// reason that check consults this map rather than the import set. The
-	// version is the one harness v0.32.0 pins and is published.
+	// version is the one harness v0.33.0 pins and is published.
 	"inference": "v0.12.0",
 }
 
