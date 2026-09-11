@@ -176,7 +176,6 @@ func pooledOptions(t *testing.T, clock host.Clock) host.Options {
 	t.Helper()
 	return host.Options{
 		HostID:            "host-7c1",
-		TenantID:          "tenant-9f3",
 		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        testDepartment(t),
@@ -196,6 +195,12 @@ func pooledOptions(t *testing.T, clock host.Clock) host.Options {
 		ReconcileBatch:    129,
 	}
 }
+
+// testTenant is the tenant this package's keys name. It is a TEST constant and
+// no longer a Host one: since H8 a Host is constructed with no tenant at all,
+// so the fixture must name the tenant it admits rather than read it back off
+// the configuration.
+const testTenant sessionwire.TenantID = "tenant-9f3"
 
 // testHostGeneration is a non-zero incarnation identity. Core rejects zero.
 const testHostGeneration = uint64(9)
@@ -543,7 +548,7 @@ func TestHeartbeatMovesRankAndExpiryInOneRecord(t *testing.T) {
 	// expiry and the rank have moved by the next publication. Moving only one
 	// would leave the other's assertion satisfied by the first publication.
 	clock.Advance(options.RegistryHeartbeat)
-	if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "session-1"}, "reviewer"); err != nil {
+	if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "session-1"}, "reviewer"); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
 	after := publish(t, publisher)[0]
@@ -814,7 +819,7 @@ func TestAvailableCapacityTracksAdmissionAtThreeScales(t *testing.T) {
 				if err := advertisement.Report.Validate(); err != nil {
 					t.Fatalf("after %d admissions the report is not a valid sessionwire record: %v", admitted, err)
 				}
-				key := registry.Key{TenantID: options.TenantID, SessionID: sessionwire.SessionID("session-" + strconv.FormatUint(admitted, 10))}
+				key := registry.Key{TenantID: testTenant, SessionID: sessionwire.SessionID("session-" + strconv.FormatUint(admitted, 10))}
 				err := publisher.Admit(key, "reviewer")
 				if admitted < admits {
 					// The row BELOW the boundary: still admissible.
@@ -867,8 +872,8 @@ func TestReleaseReturnsExactlyTheWeightItCharged(t *testing.T) {
 	)
 	publisher := newPublisher(t, options)
 
-	reviewer := registry.Key{TenantID: options.TenantID, SessionID: "session-r"}
-	planner := registry.Key{TenantID: options.TenantID, SessionID: "session-p"}
+	reviewer := registry.Key{TenantID: testTenant, SessionID: "session-r"}
+	planner := registry.Key{TenantID: testTenant, SessionID: "session-p"}
 	for _, admission := range []struct {
 		key   registry.Key
 		agent sessionwire.AgentID
@@ -904,7 +909,7 @@ func TestReleaseReturnsExactlyTheWeightItCharged(t *testing.T) {
 	if publisher.Release(planner) {
 		t.Error("releasing an already-released key reported a release")
 	}
-	if publisher.Release(registry.Key{TenantID: options.TenantID, SessionID: "never-admitted"}) {
+	if publisher.Release(registry.Key{TenantID: testTenant, SessionID: "never-admitted"}) {
 		t.Error("releasing a key that was never admitted reported a release")
 	}
 	if got := publisher.ConsumedWeight(); got != 2 {
@@ -929,13 +934,16 @@ func TestAdmissionLedgerIsKeyedByTenantAndSession(t *testing.T) {
 
 	options := pooledOptions(t, newFakeClock())
 	options.Capacity = 4
+	// Cross-tenant-isolated, because since H8 that is exactly the Host this
+	// case describes: one that legitimately holds two tenants at once. The
+	// LEDGER must not be the place a tenant assumption is enforced silently —
+	// charging once for two distinct keys is an over-admission whichever
+	// tenants they name — and under the exclusive class the refusal would
+	// arrive before the charge and this property would go untested.
+	options.IsolationClass = sessionwire.HostIsolationClassCrossTenantIsolated
 	publisher := newPublisher(t, options)
 
-	// A Host is tenant-scoped, so the second key is a key this Host would never
-	// see in production. It is here because the LEDGER must not be the place
-	// that assumption is enforced silently: charging once for two distinct keys
-	// is an over-admission whichever tenant they name.
-	for _, tenant := range []sessionwire.TenantID{options.TenantID, "tenant-other"} {
+	for _, tenant := range []sessionwire.TenantID{testTenant, "tenant-other"} {
 		if err := publisher.Admit(registry.Key{TenantID: tenant, SessionID: "same-name"}, "reviewer"); err != nil {
 			t.Fatalf("Admit for tenant %q: %v", tenant, err)
 		}
@@ -956,7 +964,7 @@ func TestRepeatedAdmissionOfOneKeyChargesOnce(t *testing.T) {
 		registration("planner", pooledCapabilities(3)),
 	)
 	publisher := newPublisher(t, options)
-	key := registry.Key{TenantID: options.TenantID, SessionID: "session-r"}
+	key := registry.Key{TenantID: testTenant, SessionID: "session-r"}
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		if err := publisher.Admit(key, "reviewer"); err != nil {
@@ -999,7 +1007,7 @@ func TestAdmissionRefusesAnAgentThisDepartmentDoesNotRegister(t *testing.T) {
 	options := pooledOptions(t, newFakeClock())
 	publisher := newPublisher(t, options)
 
-	err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "not-registered")
+	err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "not-registered")
 	if err == nil {
 		t.Fatal("admitting an unregistered agent was accepted")
 	}
@@ -1018,7 +1026,7 @@ func TestAdmissionRefusesAnAgentThisDepartmentDoesNotRegister(t *testing.T) {
 		t.Errorf("ConsumedWeight = %d after a refused admission, want 0", got)
 	}
 	// The control, one position over: the registered agent is admitted.
-	if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+	if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "reviewer"); err != nil {
 		t.Errorf("the registered agent was refused too, so the assertion above proves nothing: %v", err)
 	}
 }
@@ -1127,7 +1135,7 @@ func TestATargetThatCannotRunHereIsAdvertisedButNotAccepting(t *testing.T) {
 					t.Errorf("%q report is not a valid sessionwire record: %v", agent, err)
 				}
 			}
-			err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, row.wantRefusedFor)
+			err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, row.wantRefusedFor)
 			if err == nil {
 				t.Fatalf("admitting %q onto a %s Host was accepted, though the target does not support that placement", row.wantRefusedFor, row.placement)
 			}
@@ -1224,7 +1232,7 @@ func TestDrainUnranksAndTombstonesEveryAdvertisement(t *testing.T) {
 
 	// Drain stops NEW admission and keeps the existing ledger, which is the
 	// difference between draining and being emptied.
-	err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer")
+	err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "reviewer")
 	if err == nil {
 		t.Fatal("a draining Host accepted a new admission")
 	}
@@ -1245,7 +1253,7 @@ func TestDrainReleasesTheSessionsItStillHolds(t *testing.T) {
 	options := pooledOptions(t, newFakeClock())
 	options.Department = testDepartment(t, registration("reviewer", pooledCapabilities(2)))
 	publisher := newPublisher(t, options)
-	key := registry.Key{TenantID: options.TenantID, SessionID: "session-r"}
+	key := registry.Key{TenantID: testTenant, SessionID: "session-r"}
 
 	if err := publisher.Admit(key, "reviewer"); err != nil {
 		t.Fatalf("Admit: %v", err)
@@ -1304,7 +1312,7 @@ func TestPublishedAgentsAreExactlyTheDepartmentsRegisteredAgents(t *testing.T) {
 		{"initial publish", func(*testing.T) {}},
 		{"after admission", func(t *testing.T) {
 			t.Helper()
-			if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "planner"); err != nil {
+			if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "planner"); err != nil {
 				t.Fatalf("Admit: %v", err)
 			}
 		}},
@@ -1935,7 +1943,7 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 		if after.Rank != before.Rank {
 			t.Errorf("Rank moved from %d to %d because a target changed its mind", before.Rank, after.Rank)
 		}
-		if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+		if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "reviewer"); err != nil {
 			t.Fatalf("Admit: %v", err)
 		}
 		if got := publisher.ConsumedWeight(); got != 2 {
@@ -1962,7 +1970,7 @@ func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 		// Admission charges the snapshotted weight too, and a zero weight there
 		// would admit without bound — which is the rule Capabilities.Validate
 		// exists to enforce and could no longer see.
-		if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+		if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "reviewer"); err != nil {
 			t.Fatalf("Admit: %v", err)
 		}
 		if got := publisher.ConsumedWeight(); got != 2 {
@@ -2369,10 +2377,10 @@ func TestPublishConsultsOnlyTheClocksNow(t *testing.T) {
 		t.Errorf("NewCapacityPublisher armed %d timers", timersBefore)
 	}
 	advertisement := publish(t, publisher)[0]
-	if err := publisher.Admit(registry.Key{TenantID: options.TenantID, SessionID: "s"}, "reviewer"); err != nil {
+	if err := publisher.Admit(registry.Key{TenantID: testTenant, SessionID: "s"}, "reviewer"); err != nil {
 		t.Fatalf("Admit: %v", err)
 	}
-	publisher.Release(registry.Key{TenantID: options.TenantID, SessionID: "s"})
+	publisher.Release(registry.Key{TenantID: testTenant, SessionID: "s"})
 	publisher.BeginDrain()
 	_ = publish(t, publisher)
 
@@ -2655,7 +2663,7 @@ func TestPublisherIsSafeUnderConcurrentUse(t *testing.T) {
 		group.Add(1)
 		go func(i int) {
 			defer group.Done()
-			key := registry.Key{TenantID: options.TenantID, SessionID: sessionwire.SessionID("session-" + strconv.Itoa(i))}
+			key := registry.Key{TenantID: testTenant, SessionID: sessionwire.SessionID("session-" + strconv.Itoa(i))}
 			if err := publisher.Admit(key, "reviewer"); err != nil {
 				t.Errorf("Admit: %v", err)
 				return
@@ -2684,4 +2692,125 @@ func TestPublisherIsSafeUnderConcurrentUse(t *testing.T) {
 	if got := publisher.ConsumedWeight(); got != sessions/2 {
 		t.Errorf("ConsumedWeight = %d, want %d: half the weight-1 sessions were released", got, sessions/2)
 	}
+}
+
+// TestTheIsolationClassIsThePooledAdmissionRule is human gate H8, answered
+// 2026-09-04 as option (a): drop the fixed TenantID.
+//
+// Host was constructed with a TenantID and the residency manager refused every
+// attach naming another, so a pooled deployment needed one Host Deployment per
+// tenant and IsolationClass — the field spec §12 says decides this — had no
+// reader that could matter. It has one now, and it is HERE rather than in the
+// residency manager for a reason the fix depends on: this is the Host's ONE
+// admission ledger and its lock is the only Host-wide critical section an
+// admission passes through. The manager's per-key slot cannot order two
+// attaches for two DIFFERENT keys, so a tenant rule enforced there would be
+// decided by two concurrent readers of the same empty registry.
+//
+// A Host WITHOUT the class is tenant-exclusive by PLACEMENT, not by
+// construction: spec §12 says "Factory placement enforces the restriction".
+// What is held here is the local backstop, and the exclusivity is a property of
+// what is currently resident — so it is acquired by the first admission and
+// GIVEN UP when the last one is released, which is what makes a warm release
+// the thing that frees a pooled Host for another tenant.
+func TestTheIsolationClassIsThePooledAdmissionRule(t *testing.T) {
+	t.Parallel()
+
+	first := registry.Key{TenantID: "tenant-9f3", SessionID: "session-a"}
+	second := registry.Key{TenantID: "tenant-other", SessionID: "session-b"}
+
+	t.Run("cross_tenant_isolated admits two tenants", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t, newFakeClock())
+		options.IsolationClass = sessionwire.HostIsolationClassCrossTenantIsolated
+		publisher := newPublisher(t, options)
+
+		if err := publisher.Admit(first, "reviewer"); err != nil {
+			t.Fatalf("Admit(%v) = %v, want acceptance", first, err)
+		}
+		if err := publisher.Admit(second, "reviewer"); err != nil {
+			t.Fatalf("a cross-tenant-isolated Host refused a second tenant: %v", err)
+		}
+	})
+
+	t.Run("tenant_exclusive refuses a second tenant", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t, newFakeClock())
+		options.IsolationClass = sessionwire.HostIsolationClassTenantExclusive
+		publisher := newPublisher(t, options)
+
+		if err := publisher.Admit(first, "reviewer"); err != nil {
+			t.Fatalf("Admit(%v) = %v, want acceptance", first, err)
+		}
+		// The SAME tenant's second session is unaffected: exclusivity is about
+		// tenants, not about how many sessions one tenant may hold.
+		sibling := registry.Key{TenantID: first.TenantID, SessionID: "session-sibling"}
+		if err := publisher.Admit(sibling, "reviewer"); err != nil {
+			t.Fatalf("a tenant-exclusive Host refused the SAME tenant's second session: %v", err)
+		}
+
+		err := publisher.Admit(second, "reviewer")
+		var refused *service.AdmissionRefusedError
+		if !errors.As(err, &refused) {
+			t.Fatalf("Admit(%v) = %v, want an *AdmissionRefusedError", second, err)
+		}
+		if refused.Code != sessionwire.HostLinkErrorNotAdmitting {
+			t.Errorf("refusal code = %q, want %q", refused.Code, sessionwire.HostLinkErrorNotAdmitting)
+		}
+		if !strings.Contains(refused.Reason, string(first.TenantID)) {
+			t.Errorf("the refusal %q does not name the tenant that holds this Host", refused.Reason)
+		}
+	})
+
+	t.Run("the isolation refusal precedes the target lookup", func(t *testing.T) {
+		t.Parallel()
+		// A MUTATION SURVIVED THIS FILE UNTIL THIS ROW EXISTED. Moving the
+		// isolation check below the byAgent lookup passed the whole suite,
+		// because no case presented BOTH a foreign tenant and an agent this
+		// Department does not register — and the two refusals carry different
+		// Codes, which is the value a Factory branches on. not_admitting means
+		// re-run placement; runtime_unavailable means this Host cannot serve
+		// the agent at all, which is a statement about the Department that is
+		// false here and which also answers a question about another tenant's
+		// placement that the refusal has no business answering.
+		options := pooledOptions(t, newFakeClock())
+		options.IsolationClass = sessionwire.HostIsolationClassTenantExclusive
+		publisher := newPublisher(t, options)
+		if err := publisher.Admit(first, "reviewer"); err != nil {
+			t.Fatalf("Admit(%v) = %v, want acceptance", first, err)
+		}
+
+		err := publisher.Admit(second, "not-registered")
+		var refused *service.AdmissionRefusedError
+		if !errors.As(err, &refused) {
+			t.Fatalf("Admit = %v, want an *AdmissionRefusedError", err)
+		}
+		if refused.Code != sessionwire.HostLinkErrorNotAdmitting {
+			t.Errorf("refusal code = %q, want %q: the isolation rule is decided before this Host looks the agent up", refused.Code, sessionwire.HostLinkErrorNotAdmitting)
+		}
+	})
+
+	t.Run("releasing the last session frees the Host for another tenant", func(t *testing.T) {
+		t.Parallel()
+		options := pooledOptions(t, newFakeClock())
+		options.IsolationClass = sessionwire.HostIsolationClassTenantExclusive
+		publisher := newPublisher(t, options)
+
+		if err := publisher.Admit(first, "reviewer"); err != nil {
+			t.Fatalf("Admit(%v) = %v, want acceptance", first, err)
+		}
+		if err := publisher.Admit(second, "reviewer"); err == nil {
+			t.Fatal("a second tenant was admitted while the first was resident")
+		}
+		if !publisher.Release(first) {
+			t.Fatal("Release reported the first session was not admitted")
+		}
+		// This is the warm release's consequence, and it is why exclusivity is
+		// derived from the ledger rather than latched at the first admission: a
+		// latched value would hold this Host to a tenant that has no session on
+		// it, forever.
+		if err := publisher.Admit(second, "reviewer"); err != nil {
+			t.Fatalf("the Host stayed bound to a tenant with nothing resident: %v", err)
+		}
+	})
 }

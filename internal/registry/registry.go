@@ -93,8 +93,23 @@ type Entry struct {
 	// residency that has since been replaced under the same Key.
 	Generation uint64
 
-	State        ResidencyState
-	Accepting    bool
+	State ResidencyState
+
+	// Accepting reports whether THIS SESSION may take new work. It is NOT a
+	// function of State: StopAdmitting closes it while the residency is still
+	// resident, which is the state a warm release passes through between
+	// closing admission and writing its durable `releasing` observation.
+	//
+	// It was a strict function of State until O6.1 — Insert set
+	// {resident, true} and both MarkReleasing and BeginTeardown set false — and
+	// the consequence was recorded across this module: a reader consulting
+	// State and Accepting together would have had one decide every reachable
+	// case and the other decide none. That is no longer true, and the three
+	// facts a caller can now tell apart are a resident session that has stopped
+	// admitting, a releasing one, and a Host-wide drain, which live in three
+	// different places and have three different repairs.
+	Accepting bool
+
 	LastActivity time.Time
 
 	// TeardownOwned reports whether some caller has already claimed teardown.
@@ -173,6 +188,30 @@ func (r *Registry) current(key Key, generation uint64) (*Entry, bool) {
 		return nil, false
 	}
 	return entry, true
+}
+
+// StopAdmitting closes a residency to new work WITHOUT moving its state.
+//
+// IT IS NOT A WEAKER MarkReleasing AND MUST NOT BE FOLDED INTO ONE. Warm
+// release stops admission first and marks the residency releasing second,
+// because the reverse order publishes a `releasing` observation while this Host
+// is still accepting commands into the runtime that observation says is going
+// away. The intermediate state is {resident, accepting:false}: the route is
+// still live for the bindings that hold it, and no new work enters.
+//
+// It is IDEMPOTENT and takes the same generation rule as every other mutating
+// method, so a late warm timer cannot close admission on the residency that
+// REPLACED the one it was armed for.
+func (r *Registry) StopAdmitting(key Key, generation uint64) (Entry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.current(key, generation)
+	if !ok {
+		return Entry{}, false
+	}
+	entry.Accepting = false
+	entry.LastActivity = r.clock.Now()
+	return *entry, true
 }
 
 // MarkReleasing moves a residency to StateReleasing and stops it accepting.

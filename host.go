@@ -25,7 +25,6 @@ import (
 // SessionStore.
 type Host struct {
 	id               sessionwire.HostID
-	tenant           sessionwire.TenantID
 	internalEndpoint sessionwire.InternalEndpoint
 	isolationClass   sessionwire.HostIsolationClass
 
@@ -61,7 +60,6 @@ func New(options Options) (*Host, error) {
 	}
 	return &Host{
 		id:                options.HostID,
-		tenant:            options.TenantID,
 		internalEndpoint:  options.InternalEndpoint,
 		isolationClass:    options.IsolationClass,
 		department:        options.Department,
@@ -86,13 +84,12 @@ func New(options Options) (*Host, error) {
 // ID returns the Host's identity.
 func (h *Host) ID() sessionwire.HostID { return h.id }
 
-// TenantID returns the tenant every session on this Host belongs to.
-func (h *Host) TenantID() sessionwire.TenantID { return h.tenant }
-
 // InternalEndpoint returns the address Factory dials for HostLink.
 func (h *Host) InternalEndpoint() sessionwire.InternalEndpoint { return h.internalEndpoint }
 
-// IsolationClass returns the advertised cross-tenant boundary.
+// IsolationClass returns the advertised cross-tenant boundary, which is also
+// this Host's pooled admission rule. There is no TenantID accessor beside it:
+// see Options.IsolationClass for H8.
 func (h *Host) IsolationClass() sessionwire.HostIsolationClass { return h.isolationClass }
 
 // Department returns the immutable set of launch targets this Host serves.

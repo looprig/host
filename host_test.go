@@ -105,7 +105,6 @@ func pooledOptions(t *testing.T) host.Options {
 	t.Helper()
 	return host.Options{
 		HostID:            "host-7c1",
-		TenantID:          "tenant-9f3",
 		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        testDepartment(t),
@@ -245,13 +244,12 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 		t.Parallel()
 		options := pooledOptions(t)
 		options.HostID = "h"
-		options.TenantID = "t"
 		built, err := host.New(options)
 		if err != nil {
 			t.Fatalf("New with single-character identifiers = %v, want acceptance: the rule is non-empty", err)
 		}
-		if built.ID() != "h" || built.TenantID() != "t" {
-			t.Errorf("resolved (%q, %q), want (h, t)", built.ID(), built.TenantID())
+		if built.ID() != "h" {
+			t.Errorf("resolved %q, want h", built.ID())
 		}
 	})
 
@@ -259,7 +257,6 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 		t.Parallel()
 		options := dedicatedOptions(t)
 		options.HostID = "h"
-		options.TenantID = "t"
 		options.FixedSessionID = "s"
 		built, err := host.New(options)
 		if err != nil {
@@ -273,11 +270,10 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 	// The other side stays closed at that scale, so these rows do not soften
 	// the emptiness rule they are bounding.
 	for name, spoil := range map[string]func(*host.Options){
-		"HostID":   func(o *host.Options) { o.HostID = "" },
-		"TenantID": func(o *host.Options) { o.TenantID = "" },
+		"HostID": func(o *host.Options) { o.HostID = "" },
 	} {
 		options := pooledOptions(t)
-		options.HostID, options.TenantID = "h", "t"
+		options.HostID = "h"
 		spoil(&options)
 		if _, err := host.New(options); err == nil {
 			t.Errorf("an empty %s was accepted", name)
@@ -314,8 +310,6 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 	}{
 		{name: "host id too long", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(overLong) }, field: "HostID", code: sessionwire.IDValidationCodeTooLong},
 		{name: "host id invalid utf8", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(badUTF8) }, field: "HostID", code: sessionwire.IDValidationCodeInvalidUTF8},
-		{name: "tenant id too long", spoil: func(o *host.Options) { o.TenantID = sessionwire.TenantID(overLong) }, field: "TenantID", code: sessionwire.IDValidationCodeTooLong},
-		{name: "tenant id invalid utf8", spoil: func(o *host.Options) { o.TenantID = sessionwire.TenantID(badUTF8) }, field: "TenantID", code: sessionwire.IDValidationCodeInvalidUTF8},
 	}
 
 	for _, tt := range tests {
@@ -396,7 +390,6 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 		atLimit := strings.Repeat("x", sessionwire.MaxIDBytes)
 		options := dedicatedOptions(t)
 		options.HostID = sessionwire.HostID(atLimit)
-		options.TenantID = sessionwire.TenantID(atLimit)
 		options.FixedSessionID = sessionwire.SessionID(atLimit)
 		built, err := host.New(options)
 		if err != nil {
@@ -471,7 +464,13 @@ func TestIdentityRulesAreDelegatedNotRestated(t *testing.T) {
 		return true
 	})
 
-	for _, identity := range []string{"HostID", "TenantID", "FixedSessionID"} {
+	// TenantID LEFT THIS LIST AT H8 RATHER THAN BEING DROPPED FROM IT. Host is
+	// no longer constructed with a tenant, so there is no o.TenantID for
+	// options.go to delegate on; the identity rule moved to
+	// residency.Manager.validateRequest, which calls request.TenantID.Validate
+	// on the tenant each attach names, and TestAttachValidatesTheTenantIdentity
+	// in that package is this row's successor.
+	for _, identity := range []string{"HostID", "FixedSessionID"} {
 		if !delegated[identity] {
 			t.Errorf("options.go never calls Validate on o.%s. Core's rule must be ASKED FOR: a faithful restatement passes every behavioural test in this file and diverges silently the next time Core moves. Note this guard closes REPLACEMENT, not ADDITION — a redundant check alongside the call names none of the banned symbols and passes", identity)
 		}
@@ -685,7 +684,6 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 	// separate question"; it was answered two commits later and the comment was
 	// left contradicting the code below it.)
 	long := sessionwire.HostID(strings.Repeat("h", sessionwire.MaxIDBytes))
-	longTenant := sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes))
 	longSession := sessionwire.SessionID(strings.Repeat("s", sessionwire.MaxIDBytes))
 
 	t.Run("pooled, generous", func(t *testing.T) {
@@ -712,7 +710,6 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		}
 		options.Department = testDepartment(t, crowd...)
 		options.HostID = long
-		options.TenantID = longTenant
 		// A second, structurally different endpoint: ws rather than wss, an
 		// address literal rather than a name, an explicit port, and a path that
 		// is not "/hostlink".
@@ -730,7 +727,7 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New with a generous but legal configuration = %v. Every rule here is a floor; a ceiling above it is an undocumented rule owing its own constant and its own boundary rows", err)
 		}
-		if built.ID() != long || built.TenantID() != longTenant {
+		if built.ID() != long {
 			t.Error("a long identifier did not survive construction")
 		}
 		if built.Capacity() != 1_000_000 {
@@ -835,9 +832,6 @@ func TestResolvedConfigurationReportsWhatItWasGiven(t *testing.T) {
 
 	if got := built.ID(); got != options.HostID {
 		t.Errorf("ID() = %q, want %q", got, options.HostID)
-	}
-	if got := built.TenantID(); got != options.TenantID {
-		t.Errorf("TenantID() = %q, want %q", got, options.TenantID)
 	}
 	if got := built.InternalEndpoint(); got != options.InternalEndpoint {
 		t.Errorf("InternalEndpoint() = %q, want %q", got, options.InternalEndpoint)
@@ -980,7 +974,6 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 		code  host.OptionErrorCode
 	}{
 		{name: "host id", spoil: func(o *host.Options) { o.HostID = "" }, field: "HostID", code: host.OptionErrorCodeMissing},
-		{name: "tenant id", spoil: func(o *host.Options) { o.TenantID = "" }, field: "TenantID", code: host.OptionErrorCodeMissing},
 		{name: "internal endpoint absent", spoil: func(o *host.Options) { o.InternalEndpoint = "" }, field: "InternalEndpoint", code: host.OptionErrorCodeMissing},
 		{name: "internal endpoint malformed", spoil: func(o *host.Options) { o.InternalEndpoint = "http://host/hostlink" }, field: "InternalEndpoint", code: host.OptionErrorCodeInvalid},
 		{name: "isolation class unknown", spoil: func(o *host.Options) { o.IsolationClass = "shared" }, field: "IsolationClass", code: host.OptionErrorCodeUnknownEnum},
@@ -1051,14 +1044,14 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 // discriminate the refusals BELOW, which is the property O1.1 shipped without:
 // an exported error type no consumer could match is a type that does not exist.
 //
-// READ THE NAME NARROWLY. Ten rules are covered and FOUR ARE DELIBERATELY
-// EXCLUDED: the three identity delegations (HostID, TenantID, FixedSessionID)
-// and, with them, the endpoint rule they would collide with. All four report
+// READ THE NAME NARROWLY. Ten rules are covered and THREE ARE DELIBERATELY
+// EXCLUDED: the two identity delegations (HostID, FixedSessionID)
+// and, with them, the endpoint rule they would collide with. All three report
 // OptionErrorCodeInvalid, so adding a spoiler for any of them would fail the
 // distinctness assertion — and the correct response then is NOT to relax the
 // assertion but to split the code.
 //
-// The exclusion is safe today because those four are discriminated by two
+// The exclusion is safe today because those three are discriminated by two
 // routes this test does not use: the Field, and a typed cause of a different
 // type — Core's *RequestValidationError for the endpoint against its
 // *IDValidationError for the identities, both asserted in

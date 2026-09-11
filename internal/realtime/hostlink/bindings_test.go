@@ -443,6 +443,28 @@ func TestEachBindRefusalHasASoleCause(t *testing.T) {
 			code:    sessionwire.HostLinkErrorNotAdmitting,
 		},
 		{
+			// The row O6.1 makes reachable. The residency is STILL RESIDENT and
+			// this Host is NOT draining; what has closed is this one session's
+			// admission, which is the state a warm release passes through
+			// before it writes its durable `releasing` observation.
+			name: "session not admitting",
+			perturb: func(f *fixture, _ *sessionwire.HostLinkBindRequest) {
+				entry, held := f.registry.Get(residencyKey(testSession))
+				if !held {
+					f.t.Fatal("fixture residency vanished")
+				}
+				stopped, ok := f.registry.StopAdmitting(entry.Key, entry.Generation)
+				if !ok {
+					f.t.Fatal("StopAdmitting refused the fixture residency")
+				}
+				if stopped.State != registry.StateResident {
+					f.t.Fatalf("the perturbed residency is %q, want resident: this row must not be the releasing one wearing another name", stopped.State)
+				}
+			},
+			refusal: hostlink.RefusalSessionNotAdmitting,
+			code:    sessionwire.HostLinkErrorNotAdmitting,
+		},
+		{
 			name: "link binding budget spent",
 			perturb: func(f *fixture, _ *sessionwire.HostLinkBindRequest) {
 				mustBind(f.t, f.mux, linkA, otherSession)
@@ -538,6 +560,7 @@ func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 		"RefusalRuntimeMismatch":     hostlink.RefusalRuntimeMismatch,
 		"RefusalReleasing":           hostlink.RefusalReleasing,
 		"RefusalHostNotAdmitting":    hostlink.RefusalHostNotAdmitting,
+		"RefusalSessionNotAdmitting": hostlink.RefusalSessionNotAdmitting,
 		"RefusalNoLinkCapacity":      hostlink.RefusalNoLinkCapacity,
 		"RefusalNoHostCapacity":      hostlink.RefusalNoHostCapacity,
 		"RefusalNotBound":            hostlink.RefusalNotBound,
@@ -915,7 +938,11 @@ func TestProductionHoldsNoMutableRegistryHandle(t *testing.T) {
 	// which is what makes holding this list equivalent to holding no mutator.
 	allowed := map[string]bool{
 		"Key": true, "TenantID": true, "SessionID": true,
-		"Entry": true, "LeaseEpoch": true, "CompatibilityID": true, "State": true,
+		// Accepting joined the list at O6.1, and it is the same CLASS of entry
+		// as State: a field of the copy Get returns, whose mutation changes
+		// nothing. What changed is that it became reachable independently of
+		// State, so a bind reading it decides a case State does not.
+		"Entry": true, "LeaseEpoch": true, "CompatibilityID": true, "State": true, "Accepting": true,
 		"ResidencyState": true, "StateResident": true, "StateReleasing": true, "StateDraining": true,
 	}
 
@@ -1873,5 +1900,79 @@ func TestAnUnboundLinkLearnsNothingFromItsOwnMalformedBody(t *testing.T) {
 	}
 	if got := f.consumers.consumers[residencyKey(testSession)].recorded(); len(got) != 0 {
 		t.Fatalf("a malformed body woke the consumer: %v", got)
+	}
+}
+
+// TestReleasingAndNotAdmittingDoNotMaskEachOther is O6.1's split decision in
+// executable form, and it is three facts rather than two.
+//
+// Until O6.1 there were two: a Host-wide drain and a releasing residency, read
+// from different places precisely so neither could stand in for the other. The
+// third is a resident session that has stopped admitting — reachable now that
+// registry.StopAdmitting exists — and it is the one a warm release produces
+// FIRST, before the residency state moves at all.
+//
+// The ordering assertion is the substance. registry.MarkReleasing sets BOTH
+// State and Accepting, so a releasing residency satisfies the not-admitting
+// predicate too; if Bind checked admission before state, every releasing bind
+// would answer session_not_admitting and RefusalReleasing would become
+// unreachable through this path — the same masking the Host-wide/per-session
+// separation exists to prevent, reintroduced one layer down. The wire code is
+// the same for two of the three, which is exactly how such a path acquires no
+// test of its own.
+func TestReleasingAndNotAdmittingDoNotMaskEachOther(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name    string
+		perturb func(*fixture)
+		refusal hostlink.Refusal
+		code    sessionwire.HostLinkErrorCode
+	}{
+		{
+			name: "a resident session with admission stopped",
+			perturb: func(f *fixture) {
+				entry, _ := f.registry.Get(residencyKey(testSession))
+				f.registry.StopAdmitting(entry.Key, entry.Generation)
+			},
+			refusal: hostlink.RefusalSessionNotAdmitting,
+			code:    sessionwire.HostLinkErrorNotAdmitting,
+		},
+		{
+			name: "a releasing session, which is also not accepting",
+			perturb: func(f *fixture) {
+				entry, _ := f.registry.Get(residencyKey(testSession))
+				f.registry.MarkReleasing(entry.Key, entry.Generation)
+			},
+			refusal: hostlink.RefusalReleasing,
+			code:    sessionwire.HostLinkErrorReleasing,
+		},
+		{
+			name:    "a draining Host, whose session is resident and accepting",
+			perturb: func(f *fixture) { f.admission.beginDrain() },
+			refusal: hostlink.RefusalHostNotAdmitting,
+			code:    sessionwire.HostLinkErrorNotAdmitting,
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t)
+			row.perturb(f)
+			_, err := f.mux.Bind(linkA, bindRequest(testSession))
+			var refusal *hostlink.BindError
+			if !errors.As(err, &refusal) {
+				t.Fatalf("Bind = %v, want a *BindError", err)
+			}
+			if refusal.Refusal != row.refusal {
+				t.Errorf("Refusal = %q, want %q", refusal.Refusal, row.refusal)
+			}
+			wire, ok := refusal.HostLinkError()
+			if !ok {
+				t.Fatal("the refusal carries no wire class")
+			}
+			if wire.Code != row.code {
+				t.Errorf("wire code = %q, want %q", wire.Code, row.code)
+			}
+		})
 	}
 }

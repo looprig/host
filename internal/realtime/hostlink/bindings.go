@@ -51,16 +51,20 @@ type Residencies interface {
 // Host-wide fact and not a session's.
 //
 // It is separate from the residency row on purpose, and the separation is what
-// keeps not_admitting and releasing from masking each other. Inside registry,
-// Entry.Accepting is a strict function of Entry.State — Insert sets
-// resident/true, MarkReleasing and BeginTeardown both set false — so a bind
-// reading both fields would have one of them decide every reachable case and
-// the other decide none, which is an identical refusal standing in for two
-// checks. Host-wide non-admission and a releasing session are independently
-// reachable facts with different repairs, so they are read from different
-// places. Entry.Accepting consequently has no reader here; it is owed a real
-// one by O6.1, whose per-session admission stop is what makes a resident,
-// non-accepting row reachable at all.
+// keeps not_admitting and releasing from masking each other. There are now
+// THREE such facts, not two, and each is read from the place that owns it:
+// this interface for the Host-wide drain, Entry.State for a residency whose
+// release has been published, and Entry.Accepting for a resident session whose
+// admission a warm release has just closed.
+//
+// The third became reachable at O6.1. Until then Entry.Accepting was a strict
+// function of Entry.State — Insert set resident/true, MarkReleasing and
+// BeginTeardown both set false — so a bind reading both fields would have had
+// one decide every reachable case and the other decide none, which is an
+// identical refusal standing in for two checks; the field consequently had no
+// reader here. registry.StopAdmitting is what separated them, and Bind reads
+// State FIRST so that the releasing ground is not swallowed by the admission
+// one, which MarkReleasing also satisfies.
 type Admission interface {
 	// Draining reports that this Host has begun a drain and is publishing
 	// accepting=false, so a new binding must not be established.
@@ -110,7 +114,8 @@ type Refusal string
 
 const (
 	// RefusalForeignTenant reports a bind naming a tenant other than the one
-	// this Host serves and this link authenticated as.
+	// this link authenticated as. Since H8 that is the whole of the rule: the
+	// Host itself serves whatever tenants its isolation class permits.
 	RefusalForeignTenant Refusal = "foreign_tenant"
 
 	// RefusalUnknownSession reports a session this Host does not hold.
@@ -140,6 +145,19 @@ const (
 	// session is still resident and still accepting through existing
 	// bindings; what is refused is establishing a new one.
 	RefusalHostNotAdmitting Refusal = "host_not_admitting"
+
+	// RefusalSessionNotAdmitting reports a residency that is still RESIDENT and
+	// has stopped admitting new work. It is the third fact, added by O6.1, and
+	// it is not either of its neighbours: RefusalHostNotAdmitting is about this
+	// whole Host and RefusalReleasing is about a residency whose state has
+	// already moved. This one is a warm release that has closed admission and
+	// not yet written its durable `releasing` observation.
+	//
+	// It publishes not_admitting, which is the class §9.3 names for a command
+	// racing release, and which it shares with the Host-wide ground. The
+	// repairs differ: a Factory re-places this session and leaves the Host
+	// alone, where a draining Host must be avoided entirely.
+	RefusalSessionNotAdmitting Refusal = "session_not_admitting"
 
 	// RefusalNoLinkCapacity reports one link's binding budget already spent.
 	RefusalNoLinkCapacity Refusal = "no_link_capacity"
@@ -278,8 +296,17 @@ type Binding struct {
 
 // MultiplexerOptions configures a Multiplexer.
 type MultiplexerOptions struct {
-	// TenantID is the single tenant this Host serves, and the identity every
-	// link on it authenticated as.
+	// TenantID is the tenant every link on this Multiplexer authenticated as.
+	//
+	// IT IS THE LINK'S TENANT AND NO LONGER THE HOST'S. Human gate H8, answered
+	// 2026-09-04, dropped the fixed tenant from host.Options: a pooled Host
+	// advertising cross_tenant_isolated admits several tenants, and one
+	// advertising tenant_exclusive is exclusive by PLACEMENT rather than by
+	// construction. A composition therefore supplies this from the
+	// authenticated service identity of the connection, not from the Host, and
+	// a Host serving several tenants runs one Multiplexer per authenticated
+	// tenant. The refusal below still says "this link is authenticated for
+	// another tenant", which was always the accurate sentence.
 	TenantID sessionwire.TenantID
 
 	// HostID and HostGeneration are this Host process's identity and
@@ -488,6 +515,21 @@ func (m *Multiplexer) Bind(link LinkID, request sessionwire.HostLinkBindRequest)
 			Key:     key,
 			Reason:  "this residency is releasing and its route is about to disappear",
 			wire:    sessionwire.HostLinkErrorReleasing,
+		}
+	}
+	// STATE IS CHECKED FIRST AND THAT ORDER IS THE MECHANISM. MarkReleasing
+	// sets State AND Accepting, so a releasing residency satisfies this
+	// predicate too; reading admission first would answer not_admitting for
+	// every releasing bind and leave RefusalReleasing unreachable through this
+	// path. Reaching here means the residency is resident and has stopped
+	// admitting on its own, which is the warm release's first step and nothing
+	// else.
+	if !entry.Accepting {
+		return Binding{}, &BindError{
+			Refusal: RefusalSessionNotAdmitting,
+			Key:     key,
+			Reason:  "this residency has stopped admitting new work and is being released",
+			wire:    sessionwire.HostLinkErrorNotAdmitting,
 		}
 	}
 	return m.record(link, key, request.LeaseEpoch, request.IdempotencyKey)

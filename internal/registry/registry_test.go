@@ -1157,3 +1157,79 @@ func TestOperationsOnAnAbsentKeyReportNothing(t *testing.T) {
 		t.Errorf("Snapshot() = %v, want empty", snapshot)
 	}
 }
+
+// TestStopAdmittingLeavesTheResidencyResident is the row O6.1 makes reachable,
+// and the reason it is a separate writer from MarkReleasing.
+//
+// Until this method existed, Accepting was a STRICT FUNCTION of State — Insert
+// set {resident, true}, MarkReleasing and BeginTeardown both set false — so
+// {resident, accepting:false} could not be produced through the public API and
+// a reader consulting both fields would have one decide every reachable case
+// and the other decide none. Warm release stops admission for a session BEFORE
+// it marks it releasing, precisely so no command can be accepted into a
+// residency whose durable `releasing` observation has not been written yet, and
+// that intermediate state is this one. The assertion is therefore on the pair,
+// not on Accepting alone: a StopAdmitting that also moved State would collapse
+// back into MarkReleasing and buy nothing.
+func TestStopAdmittingLeavesTheResidencyResident(t *testing.T) {
+	t.Parallel()
+
+	index := registry.New(newClock())
+	key := registry.Key{TenantID: "tenant-9f3", SessionID: "session-71c"}
+	entry, _ := index.Insert(key, admission("a"))
+	if !entry.Accepting || entry.State != registry.StateResident {
+		t.Fatalf("a fresh residency is (%v, %q), want accepting and resident", entry.Accepting, entry.State)
+	}
+
+	stopped, ok := index.StopAdmitting(key, entry.Generation)
+	if !ok {
+		t.Fatal("StopAdmitting reported no residency")
+	}
+	if stopped.Accepting {
+		t.Error("the residency is still accepting after StopAdmitting")
+	}
+	if stopped.State != registry.StateResident {
+		t.Errorf("State = %q, want %q: stopping admission is not a residency transition", stopped.State, registry.StateResident)
+	}
+	// The stored row changed, not just the returned copy.
+	held, _ := index.Get(key)
+	if held.Accepting || held.State != registry.StateResident {
+		t.Errorf("the stored entry is (%v, %q); StopAdmitting changed only its return value or moved the state", held.Accepting, held.State)
+	}
+	// Idempotent, and a later MarkReleasing still moves the state.
+	if again, ok := index.StopAdmitting(key, entry.Generation); !ok || again.Accepting {
+		t.Errorf("a repeated StopAdmitting reported (%v, %v), want (accepting=false, ok=true)", again.Accepting, ok)
+	}
+	released, ok := index.MarkReleasing(key, entry.Generation)
+	if !ok || released.State != registry.StateReleasing || released.Accepting {
+		t.Errorf("MarkReleasing after StopAdmitting = (%q, %v, %v), want (releasing, false, true)", released.State, released.Accepting, ok)
+	}
+}
+
+// TestStopAdmittingRefusesAReplacedResidency holds the generation rule every
+// other mutating method takes, because a late warm timer holding a generation
+// that has been replaced must not close admission on its REPLACEMENT.
+func TestStopAdmittingRefusesAReplacedResidency(t *testing.T) {
+	t.Parallel()
+
+	index := registry.New(newClock())
+	key := registry.Key{TenantID: "tenant-9f3", SessionID: "session-71c"}
+	first, _ := index.Insert(key, admission("a"))
+	if !index.RemoveByGeneration(key, first.Generation) {
+		t.Fatal("the first residency could not be removed")
+	}
+	second, _ := index.Insert(key, admission("b"))
+
+	if _, ok := index.StopAdmitting(key, first.Generation); ok {
+		t.Error("StopAdmitting acted under a generation that has been replaced")
+	}
+	if held, _ := index.Get(key); !held.Accepting {
+		t.Error("the replacement residency stopped accepting on the previous generation's timer")
+	}
+	if _, ok := index.StopAdmitting(key, second.Generation); !ok {
+		t.Error("StopAdmitting refused the current generation")
+	}
+	if _, ok := index.StopAdmitting(registry.Key{TenantID: "tenant-9f3", SessionID: "absent"}, 1); ok {
+		t.Error("StopAdmitting succeeded on an absent key")
+	}
+}

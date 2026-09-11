@@ -1448,8 +1448,26 @@ func (m *Manager) validateRequest(key registry.Key, request Request) error {
 	refuse := func(code sessionwire.HostLinkErrorCode, reason string, cause error) error {
 		return &AttachError{Step: StepValidate, Code: code, Key: key, Reason: reason, Cause: cause}
 	}
-	if request.TenantID != m.host.TenantID() {
-		return refuse("", "this Host serves tenant "+strconv.Quote(string(m.host.TenantID()))+" and the request names "+strconv.Quote(string(request.TenantID)), nil)
+	// THE TENANT IS VALIDATED, NOT COMPARED, and that is human gate H8 answered
+	// 2026-09-04 as option (a). This used to refuse any request whose tenant
+	// differed from a fixed Options.TenantID; that field is gone, because a
+	// Host that is tenant-exclusive BY CONSTRUCTION makes spec §12's isolation
+	// class unreadable and forces one Host Deployment per tenant. The rule did
+	// not disappear, it moved to the two places that can hold it correctly:
+	// Factory placement, which §12 makes the enforcer, and this Host's ONE
+	// admission ledger, whose lock is the only Host-wide critical section an
+	// admission passes through and which refuses a second tenant unless the
+	// advertised class is cross_tenant_isolated.
+	//
+	// WHAT REMAINS HERE IS THE IDENTITY RULE, and it is not a leftover. The
+	// comparison was implicitly bounding the tenant too — an over-long or
+	// invalid-UTF-8 tenant could not equal a validated Options.TenantID — so
+	// removing it without this would have let an identity Core rejects on every
+	// HostLink record reach the lease, the workspace prefix and the §15
+	// projection. host.Options delegated this same rule to Core for its own
+	// fields; a tenant now enters this Host here instead.
+	if err := request.TenantID.Validate(); err != nil {
+		return refuse("", "the tenant identity is not a permitted sessionwire identity: "+err.Error(), err)
 	}
 	if err := request.SessionID.Validate(); err != nil {
 		return refuse("", "the session identity is not a permitted sessionwire identity: "+err.Error(), err)

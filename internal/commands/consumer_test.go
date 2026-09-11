@@ -458,7 +458,6 @@ func newTestHost(t *testing.T, clock host.Clock) *host.Host {
 	}
 	built, err := host.New(host.Options{
 		HostID:            sessionwire.HostID("host-inbox"),
-		TenantID:          testTenant,
 		InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        dept,
@@ -675,7 +674,6 @@ func TestAFullPageIsWellDefinedBecauseTheBatchIsPositive(t *testing.T) {
 	for _, batch := range []int{0, -1} {
 		options := host.Options{
 			HostID:            sessionwire.HostID("host-inbox"),
-			TenantID:          testTenant,
 			InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
 			IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 			Department:        dept,

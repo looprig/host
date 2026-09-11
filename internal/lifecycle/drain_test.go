@@ -1958,14 +1958,20 @@ func TestThePlatformGraceEndsAWaitWhoseOwnBoundHasNotFired(t *testing.T) {
 // deferrals this task was told not to disturb, structurally rather than by
 // recollection.
 //
-// registry.Entry.Accepting HAS NO READER, and that is a ruled deferral: inside
-// internal/registry, Accepting is a strict function of State — Insert sets
-// {resident, true} and MarkReleasing and BeginTeardown are the only writers,
-// both setting it false alongside a non-resident State — so {resident,
-// accepting:false} is unreachable. This drain publishes accepting=false through
-// the injected Advertiser, which is the ORCHESTRATION-STORE row and not a
-// registry entry, so it does not make that row reachable. A reader added here
-// would be the change that reopens it.
+// registry.Entry.Accepting HAS NO READER IN THIS PACKAGE, and as of O6.1 that
+// is a CHOICE rather than a consequence. It used to be a ruled deferral resting
+// on unreachability: Accepting was a strict function of State, so {resident,
+// accepting:false} could not be produced. registry.StopAdmitting produces it
+// now — a warm release closes one session's admission before its residency
+// state moves — so the old justification is gone and the rule is not.
+//
+// What holds it is the DIVISION OF LABOUR. A drain is Host-wide: it publishes
+// accepting=false through the injected Advertiser, which is the
+// ORCHESTRATION-STORE row and not a registry entry, and it releases every
+// resident session whatever each one's admission says. Reading the per-session
+// flag here would make a Host-wide decision out of a per-session fact.
+// internal/realtime/hostlink is where that flag is read, because a BIND is
+// about one session. metrics.go reads Entry.State and nothing else.
 //
 // registry.Entry.LeaseEpoch is the RESIDENCY epoch and sits beside
 // Entry.Runtime.LeaseEpoch(), which is the JOURNAL one: one identifier over two
@@ -1984,7 +1990,7 @@ func TestTheDrainReadsNeitherHalfOfTheRegistryEntrySeam(t *testing.T) {
 		t.Fatalf("read the lifecycle package directory: %v", err)
 	}
 	forbidden := map[string]string{
-		"Accepting":  "registry.Entry.Accepting has no reader by a ruled deferral; publishing nonaccepting goes through the Advertiser",
+		"Accepting":  "registry.Entry.Accepting is a PER-SESSION admission fact and this package makes Host-wide decisions; publishing nonaccepting goes through the Advertiser and the per-session flag is read in internal/realtime/hostlink",
 		"LeaseEpoch": "registry.Entry.LeaseEpoch is one identifier over two domains (O3.4-registry-entry-seam); a drain reads neither",
 	}
 	fileSet := token.NewFileSet()

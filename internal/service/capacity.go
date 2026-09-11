@@ -462,6 +462,7 @@ func (p *CapacityPublisher) Admit(key registry.Key, agent sessionwire.AgentID) e
 	// that bluntness is deliberate: telling "safe accessor" from "caller code"
 	// at each site is a judgement, and a judgement is what drifts.
 	placement, capacity := p.host.Placement(), p.host.Capacity()
+	isolation := p.host.IsolationClass()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -477,6 +478,38 @@ func (p *CapacityPublisher) Admit(key registry.Key, agent sessionwire.AgentID) e
 			Code:    sessionwire.HostLinkErrorNotAdmitting,
 			AgentID: agent,
 			Reason:  "this Host is draining and has stopped admitting new sessions",
+		}
+	}
+	// H8, answered 2026-09-04: THE ISOLATION CLASS IS THE POOLED ADMISSION
+	// RULE, and this is the only place in the Host where it can be enforced
+	// atomically. Host is no longer constructed with a TenantID — a pooled
+	// deployment used to need one Deployment per tenant, and the field spec §12
+	// says decides this had no reader that could matter — so "which tenant does
+	// this Host serve" is now a question about what is CURRENTLY ADMITTED, and
+	// the ledger is the thing that knows.
+	//
+	// DERIVED, NOT LATCHED. A cached tenant set at the first admission would
+	// hold this Host to a tenant with nothing resident on it, so a warm release
+	// would free capacity without freeing the Host. Deriving it from the ledger
+	// makes "the last session released frees the Host" true by construction
+	// rather than by a Release that remembers to clear a field; under
+	// exclusivity at most one tenant can be present, so the loop reports a
+	// deterministic tenant and costs one pass over a bounded map.
+	//
+	// §12 assigns the enforcement to Factory placement — "A Host without that
+	// class is tenant-exclusive and Factory placement enforces the restriction"
+	// — so this is the local backstop for that, not the primary control.
+	if isolation != sessionwire.HostIsolationClassCrossTenantIsolated {
+		for other := range p.admitted {
+			if other.TenantID != key.TenantID {
+				return &AdmissionRefusedError{
+					Code:    sessionwire.HostLinkErrorNotAdmitting,
+					AgentID: agent,
+					Reason: "this Host advertises " + string(isolation) + " isolation and already holds tenant " +
+						strconv.Quote(string(other.TenantID)) + " resident, so it may not admit tenant " +
+						strconv.Quote(string(key.TenantID)) + " as well",
+				}
+			}
 		}
 	}
 	target, registered := p.byAgent[agent]

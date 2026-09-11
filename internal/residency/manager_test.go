@@ -1033,7 +1033,6 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 	}
 	built, err := host.New(host.Options{
 		HostID:            testHost,
-		TenantID:          testTenant,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        dept,
@@ -2313,7 +2312,6 @@ func TestAttachRefusesAnInvalidRequestBeforeTakingAnything(t *testing.T) {
 		mutate   func(*Request)
 		wantCode sessionwire.HostLinkErrorCode
 	}{
-		{name: "another tenant's session", mutate: func(r *Request) { r.TenantID = "tenant-other"; r.Principal.TenantID = "tenant-other" }},
 		{name: "a principal acting for another tenant", mutate: func(r *Request) { r.Principal.TenantID = "tenant-other" }},
 		{name: "no session id", mutate: func(r *Request) { r.SessionID = "" }},
 		{name: "no agent id", mutate: func(r *Request) { r.AgentID = "" }},
@@ -4189,5 +4187,78 @@ func TestTheWarmPathReportsARuntimeThatHasLOSTItsJournalGrant(t *testing.T) {
 	// journal loss does not end residency.
 	if warm.LeaseEpoch != first.LeaseEpoch || warm.LeaseEpoch == 0 {
 		t.Errorf("the residency epoch moved to %d when the journal grant was lost; it was %d", warm.LeaseEpoch, first.LeaseEpoch)
+	}
+}
+
+// TestAttachValidatesTheTenantIdentity is human gate H8 in this package, and it
+// is BOTH HALVES: a tenant this Host was not built for is now ordinary, and the
+// identity rule that the removed comparison was implicitly carrying is not.
+//
+// Attach used to refuse any request whose tenant differed from a fixed
+// Options.TenantID. H8 was answered 2026-09-04 as option (a) — drop it —
+// because a Host that is tenant-exclusive BY CONSTRUCTION makes spec §12's
+// isolation class unreadable and forces one Host Deployment per tenant. The
+// enforcement moved to Factory placement, which §12 names as the enforcer, and
+// to this Host's ONE admission ledger.
+//
+// THE SECOND HALF IS THE ONE THAT COULD HAVE BEEN LOST SILENTLY. The
+// comparison was bounding the tenant as a side effect — an over-long or
+// invalid-UTF-8 tenant cannot equal a validated Options.TenantID — so deleting
+// it without putting Core's own rule in its place would have let an identity
+// Core rejects on every HostLink record reach the lease, the workspace prefix
+// and the §15 projection, failing at first publication instead of at validate.
+// host_test.go's identity-delegation guard dropped its TenantID row pointing
+// here; this is that row's successor.
+func TestAttachValidatesTheTenantIdentity(t *testing.T) {
+	t.Run("a tenant this Host was not constructed for is admitted", func(t *testing.T) {
+		f := newFixture(t)
+		request := f.request(ModeCreate)
+		request.TenantID = "tenant-elsewhere"
+		request.Principal.TenantID = "tenant-elsewhere"
+
+		residency, err := f.manager.Attach(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Attach for another tenant = %v, want acceptance: since H8 a Host holds no tenant of its own", err)
+		}
+		if residency.Key.TenantID != "tenant-elsewhere" {
+			t.Errorf("the residency is keyed by tenant %q, want the requested one", residency.Key.TenantID)
+		}
+	})
+
+	for _, row := range []struct {
+		name   string
+		tenant sessionwire.TenantID
+	}{
+		{name: "empty", tenant: ""},
+		{name: "over MaxIDBytes", tenant: sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes+1))},
+		{name: "not valid UTF-8", tenant: sessionwire.TenantID([]byte{0xff, 0xfe})},
+	} {
+		t.Run("a tenant identity Core refuses: "+row.name, func(t *testing.T) {
+			f := newFixture(t)
+			request := f.request(ModeCreate)
+			request.TenantID = row.tenant
+			request.Principal.TenantID = row.tenant
+
+			_, err := f.manager.Attach(context.Background(), request)
+			var attach *AttachError
+			if !errors.As(err, &attach) {
+				t.Fatalf("Attach = %v, want an *AttachError", err)
+			}
+			if attach.Step != StepValidate {
+				t.Errorf("the refusal names step %q, want %q", attach.Step, StepValidate)
+			}
+			// Core's OWN typed cause, not a sentence: the rule is asked for
+			// rather than restated, so a caller tells "too long" from "invalid
+			// UTF-8" the same way it does for every other Host identity.
+			var identity *sessionwire.IDValidationError
+			if !errors.As(err, &identity) {
+				t.Fatalf("the refusal carries %T, want Core's *IDValidationError: the rule must be delegated, not restated", errors.Unwrap(attach))
+			}
+			// Nothing was taken. A refusal at validate runs before the lease,
+			// the admission charge and the workspace.
+			if held := f.leases.heldCount(); held != 0 {
+				t.Errorf("%d leases are held after a request refused at validate", held)
+			}
+		})
 	}
 }

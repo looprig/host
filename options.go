@@ -123,14 +123,24 @@ type Options struct {
 	// HostID identifies this Host to Factory and in HostLink bindings.
 	HostID sessionwire.HostID
 
-	// TenantID scopes every session this Host may hold resident.
-	TenantID sessionwire.TenantID
-
 	// InternalEndpoint is the credential-free WebSocket address Factory dials.
 	InternalEndpoint sessionwire.InternalEndpoint
 
 	// IsolationClass is advertised with capacity so Factory can place
-	// cross-tenant work correctly. Pooled placement alone does not establish it.
+	// cross-tenant work correctly, AND IT IS THIS HOST'S POOLED ADMISSION RULE.
+	// Pooled placement alone does not establish the boundary.
+	//
+	// THERE IS NO TenantID BESIDE IT, and that is human gate H8, answered
+	// 2026-09-04 as option (a). A Host used to be constructed with a fixed
+	// tenant and the residency manager refused every request naming another, so
+	// a pooled deployment needed one Host Deployment per tenant and this field
+	// — which spec §12 says decides the question — had no reader that could
+	// matter. A Host advertising cross_tenant_isolated may hold several tenants
+	// resident; one advertising tenant_exclusive is exclusive by PLACEMENT, not
+	// by construction, which is §12's own wording: "Factory placement enforces
+	// the restriction". internal/service's admission ledger holds the local
+	// backstop for it, atomically, because the ledger's lock is the only
+	// Host-wide critical section an admission passes through.
 	IsolationClass sessionwire.HostIsolationClass
 
 	// Department is the immutable set of launch targets this Host serves.
@@ -251,9 +261,6 @@ func (o Options) validatePresence() error {
 	if o.HostID == "" {
 		return missing("HostID")
 	}
-	if o.TenantID == "" {
-		return missing("TenantID")
-	}
 	if o.InternalEndpoint == "" {
 		return missing("InternalEndpoint")
 	}
@@ -288,9 +295,13 @@ func (o Options) validateShape() error {
 			Cause:  err,
 		}
 	}
-	// DELEGATED to Core, not restated. HostID.Validate, TenantID.Validate and
-	// SessionID.Validate are exported and each calls Core's validateID, so this
-	// enforces Core's rule BY CALLING IT and cannot drift if Core changes it.
+	// DELEGATED to Core, not restated. HostID.Validate and SessionID.Validate
+	// are exported and each calls Core's validateID, so this enforces Core's
+	// rule BY CALLING IT and cannot drift if Core changes it. TenantID took the
+	// same treatment until H8 removed the field; the rule did not go with it,
+	// it MOVED — residency.Manager.validateRequest now calls
+	// request.TenantID.Validate on the tenant each attach names, which is where
+	// a tenant now enters this Host.
 	//
 	// TWO of validateID's three arms are reachable here: over MaxIDBytes and
 	// invalid UTF-8. The EMPTY arm is delegated but SHADOWED, because
@@ -320,7 +331,6 @@ func (o Options) validateShape() error {
 		validate func() error
 	}{
 		{"HostID", o.HostID.Validate},
-		{"TenantID", o.TenantID.Validate},
 	} {
 		if err := identity.validate(); err != nil {
 			return &InvalidOptionsError{

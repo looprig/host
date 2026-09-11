@@ -226,7 +226,6 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 	}
 	built, err := host.New(host.Options{
 		HostID:            testHost,
-		TenantID:          testTenant,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        dept,
