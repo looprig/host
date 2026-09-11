@@ -157,7 +157,27 @@ const (
 	// racing release, and which it shares with the Host-wide ground. The
 	// repairs differ: a Factory re-places this session and leaves the Host
 	// alone, where a draining Host must be avoided entirely.
+	//
+	// IT IS READ ON BOTH PATHS. Bind refuses a NEW binding, and Deliver refuses
+	// a command over a RETAINED one — which §9.3 makes the likely path, since a
+	// binding may remain through the warm TTL. The first round of O6.1 shipped
+	// only the bind half, and a retained binding went on delivering into a
+	// session that had stopped admitting.
 	RefusalSessionNotAdmitting Refusal = "session_not_admitting"
+
+	// RefusalResidencyReleased reports a delivery over a RETAINED binding whose
+	// session this Host no longer holds resident.
+	//
+	// IT IS SEPARATE FROM RefusalUnknownSession, which answers the same
+	// question on the bind path, and the difference is disclosure. A bind is
+	// refused with runtime_unavailable precisely so that it cannot tell a
+	// caller whether somebody else's session exists; a DELIVERY arrives over a
+	// binding this Host itself granted, so the caller has already proved it
+	// knew, and there is nothing left to withhold. That is what lets this one
+	// publish the class §9.3 names for a command racing release —
+	// not_admitting, on which a Factory invalidates the binding and re-runs
+	// placement — instead of the deliberately uninformative one.
+	RefusalResidencyReleased Refusal = "residency_released"
 
 	// RefusalNoLinkCapacity reports one link's binding budget already spent.
 	RefusalNoLinkCapacity Refusal = "no_link_capacity"
@@ -638,6 +658,12 @@ func (m *Multiplexer) remove(link LinkID, channel string) {
 // The delivery record carries a CommandID and nothing else, and repeating one
 // is harmless — Hint is a wake, so the second one either finds the pass already
 // running or starts another that finds the durable record already terminal.
+//
+// HOLDING THE ROUTE IS NECESSARY AND NOT SUFFICIENT. The residency is re-read
+// here on every delivery, because §9.3 lets a session binding outlive the
+// admission it was granted under: "A session binding may remain through the
+// warm TTL". A binding is therefore a statement about routing and never a
+// standing permission to wake a runtime.
 func (m *Multiplexer) Deliver(link LinkID, channel string, delivery sessionwire.HostLinkCommandDelivery) error {
 	binding, bound := m.binding(link, channel)
 	if !bound {
@@ -649,6 +675,45 @@ func (m *Multiplexer) Deliver(link LinkID, channel string, delivery sessionwire.
 	}
 	if err := delivery.Validate(); err != nil {
 		return &BindError{Refusal: RefusalMalformedRequest, Key: binding.Key, Reason: "the command delivery is not a valid Core record", Cause: err}
+	}
+	// THE RESIDENCY IS RE-READ ON EVERY DELIVERY, not once at bind time, and
+	// that is §9.3's "commands racing release receive typed not_admitting"
+	// landing on the arm a racing command actually takes. §9.3 also says "A
+	// session binding may remain through the warm TTL", so the binding a
+	// Factory holds outlives the residency's admission by design; checking only
+	// at Bind left the RETAINED-binding path — the likely one — delivering into
+	// a session that had stopped admitting, was releasing, or was gone.
+	//
+	// THE EPOCH FENCE DOES NOT COVER THIS. Warm release steps 2 through 4 leave
+	// the same Host holding the same lease epoch, so the binding is exactly
+	// current and nothing about it is stale except this read.
+	//
+	// The order is Bind's, for Bind's reason: MarkReleasing sets State AND
+	// Accepting, so reading admission first would answer not_admitting for
+	// every releasing delivery and leave RefusalReleasing unreachable here.
+	entry, resident := m.residencies.Get(binding.Key)
+	switch {
+	case !resident:
+		return &BindError{
+			Refusal: RefusalResidencyReleased,
+			Key:     binding.Key,
+			Reason:  "this Host no longer holds the residency this binding names",
+			wire:    sessionwire.HostLinkErrorNotAdmitting,
+		}
+	case entry.State != registry.StateResident:
+		return &BindError{
+			Refusal: RefusalReleasing,
+			Key:     binding.Key,
+			Reason:  "this residency is releasing and is no longer taking commands",
+			wire:    sessionwire.HostLinkErrorReleasing,
+		}
+	case !entry.Accepting:
+		return &BindError{
+			Refusal: RefusalSessionNotAdmitting,
+			Key:     binding.Key,
+			Reason:  "this residency has stopped admitting new work and is being released",
+			wire:    sessionwire.HostLinkErrorNotAdmitting,
+		}
 	}
 	consumer, running := m.consumers.ConsumerFor(binding.Key)
 	if !running {

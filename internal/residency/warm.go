@@ -314,6 +314,15 @@ type warmWatch struct {
 // ErrWarmSessionWatched reports a second Watch for a key already watched.
 var ErrWarmSessionWatched = errors.New("residency: this session is already watched for warm release")
 
+// ErrWarmReleaserStopped reports a Watch on a releaser that has been stopped.
+//
+// IT IS A DIFFERENT FACT FROM ErrWarmSessionWatched and a caller must be able
+// to tell them apart: one says this session is already being watched by a
+// running releaser, and the other says nothing on this releaser will ever run
+// again. Both were once "an error", which is how a Stop that failed to clear
+// its watch table reported the wrong one and passed.
+var ErrWarmReleaserStopped = errors.New("residency: this warm releaser has been stopped")
+
 // NewWarmReleaser validates the options and returns a releaser watching
 // nothing.
 func NewWarmReleaser(options WarmOptions) (*WarmReleaser, error) {
@@ -364,7 +373,7 @@ func (w *WarmReleaser) Watch(session WarmSession) error {
 	select {
 	case <-w.stopped:
 		w.mu.Unlock()
-		return errors.New("residency: this warm releaser has been stopped")
+		return ErrWarmReleaserStopped
 	default:
 	}
 	w.watches[key] = watch

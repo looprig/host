@@ -61,6 +61,22 @@ type fakeWarmTimer struct {
 
 func (t *fakeWarmTimer) C() <-chan time.Time { return t.fired }
 
+// Stop RECORDS the stop and does not suppress a later expire, and that
+// looseness is deliberate rather than an oversight.
+//
+// A faithful timer would swallow a tick delivered after Stop with no
+// intervening Reset, and then `run`'s re-read of `armed` — the mechanism that
+// makes a cancellation safe against a tick ALREADY IN FLIGHT — would have
+// nothing to discard and could be deleted with the suite green. Keeping the
+// fake looser here is what lets TestAGateWaitIsNotWholeSessionIdle drive a
+// stale tick through the real code path.
+//
+// THE CONSEQUENCE IS BOOKED, not hidden: it is why the `armed = false`
+// statement in warmWatch.stop cannot be killed on its own. Under the real
+// time.Timer contract a stopped timer delivers nothing, so that statement is
+// redundant with the Stop beside it; it is kept as defence against a timer
+// implementation that does not honour Stop, and the Stop itself IS sampled —
+// see TestForgetDisarmsTheTimerAndNotOnlyTheGoroutine.
 func (t *fakeWarmTimer) Stop() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1099,5 +1115,75 @@ func TestForgetAndStopEndTheWatchGoroutineAndNotJustItsTimer(t *testing.T) {
 				t.Errorf("an outcome was produced after %s", row.name)
 			}
 		})
+	}
+}
+
+// TestStopClearsTheWatchTableAndNotOnlyTheTimers closes two call sites the
+// first round's checklist table signed off without sampling, and the diagnosis
+// matters more than either.
+//
+// Stop has TWO statements per watch — delete the map entry, and stop the watch
+// — and the round signed the site off on the second. The first has its own
+// observables and they are not small: a releaser that stopped without clearing
+// its table answers ErrWarmSessionWatched to a later Watch, which says "this
+// session is already being watched" about a releaser that will never run
+// again, and it leaves Observe able to RE-ARM a dead watch's timer.
+//
+// warmWatch.stop's own timer.Stop() is sampled here for the same reason and by
+// the same technique the Observe row already used: the fake counts its stops.
+// The first round deferred that one on the ground that the race interleaving
+// could not be staged — which conflated staging the INTERLEAVING, genuinely
+// not constructible against an on-demand fake, with sampling the STATEMENT,
+// which needs no concurrency at all.
+func TestStopClearsTheWatchTableAndNotOnlyTheTimers(t *testing.T) {
+	t.Parallel()
+
+	f := newWarmFixture(t)
+	timer := f.clock.only(t)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	armedBefore := len(timer.resetsSeen())
+	stoppedBefore := timer.stopsSeen()
+
+	f.releaser.Stop()
+
+	// The watch was disarmed, not merely orphaned. This is warmWatch.stop's
+	// timer.Stop() statement, sampled directly.
+	if timer.stopsSeen() <= stoppedBefore {
+		t.Errorf("Stop left the watch armed: stops %d before and %d after", stoppedBefore, timer.stopsSeen())
+	}
+
+	// The table was cleared. A stopped releaser has no watches, so Observe
+	// finds nothing to re-arm.
+	f.releaser.Observe(f.key, WorkStateIdle)
+	if armedAfter := len(timer.resetsSeen()); armedAfter != armedBefore {
+		t.Errorf("the timer was re-armed after Stop (%d resets before, %d after); a stopped releaser still holds its watch table", armedBefore, armedAfter)
+	}
+
+	// And a later Watch says which fact it is refusing on. "Already watched"
+	// would be false: nothing is watching anything.
+	err := f.releaser.Watch(f.session)
+	if !errors.Is(err, ErrWarmReleaserStopped) {
+		t.Errorf("Watch after Stop = %v, want ErrWarmReleaserStopped", err)
+	}
+	if errors.Is(err, ErrWarmSessionWatched) {
+		t.Error("Watch after Stop reported the session as already watched; the stopped releaser's table was never cleared")
+	}
+}
+
+// TestForgetDisarmsTheTimerAndNotOnlyTheGoroutine is the Forget half of the
+// same pair. TestForgetAndStopEndTheWatchGoroutineAndNotJustItsTimer samples
+// the goroutine; this samples the disarming, which is the other statement.
+func TestForgetDisarmsTheTimerAndNotOnlyTheGoroutine(t *testing.T) {
+	t.Parallel()
+
+	f := newWarmFixture(t)
+	timer := f.clock.only(t)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	stoppedBefore := timer.stopsSeen()
+
+	f.releaser.Forget(f.key)
+
+	if timer.stopsSeen() <= stoppedBefore {
+		t.Errorf("Forget left the watch armed: stops %d before and %d after. An armed watch whose tick is taken in the window before its goroutine observes the close releases a session the caller has said this releaser no longer owns", stoppedBefore, timer.stopsSeen())
 	}
 }

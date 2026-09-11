@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1515,5 +1516,47 @@ func TestPlacementBindingRules(t *testing.T) {
 		return tt.placement == sessionwire.HostPlacementDedicated && tt.code == ""
 	}) {
 		t.Error("no accepted DEDICATED row: the dedicated rejections would be satisfied by refusing dedicated placement outright")
+	}
+}
+
+// TestHostExposesNoTenantAccessor is a TRIP-WIRE for the most likely way human
+// gate H8 gets silently undone, and it is deliberately a structural guard
+// rather than a behavioural one.
+//
+// H8 (answered 2026-09-04, option (a)) removed the fixed tenant from this type:
+// a pooled Host advertising cross_tenant_isolated may hold several tenants, and
+// one advertising tenant_exclusive is exclusive by PLACEMENT rather than by
+// construction, which is spec §12's own wording. The admission rule now lives
+// in internal/service's ledger and the identity rule in the residency manager.
+//
+// THE REVERSAL PATH IS CONCRETE. hostlink.MultiplexerOptions still carries a
+// TenantID — correctly, because it is the tenant a LINK authenticated as — and
+// the composition root that fills it does not exist yet (O7.1). The obvious
+// wrong move when writing it is to reach for a Host-wide tenant, which means
+// re-adding this accessor; and a Host serving one Multiplexer for several
+// tenants then refuses every cross-tenant bind with foreign_tenant, undoing H8
+// while failing CLOSED and therefore quietly. The correct composition is one
+// Multiplexer per authenticated tenant.
+//
+// This cannot make the wrong composition fail, because no composition exists
+// for a guard to see; what it makes fail is the EDIT that composition would
+// have to make first. Written down so a later reader does not mistake it for
+// more coverage than it is.
+func TestHostExposesNoTenantAccessor(t *testing.T) {
+	t.Parallel()
+
+	hostType := reflect.TypeOf((*host.Host)(nil))
+	if hostType.NumMethod() == 0 {
+		t.Fatal("*host.Host has no methods at all, so this guard is vacuous")
+	}
+	// The control: a method this type DOES have, so a guard that could never
+	// find anything is distinguishable from one that found nothing wrong.
+	if _, present := hostType.MethodByName("IsolationClass"); !present {
+		t.Fatal("*host.Host has no IsolationClass method, so the lookup used below does not work")
+	}
+	for _, banned := range []string{"TenantID", "Tenant"} {
+		if _, present := hostType.MethodByName(banned); present {
+			t.Errorf("*host.Host exposes %s. H8 removed the fixed tenant from this type; a Host is tenant-exclusive by PLACEMENT, not by construction, and re-adding this is how a composition feeds one tenant to a Host-wide hostlink.Multiplexer and reverses H8 without any behavioural test failing. If a caller needs a tenant, it is the one the REQUEST or the LINK names", banned)
+		}
 	}
 }

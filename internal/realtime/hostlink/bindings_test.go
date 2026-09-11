@@ -561,6 +561,7 @@ func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 		"RefusalReleasing":           hostlink.RefusalReleasing,
 		"RefusalHostNotAdmitting":    hostlink.RefusalHostNotAdmitting,
 		"RefusalSessionNotAdmitting": hostlink.RefusalSessionNotAdmitting,
+		"RefusalResidencyReleased":   hostlink.RefusalResidencyReleased,
 		"RefusalNoLinkCapacity":      hostlink.RefusalNoLinkCapacity,
 		"RefusalNoHostCapacity":      hostlink.RefusalNoHostCapacity,
 		"RefusalNotBound":            hostlink.RefusalNotBound,
@@ -1972,6 +1973,101 @@ func TestReleasingAndNotAdmittingDoNotMaskEachOther(t *testing.T) {
 			}
 			if wire.Code != row.code {
 				t.Errorf("wire code = %q, want %q", wire.Code, row.code)
+			}
+		})
+	}
+}
+
+// TestARetainedBindingDoesNotDeliverIntoASessionThatHasStoppedAdmitting is the
+// defect O6.1's first round shipped, and the reason it slipped is worth the
+// paragraph.
+//
+// §9.3's "Commands racing release receive typed not_admitting" was satisfied on
+// Bind — the NEW-binding path — and Deliver never consulted the residency at
+// all: it checked the link held the binding, validated the record, and hinted
+// the consumer. §9.3 also says "A session binding may remain through the warm
+// TTL", which makes the RETAINED binding the likely path and the re-bind the
+// exotic one, so the check was on the arm a racing command mostly does not
+// take.
+//
+// THE EPOCH FENCE DOES NOT BACKSTOP IT. Warm release steps 2 through 4 leave
+// the same Host holding the same lease epoch, so the binding the Factory holds
+// is still exactly current; nothing about it is stale except the one fact
+// Deliver was not reading.
+//
+// The three rows are the three residency facts, and each is independently
+// reachable: a resident session that has stopped admitting is O6.1's new one,
+// a releasing residency PRE-DATES this task, and a released one is what steps
+// 5 and 6 leave behind.
+func TestARetainedBindingDoesNotDeliverIntoASessionThatHasStoppedAdmitting(t *testing.T) {
+	t.Parallel()
+
+	for _, row := range []struct {
+		name    string
+		perturb func(*fixture)
+		refusal hostlink.Refusal
+		code    sessionwire.HostLinkErrorCode
+	}{
+		{
+			name: "warm release has stopped this session's admission",
+			perturb: func(f *fixture) {
+				entry, _ := f.registry.Get(residencyKey(testSession))
+				f.registry.StopAdmitting(entry.Key, entry.Generation)
+			},
+			refusal: hostlink.RefusalSessionNotAdmitting,
+			code:    sessionwire.HostLinkErrorNotAdmitting,
+		},
+		{
+			name: "the residency is releasing",
+			perturb: func(f *fixture) {
+				entry, _ := f.registry.Get(residencyKey(testSession))
+				f.registry.MarkReleasing(entry.Key, entry.Generation)
+			},
+			refusal: hostlink.RefusalReleasing,
+			code:    sessionwire.HostLinkErrorReleasing,
+		},
+		{
+			name: "the residency has been released and removed",
+			perturb: func(f *fixture) {
+				entry, _ := f.registry.Get(residencyKey(testSession))
+				f.registry.RemoveByGeneration(entry.Key, entry.Generation)
+			},
+			refusal: hostlink.RefusalResidencyReleased,
+			code:    sessionwire.HostLinkErrorNotAdmitting,
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t)
+			binding := mustBind(t, f.mux, linkA, testSession)
+
+			// The CONTROL, and it is what makes each row below a statement
+			// about the perturbation: the same delivery over the same retained
+			// binding is accepted while the session is resident and accepting.
+			deliver(t, f.mux, linkA, binding.Channel, "command-before")
+			if got := f.consumers.consumers[residencyKey(testSession)].recorded(); len(got) != 1 {
+				t.Fatalf("hints before the perturbation = %v, want one", got)
+			}
+
+			row.perturb(f)
+
+			refusal := refusalOf(t, f.mux.Deliver(linkA, binding.Channel, sessionwire.HostLinkCommandDelivery{CommandID: "command-racing"}))
+			if refusal.Refusal != row.refusal {
+				t.Errorf("Refusal = %q, want %q", refusal.Refusal, row.refusal)
+			}
+			wire, carried := refusal.HostLinkError()
+			if !carried {
+				t.Fatal("the refusal carries no wire class")
+			}
+			if wire.Code != row.code {
+				t.Errorf("wire code = %q, want %q", wire.Code, row.code)
+			}
+			// THE POSITIVE OBSERVABLE, and the one that matters: the consumer
+			// was not hinted. A refusal returned while the command was hinted
+			// anyway would satisfy every assertion above and leak the command
+			// into a runtime that is going away.
+			if got := f.consumers.consumers[residencyKey(testSession)].recorded(); len(got) != 1 {
+				t.Errorf("the consumer was hinted %v; the racing command reached a session that is not admitting", got)
 			}
 		})
 	}
