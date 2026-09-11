@@ -32,6 +32,7 @@ type capabilities interface {
 	department.Releaser
 	department.PublicationSubscriber
 	department.CommandApplier
+	department.LeaseEpochReporter
 }
 
 // The bound session carries every capability department discovers, so a rig
@@ -136,7 +137,8 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 					livenessPart
 					releaserPart
 					committedPart
-				}{committedPart: committedPart{available: true}}
+					leaseEpochPart
+				}{committedPart: committedPart{available: true}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 			},
 		},
 		{
@@ -148,7 +150,8 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 					idlePart
 					releaserPart
 					committedPart
-				}{committedPart: committedPart{available: true}}
+					leaseEpochPart
+				}{committedPart: committedPart{available: true}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 			},
 		},
 		{
@@ -160,7 +163,8 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 					idlePart
 					livenessPart
 					committedPart
-				}{committedPart: committedPart{available: true}}
+					leaseEpochPart
+				}{committedPart: committedPart{available: true}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 			},
 		},
 		{
@@ -172,7 +176,25 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 					idlePart
 					livenessPart
 					releaserPart
-				}{}
+					leaseEpochPart
+				}{leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
+			},
+		},
+		{
+			// O3.4. The epoch an admitted command names is the RUNTIME's grant,
+			// read through this capability, so a controller that cannot report
+			// one is refused at bind rather than at the first command — which is
+			// after Host has published the residency route.
+			omit:    "LeaseEpoch",
+			missing: "session.LeaseEpochReporter",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					livenessPart
+					releaserPart
+					committedPart
+				}{committedPart: committedPart{available: true}}
 			},
 		},
 	} {
@@ -207,7 +229,8 @@ func TestBindRefusesASessionWhoseCommittedEventsAreUnavailable(t *testing.T) {
 		livenessPart
 		releaserPart
 		committedPart
-	}{committedPart: committedPart{available: false}}
+		leaseEpochPart
+	}{committedPart: committedPart{available: false}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 
 	// THE CONTROL: the same value DOES satisfy the source interface, so an
 	// adapter asserting on the source would have bound it.
@@ -236,7 +259,8 @@ func TestBindRefusesANilCommittedEventSource(t *testing.T) {
 		livenessPart
 		releaserPart
 		nilSourceProvider
-	}{}
+		leaseEpochPart
+	}{leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 
 	adapter := newAdapter(t, stubRigs{})
 	if _, err := adapter.bind(controller, testTenant, testSession); err == nil {
@@ -252,8 +276,8 @@ func TestBindNamesEveryMissingCapabilityAtOnce(t *testing.T) {
 	if !errors.As(err, &incapable) {
 		t.Fatalf("bind of a bare controller = %v, want IncapableSessionError", err)
 	}
-	if len(incapable.Missing) != 4 {
-		t.Fatalf("Missing = %v, want all four capabilities", incapable.Missing)
+	if len(incapable.Missing) != 5 {
+		t.Fatalf("Missing = %v, want all five capabilities", incapable.Missing)
 	}
 	if !strings.Contains(incapable.Error(), "session.IdleWaiter") {
 		t.Fatalf("Error() = %q, want it to name the missing capabilities", incapable.Error())
@@ -536,7 +560,8 @@ func TestSubscribeCommittedReportsASubscribeFailure(t *testing.T) {
 		livenessPart
 		releaserPart
 		committedPart
-	}{committedPart: committedPart{available: true, subscribeErr: sentinel}}
+		leaseEpochPart
+	}{committedPart: committedPart{available: true, subscribeErr: sentinel}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 
 	runtime := boundFor(t, controller)
 	if _, err := runtime.SubscribeCommitted(t.Context(), ""); !errors.Is(err, sentinel) {
@@ -758,4 +783,47 @@ func TestThePumpAbsorbsABurstThenGivesUpRatherThanBlockingItsProducer(t *testing
 		t.Fatalf("the pump absorbed %d publications, want exactly the %d-slot egress buffer", absorbed, committedEgressBuffer)
 	}
 	waitFor(t, func() bool { return closed == 1 })
+}
+
+// THE WRAPPER MUST FORWARD THE EPOCH, AND A WRAPPER THAT DOES NOT IS SILENT.
+// harness's capability doc names this as the hazard the two-result form cannot
+// protect against: "a wrapper around a live session that does not forward the
+// method silently opts its wrapped session out". boundSession IS such a wrapper,
+// and Host reads the journal epoch through department.Runtime — so a forwarder
+// answering (0, false) would make every resident session look like one that holds
+// no journal grant, and Host would refuse commands it could in fact apply.
+//
+// MEASURED: a boundSession.LeaseEpoch returning a constant (0, false) survived
+// this package's entire suite before this test existed, because admit reads the
+// field directly and nothing exercised the forwarded method.
+//
+// BOTH ANSWERS, because a forwarder that answered a constant (7, true) would pass
+// a one-row version of this.
+func TestTheBoundSessionForwardsTheRuntimesLeaseEpoch(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		part  leaseEpochPart
+		epoch uint64
+		held  bool
+	}{
+		{name: "a held grant", part: leaseEpochPart{epoch: 12, held: true}, epoch: 12, held: true},
+		{name: "no grant", part: leaseEpochPart{}, epoch: 0, held: false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			controller := &struct {
+				controllerBase
+				idlePart
+				livenessPart
+				releaserPart
+				committedPart
+				leaseEpochPart
+			}{committedPart: committedPart{available: true}, leaseEpochPart: row.part}
+
+			runtime := boundFor(t, controller)
+			epoch, held := runtime.LeaseEpoch()
+			if epoch != row.epoch || held != row.held {
+				t.Fatalf("LeaseEpoch() = (%d, %t), want the controller's (%d, %t)", epoch, held, row.epoch, row.held)
+			}
+		})
+	}
 }

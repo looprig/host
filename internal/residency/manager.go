@@ -66,12 +66,56 @@ import (
 // internal/sessionstoreadapter. So no released type satisfies Lease as declared
 // below. These describe what Host requires; the concrete edges are later tasks.
 
-// Lease is one granted, epoch-fenced session lease.
+// ResidencyEpoch is HOST'S OWN orchestration grant over a session, and it is a
+// defined type rather than a uint64 so that the other epoch in this system cannot
+// be put where one is wanted.
+//
+// THE TWO EPOCHS ARE DIFFERENT GRANTS WITH DIFFERENT HOLDERS. This one is minted
+// by the lease Host takes in the session's residency namespace; it authorizes
+// Host to publish the §15 route and to fence its own registry writes, and it
+// authorizes NO journal write and no command application.
+// sessionstore.ResidencyEpoch states the rule in terms — it "must never be
+// compared with, or used as, a journal epoch" — and JournalEpoch below is the
+// other one. That the two often agree early in a session's life is an accident of
+// two fresh counters both starting at 1; this package's fakes are seeded from
+// different bases precisely so that accident cannot pass for a relationship.
+type ResidencyEpoch uint64
+
+// JournalEpoch is THE RUNTIME'S grant over its own agent journal, surfaced to
+// Host as a value it reads and never as one it chooses.
+//
+// HOST DOES NOT HOLD THIS LEASE. It is minted by the storage lease the runtime's
+// composition root acquired, and the only route out of a live runtime is
+// department.LeaseEpochReporter. Host reads it in order to STAMP work the runtime
+// will fence — harness compares an admitted command's epoch for equality against
+// the lease it holds, and a disposition attempt records the journal and residency
+// epochs as separate members whose settlement fence orders the journal one. A
+// residency epoch copied into either slot produces work that is refused, or an
+// attempt no evidence can ever match.
+type JournalEpoch uint64
+
+// Lease is HOST'S OWN residency grant, and nothing else.
+//
+// IT USED TO BE BOTH GRANTS AT ONCE. Epoch() was documented as the value
+// published as the registry observation's lease_epoch AND as the value stamped
+// into the in-stream journal fence, which is two grants in two epoch domains
+// behind one uint64. Against the LEGACY shared-backend store that was accurate —
+// Store.OpenJournal hands out one number that really does play every role — but
+// legacy is not a supported deployment target, and a disposition-mode session
+// refuses the fusion outright: Store.AcquireResidency rejects a legacy session
+// with catalog invalid and Store.OpenJournal rejects a disposition session with
+// catalog conflict on binding.protocol_mode. The journal epoch is now
+// JournalEpoch, read from the runtime; see finding F15 in
+// internal/sessionstoreadapter.
+//
+// *sessionstore.ResidencyGrant satisfies this shape with the wrap in
+// internal/sessionstoreadapter, which is also what finally gives Lost() a real
+// provider signal rather than an echo of Host's own writes (finding F3).
 type Lease interface {
-	// Epoch is the lease epoch this grant owns. It is never zero: Core rejects
-	// a zero lease_epoch on the registry observation, so a store that grants
-	// one has granted something Host cannot publish under.
-	Epoch() uint64
+	// Epoch is the RESIDENCY epoch this grant owns. It is never zero: Core
+	// rejects a zero lease_epoch on the registry observation, so a store that
+	// grants one has granted something Host cannot publish under.
+	Epoch() ResidencyEpoch
 
 	// Lost closes when the grant is no longer held, whether by renewal
 	// failure, expiry, or observation of a later epoch. It is the FAST guard
@@ -83,17 +127,72 @@ type Lease interface {
 	Release(context.Context) error
 }
 
-// SessionLeases grants exclusive epoch-fenced leases over a session.
+// SessionLeases grants exclusive epoch-fenced residency leases over a session.
 type SessionLeases interface {
 	// AcquireSessionLease grants the lease for one session, or reports
 	// ErrLeaseHeld if another holder has it.
+	//
+	// A REFUSAL MAY STILL OWE A RELEASE, which is finding F16(b) and the reason
+	// LeaseCleanupError exists. (Lease, error) cannot say "refused, and you
+	// still owe a release", so every fake in this module read a non-nil error
+	// as nothing acquired and LEAKED the case the released store actually
+	// produces. An implementation in that state wraps the refusal in a
+	// *LeaseCleanupError; a caller reaches it with errors.As and owns the retry.
 	AcquireSessionLease(context.Context, sessionwire.TenantID, sessionwire.SessionID) (Lease, error)
+}
+
+// LeaseCleanupError is a refused acquisition that still holds a provider lease
+// and, against sessionstore, a Store admission. Until a release succeeds the
+// admission is retained and Store.Close may time out.
+//
+// IT CARRIES A RELEASE AND NOT A LEASE, deliberately. sessionstore's
+// ResidencyAcquireCleanupError "exposes no ownership capability" and neither does
+// this: the caller owns a cleanup obligation, not a grant, and handing back
+// something with Epoch() and Lost() would invite a caller to attach under a lease
+// the store has already refused it.
+type LeaseCleanupError struct {
+	// Cause is the refusal, joined with the cleanup failure by an
+	// implementation that has both.
+	Cause error
+
+	// Cleanup retries the release. It may be nil only in a value nobody built
+	// through a store; Release treats that as nothing owed.
+	Cleanup func(context.Context) error
+}
+
+func (e *LeaseCleanupError) Error() string {
+	message := "residency: the refused lease acquisition still holds a grant that must be released"
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *LeaseCleanupError) Unwrap() error { return e.Cause }
+
+// Release retries the cleanup this refusal owes. It is safe on a nil Cleanup so
+// that an unwinder can own the obligation without first interrogating it.
+func (e *LeaseCleanupError) Release(ctx context.Context) error {
+	if e.Cleanup == nil {
+		return nil
+	}
+	return e.Cleanup(ctx)
 }
 
 // JournalFencer commits the opening in-stream ownership record.
 type JournalFencer interface {
-	// CommitOpeningFence appends the fence stamped with the lease epoch,
-	// committed by sequence CAS against the tip read immediately beforehand.
+	// CommitOpeningFence appends the fence, committed by sequence CAS against
+	// the tip read immediately beforehand.
+	//
+	// IT TAKES NO EPOCH, and the removal is the structural half of O3.4's split.
+	// The fence is a JOURNAL record and Host does not hold the journal grant, so
+	// there is no number Host could soundly name here — the only epoch in Host's
+	// hand at this point in the sequence is its residency grant, which is the
+	// one value that must never reach a journal fence. The writer stamps its
+	// own, which is what the released store does anyway: JournalWriter refuses
+	// an application prefix whose epoch a caller chose, for the same reason.
+	// Removing the parameter means Host cannot get this wrong rather than
+	// meaning Host currently gets it right.
 	//
 	// A REFUSED CAS RETURNS ErrFenceConflict, and that is a contract rather
 	// than a courtesy. §10.1 fences the journal with an in-stream ownership
@@ -104,7 +203,7 @@ type JournalFencer interface {
 	// it as an untyped error leaves the one write that is not a location write
 	// unclassifiable, which is where the next occurrence of this defect would
 	// have been.
-	CommitOpeningFence(context.Context, sessionwire.TenantID, sessionwire.SessionID, uint64) error
+	CommitOpeningFence(context.Context, sessionwire.TenantID, sessionwire.SessionID) error
 }
 
 // SessionState is the durable state a hydration reads. It is deliberately not
@@ -201,7 +300,7 @@ type OwnershipRequest struct {
 	Key             registry.Key
 	AgentID         sessionwire.AgentID
 	CompatibilityID department.CompatibilityID
-	LeaseEpoch      uint64
+	LeaseEpoch      ResidencyEpoch
 	Generation      uint64
 	Runtime         department.Runtime
 
@@ -381,9 +480,24 @@ type Residency struct {
 	Key             registry.Key
 	AgentID         sessionwire.AgentID
 	CompatibilityID department.CompatibilityID
-	LeaseEpoch      uint64
 	Generation      uint64
 	Runtime         department.Runtime
+
+	// LeaseEpoch is HOST'S residency grant, the value published as the registry
+	// observation's lease_epoch.
+	LeaseEpoch ResidencyEpoch
+
+	// JournalEpoch is THE RUNTIME'S grant, read from the launched runtime and
+	// never derived from LeaseEpoch. Its type differs from LeaseEpoch's so the
+	// two cannot be assigned across without a conversion a reviewer can see.
+	//
+	// JournalEpochHeld is the half a consumer must branch on. A runtime that is
+	// headless, has no persistence, or is simply not wired for durable commands
+	// legitimately holds no journal lease, and one whose lease has been released
+	// or lost reports absence rather than the number it used to hold. Zero is
+	// therefore not "no epoch" — false is.
+	JournalEpoch     JournalEpoch
+	JournalEpochHeld bool
 
 	// Attached reports whether THIS call established the residency. False
 	// means the session was already resident and this call took nothing.
@@ -784,14 +898,22 @@ func existingResidency(entry registry.Entry, key registry.Key, request Request) 
 			Reason: "the session is resident on runtime " + strconv.Quote(string(entry.CompatibilityID)) + " and the request was placed on " + strconv.Quote(string(request.CompatibilityID)),
 		}
 	}
+	// THE JOURNAL EPOCH IS READ LIVE ON THE WARM PATH TOO, from the resident
+	// runtime rather than from the registry entry. The registry records Host's
+	// residency grant, which is fixed for the life of the residency; the
+	// runtime's journal grant is not Host's to cache, and a cached copy would be
+	// the same fusion in a slower form.
+	journalEpoch, journalHeld := entry.Runtime.LeaseEpoch()
 	return Residency{
-		Key:             entry.Key,
-		AgentID:         entry.AgentID,
-		CompatibilityID: entry.CompatibilityID,
-		LeaseEpoch:      entry.LeaseEpoch,
-		Generation:      entry.Generation,
-		Runtime:         entry.Runtime,
-		Attached:        false,
+		Key:              entry.Key,
+		AgentID:          entry.AgentID,
+		CompatibilityID:  entry.CompatibilityID,
+		LeaseEpoch:       ResidencyEpoch(entry.LeaseEpoch),
+		Generation:       entry.Generation,
+		Runtime:          entry.Runtime,
+		JournalEpoch:     JournalEpoch(journalEpoch),
+		JournalEpochHeld: journalHeld,
+		Attached:         false,
 	}, nil
 }
 
@@ -956,6 +1078,18 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	lease, err := m.leases.AcquireSessionLease(sessionCtx, key.TenantID, key.SessionID)
 	switch {
 	case err != nil:
+		// F16(b). A REFUSAL CAN STILL OWE A RELEASE, and (Lease, error) cannot
+		// say so. sessionstore's AcquireResidency returns no grant and yet
+		// leaves a provider lease and a Store admission held when its own
+		// rollback failed; until a release succeeds the admission is retained
+		// and Close may time out. The obligation is OWNED BY THE UNWINDER
+		// rather than retried inline, so the one ladder that reports what it
+		// could not give back reports this too — an inline retry that failed
+		// would vanish into the error text and out of Unreleased.
+		var cleanup *LeaseCleanupError
+		if errors.As(err, &cleanup) {
+			unwound.own("refused session lease", cleanup.Release)
+		}
 		code := sessionwire.HostLinkErrorCode("")
 		if errors.Is(err, ErrLeaseHeld) {
 			// §15: LeaseHeld means the registry Factory routed from was stale,
@@ -994,7 +1128,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	// -- 3. the opening journal fence, BEFORE hydration ----------------------
 	if err := fence.write(func() error {
-		return m.journal.CommitOpeningFence(sessionCtx, key.TenantID, key.SessionID, epoch)
+		return m.journal.CommitOpeningFence(sessionCtx, key.TenantID, key.SessionID)
 	}); err != nil {
 		return fail(StepFence, "", "the opening journal fence could not be committed", err)
 	}
@@ -1101,13 +1235,29 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	default:
 	}
 
+	// THE RUNTIME'S OWN JOURNAL GRANT, read here and nowhere else in this
+	// sequence. It is a capability of the launched runtime, so it cannot be read
+	// before step 4 and must not be guessed before then — which is precisely why
+	// step 3's fence no longer names an epoch at all.
+	//
+	// A RUNTIME REPORTING NO GRANT IS NOT REFUSED. harness gates the report on
+	// the lease still being held and answers (0, false) for a headless session,
+	// one without persistence, one not wired for durable commands, and one whose
+	// lease is already gone. The first three are legitimate configurations, and
+	// the fourth is caught by the Done() check above and by the fence, so
+	// refusing here would turn supported deployments into attach failures. What
+	// Host must never do is SUBSTITUTE its own grant, and the value below cannot
+	// be substituted: JournalEpoch and ResidencyEpoch are different types.
+	reportedEpoch, journalHeld := runtime.LeaseEpoch()
+	journalEpoch := JournalEpoch(reportedEpoch)
+
 	// -- 6. the atomic local registry winner ---------------------------------
 	entry, won := m.registry.Insert(key, registry.Admission{
 		AgentID:         request.AgentID,
 		Target:          target.target,
 		CompatibilityID: target.compatibility,
 		Runtime:         runtime,
-		LeaseEpoch:      epoch,
+		LeaseEpoch:      uint64(epoch),
 	})
 	if !won {
 		// THE LOSER. It releases its OWN lease, runtime and context — the
@@ -1186,7 +1336,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// away. Refusing leaves this Host's own record to expire, which §18.2
 		// assigns to registry expiry and Factory's due reconciler.
 		return fence.write(func() error {
-			return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, epoch)
+			return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, uint64(epoch))
 		})
 	})
 
@@ -1255,13 +1405,15 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	m.mu.Unlock()
 
 	return Residency{
-		Key:             key,
-		AgentID:         request.AgentID,
-		CompatibilityID: target.compatibility,
-		LeaseEpoch:      epoch,
-		Generation:      entry.Generation,
-		Runtime:         runtime,
-		Attached:        true,
+		Key:              key,
+		AgentID:          request.AgentID,
+		CompatibilityID:  target.compatibility,
+		LeaseEpoch:       epoch,
+		Generation:       entry.Generation,
+		Runtime:          runtime,
+		JournalEpoch:     journalEpoch,
+		JournalEpochHeld: journalHeld,
+		Attached:         true,
 	}, nil
 }
 
@@ -1416,7 +1568,7 @@ func (m *Manager) newSessionContext(principal Principal) (context.Context, conte
 }
 
 // observation derives the epoch-fenced durable projection of §15.
-func (m *Manager) observation(key registry.Key, agent sessionwire.AgentID, compatibility department.CompatibilityID, epoch uint64, residency sessionwire.SessionResidency, accepting bool) sessionwire.HostLinkRegistryObservation {
+func (m *Manager) observation(key registry.Key, agent sessionwire.AgentID, compatibility department.CompatibilityID, epoch ResidencyEpoch, residency sessionwire.SessionResidency, accepting bool) sessionwire.HostLinkRegistryObservation {
 	now := m.host.Clock().Now()
 	return sessionwire.HostLinkRegistryObservation{
 		Version:                sessionwire.CurrentWireVersion,
@@ -1430,9 +1582,13 @@ func (m *Manager) observation(key registry.Key, agent sessionwire.AgentID, compa
 		InternalEndpoint:       m.host.InternalEndpoint(),
 		Residency:              residency,
 		Accepting:              accepting,
-		LeaseEpoch:             epoch,
-		ObservedAt:             now,
-		ExpiresAt:              now.Add(m.host.RegistryExpiry()),
+		// THE ONE CONVERSION TO THE WIRE. Core's observation carries a plain
+		// uint64 and the record it fences is Host's own registry route, so the
+		// residency epoch is the right value and this is the only place it is
+		// stripped of its type.
+		LeaseEpoch: uint64(epoch),
+		ObservedAt: now,
+		ExpiresAt:  now.Add(m.host.RegistryExpiry()),
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/residency"
@@ -426,5 +427,112 @@ func TestEveryRefusalNamesItsSubject(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F16(b): the refusal that still owes a release
+// ---------------------------------------------------------------------------
+
+// TestClassifyResidencyKeepsTheCleanupObligation is the arm the released store
+// cannot be driven into from here, so it is measured over a constructed error for
+// the reason the journal ownership codes are: memstore offers no way to make a
+// lease release FAIL, and ResidencyAcquireCleanupError is reached only when the
+// store's own rollback failed.
+//
+// THE OBLIGATION IS THE ASSERTION, NOT THE LABEL. A classifier that returned the
+// error unchanged would keep every errors.As a caller might run on the STORE's
+// type and still leak, because residency's unwinder reaches for
+// *residency.LeaseCleanupError and would find nothing to own.
+func TestClassifyResidencyKeepsTheCleanupObligation(t *testing.T) {
+	refusal := errors.New("the acquisition was cancelled")
+	classified := classifyResidency(errors.Join(&sessionstore.ResidencyAcquireCleanupError{}, refusal))
+
+	var owed *residency.LeaseCleanupError
+	if !errors.As(classified, &owed) {
+		t.Fatalf("classified = %T, want *residency.LeaseCleanupError", classified)
+	}
+	if owed.Cleanup == nil {
+		t.Fatal("the obligation carries no cleanup, so a caller cannot discharge it and the Store admission is held forever")
+	}
+	if !errors.Is(owed, refusal) {
+		t.Error("the store's own refusal did not survive as the cause")
+	}
+}
+
+// THE ORDER OF THE TWO ARMS IS LOAD-BEARING, and this is the case that fails if
+// they are swapped: a cleanup error whose joined cause is provider contention
+// matches BOTH arms, and reporting it as a plain ErrLeaseHeld discards the release
+// obligation — the leak F16(b) names, arriving as an error a caller believes it has
+// handled.
+func TestClassifyResidencyPrefersTheObligationOverContention(t *testing.T) {
+	joined := errors.Join(
+		&sessionstore.ResidencyAcquireCleanupError{},
+		&storage.LeaseHeldError{Name: "tenant/session/residency/lease", HolderEpoch: 4},
+	)
+	classified := classifyResidency(joined)
+
+	var owed *residency.LeaseCleanupError
+	if !errors.As(classified, &owed) {
+		t.Fatalf("classified = %T, want the cleanup obligation to win", classified)
+	}
+	// AND NOTHING IS LOST BY PREFERRING IT: the contention fact is still on the
+	// cause, so a caller that wants it still reaches it.
+	var held *storage.LeaseHeldError
+	if !errors.As(classified, &held) {
+		t.Error("preferring the obligation discarded the contention cause")
+	}
+}
+
+// CONTENTION ALONE IS ErrLeaseHeld, which is the control that keeps the two tests
+// above from passing on a classifier that answers the obligation to everything.
+func TestClassifyResidencyReportsContentionAsLeaseHeld(t *testing.T) {
+	classified := classifyResidency(&sessionstore.ResidencyError{
+		Operation: "acquire",
+		Cause:     &storage.LeaseHeldError{Name: "tenant/session/residency/lease", HolderEpoch: 4},
+	})
+	if !errors.Is(classified, residency.ErrLeaseHeld) {
+		t.Fatalf("classified = %v, want residency.ErrLeaseHeld", classified)
+	}
+	var owed *residency.LeaseCleanupError
+	if errors.As(classified, &owed) {
+		t.Error("a plain contention refusal reported a cleanup obligation it does not owe")
+	}
+}
+
+// EVERY OTHER RESIDENCY FAILURE IS LEFT ALONE, in both directions. The catalog
+// refusal is the one a legacy-mode session gets, and classifying it as contention
+// would tell Factory to re-place a session that has nowhere better to go.
+func TestClassifyResidencyLeavesEveryOtherFailureAlone(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		err  error
+	}{
+		{name: "a mode refusal", err: &sessionstore.CatalogError{Code: sessionstore.CatalogErrorInvalid, Field: "binding.protocol_mode"}},
+		{name: "a closed store", err: &sessionstore.StoreClosedError{}},
+		{name: "an unreachable provider", err: errors.New("dial tcp: connection refused")},
+		{name: "a release failure", err: &sessionstore.ResidencyError{Operation: "release", Cause: errors.New("backend down")}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			classified := classifyResidency(row.err)
+			if errors.Is(classified, residency.ErrLeaseHeld) {
+				t.Error("reported as another holder owning the lease")
+			}
+			var owed *residency.LeaseCleanupError
+			if errors.As(classified, &owed) {
+				t.Error("reported as owing a release it does not owe")
+			}
+			if !errors.Is(classified, row.err) {
+				t.Errorf("the store's own error did not survive: %v", classified)
+			}
+		})
+	}
+}
+
+// A nil failure classifies to nil. Without this the three tests above would pass
+// on a classifier that manufactured an error out of success.
+func TestClassifyResidencyPassesSuccessThrough(t *testing.T) {
+	if err := classifyResidency(nil); err != nil {
+		t.Fatalf("classifyResidency(nil) = %v, want nil", err)
 	}
 }

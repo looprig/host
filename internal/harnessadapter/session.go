@@ -27,16 +27,16 @@ import (
 type boundSession struct {
 	controller session.SessionController
 
-	idle      session.IdleWaiter
-	live      session.Liveness
-	releaser  session.Releaser
-	committed session.CommittedPublicEventSource
+	idle       session.IdleWaiter
+	live       session.Liveness
+	releaser   session.Releaser
+	committed  session.CommittedPublicEventSource
+	leaseEpoch session.LeaseEpochReporter
 
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
 
-	leaseEpoch uint64
-	decode     BlockDecoder
+	decode BlockDecoder
 }
 
 // ID is Harness's identity for the session.
@@ -52,6 +52,16 @@ func (s *boundSession) Done() <-chan struct{} { return s.live.Done() }
 func (s *boundSession) ReleaseResidency(ctx context.Context) error {
 	return s.releaser.ReleaseResidency(ctx)
 }
+
+// LeaseEpoch reports the journal single-writer lease epoch THIS runtime holds,
+// and whether it holds one. It is a straight forward of harness's capability.
+//
+// FORWARDING IT IS THE POINT AND NOT A FORMALITY. harness's own doc names the
+// hazard: "a wrapper around a live session that does not forward the method
+// silently opts its wrapped session out". boundSession is exactly such a wrapper,
+// and a Host reading a silent (0, false) would conclude the runtime holds no
+// journal grant and refuse every command it could in fact apply.
+func (s *boundSession) LeaseEpoch() (uint64, bool) { return s.leaseEpoch.LeaseEpoch() }
 
 // ErrResumeUnsupported is the refusal SubscribeCommitted returns for a non-empty
 // resume point.
@@ -204,11 +214,18 @@ func (s *boundSession) ApplyCommand(ctx context.Context, command department.Runt
 // admit translates one Host command into the released admitted command, or
 // reports why it cannot be translated.
 func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.Admitted, error) {
-	if s.leaseEpoch == 0 {
+	// SOURCED FROM THE RUNTIME'S OWN GRANT, and `held` is what is branched on.
+	// harness gates the report on the lease still being Valid(), so a released or
+	// lost lease answers (0, false) rather than the stale number it used to hold;
+	// no pinned provider zeroes a dead lease's Epoch(), so reading the epoch alone
+	// would stamp a live-looking dead value that the equality check at
+	// ApplyRuntimeCommand would then reject as merely stale.
+	epoch, held := s.leaseEpoch.LeaseEpoch()
+	if !held {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{
 			CommandID: command.CommandID,
 			Kind:      command.Kind,
-			Reason:    "no lease epoch was bound, and an admitted command must name one",
+			Reason:    "this runtime holds no single-writer journal lease, so there is no epoch an admitted command could name",
 		}
 	}
 	if command.PayloadRef != (sessionwire.ObjectReference{}) {
@@ -223,7 +240,7 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		CommandID:        runtimecommand.CommandID(command.CommandID),
 		RuntimeCommandID: command.RuntimeCommandID,
 		Kind:             runtimecommand.Kind(command.Kind),
-		LeaseEpoch:       s.leaseEpoch,
+		LeaseEpoch:       epoch,
 	}
 	if !admitted.Kind.Valid() {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{

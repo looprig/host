@@ -999,8 +999,8 @@ func TestRestoreWithNoDeclaredCompatibilityFailsClosed(t *testing.T) {
 func TestLaunchRejectsASessionMissingACapability(t *testing.T) {
 	t.Parallel()
 
-	if len(testkit.AllCapabilities) != 5 {
-		t.Fatalf("testkit lists %d capabilities, want the 5 Host requires", len(testkit.AllCapabilities))
+	if len(testkit.AllCapabilities) != 6 {
+		t.Fatalf("testkit lists %d capabilities, want the 6 Host requires", len(testkit.AllCapabilities))
 	}
 
 	for _, capability := range testkit.AllCapabilities {

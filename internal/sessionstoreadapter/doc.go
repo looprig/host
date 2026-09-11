@@ -20,11 +20,12 @@
 //
 //	LOCAL SEAM                          RELEASED COUNTERPART
 //	host.SessionStore.LoadSession       Store.GetCatalogEntry            (F1, F13)
-//	residency.SessionLeases.Acquire…    Store.OpenJournal                (F2, fused)
-//	residency.Lease.Epoch               JournalWriter.Epoch
-//	residency.Lease.Lost                none                             (F3)
-//	residency.Lease.Release             JournalWriter.Close
+//	residency.SessionLeases.Acquire…    Store.AcquireResidency           (F16)
+//	residency.Lease.Epoch               ResidencyGrant.Epoch
+//	residency.Lease.Lost                ResidencyGrant.Lost              (F3, closed)
+//	residency.Lease.Release             ResidencyGrant.Release
 //	residency.JournalFencer.Commit…     Store.OpenJournal                (F2, fused)
+//	commands.JournalWrites.AppendAp…    JournalWriter.Append             (journal grant)
 //	residency.DurableStore.LoadSess…    Store.GetCatalogEntry            (F4, F5, F13)
 //	residency.Workspaces.Ensure/Rel…    none                             (F6)
 //	host.WorkspaceProvider.Ensure…      none                             (F6)
@@ -93,6 +94,23 @@
 // unreachable from this package's tests — see TestLostReportsOnlyWhatThisGrantDid
 // — and why O7.1's Fence adapter cannot be discharged by delegation; see the
 // grantFence comment in applier_test.go.
+//
+// F3 AT O3.4 — THE RESIDENCY HALF IS NOW CLOSED AND THE JOURNAL HALF IS NOT.
+// residency.Lease is no longer satisfied by Grant at all; it is satisfied by
+// ResidencyLease in residency.go, whose Lost() is ResidencyGrant.Lost() —
+// Storage's own lease channel, "the provider's actual notification, never
+// inferred from journal events, release errors or caller cancellation". So the
+// heartbeat and the drain supervisor now select on a real signal. What remains
+// open is exactly what the paragraphs below describe: the JOURNAL grant still
+// publishes no loss channel, so commands.Fence and Grant.Lost are still this
+// adapter's own echo. The paragraphs are kept rather than rewritten because the
+// finding they record did not go away, it narrowed.
+//
+// AND IT IS NOT A TAKEOVER CLAIM. ResidencyGrant's liveness is the provider's:
+// its doc says memstore offers neither TTL nor crash takeover, so under this
+// module's tests the only thing that closes the channel is a release. A real
+// takeover measurement needs pgstore behind PGSTORE_TEST_DSN and this module has
+// no such lane.
 //
 // F3 AT v0.6.0 — PARTIALLY DISCHARGED, AND NOT THE PART THIS SEAM NEEDS. The
 // rebind re-ran this row against the released module and the answer changed
@@ -246,8 +264,32 @@
 // settlement fence orders AuthorJournalEpoch against AttemptJournalEpoch. A Host
 // that copied its residency epoch into JournalEpoch would make a disposition
 // command UNSETTLEABLE FOREVER. So the finding stands and is booked as O3.4;
-// what was wrong was its scope, not its existence. Whether Host tracks two
-// grants or one remains a design decision rather than a rebind.
+// what was wrong was its scope, not its existence.
+//
+// F15 IS DISCHARGED AT O3.4, BY OWNERSHIP AND NOT BY FIELD COUNT. Host does not
+// track two grants: it HOLDS one and READS the other. residency.Lease is narrowed
+// to the residency grant and answers residency.ResidencyEpoch; the journal epoch
+// is department.LeaseEpochReporter, a capability of the launched RUNTIME, and
+// reaches Host as residency.JournalEpoch — a different defined type, so the
+// substitution no longer compiles. Three structural consequences are worth
+// naming, because each closes a place the fusion could come back:
+//
+//   - residency.JournalFencer.CommitOpeningFence takes NO epoch. Host holds no
+//     journal grant, so there was no number it could soundly name; the writer
+//     stamps its own, exactly as it already does for an application prefix.
+//   - harnessadapter's WithLeaseEpoch is GONE. It let a composition supply the
+//     epoch every admitted command was applied under, and harness compares that
+//     number for equality against the lease the runtime itself holds — right
+//     only while two independent counters agreed. boundSession reads the
+//     capability per command instead.
+//   - the fakes are seeded from DIFFERENT BASES: residency mints residency epochs
+//     from 1000 and testkit mints journal epochs from 1. Both used to start at 1,
+//     which is why the fusion passed for twelve tasks.
+//
+// The LEGACY reading above stays true and stays here: against a legacy-mode
+// session Store.OpenJournal really does hand out one number playing every role.
+// It is recorded rather than deleted because the correction is bounded — legacy
+// is not a supported deployment target, not a mode in which Host was wrong.
 //
 // F16. THE RESIDENCY GRANT IS ADMITTED ONLY FOR A DISPOSITION-MODE SESSION, AND
 // A FAILED ACQUISITION CAN STILL OWE A RELEASE. Two properties of

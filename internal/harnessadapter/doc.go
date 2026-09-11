@@ -13,6 +13,7 @@
 //	department.PublicationSubscriber.Sub…   session.CommittedPublicEvent…
 //	                                          …Provider/Source          (H0, H3, H4)
 //	department.CommandApplier.ApplyCommand  runtimecommand.Provider/Applier
+//	department.LeaseEpochReporter.Lease…    session.LeaseEpochReporter  (H5)
 //	                                          (H0, H5, H6, H7, H8)
 //
 // SEAMS NOT IN THE TABLE ABOVE, stated because the sessionstore side states its
@@ -87,8 +88,29 @@
 // H5. ADMITTED REQUIRES A LEASE EPOCH AND THE COMMAND SEAM CARRIES NONE.
 // runtimecommand.Admitted.Validate refuses a zero LeaseEpoch outright.
 // department.RuntimeCommand has no epoch member at all, and commands.Applier
-// constructs it from a record without one. The epoch is supplied to this adapter
-// at bind time instead; a session bound without one cannot apply anything.
+// constructs it from a record without one.
+//
+// H5 AS RESOLVED BY O3.4, AND THE FIRST ANSWER WAS A DEFECT. The epoch used to be
+// supplied to this adapter at bind time, through WithLeaseEpoch, which made it "a
+// property of the BINDING rather than of the command". That was the weaker half of
+// the problem; the stronger half went unsaid. THE COMPOSITION DOES NOT HAVE THIS
+// NUMBER. harness checks an admitted command's LeaseEpoch for EQUALITY against the
+// single-writer lease the session itself holds
+// (internal/sessionruntime/runtime_command.go:140), and the only lease Host holds
+// is its residency grant — a different issuer over a different namespace, which
+// sessionstore.ResidencyEpoch says in terms must never be used as a journal epoch.
+// The bound number was therefore right exactly while two independent per-session
+// counters happened to agree, which under memstore they do because both start at
+// 1. It would have failed deterministically the first time the two were acquired
+// out of step.
+//
+// harness v0.33.0 publishes session.LeaseEpochReporter, and the epoch is now read
+// from THE RUNTIME, per command, through that capability. WithLeaseEpoch is gone.
+// A session that reports no held grant — headless, no persistence, not wired for
+// durable commands, or a lease already released — is refused with an
+// UnsupportedCommandError rather than stamped with a plausible zero, because the
+// capability's two results exist to separate "no epoch" from "epoch 0" and harness
+// gates the report on the lease still being Valid.
 //
 // H6. HARNESS APPLIES ONLY input AND interrupt. runtimecommand.Kind is a closed
 // two-member set. commands.Kind has five: create, restore, input, interrupt and

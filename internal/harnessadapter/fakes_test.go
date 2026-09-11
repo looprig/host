@@ -120,6 +120,17 @@ func (p committedPart) SubscribeCommittedPublicEvents(filter event.EventFilter) 
 	return p.subscription, nil
 }
 
+// leaseEpochPart is the RUNTIME's journal grant, the fourth assertion-discovered
+// capability. Its base is 7 and residency's residency-lease fake mints from 1000,
+// so a value that crossed the domains is a visibly wrong number rather than a
+// coincidence.
+type leaseEpochPart struct {
+	epoch uint64
+	held  bool
+}
+
+func (p leaseEpochPart) LeaseEpoch() (uint64, bool) { return p.epoch, p.held }
+
 // fullController has every capability Host requires.
 type fullController struct {
 	controllerBase
@@ -127,6 +138,7 @@ type fullController struct {
 	livenessPart
 	releaserPart
 	committedPart
+	leaseEpochPart
 }
 
 func newFullController(subscription event.Subscription, filters *[]event.EventFilter, released *int) *fullController {
@@ -135,6 +147,7 @@ func newFullController(subscription event.Subscription, filters *[]event.EventFi
 		livenessPart:   livenessPart{done: make(chan struct{})},
 		releaserPart:   releaserPart{released: released},
 		committedPart:  committedPart{available: true, subscription: subscription, filters: filters},
+		leaseEpochPart: leaseEpochPart{epoch: 7, held: true},
 	}
 }
 

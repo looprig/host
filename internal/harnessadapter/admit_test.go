@@ -3,6 +3,7 @@ package harnessadapter
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -26,20 +27,121 @@ func inputCommand() department.RuntimeCommand {
 	}
 }
 
-// H5. runtimecommand.Admitted refuses a zero lease epoch and
-// department.RuntimeCommand carries none, so a session bound without one cannot
-// apply anything. The fake applier accepts every command and asserts on the
-// fields it was given; it has no epoch to be missing.
-func TestAdmitRefusesWithoutABoundLeaseEpoch(t *testing.T) {
-	bound := &boundSession{decode: func([]byte) ([]content.Block, error) { return nil, nil }}
-	_, err := bound.admit(inputCommand())
-	var unsupported *UnsupportedCommandError
-	if !errors.As(err, &unsupported) {
-		t.Fatalf("admit with no epoch = %v, want UnsupportedCommandError", err)
+// stubLeaseEpochReporter is a session.LeaseEpochReporter whose answer a test
+// chooses, including the legitimate "this session holds no lease that reports an
+// epoch" answer harness's two-result form exists to express.
+type stubLeaseEpochReporter struct {
+	epoch uint64
+	held  bool
+}
+
+func (r stubLeaseEpochReporter) LeaseEpoch() (uint64, bool) { return r.epoch, r.held }
+
+// heldEpoch is a reporter that holds the given grant.
+func heldEpoch(epoch uint64) session.LeaseEpochReporter {
+	return stubLeaseEpochReporter{epoch: epoch, held: true}
+}
+
+// H5 AS REWRITTEN BY O3.4. The refusal is no longer "nothing was BOUND" — there is
+// nothing to bind. runtimecommand.Admitted refuses a zero lease epoch and
+// department.RuntimeCommand carries none, so the epoch is read from the RUNTIME's
+// own grant at admission time, and a runtime that holds no such grant has no epoch
+// an admitted command could name.
+//
+// held IS WHAT IS BRANCHED ON AND NOT THE NUMBER. The second row is the control
+// that makes that a mechanism rather than a spelling: a reporter holding a grant
+// whose epoch is 0 would be admitted by a check reading only the number, and
+// harness would then refuse it at Validate — so the two rows must part company.
+func TestAdmitRefusesARuntimeThatHoldsNoJournalGrant(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		reporter session.LeaseEpochReporter
+		refused  bool
+	}{
+		{name: "no grant at all", reporter: stubLeaseEpochReporter{}, refused: true},
+		{name: "a released grant still reporting its old number", reporter: stubLeaseEpochReporter{epoch: 7}, refused: true},
+		{name: "control: a held grant", reporter: heldEpoch(7), refused: false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			bound := &boundSession{
+				leaseEpoch: row.reporter,
+				decode: func([]byte) ([]content.Block, error) {
+					return []content.Block{&content.TextBlock{Text: "hello"}}, nil
+				},
+			}
+			admitted, err := bound.admit(inputCommand())
+			if !row.refused {
+				if err != nil {
+					t.Fatalf("admit under a held grant: %v", err)
+				}
+				if admitted.LeaseEpoch != 7 {
+					t.Fatalf("lease epoch = %d, want the runtime's 7", admitted.LeaseEpoch)
+				}
+				return
+			}
+			var unsupported *UnsupportedCommandError
+			if !errors.As(err, &unsupported) {
+				t.Fatalf("admit with no held grant = %v, want UnsupportedCommandError", err)
+			}
+			if !strings.Contains(unsupported.Reason, "journal lease") {
+				t.Fatalf("reason = %q, want the missing journal lease", unsupported.Reason)
+			}
+		})
 	}
-	if !strings.Contains(unsupported.Reason, "lease epoch") {
-		t.Fatalf("reason = %q, want the missing lease epoch", unsupported.Reason)
+}
+
+// THE EPOCH IS THE RUNTIME'S AND IS RE-READ PER COMMAND, which is the whole of
+// O3.4's first live consequence. harness compares an admitted command's LeaseEpoch
+// for EQUALITY against the lease the session itself holds
+// (internal/sessionruntime/runtime_command.go:140), so a number Host chose — and
+// the only lease Host holds is its residency grant — is right exactly when two
+// independent counters happen to agree.
+//
+// THE SECOND ADMISSION IS THE ASSERTION, not the first. A binding that cached the
+// epoch it was constructed with passes the first row and fails the second, which is
+// the difference between reading the capability and remembering it.
+func TestAdmitReadsTheEpochFromTheRuntimeEveryTime(t *testing.T) {
+	reporter := &movingReporter{epoch: 4, held: true}
+	bound := &boundSession{
+		leaseEpoch: reporter,
+		decode: func([]byte) ([]content.Block, error) {
+			return []content.Block{&content.TextBlock{Text: "hello"}}, nil
+		},
 	}
+	first, err := bound.admit(inputCommand())
+	if err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	if first.LeaseEpoch != 4 {
+		t.Fatalf("first lease epoch = %d, want the runtime's 4", first.LeaseEpoch)
+	}
+	reporter.moveTo(11, true)
+	second, err := bound.admit(inputCommand())
+	if err != nil {
+		t.Fatalf("second admit: %v", err)
+	}
+	if second.LeaseEpoch != 11 {
+		t.Fatalf("second lease epoch = %d, want the runtime's new 11", second.LeaseEpoch)
+	}
+}
+
+// movingReporter is a grant whose epoch a test moves under a live binding.
+type movingReporter struct {
+	mu    sync.Mutex
+	epoch uint64
+	held  bool
+}
+
+func (r *movingReporter) LeaseEpoch() (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.epoch, r.held
+}
+
+func (r *movingReporter) moveTo(epoch uint64, held bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.epoch, r.held = epoch, held
 }
 
 // H6. commands.Kind has five members and runtimecommand.Kind has two. The three
@@ -58,7 +160,7 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 	for _, kind := range []string{"create", "restore", "input", "interrupt", "gate_response"} {
 		t.Run(kind, func(t *testing.T) {
 			bound := &boundSession{
-				leaseEpoch: 3,
+				leaseEpoch: heldEpoch(3),
 				decode: func([]byte) ([]content.Block, error) {
 					return []content.Block{&content.TextBlock{Text: "hello"}}, nil
 				},
@@ -91,7 +193,7 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 // opaque bytes, so a binding with no decoder refuses rather than applying an
 // empty turn.
 func TestAdmitRefusesAnInputWithNoDecoder(t *testing.T) {
-	bound := &boundSession{leaseEpoch: 3}
+	bound := &boundSession{leaseEpoch: heldEpoch(3)}
 	_, err := bound.admit(inputCommand())
 	var unsupported *UnsupportedCommandError
 	if !errors.As(err, &unsupported) {
@@ -108,7 +210,7 @@ func TestAdmitRefusesAnInputWithNoDecoder(t *testing.T) {
 // case runtimecommand names in its own validator.
 func TestAdmitRefusesAnInputThatDecodesToNothing(t *testing.T) {
 	bound := &boundSession{
-		leaseEpoch: 3,
+		leaseEpoch: heldEpoch(3),
 		decode:     func([]byte) ([]content.Block, error) { return nil, nil },
 	}
 	_, err := bound.admit(inputCommand())
@@ -124,7 +226,7 @@ func TestAdmitRefusesAnInputThatDecodesToNothing(t *testing.T) {
 // The fake accepts one and records it.
 func TestAdmitRefusesAnObjectReferencedPayload(t *testing.T) {
 	bound := &boundSession{
-		leaseEpoch: 3,
+		leaseEpoch: heldEpoch(3),
 		decode: func([]byte) ([]content.Block, error) {
 			return []content.Block{&content.TextBlock{Text: "hello"}}, nil
 		},
@@ -145,7 +247,7 @@ func TestAdmitRefusesAnObjectReferencedPayload(t *testing.T) {
 // An interrupt carries no payload and needs no decoder, so it is the one Host
 // kind that crosses unchanged.
 func TestAdmitCarriesAnInterruptUnchanged(t *testing.T) {
-	bound := &boundSession{leaseEpoch: 9}
+	bound := &boundSession{leaseEpoch: heldEpoch(9)}
 	command := inputCommand()
 	command.Kind = "interrupt"
 	command.Payload = nil
@@ -155,7 +257,7 @@ func TestAdmitCarriesAnInterruptUnchanged(t *testing.T) {
 		t.Fatalf("admit an interrupt: %v", err)
 	}
 	if admitted.LeaseEpoch != 9 {
-		t.Fatalf("lease epoch = %d, want the bound 9", admitted.LeaseEpoch)
+		t.Fatalf("lease epoch = %d, want the runtime's 9", admitted.LeaseEpoch)
 	}
 	if admitted.RuntimeCommandID != command.RuntimeCommandID {
 		t.Fatalf("runtime command id = %v, want %v", admitted.RuntimeCommandID, command.RuntimeCommandID)
@@ -186,7 +288,7 @@ func newApplyingController(applier applierPart) *applyingController {
 func TestApplyCommandReachesTheReleasedApplier(t *testing.T) {
 	var seen []runtimecommand.Admitted
 	controller := newApplyingController(applierPart{available: true, admitted: &seen})
-	runtime := boundFor(t, controller, WithLeaseEpoch(7))
+	runtime := boundFor(t, controller)
 
 	command := inputCommand()
 	command.Kind = "interrupt"
@@ -211,7 +313,6 @@ func TestApplyCommandCarriesDecodedBlocks(t *testing.T) {
 	var seen []runtimecommand.Admitted
 	controller := newApplyingController(applierPart{available: true, admitted: &seen})
 	runtime := boundFor(t, controller,
-		WithLeaseEpoch(7),
 		WithBlockDecoder(func(body []byte) ([]content.Block, error) {
 			return []content.Block{&content.TextBlock{Text: string(body)}}, nil
 		}))
@@ -265,7 +366,7 @@ func TestApplyCommandRefusesASessionThatCannotApply(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			runtime := boundFor(t, tt.controller, WithLeaseEpoch(7))
+			runtime := boundFor(t, tt.controller)
 			command := inputCommand()
 			command.Kind = "interrupt"
 			command.Payload = nil
@@ -292,7 +393,7 @@ func TestApplyCommandRefusesASessionThatCannotApply(t *testing.T) {
 func TestApplyCommandRefusesBeforeReachingTheApplier(t *testing.T) {
 	var seen []runtimecommand.Admitted
 	controller := newApplyingController(applierPart{available: true, admitted: &seen})
-	runtime := boundFor(t, controller, WithLeaseEpoch(7))
+	runtime := boundFor(t, controller)
 
 	command := inputCommand()
 	command.Kind = "gate_response"
@@ -308,7 +409,7 @@ func TestApplyCommandRefusesBeforeReachingTheApplier(t *testing.T) {
 func TestApplyCommandReportsAnApplierFailure(t *testing.T) {
 	sentinel := errors.New("the runtime refused the command")
 	controller := newApplyingController(applierPart{available: true, err: sentinel})
-	runtime := boundFor(t, controller, WithLeaseEpoch(7))
+	runtime := boundFor(t, controller)
 
 	command := inputCommand()
 	command.Kind = "interrupt"
@@ -325,7 +426,6 @@ func TestApplyCommandReportsADecodeFailure(t *testing.T) {
 	var seen []runtimecommand.Admitted
 	controller := newApplyingController(applierPart{available: true, admitted: &seen})
 	runtime := boundFor(t, controller,
-		WithLeaseEpoch(7),
 		WithBlockDecoder(func([]byte) ([]content.Block, error) { return nil, sentinel }))
 
 	if err := runtime.ApplyCommand(t.Context(), inputCommand()); !errors.Is(err, sentinel) {

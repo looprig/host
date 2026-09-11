@@ -107,6 +107,7 @@ const (
 	CapabilityReleaser              Capability = "Releaser"
 	CapabilityPublicationSubscriber Capability = "PublicationSubscriber"
 	CapabilityCommandApplier        Capability = "CommandApplier"
+	CapabilityLeaseEpochReporter    Capability = "LeaseEpochReporter"
 )
 
 // AllCapabilities is every capability Host requires of a launched session.
@@ -116,6 +117,7 @@ var AllCapabilities = []Capability{
 	CapabilityReleaser,
 	CapabilityPublicationSubscriber,
 	CapabilityCommandApplier,
+	CapabilityLeaseEpochReporter,
 }
 
 // A session missing a capability is a distinct TYPE, not a flag: a Go method
@@ -209,6 +211,44 @@ func (p *applierPart) Applied() []department.RuntimeCommand {
 	return append([]department.RuntimeCommand(nil), p.applied...)
 }
 
+// leaseEpochPart reports the JOURNAL lease epoch the runtime holds.
+//
+// ITS BASE IS DELIBERATELY NOT THE RESIDENCY FAKE'S. residency's fakeLeases mints
+// residency epochs from 1000 and this mints journal epochs from 1, because the
+// two counters are independent grants and a test that cannot tell them apart is
+// not testing anything. Every fake in this module used to start at 1, so a Host
+// that fed its residency epoch to a journal reader passed — the defect O3.4 exists
+// to end was invisible as a COINCIDENCE OF INITIAL CONDITIONS, which is exactly
+// what harness's own capability doc warns about.
+type leaseEpochPart struct {
+	mu    sync.Mutex
+	epoch uint64
+	held  bool
+}
+
+// LeaseEpoch reports this runtime's journal lease epoch and whether it holds one.
+func (p *leaseEpochPart) LeaseEpoch() (uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.epoch, p.held
+}
+
+// SetLeaseEpoch moves the reported grant. held false is the legitimate
+// "this session is not wired to a lease that reports an epoch" answer, and it is
+// settable so a test can exercise it rather than assuming the epoch is always
+// there.
+func (p *leaseEpochPart) SetLeaseEpoch(epoch uint64, held bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.epoch, p.held = epoch, held
+}
+
+// FirstJournalEpoch is the epoch a fresh FullSession reports. It is exported so a
+// test asserts against the fixture's declared value rather than a literal that
+// happens to match, and it is FAR from residency's first residency epoch on
+// purpose.
+const FirstJournalEpoch uint64 = 1
+
 // FullSession has every capability Host requires.
 type FullSession struct {
 	idPart
@@ -217,6 +257,7 @@ type FullSession struct {
 	*releaserPart
 	*subscriberPart
 	*applierPart
+	*leaseEpochPart
 }
 
 // NewFullSession returns a session with every capability.
@@ -227,6 +268,7 @@ func NewFullSession(id uuid.UUID) *FullSession {
 		releaserPart:   &releaserPart{},
 		subscriberPart: &subscriberPart{},
 		applierPart:    &applierPart{},
+		leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true},
 	}
 }
 
@@ -239,6 +281,7 @@ type sessionWithoutIdleWaiter struct {
 	*releaserPart
 	*subscriberPart
 	*applierPart
+	*leaseEpochPart
 }
 
 type sessionWithoutLiveness struct {
@@ -247,6 +290,7 @@ type sessionWithoutLiveness struct {
 	*releaserPart
 	*subscriberPart
 	*applierPart
+	*leaseEpochPart
 }
 
 type sessionWithoutReleaser struct {
@@ -255,6 +299,7 @@ type sessionWithoutReleaser struct {
 	livenessPart
 	*subscriberPart
 	*applierPart
+	*leaseEpochPart
 }
 
 type sessionWithoutSubscriber struct {
@@ -262,6 +307,16 @@ type sessionWithoutSubscriber struct {
 	idlePart
 	livenessPart
 	*releaserPart
+	*applierPart
+	*leaseEpochPart
+}
+
+type sessionWithoutLeaseEpochReporter struct {
+	idPart
+	idlePart
+	livenessPart
+	*releaserPart
+	*subscriberPart
 	*applierPart
 }
 
@@ -271,6 +326,7 @@ type sessionWithoutApplier struct {
 	livenessPart
 	*releaserPart
 	*subscriberPart
+	*leaseEpochPart
 }
 
 // bareSession has the identity and nothing else, so an error naming missing
@@ -287,15 +343,17 @@ func NewSessionWithout(id uuid.UUID, missing Capability) department.RigSession {
 	stopped := livenessPart{stopped: make(chan struct{})}
 	switch missing {
 	case CapabilityIdleWaiter:
-		return &sessionWithoutIdleWaiter{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}}
+		return &sessionWithoutIdleWaiter{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}, leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true}}
 	case CapabilityLiveness:
-		return &sessionWithoutLiveness{idPart: identity, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}}
+		return &sessionWithoutLiveness{idPart: identity, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}, leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true}}
 	case CapabilityReleaser:
-		return &sessionWithoutReleaser{idPart: identity, livenessPart: stopped, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}}
+		return &sessionWithoutReleaser{idPart: identity, livenessPart: stopped, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}, leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true}}
 	case CapabilityPublicationSubscriber:
-		return &sessionWithoutSubscriber{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, applierPart: &applierPart{}}
+		return &sessionWithoutSubscriber{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, applierPart: &applierPart{}, leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true}}
 	case CapabilityCommandApplier:
-		return &sessionWithoutApplier{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}}
+		return &sessionWithoutApplier{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, leaseEpochPart: &leaseEpochPart{epoch: FirstJournalEpoch, held: true}}
+	case CapabilityLeaseEpochReporter:
+		return &sessionWithoutLeaseEpochReporter{idPart: identity, livenessPart: stopped, releaserPart: &releaserPart{}, subscriberPart: &subscriberPart{}, applierPart: &applierPart{}}
 	default:
 		panic("testkit: unknown capability " + string(missing))
 	}

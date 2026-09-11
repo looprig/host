@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -94,7 +95,7 @@ var errDeadContext = errors.New("fake: called with a context that is already don
 // fakeLease is one granted lease.
 type fakeLease struct {
 	trace *trace
-	epoch uint64
+	epoch ResidencyEpoch
 	lost  chan struct{}
 
 	mu         sync.Mutex
@@ -103,7 +104,7 @@ type fakeLease struct {
 	releaseErr error
 }
 
-func (l *fakeLease) Epoch() uint64         { return l.epoch }
+func (l *fakeLease) Epoch() ResidencyEpoch { return l.epoch }
 func (l *fakeLease) Lost() <-chan struct{} { return l.lost }
 func (l *fakeLease) releasedCount() int    { l.mu.Lock(); defer l.mu.Unlock(); return l.released }
 
@@ -123,12 +124,25 @@ func (l *fakeLease) Release(ctx context.Context) error {
 	return nil
 }
 
+// FirstResidencyEpoch is the first RESIDENCY epoch fakeLeases mints.
+//
+// IT IS 1000 AND NOT 1, AND THAT IS THE POINT OF O3.4 RATHER THAN A DETAIL. Host
+// holds two grants from two different issuers — this one, and the journal grant
+// the RUNTIME holds, which testkit mints from testkit.FirstJournalEpoch = 1. Every
+// fake in this module used to start at 1, so a Host that fed its residency epoch
+// to a journal reader produced the right number by coincidence and every test
+// passed. harness's own capability doc names that coincidence in terms: "each
+// counter starting at 1 under a fresh in-memory backend is an accident of initial
+// conditions, not a relationship". Separating the bases is what turns a future
+// confusion of the two into a failing assertion instead of a green suite.
+const FirstResidencyEpoch ResidencyEpoch = 1000
+
 // fakeLeases grants leases and records every grant.
 type fakeLeases struct {
 	trace *trace
 
 	mu        sync.Mutex
-	nextEpoch uint64
+	nextEpoch ResidencyEpoch
 	// exclusive models a real Leaser: a second grant for a held session is
 	// refused with ErrLeaseHeld.
 	exclusive bool
@@ -160,6 +174,9 @@ func (s *fakeLeases) AcquireSessionLease(ctx context.Context, tenant sessionwire
 		return nil, nil
 	}
 	s.held[session] = true
+	if s.nextEpoch == 0 {
+		s.nextEpoch = FirstResidencyEpoch - 1
+	}
 	s.nextEpoch++
 	epoch := s.nextEpoch
 	if s.zeroEpoch {
@@ -191,11 +208,20 @@ type fakeJournal struct {
 	trace *trace
 
 	mu     sync.Mutex
-	fences []uint64
+	fences int
 	err    error
 }
 
-func (j *fakeJournal) CommitOpeningFence(ctx context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, epoch uint64) error {
+// CommitOpeningFence records that a fence happened and NOT the epoch it was
+// stamped with, because the seam no longer carries one.
+//
+// THE FAKE WAS LOOSER THAN THE DEPENDENCY IN EXACTLY THIS PLACE. It accepted an
+// epoch a caller chose and recorded it, so the whole package could assert that
+// Host stamped the journal fence with Host's own lease epoch — a write the
+// released store refuses on the one seam where it can be compared
+// (JournalWriter refuses an application prefix whose LeaseEpoch a caller chose)
+// and which, in disposition mode, no session accepts at all.
+func (j *fakeJournal) CommitOpeningFence(ctx context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if ctx.Err() != nil {
@@ -206,14 +232,14 @@ func (j *fakeJournal) CommitOpeningFence(ctx context.Context, _ sessionwire.Tena
 	if j.err != nil {
 		return j.err
 	}
-	j.fences = append(j.fences, epoch)
+	j.fences++
 	return nil
 }
 
-func (j *fakeJournal) committed() []uint64 {
+func (j *fakeJournal) committed() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return append([]uint64(nil), j.fences...)
+	return j.fences
 }
 
 // fakeDurable serves durable session state.
@@ -551,11 +577,37 @@ type fakeRuntime struct {
 	agentID   sessionwire.AgentID
 	done      chan struct{}
 
-	mu         sync.Mutex
-	released   int
-	shutdowns  int
-	deadCalls  int
-	releaseErr error
+	mu           sync.Mutex
+	released     int
+	shutdowns    int
+	deadCalls    int
+	releaseErr   error
+	journalEpoch uint64
+	journalHeld  bool
+	epochReads   int
+}
+
+// testJournalEpoch is the epoch a fixture runtime reports as ITS OWN journal
+// grant. It is nowhere near FirstResidencyEpoch or testEpoch: the two grants have
+// different issuers and a test that could not tell them apart would be testing
+// nothing. This is the value residency.Residency.JournalEpoch must carry, and the
+// residency epoch is the value it must not.
+const testJournalEpoch uint64 = 3
+
+// LeaseEpoch reports the runtime's journal grant and counts the reads, so a test
+// can tell a value that was READ from one that was remembered.
+func (r *fakeRuntime) LeaseEpoch() (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.epochReads++
+	return r.journalEpoch, r.journalHeld
+}
+
+// journalEpochReads reports how many times the runtime was asked for its grant.
+func (r *fakeRuntime) journalEpochReads() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.epochReads
 }
 
 func (r *fakeRuntime) SessionID() sessionwire.SessionID { return r.sessionID }
@@ -631,6 +683,11 @@ type fakeTarget struct {
 	bornDone bool
 	// nilRuntime, when true, reports success and returns nothing.
 	nilRuntime bool
+	// noJournalGrant, when true, produces a runtime that holds no single-writer
+	// journal lease: harness's headless, no-persistence and not-wired-for-
+	// durable-commands configurations all answer (0, false), and all three are
+	// legitimate rather than failures.
+	noJournalGrant bool
 	// releaseErr is given to every runtime this target produces.
 	releaseErr error
 
@@ -684,7 +741,17 @@ func (t *fakeTarget) newRuntime(session sessionwire.SessionID, agent sessionwire
 	if t.boundSessionID != "" {
 		session = t.boundSessionID
 	}
-	runtime := &fakeRuntime{trace: t.trace, sessionID: session, agentID: agent, done: make(chan struct{}), releaseErr: t.releaseErr}
+	// THE RUNTIME'S OWN GRANT, and noJournalGrant is how a test models the
+	// legitimate "this session is not wired to a lease that reports an epoch"
+	// answer rather than a failure.
+	runtime := &fakeRuntime{
+		trace: t.trace, sessionID: session, agentID: agent,
+		done: make(chan struct{}), releaseErr: t.releaseErr,
+		journalEpoch: testJournalEpoch, journalHeld: !t.noJournalGrant,
+	}
+	if t.noJournalGrant {
+		runtime.journalEpoch = 0
+	}
 	if t.bornDone {
 		close(runtime.done)
 	}
@@ -857,13 +924,20 @@ const (
 	testWeight        uint64                       = 3
 	testCapacity      uint64                       = 8
 	testExpiry                                     = 31 * time.Second
-	// testFirstEpoch is deliberately NOT 1. The first minted epoch, the first
-	// registry generation and the first of anything else counted from zero are
-	// all 1, so a fixture granting epoch 1 would let a manager that fenced the
-	// journal with a literal, or with the generation, pass every assertion about
-	// the epoch. Measured: with epoch 1 a hard-coded fence value survived the
-	// whole suite.
-	testFirstEpoch uint64 = 7
+	// testFirstEpoch is the first RESIDENCY epoch a fixture grant mints, and it
+	// is deliberately NOT 1. The first minted epoch, the first registry
+	// generation and the first of anything else counted from zero are all 1, so
+	// a fixture granting epoch 1 would let a manager that fenced the journal
+	// with a literal, or with the generation, pass every assertion about the
+	// epoch. Measured: with epoch 1 a hard-coded fence value survived the whole
+	// suite.
+	//
+	// IT IS NOW FirstResidencyEpoch, AND THE DISTANCE FROM testJournalEpoch IS
+	// THE ASSERTION O3.4 EXISTS FOR. The runtime's journal grant is minted by a
+	// different issuer; the fixture runtime reports 3 and this mints from 1000.
+	// A Host that copied one into the other's slot is now a 997-apart value
+	// mismatch rather than a coincidence of two counters that both started at 1.
+	testFirstEpoch = FirstResidencyEpoch
 )
 
 var testClockAt = time.Date(2026, 9, 2, 14, 5, 6, 0, time.UTC)
@@ -1182,7 +1256,7 @@ func TestAttachCreatesUnderTheLeaseInTheSpecifiedOrder(t *testing.T) {
 	if entry.Generation != residency.Generation {
 		t.Errorf("residency reports generation %d and the registry holds %d", residency.Generation, entry.Generation)
 	}
-	if entry.LeaseEpoch != residency.LeaseEpoch {
+	if ResidencyEpoch(entry.LeaseEpoch) != residency.LeaseEpoch {
 		t.Errorf("the registry entry carries lease epoch %d and the residency reports %d", entry.LeaseEpoch, residency.LeaseEpoch)
 	}
 	if entry.Runtime != residency.Runtime {
@@ -1191,8 +1265,29 @@ func TestAttachCreatesUnderTheLeaseInTheSpecifiedOrder(t *testing.T) {
 	if consumed := f.publisher.ConsumedWeight(); consumed != testWeight {
 		t.Errorf("the admission ledger charges %d, want the target's weight %d", consumed, testWeight)
 	}
-	if fences := f.journal.committed(); len(fences) != 1 || fences[0] != residency.LeaseEpoch {
-		t.Errorf("the opening fence carries %v, want exactly the lease epoch [%d]", fences, residency.LeaseEpoch)
+	// ONE FENCE, AND NO EPOCH ON IT. This assertion used to read "the fence
+	// carries exactly the lease epoch", which was the fusion stated as a
+	// requirement: the fence is a JOURNAL record and Host holds no journal
+	// grant, so the writer stamps its own. What is left to assert is that the
+	// fence happened exactly once, before hydration; the epoch is no longer
+	// Host's to get right or wrong.
+	if fences := f.journal.committed(); fences != 1 {
+		t.Errorf("the attach committed %d opening fences, want exactly 1", fences)
+	}
+
+	// THE TWO GRANTS, SIDE BY SIDE. The residency epoch is Host's own and comes
+	// from the lease; the journal epoch is the RUNTIME's and comes from the
+	// runtime. They are 997 apart in this fixture because they are minted by
+	// different issuers, and the whole of O3.4 is that the two are no longer one
+	// number playing both roles.
+	if !residency.JournalEpochHeld {
+		t.Error("the residency reports no journal grant, and the fixture runtime holds one")
+	}
+	if residency.JournalEpoch != JournalEpoch(testJournalEpoch) {
+		t.Errorf("residency reports journal epoch %d, want the runtime's %d", residency.JournalEpoch, testJournalEpoch)
+	}
+	if uint64(residency.JournalEpoch) == uint64(residency.LeaseEpoch) {
+		t.Errorf("the two epochs are both %d, so this fixture cannot tell the residency grant from the journal grant", residency.JournalEpoch)
 	}
 
 	// The create request the target actually received. This is the CONSUMER's
@@ -1418,7 +1513,7 @@ func TestConcurrentColdAttachInstallsExactlyOneResidency(t *testing.T) {
 // fix is not a guard.
 func TestTheRegistryLoserReleasesItsRuntimeNonterminally(t *testing.T) {
 	f := newFixture(t)
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	f.registry.beforeInsert = func() {
 		f.registry.inner.Insert(f.key(), registry.Admission{
 			AgentID:         testAgent,
@@ -1478,7 +1573,7 @@ func TestTheRegistryLoserReleasesItsRuntimeNonterminally(t *testing.T) {
 // package able to see it. Own resources are released; shared ones are not.
 func TestTheRegistryLoserLeavesTheWinnersSharedResourcesAlone(t *testing.T) {
 	f := newFixture(t)
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	f.registry.beforeInsert = func() {
 		f.registry.inner.Insert(f.key(), registry.Admission{
 			AgentID: testAgent, Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
@@ -2176,7 +2271,7 @@ func TestThePublishedProjectionIsTheEpochFencedObservation(t *testing.T) {
 		InternalEndpoint:       testEndpoint,
 		Residency:              sessionwire.SessionResidencyResident,
 		Accepting:              true,
-		LeaseEpoch:             residency.LeaseEpoch,
+		LeaseEpoch:             uint64(residency.LeaseEpoch),
 		ObservedAt:             testClockAt,
 		ExpiresAt:              testClockAt.Add(testExpiry),
 	}
@@ -2190,7 +2285,7 @@ func TestThePublishedProjectionIsTheEpochFencedObservation(t *testing.T) {
 			t.Errorf("projection %d is one Core refuses: %v", i, err)
 		}
 	}
-	if epoch := published[1].LeaseEpoch; epoch == 0 || epoch != residency.LeaseEpoch {
+	if epoch := published[1].LeaseEpoch; epoch == 0 || epoch != uint64(residency.LeaseEpoch) {
 		t.Errorf("the projection carries lease epoch %d, want the residency's non-zero %d", epoch, residency.LeaseEpoch)
 	}
 }
@@ -2964,7 +3059,7 @@ func TestAStaleSessionRecordIsNotReportableAsAttached(t *testing.T) {
 	if !f.registry.inner.RemoveByGeneration(f.key(), first.Generation) {
 		t.Fatal("the seeded residency could not be removed")
 	}
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	replacement, installed := f.registry.inner.Insert(f.key(), registry.Admission{
 		AgentID: testAgent, Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
 	})
@@ -3077,7 +3172,7 @@ func TestALosingAttachThatCannotReleaseIsNotReportedAsSuccess(t *testing.T) {
 		f.leases.releaseErr = stuck
 		f.target.releaseErr = stuck
 	})
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	f.registry.beforeInsert = func() {
 		f.registry.inner.Insert(f.key(), registry.Admission{
 			AgentID: testAgent, Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
@@ -3119,7 +3214,7 @@ func TestALosingAttachThatCannotReleaseIsNotReportedAsSuccess(t *testing.T) {
 	// idempotent success. Without this row the test above would pass for a
 	// manager that failed every loser.
 	g := newFixture(t)
-	otherRival := &fakeRuntime{trace: g.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	otherRival := &fakeRuntime{trace: g.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	g.registry.beforeInsert = func() {
 		g.registry.inner.Insert(g.key(), registry.Admission{
 			AgentID: testAgent, Target: g.target, CompatibilityID: testCompat, Runtime: otherRival, LeaseEpoch: 99,
@@ -3273,7 +3368,7 @@ func TestAColdCreateIsLaunchedWithItsDurableNamespace(t *testing.T) {
 // crediting the charge back would uncharge the resident session.
 func TestALoserWhoseRivalIsADifferentSessionNamesWhatIsStillHeld(t *testing.T) {
 	f := newFixture(t)
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: "reviewer", done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: "reviewer", done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	f.registry.beforeInsert = func() {
 		f.registry.inner.Insert(f.key(), registry.Admission{
 			AgentID: "reviewer", Target: f.target, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
@@ -3769,5 +3864,209 @@ func TestAResidencyRemovedBeforeStep9IsNotReportedAttached(t *testing.T) {
 	}
 	if _, live := f.manager.SessionContext(f.key()); live {
 		t.Error("a session context survives an attach that never reached step 9")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// O3.4: the two grants
+// ---------------------------------------------------------------------------
+
+// TestTheTwoEpochDomainsAreDistinctTypes pins the MECHANISM that keeps the two
+// grants apart, which is the thing a value assertion cannot hold on its own.
+//
+// IT IS HERE BECAUSE THE VALUES AGREE BY ACCIDENT ALL THE TIME. Two fresh
+// per-session counters under a memory backend both start at 1, so an attach that
+// fed Host's residency epoch to a journal reader produced the right number and
+// every test passed — that is exactly how the fusion survived twelve tasks.
+// Separate defined types make the substitution a COMPILE failure, which no
+// coincidence of initial conditions can mask, and the fake seeding below makes it
+// a value failure as well. Neither alone is enough: a maintainer collapsing both
+// types to uint64 "for simplicity" defeats the compiler, and this test is what
+// then fails.
+func TestTheTwoEpochDomainsAreDistinctTypes(t *testing.T) {
+	residencyType := reflect.TypeFor[ResidencyEpoch]()
+	journalType := reflect.TypeFor[JournalEpoch]()
+
+	if residencyType == journalType {
+		t.Fatal("ResidencyEpoch and JournalEpoch are the same type, so nothing stops one being used as the other")
+	}
+	if residencyType.AssignableTo(journalType) || journalType.AssignableTo(residencyType) {
+		t.Error("the two epoch types are assignable to one another, so the confusion O3.4 exists to prevent compiles silently")
+	}
+	// THE CONTROL: they are distinct because they are DEFINED types, not because
+	// their kinds differ. Both are uint64 underneath and are meant to be, so a
+	// test asserting "different kinds" would be asserting the wrong thing.
+	if residencyType.Kind() != reflect.Uint64 || journalType.Kind() != reflect.Uint64 {
+		t.Errorf("the epoch kinds are %v and %v, want both uint64", residencyType.Kind(), journalType.Kind())
+	}
+
+	// AND THE PRODUCERS ANSWER IN THE RIGHT DOMAIN. residency.Lease is Host's own
+	// grant; the runtime's journal grant reaches Host only through the reported
+	// value on Residency, which carries the other type.
+	leaseEpoch, ok := reflect.TypeFor[Lease]().MethodByName("Epoch")
+	if !ok {
+		t.Fatal("Lease has no Epoch method")
+	}
+	if got := leaseEpoch.Type.Out(0); got != residencyType {
+		t.Errorf("Lease.Epoch returns %v, want ResidencyEpoch: a Lease answering in the journal domain is the fusion restated", got)
+	}
+	reported, ok := reflect.TypeFor[Residency]().FieldByName("JournalEpoch")
+	if !ok {
+		t.Fatal("Residency has no JournalEpoch field")
+	}
+	if reported.Type != journalType {
+		t.Errorf("Residency.JournalEpoch is %v, want JournalEpoch", reported.Type)
+	}
+	held, ok := reflect.TypeFor[Residency]().FieldByName("LeaseEpoch")
+	if !ok {
+		t.Fatal("Residency has no LeaseEpoch field")
+	}
+	if held.Type != residencyType {
+		t.Errorf("Residency.LeaseEpoch is %v, want ResidencyEpoch", held.Type)
+	}
+}
+
+// TestTheJournalEpochComesFromTheRuntimeAndNotTheLease is the VALUE half, and it
+// is the assertion the different fake bases exist for.
+//
+// The fixture's lease mints 1000 and the fixture's runtime reports 3, so the two
+// answers cannot be confused for one another by any reading. A manager that filled
+// JournalEpoch from the lease would report 1000; one that filled LeaseEpoch from
+// the runtime would report 3. Both are caught, in the same call.
+func TestTheJournalEpochComesFromTheRuntimeAndNotTheLease(t *testing.T) {
+	f := newFixture(t)
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if residency.LeaseEpoch != testFirstEpoch {
+		t.Errorf("the residency epoch is %d, want the lease's %d", residency.LeaseEpoch, testFirstEpoch)
+	}
+	if residency.JournalEpoch != JournalEpoch(testJournalEpoch) {
+		t.Errorf("the journal epoch is %d, want the runtime's %d", residency.JournalEpoch, testJournalEpoch)
+	}
+	if !residency.JournalEpochHeld {
+		t.Error("the runtime holds a journal grant and the residency reports none")
+	}
+	if runtime := f.target.producedRuntimes(); len(runtime) != 1 {
+		t.Fatalf("the target produced %d runtimes, want 1", len(runtime))
+	} else if reads := runtime[0].journalEpochReads(); reads == 0 {
+		t.Error("the runtime was never asked for its journal grant, so the reported epoch came from somewhere else")
+	}
+}
+
+// TestARuntimeThatHoldsNoJournalGrantStillAttaches is the OTHER direction, and it
+// is a refusal this package deliberately does NOT make.
+//
+// harness gates its report on the lease still being held and answers (0, false)
+// for a headless session, one without persistence, and one simply not wired for
+// durable commands. Those are legitimate configurations, so an attach that refused
+// them would turn supported deployments into attach failures. What Host must never
+// do is substitute its own grant — and the assertion that matters is that the
+// residency epoch is UNCHANGED while the journal one is absent.
+//
+// IT IS ALSO THE CONTROL FOR THE TEST ABOVE. Without a row in which something
+// legitimately reports no epoch, "JournalEpochHeld is true" could be satisfied by
+// a constant.
+func TestARuntimeThatHoldsNoJournalGrantStillAttaches(t *testing.T) {
+	f := newFixture(t, func(f *fixture) { f.target.noJournalGrant = true })
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach refused a runtime that reports no journal grant: %v", err)
+	}
+	if residency.JournalEpochHeld {
+		t.Error("the residency reports a journal grant the runtime says it does not hold")
+	}
+	if residency.JournalEpoch != 0 {
+		t.Errorf("the journal epoch is %d, want 0 when no grant is held", residency.JournalEpoch)
+	}
+	// THE POINT OF THE WHOLE TASK, stated as an assertion: an absent journal
+	// grant does not become Host's residency grant.
+	if uint64(residency.JournalEpoch) == uint64(residency.LeaseEpoch) {
+		t.Errorf("with no journal grant the residency epoch %d was reported as the journal epoch", residency.LeaseEpoch)
+	}
+	if residency.LeaseEpoch != testFirstEpoch {
+		t.Errorf("the residency epoch is %d, want the lease's %d", residency.LeaseEpoch, testFirstEpoch)
+	}
+}
+
+// TestARefusedLeaseAcquisitionIsUnwoundByTheAttach is F16(b).
+//
+// sessionstore's AcquireResidency can return NO GRANT and still leave a provider
+// lease and a Store admission held; until a release succeeds the admission is
+// retained and Close may time out. (Lease, error) cannot express that, so every
+// fake in this module read a non-nil error as nothing acquired and leaked it.
+//
+// THE OBLIGATION IS OWNED BY THE UNWINDER, and the two rows are what makes that a
+// mechanism rather than a call. When the retry succeeds the refusal names nothing
+// still held; when it fails, the ladder that reports what it could not give back
+// reports this too — which an inline retry could not do, because its failure would
+// vanish into the error text.
+func TestARefusedLeaseAcquisitionIsUnwoundByTheAttach(t *testing.T) {
+	for _, row := range []struct {
+		name       string
+		cleanupErr error
+		unreleased bool
+	}{
+		{name: "the retry succeeds", cleanupErr: nil, unreleased: false},
+		{name: "the retry fails too", cleanupErr: errors.New("the provider is unreachable"), unreleased: true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var retries int
+			f := newFixture(t, func(f *fixture) {
+				f.leases.err = &LeaseCleanupError{
+					Cause: errors.New("the acquisition was cancelled"),
+					Cleanup: func(context.Context) error {
+						retries++
+						return row.cleanupErr
+					},
+				}
+			})
+
+			_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+			var attach *AttachError
+			if !errors.As(err, &attach) {
+				t.Fatalf("Attach = %v, want *AttachError", err)
+			}
+			if attach.Step != StepLease {
+				t.Errorf("the refusal names step %q, want %q", attach.Step, StepLease)
+			}
+			if retries != 1 {
+				t.Fatalf("the unwinder retried the release %d times, want exactly 1", retries)
+			}
+			// THE CAUSE SURVIVES EITHER WAY, so a caller can still tell WHY the
+			// acquisition was refused.
+			var owed *LeaseCleanupError
+			if !errors.As(err, &owed) {
+				t.Error("the refusal no longer carries the store's cleanup error as its cause")
+			}
+
+			named := slices.ContainsFunc(attach.Unreleased, func(held string) bool {
+				return strings.Contains(held, "session lease")
+			})
+			if named != row.unreleased {
+				t.Errorf("Unreleased = %v, want it to name the refused lease: %t", attach.Unreleased, row.unreleased)
+			}
+			if !row.unreleased && len(attach.Unreleased) != 0 {
+				t.Errorf("a refusal whose cleanup succeeded still reports %v as held", attach.Unreleased)
+			}
+		})
+	}
+}
+
+// A PLAIN REFUSAL OWES NOTHING, which is the control that keeps the test above
+// from passing on an unwinder that owns a cleanup for every failed acquisition.
+func TestAPlainLeaseRefusalOwesNoRelease(t *testing.T) {
+	f := newFixture(t, func(f *fixture) { f.leases.err = errors.New("the lease store is unreachable") })
+
+	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	var attach *AttachError
+	if !errors.As(err, &attach) {
+		t.Fatalf("Attach = %v, want *AttachError", err)
+	}
+	if len(attach.Unreleased) != 0 {
+		t.Errorf("a refusal that took nothing reports %v as still held", attach.Unreleased)
 	}
 }

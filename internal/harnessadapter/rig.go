@@ -57,8 +57,7 @@ var _ Launcher = (*rig.Rig)(nil)
 type Adapter struct {
 	rigs Rigs
 
-	leaseEpoch uint64
-	decode     BlockDecoder
+	decode BlockDecoder
 }
 
 // BlockDecoder turns a command's private body into the content blocks Harness
@@ -75,20 +74,6 @@ type BlockDecoder func([]byte) ([]content.Block, error)
 
 // Option configures an Adapter.
 type Option func(*Adapter)
-
-// WithLeaseEpoch supplies the session lease epoch every admitted command is
-// applied under.
-//
-// FINDING H5: runtimecommand.Admitted refuses a zero epoch and
-// department.RuntimeCommand has no member to carry one, so it arrives here
-// instead of on the command. That makes the epoch a property of the BINDING
-// rather than of the command, which is weaker than the durable record: an
-// adapter bound at attach applies every later command under the epoch it was
-// bound with, and only the store's own compare-and-swap notices if that has
-// moved on.
-func WithLeaseEpoch(epoch uint64) Option {
-	return func(a *Adapter) { a.leaseEpoch = epoch }
-}
 
 // WithBlockDecoder supplies the decoder an input command's body is read with.
 func WithBlockDecoder(decode BlockDecoder) Option {
@@ -247,7 +232,6 @@ func (a *Adapter) bind(
 		controller: controller,
 		tenant:     tenant,
 		session:    sessionID,
-		leaseEpoch: a.leaseEpoch,
 		decode:     a.decode,
 	}
 	var missing []string
@@ -265,6 +249,22 @@ func (a *Adapter) bind(
 		bound.releaser = capability
 	} else {
 		missing = append(missing, "session.Releaser")
+	}
+
+	// THE EPOCH IS THE RUNTIME'S AND IS READ FROM THE RUNTIME. It used to arrive
+	// as WithLeaseEpoch, a number the COMPOSITION supplied at bind time — and in
+	// Host's composition the only lease Host holds is its residency grant, a
+	// different issuer over a different namespace. harness compares an admitted
+	// command's LeaseEpoch for EQUALITY against the lease the session itself
+	// holds, so binding Host's number made every application depend on two
+	// independent counters happening to agree; under memstore both start at 1 and
+	// it passed. The capability is asserted here so a drift in harness's shape is
+	// a BUILD failure rather than a false ok, which is the rule the paragraph on
+	// boundSession states for every other capability in this list.
+	if capability, ok := controller.(session.LeaseEpochReporter); ok {
+		bound.leaseEpoch = capability
+	} else {
+		missing = append(missing, "session.LeaseEpochReporter")
 	}
 
 	// THE TWO-RESULT FORM, AND NOT A BARE ASSERTION ON THE SOURCE. Harness

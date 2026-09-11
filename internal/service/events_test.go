@@ -946,7 +946,7 @@ func (controllerBase) Shutdown(context.Context) error { return errNotImplemented
 
 var errNotImplemented = errors.New("service_test: the fake controller implements only the capabilities under test")
 
-// liveController is the four capabilities Host requires, three of them trivial
+// liveController is the five capabilities Host requires, four of them trivial
 // and the fourth backed by a REAL hub.
 type liveController struct {
 	base controllerBase
@@ -1017,6 +1017,12 @@ func (c *liveController) Done() <-chan struct{} {
 
 // ReleaseResidency satisfies session.Releaser.
 func (c *liveController) ReleaseResidency(context.Context) error { return nil }
+
+// LeaseEpoch satisfies session.LeaseEpochReporter. This fixture runs a real hub
+// over a test appender and holds no single-writer journal lease, so it reports
+// the RUNTIME's grant as 1 rather than pretending to Host's residency epoch —
+// which nothing here holds either.
+func (c *liveController) LeaseEpoch() (uint64, bool) { return 1, true }
 
 // CommittedPublicEvents answers with the real hub, and answers the CAPABILITY
 // question from the hub rather than unconditionally: a hub over an appender

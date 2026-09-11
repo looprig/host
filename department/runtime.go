@@ -226,6 +226,11 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	} else {
 		missing = append(missing, "CommandApplier")
 	}
+	if capability, ok := session.(LeaseEpochReporter); ok {
+		adapted.LeaseEpochReporter = capability
+	} else {
+		missing = append(missing, "LeaseEpochReporter")
+	}
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
@@ -250,6 +255,7 @@ type rigRuntime struct {
 	Releaser
 	PublicationSubscriber
 	CommandApplier
+	LeaseEpochReporter
 }
 
 func (r *rigRuntime) SessionID() sessionwire.SessionID { return r.sessionID }

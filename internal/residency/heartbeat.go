@@ -194,7 +194,7 @@ type LostResidency struct {
 	Key             registry.Key
 	AgentID         sessionwire.AgentID
 	CompatibilityID department.CompatibilityID
-	LeaseEpoch      uint64
+	LeaseEpoch      ResidencyEpoch
 	Generation      uint64
 	Runtime         department.Runtime
 	Reason          LossReason
@@ -313,7 +313,7 @@ type Heartbeat struct {
 	key        registry.Key
 	agent      sessionwire.AgentID
 	compat     department.CompatibilityID
-	epoch      uint64
+	epoch      ResidencyEpoch
 	generation uint64
 	runtime    department.Runtime
 
@@ -514,7 +514,7 @@ func (h *Heartbeat) finishRelease(ctx context.Context) error {
 	if err != nil {
 		unwritten = append(unwritten, "residency tombstone: "+err.Error())
 	} else if err := h.fence.write(func() error {
-		return h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, h.epoch)
+		return h.options.Locations.TombstoneResidency(ctx, h.key.TenantID, h.key.SessionID, uint64(h.epoch))
 	}); err != nil {
 		// Y2: the STORE'S error becomes the cause. It was taken from
 		// releasable, which is nil on this path, so the one error that is not
@@ -816,7 +816,7 @@ func (h *Heartbeat) observation(entry registry.Entry, residency sessionwire.Sess
 		InternalEndpoint:       h.options.Host.InternalEndpoint(),
 		Residency:              residency,
 		Accepting:              accepting,
-		LeaseEpoch:             h.epoch,
+		LeaseEpoch:             uint64(h.epoch),
 		ObservedAt:             now,
 		ExpiresAt:              now.Add(h.options.Host.RegistryExpiry()),
 	}

@@ -155,13 +155,19 @@ var _ Admissions = (*service.CapacityPublisher)(nil)
 // ---------------------------------------------------------------------------
 
 const (
-	// testEpoch is the lease epoch every heartbeat fixture runs under. It is
+	// testEpoch is the RESIDENCY epoch every heartbeat fixture runs under. It is
 	// DELIBERATELY NEITHER 0 NOR 1, and neither is the host generation or the
 	// registry generation it must not be confused with: this task has already
 	// lost one probe to a fence stamped with a literal that equalled the
 	// fixture's first epoch. 37, 41 and 1 are three distinct numbers, so a
 	// tombstone or an observation carrying the wrong one is visible.
-	testEpoch uint64 = 37
+	//
+	// ITS TYPE IS THE FOURTH THING IT MUST NOT BE CONFUSED WITH. The runtime's
+	// JOURNAL epoch is a different grant from a different issuer; testkit mints
+	// those from 1. Since O3.4 the distinction is carried by the type as well as
+	// by the number, so a heartbeat that published a journal epoch as the
+	// registry route's lease_epoch does not compile.
+	testEpoch ResidencyEpoch = 37
 
 	testHeartbeatInterval = 5 * time.Second
 )
@@ -202,7 +208,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		teardown:  &fakeTeardown{},
 		lease:     &fakeLease{trace: steps, epoch: testEpoch, lost: make(chan struct{})},
 	}
-	f.runtime = &fakeRuntime{trace: steps, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	f.runtime = &fakeRuntime{trace: steps, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 
 	target := &fakeTarget{
 		trace:         steps,
@@ -259,7 +265,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		Target:          target,
 		CompatibilityID: testCompat,
 		Runtime:         f.runtime,
-		LeaseEpoch:      testEpoch,
+		LeaseEpoch:      uint64(testEpoch),
 	})
 	if !installed {
 		t.Fatal("the seeded residency was not installed")
@@ -373,7 +379,7 @@ func TestEveryHeartbeatCarriesTheCurrentEpochGenerationAndState(t *testing.T) {
 			InternalEndpoint:       testEndpoint,
 			Residency:              residency,
 			Accepting:              accepting,
-			LeaseEpoch:             testEpoch,
+			LeaseEpoch:             uint64(testEpoch),
 			ObservedAt:             at,
 			ExpiresAt:              at.Add(testExpiry),
 		}
@@ -659,7 +665,7 @@ func TestAReplacedResidencyStopsItsHeartbeat(t *testing.T) {
 	if !f.registry.inner.RemoveByGeneration(f.key(), f.entry.Generation) {
 		t.Fatal("the seeded residency could not be removed")
 	}
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	replacement, installed := f.registry.inner.Insert(f.key(), registry.Admission{
 		AgentID: testAgent, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
 	})
@@ -742,7 +748,7 @@ func TestReleaseMarksReleasingPublishesItAndTombstones(t *testing.T) {
 	if releasing.Accepting {
 		t.Error("the release published Accepting true")
 	}
-	if releasing.LeaseEpoch != testEpoch {
+	if releasing.LeaseEpoch != uint64(testEpoch) {
 		t.Errorf("the release published under epoch %d, want the held %d", releasing.LeaseEpoch, testEpoch)
 	}
 	if _, held := f.registry.Get(f.key()); held {
@@ -777,7 +783,7 @@ func TestReleaseWritesTheExpiredEpochTombstoneAgainstItsOwnHighWater(t *testing.
 	if len(tombstones) != 1 {
 		t.Fatalf("%d tombstones were written, want 1", len(tombstones))
 	}
-	if tombstones[0] != testEpoch {
+	if tombstones[0] != uint64(testEpoch) {
 		t.Errorf("the tombstone was stamped with %d, want the lease epoch %d (the host generation is %d and the registry generation is %d)",
 			tombstones[0], testEpoch, testGeneration, f.entry.Generation)
 	}
@@ -1341,7 +1347,7 @@ func TestAReplacedResidencyIsNotReleasedByTheOldHandle(t *testing.T) {
 	if !f.registry.inner.RemoveByGeneration(f.key(), f.entry.Generation) {
 		t.Fatal("the seeded residency could not be removed")
 	}
-	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{})}
+	rival := &fakeRuntime{trace: f.trace, sessionID: testSession, agentID: testAgent, done: make(chan struct{}), journalEpoch: testJournalEpoch, journalHeld: true}
 	replacement, installed := f.registry.inner.Insert(f.key(), registry.Admission{
 		AgentID: testAgent, CompatibilityID: testCompat, Runtime: rival, LeaseEpoch: 99,
 	})

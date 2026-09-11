@@ -810,6 +810,7 @@ var hostRuntimeMethodSet = []string{
 	"AgentID func() v1.AgentID",
 	"ApplyCommand func(context.Context, department.RuntimeCommand) error",
 	"Done func() <-chan struct {}",
+	"LeaseEpoch func() (uint64, bool)",
 	"ReleaseResidency func(context.Context) error",
 	"SessionID func() v1.SessionID",
 	"SubscribeCommitted func(context.Context, v1.EventID) (<-chan v1.EnduringPublication, error)",
@@ -897,6 +898,8 @@ func (fakeRuntime) Done() <-chan struct{} {
 }
 
 func (fakeRuntime) ReleaseResidency(context.Context) error { return nil }
+
+func (fakeRuntime) LeaseEpoch() (uint64, bool) { return 1, true }
 
 func (fakeRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
 	return nil, nil

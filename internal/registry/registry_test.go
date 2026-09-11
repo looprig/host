@@ -57,6 +57,11 @@ func (stubRuntime) ReleaseResidency(context.Context) error {
 	return nil
 }
 
+// LeaseEpoch reports the RUNTIME's journal grant. The base is 1 while
+// residency's lease fake mints residency epochs from 1000, so a registry entry
+// that confused the two would not merely be wrong, it would be visibly wrong.
+func (stubRuntime) LeaseEpoch() (uint64, bool) { return 1, true }
+
 func (stubRuntime) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
 	return nil, nil
 }

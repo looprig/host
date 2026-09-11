@@ -30,7 +30,8 @@ var (
 	_ commands.Applications   = (*sessionstoreadapter.Store)(nil)
 	_ commands.Gates          = (*sessionstoreadapter.Store)(nil)
 	_ commands.InboxWrites    = (*sessionstoreadapter.Store)(nil)
-	_ residency.Lease         = (*sessionstoreadapter.Grant)(nil)
+	_ residency.SessionLeases = (*sessionstoreadapter.Store)(nil)
+	_ residency.Lease         = (*sessionstoreadapter.ResidencyLease)(nil)
 	_ commands.JournalWrites  = (*sessionstoreadapter.Grant)(nil)
 )
 

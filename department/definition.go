@@ -387,9 +387,47 @@ type CommandApplier interface {
 	ApplyCommand(context.Context, RuntimeCommand) error
 }
 
+// LeaseEpochReporter reports the JOURNAL single-writer lease epoch the RUNTIME
+// holds. It is harness v0.33.0's session.LeaseEpochReporter shape, verbatim, for
+// the reason every other shape in this block is verbatim: a capability declared
+// here with a different signature turns a mechanical adapter into a semantic one.
+//
+// IT IS NOT HOST'S GRANT AND MUST NEVER BE SOURCED FROM ONE. A deployment has two
+// monotonic per-session counters — Host's residency grant and the runtime's
+// journal grant — issued by different holders over different namespaces.
+// sessionstore.ResidencyEpoch says in terms that it "must never be compared with,
+// or used as, a journal epoch", and harness checks an admitted command's
+// LeaseEpoch for EQUALITY against the lease the runtime itself holds. A Host that
+// answered this from its own lease would produce work that check rejects, or —
+// worse, in disposition mode — an attempt no evidence can ever match. That the
+// two numbers often agree early in a session's life is an accident of two fresh
+// counters both starting at 1, not a relationship.
+//
+// THE TWO RESULTS ARE THE CONTRACT. held reports whether the runtime holds a
+// lease that reports an epoch AT ALL; the epoch is meaningful only when held is
+// true and is zero otherwise. A caller must branch on held: no pinned provider
+// zeroes a released lease's epoch, so reading the number alone hands back a
+// live-looking dead value once the lease is gone.
+type LeaseEpochReporter interface {
+	LeaseEpoch() (epoch uint64, held bool)
+}
+
 // Runtime is a live agent runtime, expressed as the composition of the narrow
 // capabilities Host consumes. It is deliberately a composition and not one wide
 // interface: nothing here should have to fake six methods to test one.
+//
+// LeaseEpochReporter IS REQUIRED RATHER THAN DISCOVERED, and that is a deviation
+// from the sentence on harness's own capability — "a caller MUST treat a false ok
+// as 'this session does not report a lease epoch', not as an error" — so it is
+// argued rather than assumed. That sentence is about the ASSERTION; the
+// conditional half of the capability is the `held` result, which Host does branch
+// on and never treats as an error. harness pins `var _ session.LeaseEpochReporter
+// = (*Session)(nil)` and states there is no configuration under which its Session
+// lacks the METHOD, so requiring it refuses nothing harness produces. What it does
+// refuse is a WRAPPER that fails to forward it — the hazard harness's own doc
+// names, where a wrapped live session is silently opted out and every later epoch
+// read answers a plausible zero. Host already requires Releaser on the same
+// argument, so this is the established rule here and not one invented for it.
 type Runtime interface {
 	Identity
 	IdleWaiter
@@ -397,6 +435,7 @@ type Runtime interface {
 	Releaser
 	PublicationSubscriber
 	CommandApplier
+	LeaseEpochReporter
 }
 
 // ---------------------------------------------------------------------------
