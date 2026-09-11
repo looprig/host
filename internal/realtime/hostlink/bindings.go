@@ -162,6 +162,36 @@ const (
 	// statements about ownership and a malformed body is a statement about the
 	// caller.
 	RefusalMalformedRequest Refusal = "malformed_request"
+
+	// RefusalWrongDrainScope reports a session-scoped drain this Host cannot
+	// answer: either it holds no fixed session and is drained as a whole, or
+	// it holds one and the request names a different session.
+	//
+	// The two grounds share a value ON PURPOSE, unlike every other pair here.
+	// Telling them apart would tell a caller whether this Host is dedicated
+	// and to which session, which is the same disclosure the unheld-session
+	// refusal exists to prevent. The Reason string carries the difference for
+	// the operator; the value does not.
+	RefusalWrongDrainScope Refusal = "wrong_drain_scope"
+
+	// RefusalDrainUnsupported reports a Host composed without a drain state
+	// machine. It is a DEPLOYMENT defect: this Host can never be drained
+	// gracefully, and no retry will change that.
+	RefusalDrainUnsupported Refusal = "drain_unsupported"
+
+	// RefusalDrainUnavailable reports a drain state machine that could not
+	// begin, or that answered with a status Core refuses to publish. It is a
+	// RUNNING-HOST condition — a process already shutting down is the ordinary
+	// case — and it is separate from RefusalDrainUnsupported because a retry
+	// or a different Host is the repair for one and a redeploy is the repair
+	// for the other.
+	RefusalDrainUnavailable Refusal = "drain_unavailable"
+
+	// RefusalNoDrainInProgress reports a status observation on a Host that has
+	// begun no drain covering that scope. It is NOT a drained observation, and
+	// the distinction is what stops a Factory whose drain request never
+	// arrived from reading silence as completion.
+	RefusalNoDrainInProgress Refusal = "no_drain_in_progress"
 )
 
 // BindError reports a declined bind, unbind or command delivery.
@@ -261,6 +291,29 @@ type MultiplexerOptions struct {
 	Admission   Admission
 	Consumers   CommandConsumers
 
+	// DrainStarter and DrainObserver are the drain state machine this Host's
+	// HostLink may begin and observe. They are OPTIONAL AND PAIRED: supplying
+	// one without the other is refused, because a Host that can be told to
+	// drain and cannot be asked how it is going, or the reverse, is a Factory
+	// bug discovered in production instead of at construction.
+	//
+	// Their ABSENCE IS A REFUSAL AND NOT A DEFAULT. A Multiplexer built
+	// without them answers both drain RPCs with RefusalDrainUnsupported, so a
+	// Host with no drain to run cannot be made to look as though it started
+	// one. That is the same shape as Config.Multiplexer's own absence.
+	DrainStarter  DrainStarter
+	DrainObserver DrainObserver
+
+	// FixedSessionID is the sole session a DEDICATED Host holds, and its zero
+	// value means this Host is pooled.
+	//
+	// It is read by the drain path only. It is NOT a second admission rule:
+	// nothing on the bind path consults it, and the dedicated-attach refusal
+	// lives in the residency manager where the durable state is. Putting a
+	// second copy of "which sessions may this Host hold" on the routing table
+	// would be two answers to one question.
+	FixedSessionID sessionwire.SessionID
+
 	// MaxBindingsPerLink and MaxBindings bound what one link and the whole
 	// Host may hold. A binding is not free — it is a subscription and an
 	// enduring-event queue — so an unbounded one is an unbounded Host.
@@ -288,8 +341,13 @@ type Multiplexer struct {
 	residencies Residencies
 	admission   Admission
 	consumers   CommandConsumers
-	perLink     int
-	total       int
+
+	drainStarter  DrainStarter
+	drainObserver DrainObserver
+	fixedSession  sessionwire.SessionID
+
+	perLink int
+	total   int
 
 	mu    sync.Mutex
 	links map[LinkID]map[string]Binding
@@ -322,15 +380,29 @@ func NewMultiplexer(options MultiplexerOptions) (*Multiplexer, error) {
 	if options.MaxBindings <= 0 {
 		return nil, &InvalidMultiplexerOptionsError{Field: "MaxBindings", Reason: "must be positive"}
 	}
+	if options.DrainStarter != nil && options.DrainObserver == nil {
+		return nil, &InvalidMultiplexerOptionsError{Field: "DrainObserver", Reason: "is required alongside DrainStarter; a drain nobody can observe is one Factory cannot wait for"}
+	}
+	if options.DrainObserver != nil && options.DrainStarter == nil {
+		return nil, &InvalidMultiplexerOptionsError{Field: "DrainStarter", Reason: "is required alongside DrainObserver; a drain nobody can begin has nothing to observe"}
+	}
+	if options.FixedSessionID != "" {
+		if err := options.FixedSessionID.Validate(); err != nil {
+			return nil, &InvalidMultiplexerOptionsError{Field: "FixedSessionID", Reason: "must be a valid Core session ID; a dedicated Host cannot hold a session Core refuses"}
+		}
+	}
 	return &Multiplexer{
-		tenant:      options.TenantID,
-		hostID:      options.HostID,
-		generation:  options.HostGeneration,
-		residencies: options.Residencies,
-		admission:   options.Admission,
-		consumers:   options.Consumers,
-		perLink:     options.MaxBindingsPerLink,
-		total:       options.MaxBindings,
+		tenant:        options.TenantID,
+		hostID:        options.HostID,
+		generation:    options.HostGeneration,
+		residencies:   options.Residencies,
+		admission:     options.Admission,
+		consumers:     options.Consumers,
+		drainStarter:  options.DrainStarter,
+		drainObserver: options.DrainObserver,
+		fixedSession:  options.FixedSessionID,
+		perLink:       options.MaxBindingsPerLink,
+		total:         options.MaxBindings,
 	}, nil
 }
 
@@ -703,7 +775,8 @@ var MaxChannelBytes = len(ChannelPrefix) + 1 + 2*base64.RawURLEncoding.EncodedLe
 // Transport dispatch
 // ---------------------------------------------------------------------------
 
-// MethodBind and MethodUnbind are the two reserved RPC method names. Any other
+// MethodBind and MethodUnbind are two of the four reserved RPC method names;
+// MethodDrain and MethodDrainStatus in drain.go are the others. Any other
 // method is treated as a channel and resolved by exact lookup against the
 // routes this link holds, so a command delivery names its binding and carries
 // only a CommandID in its body.
@@ -722,9 +795,15 @@ var errUnroutableRPC = errors.New("hostlink: the RPC body is not a valid Core re
 // HostLinkError as its body, which is the whole reply contract: a Factory needs
 // no out-of-band signal to tell them apart because an empty body cannot be a
 // valid HostLinkError — Core's own Validate refuses an absent code.
+//
+// THE TWO DRAIN METHODS ARE THE EXCEPTION and leave through their own return,
+// because an acknowledgement carries a generation and so cannot be empty. See
+// dispatchDrain for what keeps their two bodies apart.
 func (m *Multiplexer) dispatch(link LinkID, method string, data []byte) ([]byte, error) {
 	var err error
 	switch method {
+	case MethodDrain, MethodDrainStatus:
+		return m.dispatchDrain(method, data)
 	case MethodBind:
 		var request sessionwire.HostLinkBindRequest
 		if decodeErr := json.Unmarshal(data, &request); decodeErr != nil {

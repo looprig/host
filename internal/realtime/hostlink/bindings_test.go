@@ -507,28 +507,51 @@ func mustFailBind(t *testing.T, mux *hostlink.Multiplexer, link hostlink.LinkID,
 // TestRefusalsAreDistinguishableWhereTheWireIsNot pins the deliberate
 // narrowing rather than leaving it to be read off the table above.
 //
-// Seven of the twelve refusals share a Core class with at least one other —
-// five publish runtime_unavailable and two publish no_capacity — so the local
+// Eleven of the SIXTEEN refusals share a Core class with at least one other —
+// nine publish runtime_unavailable and two publish no_capacity — so the local
 // value is the only thing keeping those paths apart, and a duplicated string
 // would silently merge two of them. Every constant is listed here, which is
 // what makes each one's VALUE read by something: comparing the enum symbols
 // alone would survive two of them being spelled identically.
+//
+// THE LIST IS NO LONGER HAND-MAINTAINED ALONE. O5.4 added four refusals and a
+// fifth would have been forgotten the same way: a constant absent from the
+// slice below is a refusal whose value nothing reads, and the suite stays
+// green. assertEveryRefusalConstantIsListed derives the set from the package's
+// own declarations, so the enumeration is of CONSUMERS and the rules stay the
+// side that grows.
+//
+// O5.4's four are the drain ones, and the pair most at risk of being collapsed
+// is unsupported/unavailable: the first says this Host was composed without a
+// drain state machine, and the second says the machine it has could not start
+// or could not answer. Those are a deployment defect and a running-Host
+// condition respectively.
 func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 	t.Parallel()
 
-	all := []hostlink.Refusal{
-		hostlink.RefusalForeignTenant,
-		hostlink.RefusalUnknownSession,
-		hostlink.RefusalForeignHost,
-		hostlink.RefusalStaleHostGeneration,
-		hostlink.RefusalEpochMismatch,
-		hostlink.RefusalRuntimeMismatch,
-		hostlink.RefusalReleasing,
-		hostlink.RefusalHostNotAdmitting,
-		hostlink.RefusalNoLinkCapacity,
-		hostlink.RefusalNoHostCapacity,
-		hostlink.RefusalNotBound,
-		hostlink.RefusalMalformedRequest,
+	named := map[string]hostlink.Refusal{
+		"RefusalForeignTenant":       hostlink.RefusalForeignTenant,
+		"RefusalUnknownSession":      hostlink.RefusalUnknownSession,
+		"RefusalForeignHost":         hostlink.RefusalForeignHost,
+		"RefusalStaleHostGeneration": hostlink.RefusalStaleHostGeneration,
+		"RefusalEpochMismatch":       hostlink.RefusalEpochMismatch,
+		"RefusalRuntimeMismatch":     hostlink.RefusalRuntimeMismatch,
+		"RefusalReleasing":           hostlink.RefusalReleasing,
+		"RefusalHostNotAdmitting":    hostlink.RefusalHostNotAdmitting,
+		"RefusalNoLinkCapacity":      hostlink.RefusalNoLinkCapacity,
+		"RefusalNoHostCapacity":      hostlink.RefusalNoHostCapacity,
+		"RefusalNotBound":            hostlink.RefusalNotBound,
+		"RefusalMalformedRequest":    hostlink.RefusalMalformedRequest,
+		"RefusalWrongDrainScope":     hostlink.RefusalWrongDrainScope,
+		"RefusalDrainUnsupported":    hostlink.RefusalDrainUnsupported,
+		"RefusalDrainUnavailable":    hostlink.RefusalDrainUnavailable,
+		"RefusalNoDrainInProgress":   hostlink.RefusalNoDrainInProgress,
+	}
+	assertEveryRefusalConstantIsListed(t, named)
+
+	all := make([]hostlink.Refusal, 0, len(named))
+	for _, refusal := range named {
+		all = append(all, refusal)
 	}
 	seen := map[hostlink.Refusal]bool{}
 	for _, refusal := range all {
@@ -546,13 +569,81 @@ func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 	// The subset that shares one Core class is where a duplicate would do the
 	// most damage, so it is named rather than left implicit.
 	for _, group := range [][]hostlink.Refusal{
-		{hostlink.RefusalForeignTenant, hostlink.RefusalUnknownSession, hostlink.RefusalForeignHost, hostlink.RefusalStaleHostGeneration, hostlink.RefusalNotBound},
+		{
+			hostlink.RefusalForeignTenant, hostlink.RefusalUnknownSession, hostlink.RefusalForeignHost,
+			hostlink.RefusalStaleHostGeneration, hostlink.RefusalNotBound, hostlink.RefusalWrongDrainScope,
+			hostlink.RefusalDrainUnsupported, hostlink.RefusalDrainUnavailable, hostlink.RefusalNoDrainInProgress,
+		},
 		{hostlink.RefusalNoLinkCapacity, hostlink.RefusalNoHostCapacity},
 	} {
 		for index, refusal := range group {
 			if slices.Index(group, refusal) != index {
 				t.Fatalf("refusal %q is repeated inside one wire class", refusal)
 			}
+		}
+	}
+}
+
+// assertEveryRefusalConstantIsListed derives the Refusal constants this package
+// declares and holds the caller's list to exactly that set.
+//
+// It reads the package's DECLARATIONS rather than a list of files or a count,
+// so a refusal added in a new file is covered without this helper being
+// touched. It fails at zero constants, which is what stops a renamed type or a
+// moved declaration block from turning the whole check into a vacuous pass.
+func assertEveryRefusalConstantIsListed(t *testing.T, listed map[string]hostlink.Refusal) {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the hostlink package directory: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	declared := map[string]bool{}
+	var production int
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		production++
+		file, err := parser.ParseFile(fileSet, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, declaration := range file.Decls {
+			general, isGeneral := declaration.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range general.Specs {
+				value, isValue := spec.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				identifier, isIdentifier := value.Type.(*ast.Ident)
+				if !isIdentifier || identifier.Name != "Refusal" {
+					continue
+				}
+				for _, name := range value.Names {
+					declared[name.Name] = true
+				}
+			}
+		}
+	}
+	if production == 0 {
+		t.Fatal("no production files were parsed, so this check proves nothing")
+	}
+	if len(declared) == 0 {
+		t.Fatal("no Refusal constants were found, so this check proves nothing")
+	}
+	for name := range declared {
+		if _, covered := listed[name]; !covered {
+			t.Fatalf("hostlink.%s is declared and not listed, so nothing reads its value", name)
+		}
+	}
+	for name := range listed {
+		if !declared[name] {
+			t.Fatalf("%q is listed and not declared as a Refusal constant", name)
 		}
 	}
 }
