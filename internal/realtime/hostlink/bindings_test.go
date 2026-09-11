@@ -620,8 +620,7 @@ func assertEveryRefusalConstantIsListed(t *testing.T, listed map[string]hostlink
 				if !isValue {
 					continue
 				}
-				identifier, isIdentifier := value.Type.(*ast.Ident)
-				if !isIdentifier || identifier.Name != "Refusal" {
+				if !declaresRefusal(value) {
 					continue
 				}
 				for _, name := range value.Names {
@@ -646,6 +645,30 @@ func assertEveryRefusalConstantIsListed(t *testing.T, listed map[string]hostlink
 			t.Fatalf("%q is listed and not declared as a Refusal constant", name)
 		}
 	}
+}
+
+// declaresRefusal reports whether one const spec declares Refusal values.
+//
+// IT READS BOTH SPELLINGS, and the second is a gap a probe found in the first
+// version of this derivation. `RefusalX Refusal = "x"` carries the type on the
+// SPEC; `RefusalX = Refusal("x")` carries it on the VALUE, as a conversion, and
+// a Type-only check silently skipped it — which is the same hole the
+// hand-maintained list had, reintroduced by the thing that replaced it. Go
+// accepts both spellings and so must this.
+func declaresRefusal(value *ast.ValueSpec) bool {
+	if identifier, isIdentifier := value.Type.(*ast.Ident); isIdentifier && identifier.Name == "Refusal" {
+		return true
+	}
+	for _, expression := range value.Values {
+		call, isCall := expression.(*ast.CallExpr)
+		if !isCall {
+			continue
+		}
+		if identifier, isIdentifier := call.Fun.(*ast.Ident); isIdentifier && identifier.Name == "Refusal" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestForeignTenantBindReadsNoResidencyAtAll is the non-leak half of the

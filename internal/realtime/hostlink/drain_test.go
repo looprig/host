@@ -6,10 +6,14 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
@@ -52,6 +56,25 @@ type stubDrains struct {
 	drainState sessionwire.HostLinkDrainState
 	generation uint64
 	startErr   error
+
+	// entered counts entries to StartDrain WITHOUT taking the mutex, so a test
+	// can synchronise on the call having arrived even when the call is holding
+	// something. A predicate that needed this fake's own lock deadlocked
+	// against a blocked StartDrain and turned an assertion into a ten-minute
+	// hang, which is not a kill.
+	entered atomic.Int64
+
+	// block makes StartDrain GENUINELY BLOCK until it is released.
+	//
+	// IT EXISTS BECAUSE A FAKE THAT CANNOT BE SLOW CANNOT EXPOSE A HANDLER THAT
+	// SERIALIZES. The six-property audit in internal/lifecycle compares
+	// BEHAVIOUR, not blocking, so the timing axis was invisible to it — and the
+	// production machine did once block its own status observation for the
+	// whole of a publication. The stub is the only place this package can put
+	// that axis, and the lock is released before blocking on purpose: a fake
+	// that blocked while holding its own mutex would fail the test below for
+	// the FAKE's reason rather than the handler's.
+	block chan struct{}
 }
 
 func newStubDrains() *stubDrains {
@@ -59,13 +82,22 @@ func newStubDrains() *stubDrains {
 }
 
 func (d *stubDrains) StartDrain(scope hostlink.DrainScope) (hostlink.DrainStatus, error) {
+	d.entered.Add(1)
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.starts++
 	d.scopes = append(d.scopes, scope)
 	if d.startErr != nil {
-		return hostlink.DrainStatus{}, d.startErr
+		err := d.startErr
+		d.mu.Unlock()
+		return hostlink.DrainStatus{}, err
 	}
+	block := d.block
+	d.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if !d.begun {
 		d.begun = true
 		d.begins++
@@ -957,50 +989,85 @@ func TestOnlyAnAuthenticatedServicePrincipalReachesTheDrainRPC(t *testing.T) {
 	assertOneConnectGateAuthenticatingFirst(t)
 }
 
-// assertOneConnectGateAuthenticatingFirst parses this package's own transport
-// file and holds the mechanism the test above depends on.
+// assertOneConnectGateAuthenticatingFirst holds the mechanism the test above
+// depends on: this package installs exactly ONE connect gate, and it
+// authenticates before it does anything else.
 //
-// It is a STRUCTURAL check because the property is about what exists, not about
-// what one connection did: a second OnConnecting registration that skipped
-// VerifyTenant would leave every behavioural test in this file green, since
-// they all dial the gate that does authenticate. It fails at zero files and at
-// zero registrations, so a renamed file or a rewritten transport is a failure
-// rather than a silent pass.
+// It is a STRUCTURAL check because the property is about what EXISTS, not about
+// what one connection did: a gate that skipped VerifyTenant would leave every
+// behavioural test in this file green, since they all dial the gate that does
+// authenticate.
+//
+// IT WALKS THE WHOLE PACKAGE, and that is the correction a probe forced. An
+// earlier version parsed a hard-coded "centrifuge.go". centrifuge@v0.38.0's
+// Node.OnConnecting is a SILENT SETTER — the last registration wins and none of
+// them is refused — so a second gate declared in ANY OTHER FILE of this package
+// installed the exact defect this guard exists to catch and the whole suite
+// stayed green. The two sibling guards in this module already walked their
+// directories; this one did not, and the inconsistency was the tell.
+//
+// It fails at zero production files and at zero registrations, so a renamed
+// file or a rewritten transport is a failure rather than a silent pass.
 func assertOneConnectGateAuthenticatingFirst(t *testing.T) {
 	t.Helper()
-	const source = "centrifuge.go"
-	file, err := parser.ParseFile(token.NewFileSet(), source, nil, 0)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse %s: %v", source, err)
+		t.Fatalf("read the hostlink package directory: %v", err)
 	}
+	fileSet := token.NewFileSet()
 
-	var gates []*ast.FuncLit
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, isCall := node.(*ast.CallExpr)
-		if !isCall {
+	type connectGate struct {
+		file string
+		line int
+		body *ast.FuncLit
+	}
+	var gates []connectGate
+	var production int
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		production++
+		file, err := parser.ParseFile(fileSet, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			selector, isSelector := call.Fun.(*ast.SelectorExpr)
+			if !isSelector || selector.Sel.Name != "OnConnecting" || len(call.Args) != 1 {
+				return true
+			}
+			literal, isLiteral := call.Args[0].(*ast.FuncLit)
+			if !isLiteral {
+				t.Fatalf("%s: OnConnecting is registered with a non-literal handler, which this check cannot read", name)
+			}
+			gates = append(gates, connectGate{file: name, line: fileSet.Position(call.Pos()).Line, body: literal})
 			return true
-		}
-		selector, isSelector := call.Fun.(*ast.SelectorExpr)
-		if !isSelector || selector.Sel.Name != "OnConnecting" || len(call.Args) != 1 {
-			return true
-		}
-		literal, isLiteral := call.Args[0].(*ast.FuncLit)
-		if !isLiteral {
-			t.Fatalf("%s: OnConnecting is registered with a non-literal handler, which this check cannot read", source)
-		}
-		gates = append(gates, literal)
-		return true
-	})
+		})
+	}
+	if production == 0 {
+		t.Fatal("no production files were parsed, so this check proves nothing")
+	}
 	if len(gates) != 1 {
-		t.Fatalf("%s registers %d connect gates, want exactly one; a second gate is a second principal class", source, len(gates))
+		where := make([]string, len(gates))
+		for index, gate := range gates {
+			where[index] = gate.file + ":" + strconv.Itoa(gate.line)
+		}
+		t.Fatalf("this package registers %d connect gates (%v), want exactly one; "+
+			"Node.OnConnecting is a silent setter, so a second gate is a second principal class", len(gates), where)
 	}
 
-	first := gates[0].Body.List
-	if len(first) == 0 {
-		t.Fatalf("%s: the connect gate is empty", source)
+	gate := gates[0]
+	if len(gate.body.Body.List) == 0 {
+		t.Fatalf("%s:%d: the connect gate is empty", gate.file, gate.line)
 	}
 	var verified bool
-	ast.Inspect(first[0], func(node ast.Node) bool {
+	ast.Inspect(gate.body.Body.List[0], func(node ast.Node) bool {
 		selector, isSelector := node.(*ast.SelectorExpr)
 		if isSelector && selector.Sel.Name == "VerifyTenant" {
 			verified = true
@@ -1008,8 +1075,76 @@ func assertOneConnectGateAuthenticatingFirst(t *testing.T) {
 		return !verified
 	})
 	if !verified {
-		t.Fatalf("%s: the connect gate does not call Authenticator.VerifyTenant as its first statement, "+
-			"so a connection can reach a handler before presenting a service credential", source)
+		t.Fatalf("%s:%d: the connect gate does not call Authenticator.VerifyTenant as its first statement, "+
+			"so a connection can reach a handler before presenting a service credential", gate.file, gate.line)
+	}
+}
+
+// TestAStatusRPCIsAnsweredWhileADrainRPCIsStillStarting is the timing axis of
+// the Class 4 audit, which the behavioural audit could not see.
+//
+// The handler holds no lock of its own, so `drain_status` must be answerable
+// while `drain` is still inside the state machine. That was not a hypothetical:
+// the production machine held one mutex across its nonaccepting publication, so
+// the status observation — the RPC whose whole purpose is answering a Factory
+// promptly — blocked for the entire write. The fix is in internal/lifecycle;
+// what belongs HERE is the property that the transport adds no serialization of
+// its own, and a fake able to express the delay so that the property is
+// testable at all.
+//
+// "IS ANSWERED PROMPTLY" IS A NOTHING-HAPPENED CLAIM, so the blocked start is
+// the positive control: the test asserts the drain RPC has NOT returned at the
+// moment the status RPC is answered.
+func TestAStatusRPCIsAnsweredWhileADrainRPCIsStillStarting(t *testing.T) {
+	t.Parallel()
+	f := newDrainFixture(t)
+	release := make(chan struct{})
+	f.drains.block = release
+
+	acknowledged := make(chan sessionwire.HostLinkDrainObservation, 1)
+	go func() { acknowledged <- mustStartDrain(t, f.mux, drainRequest()) }()
+	waitFor(t, "the drain to reach the state machine", func() bool { return f.drains.entered.Load() > 0 })
+
+	// THE POSITIVE CONTROL: the starter is genuinely blocked.
+	select {
+	case observation := <-acknowledged:
+		t.Fatalf("the drain RPC returned %+v while its state machine was still blocked, "+
+			"so this test's control does not block and proves nothing", observation)
+	default:
+	}
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := f.mux.ObserveDrain(drainRequest())
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		// No drain has begun yet — the starter has not returned — so the
+		// bounded observation correctly refuses rather than inventing one.
+		refusal := refusedDrain(t, err)
+		if refusal.Refusal != hostlink.RefusalNoDrainInProgress {
+			t.Fatalf("refusal = %q, want %q", refusal.Refusal, hostlink.RefusalNoDrainInProgress)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the status RPC blocked behind an in-flight drain RPC, so the handler serializes the two")
+	}
+
+	close(release)
+	if observation := <-acknowledged; observation.DrainGeneration != testDrainGeneration {
+		t.Fatalf("acknowledgement = %+v, want generation %d", observation, testDrainGeneration)
+	}
+}
+
+// waitFor spins on a STATE PREDICATE rather than a duration.
+func waitFor(t *testing.T, what string, reached func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !reached() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

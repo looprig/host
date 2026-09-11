@@ -167,13 +167,40 @@ type Options struct {
 
 	// Grace is the whole drain's bound — the platform's termination grace, less
 	// whatever margin the composition keeps for its own shutdown. When it
-	// expires, every outstanding idle wait is cancelled and cleanup continues.
+	// expires, every outstanding idle wait is cancelled, any wait whose session
+	// has not answered that cancellation is ABANDONED with ErrWaitAbandoned,
+	// and cleanup continues.
+	//
+	// The abandonment is the part that makes this a bound. Cancelling a context
+	// only asks; a session that ignores it would otherwise hold this drain past
+	// any grace at all.
 	Grace time.Duration
 
 	// IdleBoundary is one session's bound on reaching idle. It must not exceed
 	// Grace: a per-session wait longer than the whole drain's is a bound that
 	// can never be the one that fires, which reads as a policy and is not one.
 	IdleBoundary time.Duration
+
+	// PublishBound is how long StartDrain will wait for the nonaccepting
+	// publication before refusing the drain.
+	//
+	// IT BOUNDS THE ACKNOWLEDGEMENT, which is a synchronous RPC. DrainStarter
+	// takes no context by design — the RPC acknowledges initiation, so a
+	// caller-supplied deadline would be a deadline on the wrong event — and
+	// that left the publication with no bound at all: an Advertiser that never
+	// returned hung the drain RPC forever. The context handed to
+	// PublishNonaccepting is cancelled when this expires AND the wait for its
+	// answer ends, so the bound holds whether or not the Advertiser honours
+	// cancellation.
+	//
+	// EXPIRY REFUSES THE DRAIN rather than proceeding. This Host cannot say
+	// nonaccepting was published, so it must not act as though it were; the
+	// ledger stays stopped and a retry may find the write landed after all,
+	// which is safe because the publication is idempotent at the store.
+	//
+	// It must not exceed Grace: an acknowledgement that could outlive the whole
+	// drain's bound is not an acknowledgement of anything.
+	PublishBound time.Duration
 }
 
 // InvalidOptionsError reports an option a Drainer may not run with.
@@ -230,11 +257,15 @@ type Report struct {
 	// drained Host with failures is drained: the cleanup ran to the end and
 	// these are what an operator must reconcile.
 	//
-	// CORE'S BOUNDED STATE CANNOT EXPRESS THEM. HostLinkDrainState has exactly
-	// two values, so a Factory polling the drain-status RPC sees `drained`
-	// whether or not a step refused. That is a real limit of the published
-	// wire contract and not a decision taken here; the Failures are how a
-	// process-local caller and an operator tell the two apart.
+	// CORE'S BOUNDED STATE CANNOT EXPRESS MOST OF THEM. HostLinkDrainState has
+	// exactly two values, so a Factory polling the drain-status RPC cannot see
+	// a failed checkpoint, a missed idle boundary or a refused ReleaseResidency
+	// at all; these Failures are how a process-local caller and an operator
+	// tell them apart. That is a limit of the published wire contract.
+	//
+	// THE ONE IT CAN EXPRESS IS THE ONE THAT DESTROYS WORK. A refused
+	// FinishRelease means release did not finish, so State stays `draining` and
+	// a Factory does not delete the workload. See settledState.
 	Failures []Failure
 }
 
@@ -246,6 +277,21 @@ type Report struct {
 // the session, so a caller tells "this session would not settle" from "this
 // session reported an error while settling" with errors.Is.
 var ErrIdleBoundary = errors.New("lifecycle: the session did not reach its safe boundary in time")
+
+// ErrWaitAbandoned marks an idle wait this drain STOPPED WAITING ON because the
+// platform grace expired before the session answered its cancellation.
+//
+// It is a strictly worse condition than ErrIdleBoundary alone and is reported
+// alongside it, never instead of it. The session's WaitIdle goroutine may still
+// be running: this Host has given up on hearing from it, which is what makes
+// Grace a bound rather than a request.
+var ErrWaitAbandoned = errors.New("lifecycle: the session did not answer cancellation before the platform grace expired")
+
+// ErrPublishBound reports a nonaccepting publication that did not answer within
+// Options.PublishBound. The drain is REFUSED: this Host cannot say the write
+// landed, and a drain that proceeded on that assumption would release sessions
+// a Factory is still routing work to.
+var ErrPublishBound = errors.New("lifecycle: the nonaccepting publication did not complete within its bound")
 
 // Drainer is this Host's single drain, and is safe for concurrent use.
 //
@@ -262,6 +308,19 @@ type Drainer struct {
 	begun      bool
 	drainState sessionwire.HostLinkDrainState
 	failures   []Failure
+
+	// ledgerStopped records that Admissions.BeginDrain has been called, so a
+	// retry after a refused publication does not stop admission twice. It is
+	// separate from begun because the ledger deliberately stays stopped through
+	// a refusal: this Host has stopped admitting either way.
+	ledgerStopped bool
+
+	// starting and settled are the in-flight publication. A concurrent caller
+	// waits on settled and is then answered from the state that attempt left
+	// behind, rather than mounting a second publication of its own.
+	starting bool
+	settled  chan struct{}
+	startErr error
 
 	// done is closed once cleanup has finished. It is created by the call that
 	// begins the drain, so Wait on an unbegun Drainer cannot block on a channel
@@ -297,6 +356,12 @@ func NewDrainer(options Options) (*Drainer, error) {
 	if options.IdleBoundary > options.Grace {
 		return nil, &InvalidOptionsError{Field: "IdleBoundary", Reason: "must not exceed Grace; a per-session bound longer than the whole drain's can never be the one that fires"}
 	}
+	if options.PublishBound <= 0 {
+		return nil, &InvalidOptionsError{Field: "PublishBound", Reason: "must be positive; an unbounded nonaccepting publication is a drain RPC that can hang forever"}
+	}
+	if options.PublishBound > options.Grace {
+		return nil, &InvalidOptionsError{Field: "PublishBound", Reason: "must not exceed Grace; an acknowledgement that can outlive the whole drain's bound acknowledges nothing"}
+	}
 	return &Drainer{options: options, drainState: sessionwire.HostLinkDrainStateDraining}, nil
 }
 
@@ -307,14 +372,22 @@ func NewDrainer(options Options) (*Drainer, error) {
 // durably published before this returns, and no checkpoint, no ReleaseResidency
 // and no tombstone has run when it does.
 //
-// THE TRANSITION IS NOT OBSERVABLE HALF-DONE, and the mutex is what makes that
-// true rather than the ordering alone. The ledger flip, the publication, the
-// `begun` flag and the resident snapshot all happen inside ONE critical
-// section, so a concurrent ObserveDrain cannot land between the publication and
-// the drain becoming observable, and a concurrent StartDrain cannot begin a
-// second machine. TestTheDrainTransitionIsNotObservableHalfDone probes the
-// interleavings and carries the positive control that makes its silence mean
-// something.
+// THE TRANSITION IS NOT OBSERVABLE HALF-DONE, and what makes that true is the
+// ORDER OF THE STATE WRITES under the lock, not the lock being held for the
+// whole thing. The ledger flip happens under the lock before the publication
+// starts; `begun`, `done` and the resident snapshot are written under the lock
+// only after it has returned. So no observer can see nonaccepting published by
+// a Host still admitting, and none can see a drain that has not been published.
+// A concurrent StartDrain cannot begin a second machine because `starting` is
+// set in the same critical section as the ledger flip.
+//
+// The publication itself runs WITHOUT the lock, deliberately: holding it there
+// blocked ObserveDrain and Wait for the whole publication, which made the
+// bounded status observation unbounded.
+// TestTheDrainTransitionIsNotObservableHalfDone probes the interleavings and
+// carries the positive control that makes its silence mean something, and
+// TestTheStatusObservationIsAnsweredWhileTheDrainIsStillPublishing holds the
+// half that regressed.
 //
 // The scope is recorded and not branched on. A dedicated Host holds one
 // session, so draining that session and draining the Host are the same work;
@@ -326,18 +399,56 @@ func (d *Drainer) StartDrain(hostlink.DrainScope) (hostlink.DrainStatus, error) 
 		d.mu.Unlock()
 		return status, nil
 	}
+	if d.starting {
+		// Another caller is publishing. Wait for THAT attempt and answer from
+		// what it left behind, rather than mounting a second publication: two
+		// concurrent requests are one drain, and a thundering herd of retries
+		// against a slow store is the opposite of stopping admission.
+		settled := d.settled
+		d.mu.Unlock()
+		<-settled
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.begun {
+			return hostlink.DrainStatus{Generation: d.options.Generation, State: d.drainState}, nil
+		}
+		return hostlink.DrainStatus{}, d.startErr
+	}
 
-	// The ledger flips FIRST and the publication follows, so a Factory that
-	// reaches the store between the two finds an accepting Host at worst and
-	// never a Host that has published nonaccepting while still admitting.
-	d.options.Admissions.BeginDrain()
-	if err := d.options.Advertiser.PublishNonaccepting(context.Background()); err != nil {
+	// The ledger flips FIRST, and inside the lock, so a Factory that reaches
+	// the store between the two finds an accepting Host at worst and never a
+	// Host that has published nonaccepting while still admitting. It flips ONCE
+	// EVER — a retry after a refused publication does not stop admission again.
+	if !d.ledgerStopped {
+		d.options.Admissions.BeginDrain()
+		d.ledgerStopped = true
+	}
+	d.starting = true
+	settled := make(chan struct{})
+	d.settled = settled
+	d.mu.Unlock()
+
+	// THE LOCK IS RELEASED ACROSS THE PUBLICATION, and that is a correction a
+	// gate forced rather than the original design. Holding it made ObserveDrain
+	// and Wait block for the whole publication — an unbounded, uncancellable
+	// wait on the one RPC whose entire purpose is to answer promptly. Releasing
+	// it costs nothing the atomicity claim depends on: `begun` is still set
+	// only after the publication returns, so no observer can see a drain that
+	// has not been published, and `starting` is what keeps the transition
+	// single-owner.
+	err := d.publish()
+
+	d.mu.Lock()
+	d.starting = false
+	d.startErr = err
+	if err != nil {
 		// NOT recorded and continued past, unlike every other failure here.
 		// Nothing downstream knows this drain began, so continuing would
 		// release sessions a Factory is still routing work to. The ledger stays
-		// flipped — this Host has stopped admitting either way — and the caller
+		// stopped — this Host has stopped admitting either way — and the caller
 		// may retry.
 		d.mu.Unlock()
+		close(settled)
 		return hostlink.DrainStatus{}, err
 	}
 
@@ -346,9 +457,33 @@ func (d *Drainer) StartDrain(hostlink.DrainScope) (hostlink.DrainStatus, error) 
 	sessions := d.options.Residents.ResidentSessions()
 	status := hostlink.DrainStatus{Generation: d.options.Generation, State: d.drainState}
 	d.mu.Unlock()
+	close(settled)
 
 	go d.run(sessions)
 	return status, nil
+}
+
+// publish makes this Host's stopped admission durable, bounded by
+// Options.PublishBound.
+//
+// THE BOUND HOLDS WHETHER OR NOT THE ADVERTISER HONOURS CANCELLATION. The
+// context is cancelled, which is the cooperative half, and the wait for the
+// answer ends regardless, which is the half that makes it a bound. An expiry is
+// a REFUSAL: this Host cannot claim the row landed.
+func (d *Drainer) publish() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	published := make(chan error, 1)
+	go func() { published <- d.options.Advertiser.PublishNonaccepting(ctx) }()
+
+	select {
+	case err := <-published:
+		return err
+	case <-d.options.Clock.After(d.options.PublishBound):
+		cancel()
+		return ErrPublishBound
+	}
 }
 
 // ObserveDrain reports this Host's drain and starts nothing.
@@ -419,10 +554,41 @@ func (d *Drainer) run(sessions []Session) {
 	}
 
 	d.mu.Lock()
-	d.drainState = sessionwire.HostLinkDrainStateDrained
+	d.drainState = d.settledState()
 	done := d.done
 	d.mu.Unlock()
 	close(done)
+}
+
+// settledState is the Core state this drain finishes in, and it is NOT
+// unconditionally drained.
+//
+// Core defines HostLinkDrainStateDrained as "the observed scope has FINISHED
+// RELEASE". A session whose FinishRelease refused has not: its epoch-fenced
+// tombstone was not written or its lease was not released. Reporting `drained`
+// there is not merely imprecise — it is the signal a Factory deletes a
+// dedicated workload on, so it destroys work whose lease this Host still holds.
+//
+// THIS IS THE ONE PLACE THIS PACKAGE DOES NOT DO WHAT O6.3's PROSE SAYS. The
+// runbook's sequence ends "then report Host drained"; Core's own definition of
+// the value says when that is true, and the two disagree exactly here. The
+// deliberate deviation is recorded rather than taken quietly.
+//
+// The cost is real and is the right way round: a drain that cannot finish stays
+// `draining`, so a Factory waits and eventually escalates instead of deleting.
+// A leaked workload is visible to an operator; deleted work is not.
+//
+// ONLY FinishRelease WITHHOLDS IT. A failed checkpoint, a missed idle boundary,
+// a refused ReleaseResidency and a link that would not close are all recorded
+// and none of them means release did not finish — the tombstone is written and
+// the lease is released in every one of those.
+func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
+	for _, failure := range d.failures {
+		if failure.Step == StepFinishRelease {
+			return sessionwire.HostLinkDrainStateDraining
+		}
+	}
+	return sessionwire.HostLinkDrainStateDrained
 }
 
 // release takes one session through §9.3's order, recording what failed and
@@ -458,19 +624,52 @@ func (d *Drainer) waitIdle(graceCtx context.Context, session Session, key regist
 	waited := make(chan error, 1)
 	go func() { waited <- session.WaitIdle(idleCtx) }()
 
+	// BOTH BOUNDS ARM THE SAME EXIT. The idle boundary is the per-session one
+	// and the platform grace is the whole drain's, and the tighter one wins —
+	// but the grace has to be watched HERE as well as below, or a session whose
+	// idle timer has not yet fired outlives the grace that is supposed to bound
+	// it. IdleBoundary <= Grace makes that unreachable with a real clock; it
+	// must not depend on that.
 	select {
 	case err := <-waited:
 		if err != nil {
 			d.record(Failure{Key: key, Step: StepWaitIdle, Err: err})
 		}
+		return
 	case <-d.options.Clock.After(d.options.IdleBoundary):
-		// The boundary expired. Cancel the wait and take the session's answer
-		// rather than abandoning the goroutine holding it: a WaitIdle that
-		// honours cancellation returns promptly, and one that does not would
-		// otherwise have this drain report a session released while its own
-		// wait was still running.
+	case <-graceCtx.Done():
+	}
+
+	{
+		// A bound expired. Cancel the wait and prefer the session's own
+		// answer: a WaitIdle that honours cancellation returns promptly, and
+		// taking its answer is what stops this drain reporting a session
+		// released while its own wait was still running.
 		stopWaiting()
-		err := <-waited
+
+		// THE WAIT FOR THAT ANSWER IS ITSELF BOUNDED, by the platform grace,
+		// and that is the difference between cancelling and bounding. An
+		// earlier version blocked here unconditionally, so a WaitIdle that
+		// IGNORED its context left this drain parked forever: the state stayed
+		// `draining`, the link never closed, and every other session's cleanup
+		// sat finished behind it — with both timers already fired. WaitIdle is
+		// a capability Host declares and someone else implements, so the
+		// uncooperative case is the one Grace exists for, and a bound that
+		// holds only when the far side cooperates is not a bound.
+		var err error
+		select {
+		case err = <-waited:
+		case <-graceCtx.Done():
+			// The grace is gone. Take the answer if it has landed since, and
+			// otherwise ABANDON the wait rather than outlive the termination
+			// this drain is racing. `waited` is buffered, so the orphaned
+			// goroutine can still finish and exit.
+			select {
+			case err = <-waited:
+			default:
+				err = ErrWaitAbandoned
+			}
+		}
 		if err == nil {
 			err = context.DeadlineExceeded
 		}

@@ -42,6 +42,10 @@ const (
 	testGeneration = uint64(4)
 	testGrace      = 30 * time.Second
 	testIdleGrace  = 5 * time.Second
+
+	// testPublishBound is deliberately the TIGHTEST of the three, so a drain
+	// that took the wrong timer is visible in fakeClock.requested().
+	testPublishBound = 2 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -49,10 +53,21 @@ const (
 // ---------------------------------------------------------------------------
 
 // fakeClock hands out timer channels a test fires by hand. NOTHING SLEEPS.
+//
+// It keeps each outstanding timer's DURATION alongside its channel, because
+// "is the drain waiting yet" is not a question a bare count can answer once the
+// drain arms more than one kind of timer. It could not: the publish bound and
+// the idle boundary are both live at once, and a test that spun on a count
+// raced past the wait it meant to synchronise on.
 type fakeClock struct {
-	mu       sync.Mutex
-	waits    []time.Duration
-	channels []chan time.Time
+	mu     sync.Mutex
+	waits  []time.Duration
+	timers []fakeTimer
+}
+
+type fakeTimer struct {
+	after   time.Duration
+	channel chan time.Time
 }
 
 func (c *fakeClock) After(d time.Duration) <-chan time.Time {
@@ -60,7 +75,7 @@ func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	defer c.mu.Unlock()
 	channel := make(chan time.Time, 1)
 	c.waits = append(c.waits, d)
-	c.channels = append(c.channels, channel)
+	c.timers = append(c.timers, fakeTimer{after: d, channel: channel})
 	return channel
 }
 
@@ -68,26 +83,53 @@ func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 // the deadline path without waiting for one.
 func (c *fakeClock) fireAll() {
 	c.mu.Lock()
-	channels := append([]chan time.Time(nil), c.channels...)
-	c.channels = nil
+	timers := append([]fakeTimer(nil), c.timers...)
+	c.timers = nil
 	c.mu.Unlock()
-	for _, channel := range channels {
-		channel <- time.Unix(0, 0)
+	for _, timer := range timers {
+		timer.channel <- time.Unix(0, 0)
 	}
 }
 
+// fireFor expires only the timers of ONE duration, which is how a test reaches
+// a bound while deliberately leaving another armed.
+func (c *fakeClock) fireFor(after time.Duration) {
+	c.mu.Lock()
+	var fired, kept []fakeTimer
+	for _, timer := range c.timers {
+		if timer.after == after {
+			fired = append(fired, timer)
+			continue
+		}
+		kept = append(kept, timer)
+	}
+	c.timers = kept
+	c.mu.Unlock()
+	for _, timer := range fired {
+		timer.channel <- time.Unix(0, 0)
+	}
+}
+
+// requested reports every duration ever asked for, fired or not.
 func (c *fakeClock) requested() []time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]time.Duration(nil), c.waits...)
 }
 
-// pending reports how many timers are outstanding, so a test can wait for the
-// drain to REACH the wait rather than racing it.
-func (c *fakeClock) pending() int {
+// pendingFor reports how many timers of ONE duration are outstanding, so a test
+// can wait for the drain to REACH a particular bound rather than racing it or
+// synchronising on some other bound that happens to be armed.
+func (c *fakeClock) pendingFor(after time.Duration) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.channels)
+	var count int
+	for _, timer := range c.timers {
+		if timer.after == after {
+			count++
+		}
+	}
+	return count
 }
 
 type fakeLedger struct {
@@ -129,18 +171,52 @@ type advertiser struct {
 	// during runs inside the publication, so a test can inspect the world at
 	// the one instant the transition is half-complete by construction.
 	during func()
+
+	// block makes PublishNonaccepting GENUINELY BLOCK until it is released, or
+	// until its context is cancelled. It is the positive control for every
+	// "answered promptly" assertion below: an advertiser that returns instantly
+	// makes "the status RPC did not wait" true for free.
+	block   chan struct{}
+	cancels int
+
+	// deaf makes the blocked publication IGNORE its context, which is the case
+	// the publish bound has to hold without. An advertiser that honours
+	// cancellation proves only the cooperative half.
+	deaf bool
 }
 
-func (a *advertiser) PublishNonaccepting(context.Context) error {
+func (a *advertiser) PublishNonaccepting(ctx context.Context) error {
 	a.mu.Lock()
 	a.published++
 	a.observedDraining = append(a.observedDraining, a.ledger.Draining())
-	hook, err := a.during, a.err
+	hook, err, block, deaf := a.during, a.err, a.block, a.deaf
 	a.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
+	if block != nil {
+		if deaf {
+			<-block
+			return err
+		}
+		select {
+		case <-block:
+		case <-ctx.Done():
+			a.mu.Lock()
+			a.cancels++
+			a.mu.Unlock()
+			return ctx.Err()
+		}
+	}
 	return err
+}
+
+// cancelCount reports how many publications were ended by their context, which
+// is the cooperative half of the publish bound.
+func (a *advertiser) cancelCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cancels
 }
 
 func (a *advertiser) snapshot() (published int, observed []bool) {
@@ -205,6 +281,11 @@ type fakeSession struct {
 	// hung session the platform grace exists for.
 	hang bool
 
+	// deaf makes WaitIdle block and IGNORE cancellation, which is the session
+	// the platform grace has to bound without the session's cooperation.
+	deaf    bool
+	release chan struct{}
+
 	errs map[step]error
 
 	mu    sync.Mutex
@@ -216,6 +297,7 @@ func newSession(session sessionwire.SessionID, shared *journal) *fakeSession {
 		key:     registry.Key{TenantID: testTenant, SessionID: session},
 		journal: shared,
 		errs:    map[step]error{},
+		release: make(chan struct{}),
 	}
 }
 
@@ -234,6 +316,13 @@ func (s *fakeSession) BeginRelease(context.Context) error { return s.run(stepBeg
 func (s *fakeSession) WaitIdle(ctx context.Context) error {
 	if err := s.run(stepWaitIdle); err != nil {
 		return err
+	}
+	if s.deaf {
+		// IGNORES CANCELLATION. This is not a hypothetical: WaitIdle is a
+		// capability Host declares and a Harness session implements, and a
+		// bound that only holds when the far side cooperates is not a bound.
+		<-s.release
+		return nil
 	}
 	if !s.hang {
 		return nil
@@ -334,6 +423,7 @@ func newFixture(t *testing.T, sessions ...*fakeSession) *fixture {
 		Link:         connection,
 		Grace:        testGrace,
 		IdleBoundary: testIdleGrace,
+		PublishBound: testPublishBound,
 	})
 	if err != nil {
 		t.Fatalf("NewDrainer: %v", err)
@@ -468,22 +558,23 @@ func TestTheDrainTransitionIsNotObservableHalfDone(t *testing.T) {
 		}
 
 		// Sampled from INSIDE the publication, where the transition is
-		// half-applied by construction.
+		// half-applied by construction — the one instant at which the ledger
+		// has stopped and the publication has not landed.
 		//
-		// IT READS ONLY THE LOCK-FREE HALF, and that is itself the strongest
-		// statement of atomicity available: ObserveDrain cannot be called from
-		// here at all, because the whole transition runs inside the Drainer's
-		// one critical section and this hook runs on the goroutine holding it.
-		// A drain that published from OUTSIDE that section — the shape this
-		// test exists to forbid — would let this call through. The free-running
-		// sampler below does call ObserveDrain, from another goroutine, and its
-		// "observable before published" predicate is what covers that window.
+		// IT CALLS ObserveDrain, and that is a DETERMINISTIC assertion rather
+		// than a sampled one: at this instant a drain must not be observable,
+		// because nothing downstream yet knows one began. It became callable
+		// when the publication stopped running under the lock, which is the
+		// B2 fix; before that it deadlocked, and the deadlock was being read as
+		// evidence of atomicity when it was only evidence of a held lock.
 		var insidePublication struct {
 			draining bool
+			begun    bool
 			touched  int
 		}
 		f.advertiser.during = func() {
 			insidePublication.draining = f.ledger.Draining()
+			_, insidePublication.begun = f.drainer.ObserveDrain(hostlink.DrainScope{})
 			insidePublication.touched = f.journal.len()
 		}
 
@@ -521,6 +612,10 @@ func TestTheDrainTransitionIsNotObservableHalfDone(t *testing.T) {
 		// price, paid in that order.
 		if !insidePublication.draining {
 			t.Fatal("the ledger was still admitting while nonaccepting was being published")
+		}
+		if insidePublication.begun {
+			t.Fatal("the drain was observable from inside its own nonaccepting publication, " +
+				"so a Factory could see a drain this Host had not yet published")
 		}
 		if insidePublication.touched != 0 {
 			t.Fatalf("%d session steps had run before nonaccepting was published", insidePublication.touched)
@@ -592,6 +687,241 @@ func TestTheDrainTransitionIsNotObservableHalfDone(t *testing.T) {
 	})
 }
 
+// TestTheStatusObservationIsAnsweredWhileTheDrainIsStillPublishing is the half
+// of step 4 that regressed, and it is the reason StartDrain does not hold its
+// lock across the publication.
+//
+// An earlier version did, and ObserveDrain and Wait take the same lock — so the
+// bounded status observation was blocked for the whole publication, on a
+// context derived from Background that nothing could cancel. "Returns promptly"
+// was a claim about a path that could block forever.
+//
+// A "DOES NOT BLOCK" ASSERTION IS A NOTHING-HAPPENED CLAIM and needs a positive
+// control that genuinely blocks: against an advertiser that returns instantly,
+// every assertion below passes for free. The control is the advertiser's
+// `block` channel, and the test asserts the publication IS still in flight —
+// StartDrain has not returned — at the moment the status observation is
+// answered.
+func TestTheStatusObservationIsAnsweredWhileTheDrainIsStillPublishing(t *testing.T) {
+	t.Parallel()
+	alpha := newSession("session-alpha", nil)
+	f := newFixture(t, alpha)
+
+	release := make(chan struct{})
+	inFlight := make(chan struct{})
+	f.advertiser.block = release
+	f.advertiser.during = func() { close(inFlight) }
+
+	acknowledged := make(chan hostlink.DrainStatus, 1)
+	go func() { acknowledged <- mustStart(t, f.drainer) }()
+	<-inFlight
+
+	// THE POSITIVE CONTROL: the publication is genuinely in flight, so the
+	// observation below is answered from underneath a real block.
+	select {
+	case status := <-acknowledged:
+		t.Fatalf("StartDrain returned %+v while its publication was still blocked, "+
+			"so this test's control does not block and proves nothing", status)
+	default:
+	}
+
+	observed := make(chan bool, 1)
+	go func() {
+		_, begun := f.drainer.ObserveDrain(hostlink.DrainScope{})
+		observed <- begun
+	}()
+	select {
+	case begun := <-observed:
+		if begun {
+			t.Fatal("a drain was observable while its nonaccepting publication was still in flight")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the status observation blocked behind the nonaccepting publication, " +
+			"which is the unbounded wait step 4's bounded observation exists to avoid")
+	}
+
+	// Wait is on the same lock and must not block either.
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.drainer.Wait() }()
+	select {
+	case report := <-waited:
+		if report.State != sessionwire.HostLinkDrainStateDraining {
+			t.Fatalf("Wait mid-publication = %+v, want the unbegun report", report)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait blocked behind the nonaccepting publication")
+	}
+
+	close(release)
+	status := <-acknowledged
+	if status.State != sessionwire.HostLinkDrainStateDraining || status.Generation != testGeneration {
+		t.Fatalf("acknowledgement = %+v, want draining at %d", status, testGeneration)
+	}
+	awaitDrained(t, f.drainer)
+}
+
+// TestAPublicationThatNeverAnswersRefusesTheDrainAtItsBound is the other half
+// of the same defect: the acknowledgement itself had no bound.
+//
+// DrainStarter takes no context by design, so the publication's bound has to
+// come from the composition. An Advertiser that never returned hung the drain
+// RPC forever; now the wait ends at PublishBound and the drain is REFUSED,
+// because this Host cannot claim the row landed.
+//
+// THE BOUND HOLDS WITHOUT THE ADVERTISER'S COOPERATION. The context is
+// cancelled — asserted, because that is the half a well-behaved store needs —
+// but the wait ends whether or not anything honours it.
+func TestAPublicationThatNeverAnswersRefusesTheDrainAtItsBound(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		deaf bool
+	}{
+		{"an advertiser that honours cancellation", false},
+		{"an advertiser that ignores it", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			alpha := newSession("session-alpha", nil)
+			f := newFixture(t, alpha)
+			release := make(chan struct{})
+			f.advertiser.block = release
+			f.advertiser.deaf = test.deaf
+
+			refused := make(chan error, 1)
+			go func() {
+				_, err := f.drainer.StartDrain(hostlink.DrainScope{})
+				refused <- err
+			}()
+			waitFor(t, "the publish bound to be armed", func() bool { return f.clock.pendingFor(testPublishBound) > 0 })
+			f.clock.fireAll()
+
+			select {
+			case err := <-refused:
+				if !errors.Is(err, lifecycle.ErrPublishBound) {
+					t.Fatalf("StartDrain error = %v, want ErrPublishBound", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("StartDrain did not return when its publish bound expired, so the acknowledgement is unbounded")
+			}
+
+			if _, begun := f.drainer.ObserveDrain(hostlink.DrainScope{}); begun {
+				t.Fatal("a drain whose publication never landed is observable as begun")
+			}
+			if draining, begins := f.ledger.counts(); !draining || begins != 1 {
+				t.Fatalf("ledger after a bounded-out publication: draining=%v begins=%d, want true and 1", draining, begins)
+			}
+			if steps := alpha.stepsTaken(); len(steps) != 0 {
+				t.Fatalf("a session was touched by a drain that never published: %v", steps)
+			}
+			if test.deaf {
+				// Release the orphaned publication so the package does not end
+				// with it parked on an unbuffered channel.
+				close(release)
+			} else {
+				waitFor(t, "the publication's context to be cancelled", func() bool { return f.advertiser.cancelCount() == 1 })
+			}
+		})
+	}
+}
+
+// TestConcurrentStartsShareOnePublicationAndOneLedgerStop holds the property
+// releasing the lock could have cost.
+//
+// The critical section no longer spans the publication, so "one drain" has to
+// be carried by `starting` instead. Sixteen callers arriving while a slow
+// publication is in flight must produce ONE ledger stop and ONE publication,
+// and all sixteen must be answered from that one attempt — not queue up
+// sixteen publications against a store that is already slow.
+func TestConcurrentStartsShareOnePublicationAndOneLedgerStop(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, newSession("session-alpha", nil))
+
+	release := make(chan struct{})
+	inFlight := make(chan struct{})
+	// ONCE, because the failure this test exists to catch is a SECOND
+	// publication. A bare close would panic on it, and a panic is not an
+	// assertion — the count below is what must report the defect.
+	var announced sync.Once
+	f.advertiser.block = release
+	f.advertiser.during = func() { announced.Do(func() { close(inFlight) }) }
+
+	const callers = 16
+	statuses := make(chan hostlink.DrainStatus, callers)
+	go func() { statuses <- mustStart(t, f.drainer) }()
+	<-inFlight
+
+	var joined sync.WaitGroup
+	for range callers - 1 {
+		joined.Add(1)
+		go func() {
+			defer joined.Done()
+			statuses <- mustStart(t, f.drainer)
+		}()
+	}
+	// The late callers race the release deliberately: whichever side wins, each
+	// of them finds either `starting` or `begun` and is answered from the one
+	// attempt. There is no third state for them to find, which is the property
+	// under test, so there is nothing here to synchronise on.
+	close(release)
+	joined.Wait()
+
+	for range callers {
+		status := <-statuses
+		// The GENERATION is the invariant. A late caller may legitimately see
+		// `drained` if the release finished first — that is the same drain, and
+		// insisting on `draining` would be asserting a scheduling accident.
+		if status.Generation != testGeneration {
+			t.Fatalf("caller saw generation %d, want %d", status.Generation, testGeneration)
+		}
+		if status.State != sessionwire.HostLinkDrainStateDraining && status.State != sessionwire.HostLinkDrainStateDrained {
+			t.Fatalf("caller saw state %q, which is neither of Core's two", status.State)
+		}
+	}
+	if published, _ := f.advertiser.snapshot(); published != 1 {
+		t.Fatalf("%d callers produced %d publications, want one", callers, published)
+	}
+	if _, begins := f.ledger.counts(); begins != 1 {
+		t.Fatalf("admission was stopped %d times, want once", begins)
+	}
+	awaitDrained(t, f.drainer)
+}
+
+// TestARetryAfterARefusedPublicationDoesNotStopAdmissionTwice holds the
+// ledger's once-ever property across the refusal path.
+//
+// The ledger deliberately stays stopped through a refused drain, so a retry
+// must not stop it again: "how many times did this Host stop admitting" is the
+// count every atomicity assertion in this file reads, and a retry storm against
+// a flapping store would otherwise inflate it.
+func TestARetryAfterARefusedPublicationDoesNotStopAdmissionTwice(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, newSession("session-alpha", nil))
+	f.advertiser.err = errors.New("the orchestration store is unreachable")
+
+	for range 3 {
+		if _, err := f.drainer.StartDrain(hostlink.DrainScope{}); err == nil {
+			t.Fatal("a drain was accepted while the store was unreachable")
+		}
+	}
+	if _, begins := f.ledger.counts(); begins != 1 {
+		t.Fatalf("three refused drains stopped admission %d times, want once", begins)
+	}
+
+	f.advertiser.mu.Lock()
+	f.advertiser.err = nil
+	f.advertiser.mu.Unlock()
+	mustStart(t, f.drainer)
+	awaitDrained(t, f.drainer)
+	if _, begins := f.ledger.counts(); begins != 1 {
+		t.Fatalf("the successful retry stopped admission %d times, want once", begins)
+	}
+	if published, _ := f.advertiser.snapshot(); published != 4 {
+		t.Fatalf("publications = %d, want the three refusals and the retry", published)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Sequence
 // ---------------------------------------------------------------------------
@@ -648,7 +978,7 @@ func TestTheAcknowledgementPrecedesCheckpointAndRelease(t *testing.T) {
 	}
 
 	// The session hangs in WaitIdle, so the drain is provably still in flight.
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 	for _, forbidden := range []step{stepCheckpoint, stepReleaseResidency, stepFinishRelease} {
 		if slices.Contains(alpha.stepsTaken(), forbidden) {
 			t.Fatalf("%s had run while the drain was still acknowledged as draining", forbidden)
@@ -698,6 +1028,117 @@ func TestDrainedMeansEveryConditionFactoryWaitsForHasHappened(t *testing.T) {
 	if !begun || status.State != sessionwire.HostLinkDrainStateDrained {
 		t.Fatalf("observation after Wait = %+v/%v, want drained", status, begun)
 	}
+}
+
+// TestARefusedFinishReleaseWithholdsDrained is the Host-side mitigation for the
+// one failure Core's two-valued state CAN express.
+//
+// A Factory deletes a dedicated workload when it observes `drained`. Core
+// defines that value as "the observed scope has finished release", and a
+// session whose FinishRelease refused has not finished release — its
+// epoch-fenced tombstone was not written or its lease was not released. A Host
+// that reported `drained` anyway would have a Factory delete a workload whose
+// lease this Host still holds, which destroys work.
+//
+// So the state stays `draining`. A Factory then waits and escalates instead of
+// deleting: a leaked workload is visible to an operator and deleted work is not.
+// This is a deliberate deviation from O6.3's prose, which ends "then report Host
+// drained"; Core's definition of the value decides when that is true.
+//
+// THE POSITIVE CONTROL IS THE SECOND SUBTEST. "State stayed draining" is
+// satisfied by a drain that never reaches the end at all, so the same fixture
+// with a succeeding FinishRelease must reach `drained` — otherwise this test
+// would pass against a Drainer that simply never finishes.
+func TestARefusedFinishReleaseWithholdsDrained(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		refuse  bool
+		want    sessionwire.HostLinkDrainState
+		wantErr bool
+	}{
+		{"a refused FinishRelease", true, sessionwire.HostLinkDrainStateDraining, true},
+		{"the control: it succeeds", false, sessionwire.HostLinkDrainStateDrained, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			alpha := newSession("session-alpha", nil)
+			refused := errors.New("the residency tombstone could not be written")
+			if test.refuse {
+				alpha.errs[stepFinishRelease] = refused
+			}
+			f := newFixture(t, alpha)
+
+			mustStart(t, f.drainer)
+			report := f.drainer.Wait()
+			if report.State != test.want {
+				t.Fatalf("state = %q, want %q", report.State, test.want)
+			}
+
+			// Whatever the state, the cleanup RAN. Withholding `drained` is a
+			// statement about the outcome, not a refusal to finish the work.
+			want := []step{stepBeginRelease, stepWaitIdle, stepCheckpoint, stepReleaseResidency, stepFinishRelease}
+			if got := alpha.stepsTaken(); !slices.Equal(got, want) {
+				t.Fatalf("steps = %v, want %v", got, want)
+			}
+			if f.link.closeCount() != 1 {
+				t.Fatalf("link closes = %d, want one", f.link.closeCount())
+			}
+
+			// And the observation a Factory polls agrees with the report, so
+			// the two cannot disagree about whether the workload may be deleted.
+			status, begun := f.drainer.ObserveDrain(hostlink.DrainScope{})
+			if !begun || status.State != test.want {
+				t.Fatalf("observation = %+v/%v, want state %q", status, begun, test.want)
+			}
+
+			if test.wantErr {
+				if len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepFinishRelease {
+					t.Fatalf("failures = %v, want exactly the finish release", report.Failures)
+				}
+				if !errors.Is(report.Failures[0], refused) {
+					t.Fatalf("the refusal lost its cause: %v", report.Failures[0])
+				}
+			} else if len(report.Failures) != 0 {
+				t.Fatalf("the control reported failures: %v", report.Failures)
+			}
+		})
+	}
+}
+
+// TestOnlyAFinishReleaseFailureWithholdsDrained is the other half: every other
+// failure this drain books still reports drained, because none of them means release
+// did not finish. The tombstone is written and the lease is released in all of
+// them, so a Factory may delete the workload.
+func TestOnlyAFinishReleaseFailureWithholdsDrained(t *testing.T) {
+	t.Parallel()
+
+	for _, failing := range []step{stepBeginRelease, stepWaitIdle, stepCheckpoint, stepReleaseResidency} {
+		t.Run(string(failing), func(t *testing.T) {
+			t.Parallel()
+			alpha := newSession("session-alpha", nil)
+			alpha.errs[failing] = errors.New("this step refused")
+			f := newFixture(t, alpha)
+
+			mustStart(t, f.drainer)
+			report := awaitDrained(t, f.drainer)
+			if len(report.Failures) != 1 {
+				t.Fatalf("failures = %v, want exactly one", report.Failures)
+			}
+		})
+	}
+
+	t.Run("close_link", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t)
+		f.link.err = errors.New("the transport would not shut down")
+		mustStart(t, f.drainer)
+		report := awaitDrained(t, f.drainer)
+		if len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepCloseLink {
+			t.Fatalf("failures = %v, want exactly the link close", report.Failures)
+		}
+	})
 }
 
 // TestDrainingNoSessionsIsStillADrain is step 1's empty case: a Host holding
@@ -927,7 +1368,7 @@ func TestRepeatedDrainIsOneDrain(t *testing.T) {
 		t.Fatalf("the resident set was read %d times, want once", f.residents.readCount())
 	}
 
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 	f.clock.fireAll()
 	awaitDrained(t, f.drainer)
 
@@ -960,7 +1401,7 @@ func TestObservingReportsProgressAndNeverStartsADrain(t *testing.T) {
 	}
 
 	mustStart(t, f.drainer)
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 	status, begun := f.drainer.ObserveDrain(hostlink.DrainScope{})
 	if !begun || status.State != sessionwire.HostLinkDrainStateDraining || status.Generation != testGeneration {
 		t.Fatalf("observation mid-drain = %+v/%v, want draining at %d", status, begun, testGeneration)
@@ -988,7 +1429,7 @@ func TestANewlyResidentSessionIsRefusedRatherThanDrained(t *testing.T) {
 	f := newFixture(t, alpha)
 
 	mustStart(t, f.drainer)
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 
 	late := newSession("session-late", f.journal)
 	f.residents.add(late)
@@ -1021,7 +1462,7 @@ func TestTheIdleBoundaryAndPlatformGraceAreBothBounded(t *testing.T) {
 	f := newFixture(t, alpha)
 
 	mustStart(t, f.drainer)
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 1 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 	if requested := f.clock.requested(); !slices.Contains(requested, testIdleGrace) || !slices.Contains(requested, testGrace) {
 		t.Fatalf("timers requested = %v, want both %v and %v", requested, testIdleGrace, testGrace)
 	}
@@ -1061,7 +1502,7 @@ func TestTheLinkIsOptionalAndClosesLast(t *testing.T) {
 		// The session hangs, so the drain is PROVABLY still in flight when
 		// this runs. Synchronising on the fake clock's state rather than on a
 		// duration is what makes the assertion below deterministic.
-		waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+		waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 		if f.link.closeCount() != 0 {
 			t.Fatalf("the link was closed %d times during initiation, want none", f.link.closeCount())
 		}
@@ -1092,6 +1533,7 @@ func TestTheLinkIsOptionalAndClosesLast(t *testing.T) {
 			Residents:    index,
 			Grace:        testGrace,
 			IdleBoundary: testIdleGrace,
+			PublishBound: testPublishBound,
 		})
 		if err != nil {
 			t.Fatalf("NewDrainer without a link: %v", err)
@@ -1127,6 +1569,7 @@ func TestOptionsAreValidated(t *testing.T) {
 			Residents:    &residents{},
 			Grace:        testGrace,
 			IdleBoundary: testIdleGrace,
+			PublishBound: testPublishBound,
 		}
 	}
 
@@ -1146,6 +1589,12 @@ func TestOptionsAreValidated(t *testing.T) {
 			"an idle boundary longer than the whole drain",
 			func(o *lifecycle.Options) { o.IdleBoundary = testGrace + time.Second },
 			"IdleBoundary",
+		},
+		{"a zero publish bound", func(o *lifecycle.Options) { o.PublishBound = 0 }, "PublishBound"},
+		{
+			"a publish bound longer than the whole drain",
+			func(o *lifecycle.Options) { o.PublishBound = testGrace + time.Second },
+			"PublishBound",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1246,7 +1695,7 @@ func TestTheDrainFakeMatchesTheProductionMachineInBothDirections(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("StartDrain did not return while a session was still settling")
 	}
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pending() > 0 })
+	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
 	if slices.Contains(alpha.stepsTaken(), stepFinishRelease) {
 		t.Fatal("StartDrain returned only after the release had finished")
 	}
@@ -1321,6 +1770,131 @@ func TestTheDrainSeamsAreNarrowerThanTheTypesBehindThem(t *testing.T) {
 			t.Fatalf("%s methods = %v, want %v", test.seam, got, test.methods)
 		}
 	}
+}
+
+// TestThePlatformGraceBoundsASessionThatIgnoresCancellation is the half of
+// Options.Grace's own doc comment that was not true.
+//
+// Grace says "when it expires, every outstanding idle wait is cancelled and
+// cleanup continues". CANCELLING IS NOT BOUNDING. A WaitIdle that ignores its
+// context left this drain blocked on that session's answer forever: the state
+// stayed `draining` permanently, the link never closed, and every other
+// session's cleanup was already done and waiting on it. Both timers fired and
+// nothing moved.
+//
+// A bound that holds only when the far side cooperates is not a bound, and
+// WaitIdle is a capability Host DECLARES and someone else implements, so the
+// uncooperative case is the one it exists for. The wait for the session's own
+// answer is now itself bounded by the platform grace, and such a session is
+// booked as abandoned rather than waited on.
+//
+// It fails by TIMING OUT ON A CHANNEL rather than by hanging the package, so a
+// regression reports a failure instead of a ten-minute panic.
+func TestThePlatformGraceBoundsASessionThatIgnoresCancellation(t *testing.T) {
+	t.Parallel()
+	deaf := newSession("session-deaf", nil)
+	deaf.deaf = true
+	healthy := newSession("session-healthy", nil)
+	f := newFixture(t, deaf, healthy)
+
+	mustStart(t, f.drainer)
+	// BOTH sessions must have armed their idle bound before the clock fires,
+	// or the deaf one's timer is created after fireAll and never expires —
+	// which would be this fixture failing to reach the path, not the path
+	// failing. Go evaluates every select operand, so entering waitIdle always
+	// arms one.
+	waitFor(t, "both sessions to arm their idle bound and the grace to be armed", func() bool {
+		return f.clock.pendingFor(testIdleGrace) == 2 && f.clock.pendingFor(testGrace) > 0
+	})
+
+	finished := make(chan lifecycle.Report, 1)
+	go func() { finished <- f.drainer.Wait() }()
+	f.clock.fireAll()
+
+	var report lifecycle.Report
+	select {
+	case report = <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the platform grace did not bound a session whose WaitIdle ignores cancellation: " +
+			"the drain never finished and the state stayed draining permanently")
+	}
+
+	if report.State != sessionwire.HostLinkDrainStateDrained {
+		t.Fatalf("state = %q, want %q", report.State, sessionwire.HostLinkDrainStateDrained)
+	}
+	// The deaf session is RECORDED, not silently skipped, and it is
+	// attributable to the abandonment rather than to an ordinary error.
+	var abandoned *lifecycle.Failure
+	for index := range report.Failures {
+		if report.Failures[index].Key == deaf.Key() && report.Failures[index].Step == lifecycle.StepWaitIdle {
+			abandoned = &report.Failures[index]
+		}
+	}
+	if abandoned == nil {
+		t.Fatalf("failures = %v, want the deaf session's idle wait", report.Failures)
+	}
+	if !errors.Is(abandoned, lifecycle.ErrIdleBoundary) || !errors.Is(abandoned, lifecycle.ErrWaitAbandoned) {
+		t.Fatalf("the abandoned wait is not attributable: %v", abandoned)
+	}
+	// Cleanup still ran to the end for BOTH, which is what the bound is for.
+	for _, session := range []*fakeSession{deaf, healthy} {
+		if !slices.Contains(session.stepsTaken(), stepFinishRelease) {
+			t.Fatalf("%q did not reach FinishRelease", session.Key().SessionID)
+		}
+	}
+	if f.link.closeCount() != 1 {
+		t.Fatalf("link closes = %d, want one", f.link.closeCount())
+	}
+
+	// Release the abandoned goroutine so the package does not end with it
+	// parked on an unbuffered channel.
+	close(deaf.release)
+}
+
+// TestThePlatformGraceEndsAWaitWhoseOwnBoundHasNotFired is the arm of waitIdle's
+// first select that nothing else reaches.
+//
+// The per-session idle boundary and the platform grace both bound one wait, and
+// the validated IdleBoundary <= Grace makes the idle timer fire first with a
+// real clock. That is an argument about a clock, not a property of this code,
+// and a mechanism whose only defence is an argument is one nothing tests: a
+// probe that deleted the grace arm from the first select left the whole suite
+// green.
+//
+// So this fires ONLY the grace and leaves every idle timer armed. The drain must
+// still finish, because the grace is the whole drain's bound and a session that
+// has not reached its own is not exempt from it.
+func TestThePlatformGraceEndsAWaitWhoseOwnBoundHasNotFired(t *testing.T) {
+	t.Parallel()
+	deaf := newSession("session-deaf", nil)
+	deaf.deaf = true
+	f := newFixture(t, deaf)
+
+	mustStart(t, f.drainer)
+	waitFor(t, "the session to arm its idle bound and the grace to be armed", func() bool {
+		return f.clock.pendingFor(testIdleGrace) == 1 && f.clock.pendingFor(testGrace) > 0
+	})
+
+	finished := make(chan lifecycle.Report, 1)
+	go func() { finished <- f.drainer.Wait() }()
+	f.clock.fireFor(testGrace)
+
+	var report lifecycle.Report
+	select {
+	case report = <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the platform grace did not end a wait whose own idle bound had not fired")
+	}
+	if report.State != sessionwire.HostLinkDrainStateDrained {
+		t.Fatalf("state = %q, want %q", report.State, sessionwire.HostLinkDrainStateDrained)
+	}
+	if f.clock.pendingFor(testIdleGrace) != 1 {
+		t.Fatalf("the idle bound fired after all (%d pending), so this test took the other arm", f.clock.pendingFor(testIdleGrace))
+	}
+	if !slices.Contains(deaf.stepsTaken(), stepFinishRelease) {
+		t.Fatalf("%q did not reach FinishRelease", deaf.Key().SessionID)
+	}
+	close(deaf.release)
 }
 
 // ---------------------------------------------------------------------------
