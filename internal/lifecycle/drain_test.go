@@ -267,7 +267,7 @@ func (j *journal) recorded() []string {
 
 func (j *journal) indexOf(entry string) int { return slices.Index(j.recorded(), entry) }
 
-func (j *journal) len() int {
+func (j *journal) entryCount() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return len(j.entries)
@@ -496,7 +496,7 @@ func (p *partialStates) sample() {
 	draining := p.ledger.Draining()
 	published := p.ads.count()
 	begun := p.begun()
-	touched := p.journal.len()
+	touched := p.journal.entryCount()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -575,7 +575,7 @@ func TestTheDrainTransitionIsNotObservableHalfDone(t *testing.T) {
 		f.advertiser.during = func() {
 			insidePublication.draining = f.ledger.Draining()
 			_, insidePublication.begun = f.drainer.ObserveDrain(hostlink.DrainScope{})
-			insidePublication.touched = f.journal.len()
+			insidePublication.touched = f.journal.entryCount()
 		}
 
 		stop := make(chan struct{})
@@ -605,6 +605,15 @@ func TestTheDrainTransitionIsNotObservableHalfDone(t *testing.T) {
 		}
 		if samples == 0 {
 			t.Fatal("the probe took no samples, so it observed nothing")
+		}
+		// THE SHARED JOURNAL IS PUMPED. `touched == 0` inside the publication
+		// below is a claim about TIMING, and it is equally true of a journal
+		// that never records anything — which is a different fixture bug with
+		// the same green. By now the drain has run to the end, so it must have
+		// entries.
+		if f.journal.entryCount() == 0 {
+			t.Fatal("the shared journal recorded nothing across a completed drain, " +
+				"so the half-done assertions above are about a dead observable")
 		}
 
 		// What the hook saw. The ledger had ALREADY flipped, and neither the
@@ -815,6 +824,15 @@ func TestAPublicationThatNeverAnswersRefusesTheDrainAtItsBound(t *testing.T) {
 			if steps := alpha.stepsTaken(); len(steps) != 0 {
 				t.Fatalf("a session was touched by a drain that never published: %v", steps)
 			}
+			// THE POSITIVE CONTROL, on the same object: the recorder this
+			// emptiness is read from is live. Without it a fixture whose
+			// sessions record nothing passes the assertion above.
+			if err := alpha.BeginRelease(context.Background()); err != nil {
+				t.Fatalf("driving the session by hand: %v", err)
+			}
+			if steps := alpha.stepsTaken(); !slices.Equal(steps, []step{stepBeginRelease}) {
+				t.Fatalf("the session's recorder is dead (%v), so the assertion above proved nothing", steps)
+			}
 			if test.deaf {
 				// Release the orphaned publication so the package does not end
 				// with it parked on an unbuffered channel.
@@ -979,8 +997,21 @@ func TestTheAcknowledgementPrecedesCheckpointAndRelease(t *testing.T) {
 
 	// The session hangs in WaitIdle, so the drain is provably still in flight.
 	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
+
+	// THE OBSERVABLE HAS BEEN PUMPED before the absence below is read. The
+	// drain has reached the idle wait, so these two steps MUST already be
+	// recorded — and without asserting that, "checkpoint has not run" is
+	// equally true of a recorder that records nothing at all. A probe that
+	// stubbed stepsTaken to nil left this whole test green.
+	taken := alpha.stepsTaken()
+	for _, reached := range []step{stepBeginRelease, stepWaitIdle} {
+		if !slices.Contains(taken, reached) {
+			t.Fatalf("steps = %v: the drain reached the idle wait without recording %s, "+
+				"so the absences asserted below are about a dead observable", taken, reached)
+		}
+	}
 	for _, forbidden := range []step{stepCheckpoint, stepReleaseResidency, stepFinishRelease} {
-		if slices.Contains(alpha.stepsTaken(), forbidden) {
+		if slices.Contains(taken, forbidden) {
 			t.Fatalf("%s had run while the drain was still acknowledged as draining", forbidden)
 		}
 	}
@@ -1314,6 +1345,14 @@ func TestAFailedNonacceptingPublicationRefusesTheDrain(t *testing.T) {
 	if published, _ := f.advertiser.snapshot(); published != 2 {
 		t.Fatalf("publications = %d, want the failed one and the retry", published)
 	}
+
+	// THE POSITIVE CONTROL for the emptiness asserted above, on the same
+	// object: the retry DID drive this session, so the earlier zero was a
+	// statement about the refused drain rather than about a dead recorder.
+	want := []step{stepBeginRelease, stepWaitIdle, stepCheckpoint, stepReleaseResidency, stepFinishRelease}
+	if got := alpha.stepsTaken(); !slices.Equal(got, want) {
+		t.Fatalf("steps after the successful retry = %v, want %v", got, want)
+	}
 }
 
 // TestRepeatedDrainIsOneDrain is step 1's repeated case and O5.4 step 3's
@@ -1438,6 +1477,20 @@ func TestANewlyResidentSessionIsRefusedRatherThanDrained(t *testing.T) {
 	awaitDrained(t, f.drainer)
 	if steps := late.stepsTaken(); len(steps) != 0 {
 		t.Fatalf("a session that attached after the drain began was drained: %v", steps)
+	}
+
+	// THE POSITIVE CONTROL IS ON THE SAME OBJECT. "late recorded nothing" is
+	// satisfied by a `late` whose recorder never works — a different fixture
+	// bug with the same green. Driving one step by hand shows the observable
+	// this assertion reads is live for THIS session, not merely for alpha.
+	if err := late.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("driving the late session by hand: %v", err)
+	}
+	if steps := late.stepsTaken(); !slices.Equal(steps, []step{stepBeginRelease}) {
+		t.Fatalf("the late session's recorder is dead (%v), so the assertion above proved nothing", steps)
+	}
+	if steps := alpha.stepsTaken(); len(steps) == 0 {
+		t.Fatal("the drained session recorded nothing either")
 	}
 	if f.residents.readCount() != 1 {
 		t.Fatalf("the resident set was read %d times, want once", f.residents.readCount())

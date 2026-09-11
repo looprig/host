@@ -618,6 +618,19 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 			if begins, starts, observes := f.drains.counts(); begins != 0 || starts != 0 || observes != 0 {
 				t.Fatalf("a refused request reached the machine: begins=%d starts=%d observes=%d", begins, starts, observes)
 			}
+
+			// THE POSITIVE CONTROL FOR THAT ZERO. A counter that never counts
+			// satisfies it just as well as a refusal that never reaches the
+			// machine, and a probe stubbing counts() to 0/0/0 left this row
+			// green while every other test in the file failed. A valid
+			// whole-Host request on the SAME fixture must move it.
+			if _, err := f.mux.StartDrain(drainRequest()); err != nil {
+				t.Fatalf("the control request was refused: %v", err)
+			}
+			if begins, starts, _ := f.drains.counts(); begins != 1 || starts != 1 {
+				t.Fatalf("the control did not reach the machine (begins=%d starts=%d), "+
+					"so the zero asserted above is a property of the counter and not of the refusal", begins, starts)
+			}
 		})
 	}
 }
