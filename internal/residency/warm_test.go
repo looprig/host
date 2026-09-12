@@ -1187,3 +1187,65 @@ func TestForgetDisarmsTheTimerAndNotOnlyTheGoroutine(t *testing.T) {
 		t.Errorf("Forget left the watch armed: stops %d before and %d after. An armed watch whose tick is taken in the window before its goroutine observes the close releases a session the caller has said this releaser no longer owns", stoppedBefore, timer.stopsSeen())
 	}
 }
+
+// TestAnIdleObservationDuringAReleaseDoesNotReArmTheWatch samples the latch at
+// warm.go:495, and the reason it went missing twice is the point.
+//
+// `watch.releasing = true` is what makes Observe return early while a release
+// is under way. It was absent from the first round's call-site table AND from
+// the fix round's — signed off per SITE both times, while the site has two
+// statements whose observables are different. It is also the statement the
+// equivalence argument for `watch.armed = false` (warm.go:494) LEANS ON: that
+// argument says a stale `armed` cannot be read because no tick can arrive
+// without a Reset, and the thing that stops Observe issuing that Reset
+// mid-release is this latch. An unsampled premise under a claimed equivalence
+// is worse than an unsampled statement on its own.
+//
+// The window is opened with holdAt, the same technique the racing-command test
+// 200 lines above already uses, so this is deterministic and takes no sleep as
+// an assertion: the release is parked inside BeginRelease when Observe runs.
+//
+// The positive observable is the RESET COUNT. A releaser that re-armed
+// mid-release would, on a real clock, fire a second warm expiry into a watch
+// whose release is already past the point of no return.
+func TestAnIdleObservationDuringAReleaseDoesNotReArmTheWatch(t *testing.T) {
+	t.Parallel()
+
+	f := newWarmFixture(t)
+	resume := f.session.holdAt("begin_release")
+	f.releaser.Observe(f.key, WorkStateIdle)
+	timer := f.clock.only(t)
+	armedBefore := len(timer.resetsSeen())
+	go timer.expire(t)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for f.trace.index("begin_release") < 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the release never reached BeginRelease")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The release is parked at step 2. An idle observation arriving now is
+	// about a session whose release cannot be taken back.
+	f.releaser.Observe(f.key, WorkStateIdle)
+	if armedAfter := len(timer.resetsSeen()); armedAfter != armedBefore {
+		t.Errorf("the watch was re-armed during a release in progress (%d resets before, %d after); the releasing latch is not held", armedBefore, armedAfter)
+	}
+
+	// The CONTROL, and it is what stops the assertion above passing because
+	// Observe does nothing at all: once the release has finished and the watch
+	// is gone, Observe is a no-op for a different reason, so the control has
+	// to run while the watch is still installed. A WORKING observation is
+	// refused the same way, which is the half that proves the latch is about
+	// the release and not about the state.
+	f.releaser.Observe(f.key, WorkStateWorking)
+	if stops := timer.stopsSeen(); stops != 1 {
+		t.Errorf("timer stops = %d, want 1: a cancelling observation during a release must be refused by the same latch, not acted on", stops)
+	}
+
+	resume()
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeReleased {
+		t.Fatalf("outcome = %q (%s), want released", outcome.Kind, outcome.Reason)
+	}
+}
