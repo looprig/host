@@ -2,6 +2,7 @@ package host_test
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -2293,5 +2294,643 @@ func TestFirstWordStopsAtTheEndOfAnIdentifier(t *testing.T) {
 				t.Fatalf("firstWord(%q) = %q, want %q", tt.rest, got, tt.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The HostLink wire: Core records and nothing else
+// ---------------------------------------------------------------------------
+//
+// This is the second half of task O7.2 step 3. The first half — Host imports no
+// Factory, no WUI and no product repository — is mechanism 1 above and is
+// already enforced over every module-owned file, with its own fixture-tree
+// positive control in TestImportScanReportsForbiddenImportsInAFixtureTree.
+//
+// WHAT THIS ADDS is the other direction: not which modules Host may name, but
+// what may be put on the wire between Host and Factory. §15 makes that Core's
+// sessionwire records, and the reason is not tidiness. A Host-local struct on
+// the wire is a contract with no schema, no fixture and no version negotiation,
+// and the FIRST time it would be noticed is when a Factory built against Core
+// cannot decode it.
+//
+// IT IS A DIFFERENT MECHANISM FROM THE FIVE and does not get a numbered slot:
+// the five are about the MODULE GRAPH and this is about one package's encoders.
+// It states its own limits, as CLAUDE.md requires of a meta-guard.
+
+// hostLinkEncodingDirectories is every directory whose production code encodes
+// onto or decodes from a HostLink frame.
+//
+// THE SECOND ENTRY IS NOT OPTIONAL AND IS THE INTERESTING ONE.
+// internal/realtime/hostlink owns the RPC bodies; internal/service owns the
+// live event relay, which marshals an EnduringPublication straight onto a
+// HostLink channel. A guard over the transport package alone would have been
+// exactly the shape O7.1 shipped its bypass in: one object of a two-object
+// invariant. TestEveryHostLinkEncodingDirectoryIsScanned holds this list
+// against the module rather than against memory.
+var hostLinkEncodingDirectories = []string{
+	"internal/realtime/hostlink",
+	"internal/service",
+}
+
+// parseGoDirectory parses every Go file in one directory, optionally skipping
+// test files, and returns them by path.
+//
+// IT READS THE DIRECTORY ITSELF rather than calling go/parser.ParseDir, which
+// is deprecated as of Go 1.25 and which staticcheck reports as SA1019. The
+// replacement is not merely a deprecation shim: ParseDir groups files into
+// PACKAGES without consulting build tags, and this guard does not want packages
+// at all — it wants the files in a directory. Reading the directory says that
+// plainly.
+//
+// ITS LIMIT, as a residue item: it reads every .go file in the directory
+// whatever its build constraints, so a file excluded from the build on this
+// platform is still classified. That is deliberate — a wire encoding that
+// exists only on Linux is still a wire encoding — but it means a file's
+// presence here is not proof it compiles into any particular build.
+func parseGoDirectory(directory string, includeTests bool) (map[string]*ast.File, *token.FileSet, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, nil, err
+	}
+	fileSet := token.NewFileSet()
+	parsed := map[string]*ast.File{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		if !includeTests && strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		full := filepath.Join(directory, name)
+		file, err := parser.ParseFile(fileSet, full, nil, parser.ParseComments)
+		if err != nil {
+			return nil, nil, err
+		}
+		parsed[full] = file
+	}
+	return parsed, fileSet, nil
+}
+
+// wireEncodingScan is what one directory's encode sites amounted to.
+type wireEncodingScan struct {
+	// sites is how many json.Marshal/json.Unmarshal arguments were classified.
+	// A guard that cannot report a number cannot fail at zero.
+	sites int
+
+	// violations names every site whose value is not a Core record.
+	violations []string
+}
+
+// scanWireEncodings classifies every JSON encode and decode in one directory's
+// production source.
+//
+// HOW IT RESOLVES A TYPE, and it resolves only what it can name: a local `var`
+// declaration, a function or method PARAMETER, a named result, and a short
+// variable declaration whose right-hand side is a single call to a function or
+// method declared in the same directory. Anything else is REPORTED AS A
+// VIOLATION rather than skipped, so the guard fails closed: a site it cannot
+// read is a site that has to be made readable or explicitly handled, never one
+// that passes by being unintelligible.
+//
+// ITS LIMITS ARE A RESIDUE AND NOT A BOUNDARY. What follows is what this scan
+// is known to miss. It is NOT a closure, and a spelling absent from it is
+// unexamined rather than permitted:
+//
+//   - an encoder that is not encoding/json: a hand-written []byte, a
+//     fmt.Fprintf onto a writer, a third-party codec, or json.NewEncoder /
+//     json.NewDecoder, none of which this looks for;
+//   - a value whose declared type IS a Core record but whose CONTENT was built
+//     from Host-local material — this is a guard over types, and says nothing
+//     about what a body carries. Core's own MarshalJSON is what holds that;
+//   - a dot-import of sessionwire, which would erase the qualifier this checks
+//     for. TestSessionwireIsNeverDotImportedWhereItIsChecked closes that one
+//     rather than leaving it in this list;
+//   - an alias declared in this module whose underlying type is a Core record,
+//     which is refused (it is not sessionwire-qualified) rather than allowed —
+//     fail-closed, and therefore not a hole;
+//   - reflection, an any-typed argument resolved at run time, or a value
+//     reached through an interface;
+//   - a value assigned from a sessionwire FUNCTION is accepted on PROVENANCE
+//     rather than on its declared type, because resolving another package's
+//     result type needs a type checker. This is the one place the scan is not
+//     fail-closed; see classifyWireValue. The privilege is granted to the
+//     identifier "sessionwire" alone, and TestTheWireEncodingGuardReportsAHostLocalRecord
+//     drives a foreign-package call through it to show it is not granted wider;
+//   - a directory absent from hostLinkEncodingDirectories. That list is the
+//     subject and it is asserted against the module by
+//     TestEveryHostLinkEncodingDirectoryIsScanned, which is where a new
+//     encoding site gets caught.
+func scanWireEncodings(root, directory string) (wireEncodingScan, error) {
+	parsed, fileSet, err := parseGoDirectory(filepath.Join(root, filepath.FromSlash(directory)), false)
+	if err != nil {
+		return wireEncodingScan{}, err
+	}
+
+	results := map[string][]ast.Expr{}
+	{
+		for _, file := range parsed {
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok || function.Type.Results == nil {
+					continue
+				}
+				var types []ast.Expr
+				for _, field := range function.Type.Results.List {
+					count := max(len(field.Names), 1)
+					for range count {
+						types = append(types, field.Type)
+					}
+				}
+				results[function.Name.Name] = types
+			}
+		}
+	}
+
+	var scan wireEncodingScan
+	for path, file := range parsed {
+		jsonName, imported := jsonImportName(file)
+		if !imported {
+			continue
+		}
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			scope := functionScope(function, results)
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				argument, encoding := jsonEncodingArgument(call, jsonName)
+				if !encoding {
+					return true
+				}
+				scan.sites++
+				where := filepath.Base(path) + ":" + strconv.Itoa(fileSet.Position(call.Pos()).Line)
+				if violation, bad := classifyWireValue(where, argument, scope); bad {
+					scan.violations = append(scan.violations, violation)
+				}
+				return true
+			})
+		}
+	}
+	slices.Sort(scan.violations)
+	return scan, nil
+}
+
+// jsonImportName returns the name encoding/json is imported under in one file.
+func jsonImportName(file *ast.File) (string, bool) {
+	for _, imported := range file.Imports {
+		path, err := strconv.Unquote(imported.Path.Value)
+		if err != nil || path != "encoding/json" {
+			continue
+		}
+		if imported.Name != nil {
+			return imported.Name.Name, true
+		}
+		return "json", true
+	}
+	return "", false
+}
+
+// jsonEncodingArgument returns the value a json.Marshal or json.Unmarshal call
+// puts on, or takes off, the wire.
+//
+// Marshal's subject is its first argument and Unmarshal's is its SECOND, which
+// is the transposition a guard written from memory gets wrong and then reports
+// []byte as a violation forever.
+func jsonEncodingArgument(call *ast.CallExpr, jsonName string) (ast.Expr, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil, false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	if !ok || pkg.Name != jsonName {
+		return nil, false
+	}
+	switch selector.Sel.Name {
+	case "Marshal", "MarshalIndent":
+		if len(call.Args) == 0 {
+			return nil, false
+		}
+		return call.Args[0], true
+	case "Unmarshal":
+		if len(call.Args) < 2 {
+			return nil, false
+		}
+		return call.Args[1], true
+	default:
+		return nil, false
+	}
+}
+
+// wireScope is what one function body declares, in the two forms this guard can
+// use: a declared TYPE, and — for a value assigned from another package's
+// function — the PACKAGE it came out of.
+type wireScope struct {
+	types map[string]ast.Expr
+
+	// fromPackage records that an identifier was assigned from a call into a
+	// named package. See classifyWireValue for why that is accepted for
+	// sessionwire alone, and what it weakens.
+	fromPackage map[string]string
+}
+
+// functionScope maps every identifier one function declares to its type
+// expression: parameters, named results, local var declarations, and short
+// declarations assigned from a call this directory declares. A short
+// declaration from ANOTHER package's function records provenance instead,
+// because no type information is available without a type checker.
+func functionScope(function *ast.FuncDecl, results map[string][]ast.Expr) wireScope {
+	scope := wireScope{types: map[string]ast.Expr{}, fromPackage: map[string]string{}}
+	record := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				scope.types[name.Name] = field.Type
+			}
+		}
+	}
+	record(function.Recv)
+	record(function.Type.Params)
+	record(function.Type.Results)
+	if function.Body == nil {
+		return scope
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch statement := node.(type) {
+		case *ast.DeclStmt:
+			general, ok := statement.Decl.(*ast.GenDecl)
+			if !ok || general.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range general.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || value.Type == nil {
+					continue
+				}
+				for _, name := range value.Names {
+					scope.types[name.Name] = value.Type
+				}
+			}
+		case *ast.AssignStmt:
+			if statement.Tok != token.DEFINE || len(statement.Rhs) != 1 {
+				return true
+			}
+			call, ok := statement.Rhs[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if types, known := results[calleeName(call)]; known && len(types) == len(statement.Lhs) {
+				for index, target := range statement.Lhs {
+					identifier, ok := target.(*ast.Ident)
+					if !ok || identifier.Name == "_" {
+						continue
+					}
+					scope.types[identifier.Name] = types[index]
+				}
+				return true
+			}
+			pkg, qualified := callPackage(call)
+			if !qualified {
+				return true
+			}
+			for _, target := range statement.Lhs {
+				identifier, ok := target.(*ast.Ident)
+				if !ok || identifier.Name == "_" {
+					continue
+				}
+				scope.fromPackage[identifier.Name] = pkg
+			}
+		}
+		return true
+	})
+	return scope
+}
+
+// callPackage reports the package qualifier of a call like pkg.Func(...). It is
+// deliberately not told apart from a METHOD call on a local variable named like
+// a package; nothing distinguishes the two syntactically, and the consumer only
+// grants a privilege to one name.
+func callPackage(call *ast.CallExpr) (string, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return pkg.Name, true
+}
+
+// calleeName is the plain function or method name a call names.
+func calleeName(call *ast.CallExpr) string {
+	switch callee := call.Fun.(type) {
+	case *ast.Ident:
+		return callee.Name
+	case *ast.SelectorExpr:
+		return callee.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// classifyWireValue reports whether one encode site's value is a Core record.
+func classifyWireValue(where string, argument ast.Expr, scope wireScope) (string, bool) {
+	if unary, ok := argument.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+		argument = unary.X
+	}
+	// A composite literal names its own type, which is the easiest case and the
+	// one a future site is most likely to be written as.
+	if literal, ok := argument.(*ast.CompositeLit); ok {
+		return classifyWireType(where, "a composite literal", literal.Type)
+	}
+	identifier, ok := argument.(*ast.Ident)
+	if !ok {
+		return where + ": the encoded value is a " + fmt.Sprintf("%T", argument) +
+			", whose type this guard cannot name; give it a declared local so the wire type is legible", true
+	}
+	if declared, known := scope.types[identifier.Name]; known {
+		return classifyWireType(where, strconv.Quote(identifier.Name), declared)
+	}
+	// PROVENANCE, AND ONLY FOR CORE. A value assigned from sessionwire's own
+	// function has no declared type here — hostlink does
+	// `response, err := sessionwire.NegotiateVersion(request)` — and resolving
+	// it would need a type checker. It is accepted on the ground that it came
+	// out of Core.
+	//
+	// THIS IS THE ONE PLACE THE GUARD IS NOT FAIL-CLOSED, and it is weaker than
+	// the type rule in a way worth stating: a Core function returning a string,
+	// a []byte or a Host-visible non-record would pass here. It is narrow — it
+	// grants nothing to any other package, and an unqualified or locally-called
+	// value still fails — but it is a residue item, not a boundary.
+	if pkg, known := scope.fromPackage[identifier.Name]; known {
+		if pkg == "sessionwire" {
+			return "", false
+		}
+		return where + ": " + strconv.Quote(identifier.Name) + " is encoded onto HostLink and came out of package " + pkg +
+			", which is not Core", true
+	}
+	return where + ": the type of " + strconv.Quote(identifier.Name) +
+		" is not declared anywhere this guard can read; a HostLink encoding must name a Core record where a reader can see it", true
+}
+
+// classifyWireType requires a type expression to be sessionwire-qualified.
+func classifyWireType(where, subject string, declared ast.Expr) (string, bool) {
+	for {
+		switch typed := declared.(type) {
+		case *ast.StarExpr:
+			declared = typed.X
+		case *ast.ArrayType:
+			declared = typed.Elt
+		case *ast.ParenExpr:
+			declared = typed.X
+		default:
+			goto resolved
+		}
+	}
+resolved:
+	selector, ok := declared.(*ast.SelectorExpr)
+	if !ok {
+		return where + ": " + subject + " is encoded onto HostLink and is not a Core record", true
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	if !ok || pkg.Name != "sessionwire" {
+		return where + ": " + subject + " is encoded onto HostLink from package " + fmt.Sprintf("%v", selector.X) +
+			", and the HostLink wire carries Core sessionwire records", true
+	}
+	return "", false
+}
+
+// TestCoreRecordsAreTheOnlyThingHostLinkEncodes is step 3's second assertion.
+func TestCoreRecordsAreTheOnlyThingHostLinkEncodes(t *testing.T) {
+	t.Parallel()
+
+	total := 0
+	for _, directory := range hostLinkEncodingDirectories {
+		scan, err := scanWireEncodings(".", directory)
+		if err != nil {
+			t.Fatalf("scan %s: %v", directory, err)
+		}
+		for _, violation := range scan.violations {
+			t.Errorf("%s/%s", directory, violation)
+		}
+		if scan.sites == 0 {
+			t.Errorf("%s contributed no encode site; either it no longer encodes onto HostLink and belongs out of hostLinkEncodingDirectories, or this guard stopped seeing it", directory)
+		}
+		total += scan.sites
+	}
+	if total == 0 {
+		t.Fatal("no HostLink encode site was classified at all; the guard is vacuous")
+	}
+}
+
+// TestTheWireEncodingGuardReportsAHostLocalRecord is the POSITIVE CONTROL.
+//
+// "Nothing on the wire is Host-local" is a negative, and a negative that cannot
+// be made to fail is not an assertion. The fixture below puts a Host-local
+// struct, an unresolvable value and a legal Core record through the same
+// scanner, and requires it to report the first two and not the third.
+func TestTheWireEncodingGuardReportsAHostLocalRecord(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFixture(t, root, "wire/legal.go", `package wire
+
+import (
+	"encoding/json"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+)
+
+func decode(data []byte) error {
+	var request sessionwire.HostLinkBindRequest
+	return json.Unmarshal(data, &request)
+}
+
+func encode(observation sessionwire.HostLinkDrainObservation) ([]byte, error) {
+	return json.Marshal(observation)
+}
+
+func fromCall() ([]byte, error) {
+	wire, _ := built()
+	return json.Marshal(wire)
+}
+
+func built() (sessionwire.HostLinkError, bool) { return sessionwire.HostLinkError{}, true }
+`)
+	writeFixture(t, root, "wire/illegal.go", `package wire
+
+import (
+	"encoding/json"
+
+	"example.com/elsewhere"
+)
+
+type hostLocal struct {
+	Secret string `+"`json:\"secret\"`"+`
+}
+
+func leak() ([]byte, error) {
+	var local hostLocal
+	return json.Marshal(local)
+}
+
+func leakLiteral() ([]byte, error) {
+	return json.Marshal(hostLocal{Secret: "x"})
+}
+
+func leakUnreadable(values map[string]any) ([]byte, error) {
+	return json.Marshal(values["anything"])
+}
+
+func leakForeignProvenance() ([]byte, error) {
+	value, _ := elsewhere.Build()
+	return json.Marshal(value)
+}
+`)
+
+	scan, err := scanWireEncodings(root, "wire")
+	if err != nil {
+		t.Fatalf("scan the fixture: %v", err)
+	}
+	if scan.sites != 7 {
+		t.Fatalf("the scanner classified %d encode sites, want the 7 in the fixture; it is not reading what this control put in front of it", scan.sites)
+	}
+	wanted := []string{"illegal.go", "illegal.go", "illegal.go", "illegal.go"}
+	if len(scan.violations) != len(wanted) {
+		t.Fatalf("violations = %q, want exactly %d, all in illegal.go", scan.violations, len(wanted))
+	}
+	for _, violation := range scan.violations {
+		if !strings.HasPrefix(violation, "illegal.go:") {
+			t.Errorf("violation %q names a file other than the fixture's illegal one", violation)
+		}
+	}
+	// AND THE LEGAL FILE PRODUCED NONE, which is the other half: a scanner that
+	// reported everything would satisfy the assertions above. The comparison is
+	// on the file name as a whole — "legal.go" is a SUFFIX of "illegal.go", and
+	// a Contains check here reported all three of the intended violations as
+	// leaks from the legal file.
+	for _, violation := range scan.violations {
+		if strings.HasPrefix(violation, "legal.go:") {
+			t.Errorf("the legal Core-record file was reported: %q", violation)
+		}
+	}
+}
+
+// TestEveryHostLinkEncodingDirectoryIsScanned holds hostLinkEncodingDirectories
+// against the MODULE rather than against whoever wrote it.
+//
+// A subject list is the classic way a guard goes quiet: the rule stays correct
+// and the thing it points at stops being everything. This walks every
+// module-owned production file, finds each one that imports encoding/json AND
+// names a HostLink channel or a HostLink Core record, and requires its
+// directory to be in the list.
+//
+// ITS LIMIT, stated as a residue: it recognizes a HostLink encoder by the
+// identifiers a file mentions — hostlink.ChannelFor, hostlink.Method*, or a
+// sessionwire HostLink record — so a package that encodes onto a channel string
+// it received as a plain parameter, from a caller in another package, is not
+// recognized. The list is not a closure. What bounds that in practice is
+// internal/service's own TestPublishIsTheOnlyPublishingSurface, which holds the
+// set of files that may publish at all.
+func TestEveryHostLinkEncodingDirectoryIsScanned(t *testing.T) {
+	t.Parallel()
+
+	declared := map[string]bool{}
+	for _, directory := range hostLinkEncodingDirectories {
+		declared[directory] = true
+	}
+
+	scan, err := scanImports(".", "")
+	if err != nil {
+		t.Fatalf("enumerate module files: %v", err)
+	}
+	if len(scan.scanned) == 0 {
+		t.Fatal("the enumerator reached no file, so this guard is vacuous")
+	}
+	examined := 0
+	for _, relative := range scan.scanned {
+		if strings.HasSuffix(relative, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(filepath.Join(".", filepath.FromSlash(relative)))
+		if err != nil {
+			t.Fatalf("read %s: %v", relative, err)
+		}
+		text := string(source)
+		if !strings.Contains(text, `"encoding/json"`) {
+			continue
+		}
+		examined++
+		if !mentionsHostLinkWire(text) {
+			continue
+		}
+		directory := path.Dir(relative)
+		if !declared[directory] {
+			t.Errorf("%s encodes JSON and names the HostLink wire, but %s is not in hostLinkEncodingDirectories", relative, directory)
+		}
+	}
+	if examined == 0 {
+		t.Fatal("no production file importing encoding/json was examined; the subject check is vacuous")
+	}
+}
+
+// mentionsHostLinkWire reports whether a file names the HostLink wire.
+func mentionsHostLinkWire(text string) bool {
+	for _, marker := range []string{
+		"hostlink.ChannelFor",
+		"hostlink.Method",
+		"sessionwire.HostLink",
+		"sessionwire.EnduringPublication",
+		"ChannelFor(",
+		"MethodBind",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSessionwireIsNeverDotImportedWhereItIsChecked closes the one residue item
+// that would silently disable the wire-encoding guard.
+//
+// classifyWireType requires a "sessionwire." qualifier. A dot-import would
+// erase it and turn every Core record into an unqualified identifier, which the
+// guard reports as NOT a Core record — so the failure is loud rather than
+// silent, and this test exists to say which direction it fails in and to keep
+// it that way.
+func TestSessionwireIsNeverDotImportedWhereItIsChecked(t *testing.T) {
+	t.Parallel()
+
+	checked := 0
+	for _, directory := range hostLinkEncodingDirectories {
+		// TESTS ARE INCLUDED HERE and are excluded from the encoding scan, and
+		// the asymmetry is the point: a dot-import in a test file of the same
+		// package changes nothing about what the scan reads, but it is the
+		// spelling somebody reaches for first, and a package where it is
+		// idiomatic is a package where it will migrate into production.
+		parsed, _, err := parseGoDirectory(filepath.FromSlash(directory), true)
+		if err != nil {
+			t.Fatalf("parse %s: %v", directory, err)
+		}
+		for path, file := range parsed {
+			for _, imported := range file.Imports {
+				checked++
+				if imported.Name != nil && imported.Name.Name == "." {
+					t.Errorf("%s dot-imports %s; the wire-encoding guard reads a package qualifier", path, imported.Path.Value)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no import was examined, so this guard is vacuous")
 	}
 }

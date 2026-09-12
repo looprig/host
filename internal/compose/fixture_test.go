@@ -433,7 +433,14 @@ func (c *fakeCursors) LoadCursor(context.Context, sessionwire.TenantID, sessionw
 	return c.cursor, nil
 }
 
-func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, order uint64, _ uint64) error {
+// SaveCursor takes the EPOCH FIRST AND THE ORDER SECOND. commands.CursorWrites
+// declares SaveCursor(ctx, tenant, session, epoch, order); both are uint64, so
+// a transposition compiles. This double had the two the wrong way round and
+// therefore recorded the lease epoch as the consumed acceptance order. No test
+// in this file read the value back, so nothing failed — which is exactly why it
+// survived, and why a double whose stored value nobody reads is worth getting
+// right anyway: the next test to read it inherits the defect.
+func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, _ uint64, order uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cursor = order
