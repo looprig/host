@@ -506,10 +506,17 @@ func (o Options) validatePlacement() error {
 // ---------------------------------------------------------------------------
 //
 // Host is a GENERIC runtime host and the agents it serves are a product's. The
-// two types below are the whole of what a product supplies, and they are
-// declared here rather than in the composition for one reason: internal/ is
-// not importable from outside this module, so a seam declared there could only
-// ever be satisfied by this module's own binary. A product implements these.
+// two types below are the two a product supplies FROM OUTSIDE THIS MODULE, and
+// they are declared here rather than in the composition for one reason:
+// internal/ is not importable from outside this module, so a seam declared
+// there could only ever be satisfied by this module's own binary.
+//
+// THEY ARE NOT YET THE WHOLE OF WHAT A PRODUCT SUPPLIES, and saying so would
+// be false in this same commit. cmd/host's Bootstrap asks for five more — an
+// authenticator, a workspace provider, an inbox, a cursor store and the store
+// itself — and four of those are typed in internal/, so a product cannot
+// satisfy Bootstrap at all today. That is tracked against the sessionstore
+// release the inbox and cursor seams are waiting on; see cmd/host/main.go.
 
 // Registrar produces the Department registrations one deployment serves.
 //

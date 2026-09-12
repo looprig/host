@@ -2,10 +2,15 @@ package compose
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -78,6 +83,54 @@ func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	default:
 	}
 	return waiter
+}
+
+// waiting reports how many channels are currently filed under one duration.
+//
+// THE COUNT IS THE RENDEZVOUS AND THE REGISTRATION ANNOUNCEMENT IS NOT, when
+// two goroutines arm the same bound. The compatibility wait and the work
+// sampler both arm WorkPoll on this one clock, so a test that waited for a
+// registration ANNOUNCEMENT could be released by the sampler's and then fire a
+// bound the wait had not yet taken a handle on — the wait would never see it.
+// A waiter count discriminates: the wait's own handle is the (n+1)th.
+func (c *fakeClock) waiting(d time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.waiters[d])
+}
+
+// awaitWaiters blocks until at least want channels are filed under a duration.
+func (c *fakeClock) awaitWaiters(t *testing.T, d time.Duration, want int) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		if c.waiting(d) >= want {
+			return
+		}
+		select {
+		case <-c.registered:
+		case <-deadline.C:
+			t.Fatalf("only %d of %d waiters ever armed a %v bound", c.waiting(d), want, d)
+		}
+	}
+}
+
+// waitForWaiters is awaitWaiters without a testing.T, for use off the test
+// goroutine. It reports whether the count was reached before the deadline.
+func (c *fakeClock) waitForWaiters(d time.Duration, want int, within time.Duration) bool {
+	deadline := time.NewTimer(within)
+	defer deadline.Stop()
+	for {
+		if c.waiting(d) >= want {
+			return true
+		}
+		select {
+		case <-c.registered:
+		case <-deadline.C:
+			return false
+		}
+	}
 }
 
 // fire releases every channel currently waiting on one duration.
@@ -191,14 +244,32 @@ func (t *fakeWarmTimer) arming() time.Duration {
 // recorder is the ordered trace every fake writes into, so a test asserts on
 // what happened in what order rather than on a count per fake.
 type recorder struct {
-	mu    sync.Mutex
-	steps []string
+	mu      sync.Mutex
+	steps   []string
+	watcher func(step string)
+}
+
+// watch installs an observer called with each step AS IT IS RECORDED.
+//
+// It is how a test asserts on state that only exists WHILE a step is running —
+// "the tenant transports were still open when the drain checkpointed" is a
+// statement about an instant, and no after-the-fact trace can carry it. The
+// observer runs outside the recorder's lock so that it may read the
+// composition, and it must not record into this recorder.
+func (r *recorder) watch(observe func(step string)) {
+	r.mu.Lock()
+	r.watcher = observe
+	r.mu.Unlock()
 }
 
 func (r *recorder) record(step string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.steps = append(r.steps, step)
+	watcher := r.watcher
+	r.mu.Unlock()
+	if watcher != nil {
+		watcher(step)
+	}
 }
 
 func (r *recorder) trace() []string {
@@ -461,14 +532,48 @@ func (c *fakeCheckpointer) Checkpoint(context.Context, sessionwire.TenantID, ses
 	return c.err
 }
 
-// fakeAuth accepts one credential.
-type fakeAuth struct{}
+// fakeAuth is the service authenticator, and it HONOURS THE TENANT IT IS ASKED
+// ABOUT.
+//
+// A service credential is minted FOR one tenant, so presenting tenant-a's
+// credential to a transport asking about tenant-b fails here exactly as it
+// fails against a real authenticator. The first version of this fake took one
+// credential and ignored the tenant argument entirely, and that is the reason
+// a whole class of defect below it was invisible: a fake looser than the
+// dependency it stands for cannot defend anything downstream of it. With the
+// tenant discarded, the transport's own TenantID could be latched to a
+// constant — a tenant-a credential reaching tenant-b's Multiplexer — and the
+// entire suite stayed green.
+//
+// It records what it was asked, because "the transport authenticated this
+// connection as the tenant on its path" is a statement about the ARGUMENT and
+// not only about the outcome.
+type fakeAuth struct {
+	mu       sync.Mutex
+	verified []string
+}
 
-func (fakeAuth) VerifyTenant(_ context.Context, _ sessionwire.TenantID, credential string) error {
-	if credential != "service-credential" {
-		return errors.New("invalid credential")
+// credentialFor is the service credential minted for one tenant.
+func credentialFor(tenant sessionwire.TenantID) string {
+	return "service-credential-for-" + string(tenant)
+}
+
+func (a *fakeAuth) VerifyTenant(_ context.Context, tenant sessionwire.TenantID, credential string) error {
+	a.mu.Lock()
+	a.verified = append(a.verified, string(tenant)+":"+credential)
+	a.mu.Unlock()
+	if credential != credentialFor(tenant) {
+		return errors.New("this credential was not minted for that tenant")
 	}
 	return nil
+}
+
+// verifications reports every (tenant, credential) pair a transport asked
+// about, in order.
+func (a *fakeAuth) verifications() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.verified...)
 }
 
 // fakeWorkStates is the optional work-state source.
@@ -507,6 +612,7 @@ type fixture struct {
 	rig         *testkit.FakeRig
 	runtime     *controllableSession
 	work        *fakeWorkStates
+	auth        *fakeAuth
 	host        *host.Host
 	hostOptions host.Options
 	svc         *Service
@@ -523,6 +629,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 	runtimeSession := newControllableSession(testRigSessionID)
 	rig := &testkit.FakeRig{Session: runtimeSession}
 	work := &fakeWorkStates{}
+	auth := &fakeAuth{}
 
 	target, err := department.NewRigTarget(rig, testCompat, department.Capabilities{
 		SupportsPooled:    true,
@@ -546,7 +653,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		SessionStore:      store,
 		Workspaces:        store,
 		Clock:             hostClock{clock},
-		Auth:              fakeAuth{},
+		Auth:              auth,
 		Placement:         sessionwire.HostPlacementPooled,
 		Capacity:          4,
 		WarmTTL:           defaultFixtureWarmTTL,
@@ -574,7 +681,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		InboxWrites:          fakeCommands{},
 		Targets:              directory,
 		Checkpointer:         &fakeCheckpointer{trace: trace},
-		Auth:                 fakeAuth{},
+		Auth:                 auth,
 		MaxBindingsPerLink:   4,
 		MaxBindings:          8,
 		MaxTenantLinks:       3,
@@ -600,7 +707,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 	}
 	return &fixture{
 		t: t, trace: trace, clock: clock, store: store, directory: directory,
-		rig: rig, runtime: runtimeSession, work: work, host: built, hostOptions: hostOptions, svc: composed,
+		rig: rig, runtime: runtimeSession, work: work, auth: auth, host: built, hostOptions: hostOptions, svc: composed,
 	}
 }
 
@@ -860,28 +967,65 @@ func (s *fakeStore) loseLease(key registry.Key) {
 // awaitOutcome runs a compatibility wait, performs one action once the wait is
 // demonstrably in flight, and returns what the wait reported.
 //
-// THE RENDEZVOUS IS THE WAIT'S OWN ARMING AND NOT A SLEEP. AwaitSessionIdle arms
-// its timeout and then its poll before it selects, so observing both
-// registrations on the clock is proof that the wait is inside the select and
-// that firing either bound will reach it. Acting earlier is the race this helper
-// exists to remove: a runtime stopped, or a grant lost, before the wait has
-// taken its handle is a DIFFERENT scenario — the heartbeat tears the residency
-// down and the wait then correctly reports that this Host holds no such session.
-func (f *fixture) awaitOutcome(t *testing.T, ctx context.Context, act func()) (CompatibilityOutcome, error) {
+// THE RENDEZVOUS IS THE WAIT'S OWN HANDLE AND NOT A SLEEP. AwaitSessionIdle
+// arms its timeout and then its poll before it selects, so this clock holding
+// one MORE waiter on each of those bounds than it held before the wait started
+// is proof that the wait is inside the select and that firing either bound will
+// reach it. Acting earlier is one of the two races this helper removes: a
+// runtime stopped, or a grant lost, before the wait has taken its handle is a
+// DIFFERENT scenario — the heartbeat tears the residency down and the wait then
+// correctly reports that this Host holds no such session.
+//
+// IT COUNTS WAITERS AND DOES NOT WATCH ANNOUNCEMENTS, because the work sampler
+// arms WorkPoll on this same clock. An announcement-based rendezvous could be
+// released by the SAMPLER'S arming while the wait had taken no handle at all,
+// and the test would then fire a bound into a channel nobody was reading. That
+// was a real intermittent failure at roughly two runs in a thousand.
+//
+// A fallback bound, if one is named, is released only once the wait has GONE
+// ROUND ITS LOOP — that is, once the WorkPoll waiter count is back to what it
+// was immediately before act fired it. That number is derived and not chosen:
+// it is the sampler's arm plus the wait's, so a wait that returned instead can
+// only ever bring it back to the sampler's alone. Firing both bounds at once
+// would instead leave the select with two ready cases, and Go picks among those
+// uniformly at random, so it would be flaky in the direction that HIDES a
+// defect.
+func (f *fixture) awaitOutcome(t *testing.T, ctx context.Context, act func(), fallback ...time.Duration) (CompatibilityOutcome, error) {
 	t.Helper()
+	if len(fallback) > 1 {
+		t.Fatalf("awaitOutcome takes at most one fallback bound, got %d", len(fallback))
+	}
 	type result struct {
 		outcome CompatibilityOutcome
 		err     error
 	}
 	results := make(chan result, 1)
+
+	timeoutWaiters := f.clock.waiting(f.svc.options.CompatibilityTimeout) + 1
+	pollWaiters := f.clock.waiting(f.svc.options.WorkPoll) + 1
 	go func() {
 		outcome, err := f.svc.AwaitSessionIdle(ctx, keyA)
 		results <- result{outcome: outcome, err: err}
 	}()
 
-	f.clock.awaitRegistration(t, f.svc.options.CompatibilityTimeout)
-	f.clock.awaitRegistration(t, f.svc.options.WorkPoll)
+	f.clock.awaitWaiters(t, f.svc.options.CompatibilityTimeout, timeoutWaiters)
+	f.clock.awaitWaiters(t, f.svc.options.WorkPoll, pollWaiters)
 	act()
+
+	if len(fallback) == 1 {
+		rearmed := make(chan struct{})
+		go func() {
+			if f.clock.waitForWaiters(f.svc.options.WorkPoll, pollWaiters, 5*time.Second) {
+				close(rearmed)
+			}
+		}()
+		select {
+		case answer := <-results:
+			return answer.outcome, answer.err
+		case <-rearmed:
+			f.clock.fire(fallback[0])
+		}
+	}
 
 	select {
 	case answer := <-results:
@@ -892,45 +1036,74 @@ func (f *fixture) awaitOutcome(t *testing.T, ctx context.Context, act func()) (C
 	}
 }
 
-// fireIfRearmed waits briefly for a fresh arming of watched, and fires fallback
-// only if one appears.
+// hostLinkConnect dials one tenant's HostLink endpoint over a real WebSocket
+// and sends the Centrifuge connect frame carrying a service credential. It
+// reports whether the connection was accepted.
 //
-// It is the deterministic alternative to firing two bounds at once. A wait that
-// returned at the first bound arms nothing further, so nothing is fired and the
-// fallback stays unreachable; a wait that went round its loop arms the watched
-// bound again, which is the observable difference.
-func (c *fakeClock) fireIfRearmed(watched, fallback time.Duration) {
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for {
-		select {
-		case armed := <-c.registered:
-			if armed != watched {
-				continue
-			}
-			c.fire(fallback)
-			return
-		case <-deadline.C:
-			return
-		}
-	}
-}
-
-// awaitRegistration blocks until something arms a bound of this duration.
-func (c *fakeClock) awaitRegistration(t *testing.T, d time.Duration) {
+// IT HAS TO BE A REAL UPGRADE. VerifyTenant is reached only from the
+// transport's OnConnecting handler, which runs after the WebSocket handshake,
+// so an ordinary GET — which is what the routing test makes — authenticates
+// nothing at all. That is precisely why a latched transport TenantID was
+// invisible: the only assertions over the per-tenant endpoints were a routing
+// status code and a pointer comparison, and neither reaches the authenticator.
+func hostLinkConnect(t *testing.T, serverURL string, tenant sessionwire.TenantID, credential string) bool {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for {
-		select {
-		case armed := <-c.registered:
-			if armed == d {
-				return
-			}
-		case <-deadline.C:
-			t.Fatalf("nothing armed a %v bound", d)
-		}
+	endpoint := "ws" + strings.TrimPrefix(serverURL, "http") + HostLinkPathPrefix + string(tenant)
+	connection, response, err := websocket.DefaultDialer.Dial(endpoint, http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json"}})
+	if err != nil {
+		t.Fatalf("dial %s (response %#v): %v", endpoint, response, err)
 	}
+	defer connection.Close()
+
+	negotiation, err := json.Marshal(sessionwire.VersionNegotiationRequest{
+		SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
+	})
+	if err != nil {
+		t.Fatalf("marshal negotiation request: %v", err)
+	}
+	command := struct {
+		ID      uint32 `json:"id"`
+		Connect struct {
+			Token string          `json:"token"`
+			Data  json.RawMessage `json:"data"`
+		} `json:"connect"`
+	}{ID: 1}
+	command.Connect.Token = credential
+	command.Connect.Data = negotiation
+	frame, err := json.Marshal(command)
+	if err != nil {
+		t.Fatalf("marshal connect frame: %v", err)
+	}
+	// The deadlines below bound a REAL network read against a real embedded
+	// transport, which is the one thing in this package the fake clock does not
+	// drive. They are failure bounds and nothing in the test waits for them.
+	if err := connection.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set write deadline: %v", err)
+	}
+	if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Fatalf("write connect frame: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, payload, err := connection.ReadMessage()
+	if err != nil {
+		var closed *websocket.CloseError
+		if errors.As(err, &closed) {
+			return false
+		}
+		t.Fatalf("read connect reply: %v", err)
+	}
+	var reply struct {
+		Connect *json.RawMessage `json:"connect"`
+		Error   *struct {
+			Code uint32 `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &reply); err != nil {
+		t.Fatalf("decode connect reply %q: %v", payload, err)
+	}
+	return reply.Connect != nil && reply.Error == nil
 }
 
 // bindRequest is one Factory route request for a resident session.

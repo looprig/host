@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,8 +136,15 @@ func TestResolvingTheSameTenantTwiceReusesItsMultiplexer(t *testing.T) {
 //
 // The distinction is which tenant is refused. A latch refuses every tenant but
 // the first, forever; a capacity bound refuses whoever asks when there is no
-// room, and stops refusing as soon as an idle link is reclaimed. Both halves are
-// asserted, because the first alone is also true of a latch with a limit of one.
+// room, and stops refusing as soon as an idle link is reclaimed.
+//
+// THIS TEST ASSERTS THE ADMISSION HALF ONLY, and the name of the other test is
+// where the refusal half lives. To make a refusal reachable at all the first
+// link must be BUSY, which needs a bind and therefore a composed Host; here the
+// first link holds nothing, so a bound of one admits the second tenant and
+// reclaims the first — which a latch never does. The refusal half is
+// TestABusyTenantIsNeverEvictedByAStrangerConnecting in service_test.go. An
+// earlier version of this comment claimed both halves were asserted here.
 func TestTheTenantBoundIsACapacityAnswerAndNotALatch(t *testing.T) {
 	t.Parallel()
 
@@ -160,17 +168,47 @@ func TestTheTenantBoundIsACapacityAnswerAndNotALatch(t *testing.T) {
 }
 
 // TestAnInvalidTenantIsRefusedBeforeAnythingIsAllocated closes the other half of
-// the bound: the tenant on the path is an unauthenticated claim, so a caller
-// naming arbitrary strings must not be able to make this Host allocate for each.
+// the bound: the tenant on the path is an unauthenticated claim, so an
+// unidentifiable one must not make this Host allocate at all.
+//
+// WHAT CORE'S RULE ACTUALLY REFUSES IS EMPTY AND TOO LONG, AND NOTHING ELSE,
+// which is narrower than "arbitrary strings" and is measured here rather than
+// assumed: a space, an embedded newline, a NUL and an embedded slash are all
+// VALID TenantIDs to sessionwire, and the accepted rows below record that. Two
+// other mechanisms carry the weight the validity rule does not — tenantFromPath
+// refuses a path with a further segment, so the slash spelling never reaches
+// resolve over HTTP, and MaxTenantLinks bounds how many links an anonymous
+// caller can cause at all. This test is about the allocation-free refusal only.
 func TestAnInvalidTenantIsRefusedBeforeAnythingIsAllocated(t *testing.T) {
 	t.Parallel()
 
-	set, built := stubLinks(t, 4)
-	if _, err := set.resolve(""); err == nil {
-		t.Fatal("an empty tenant was accepted")
-	}
-	if *built != 0 {
-		t.Errorf("a refused tenant built %d links, want 0", *built)
+	for _, test := range []struct {
+		tenant  sessionwire.TenantID
+		refused bool
+	}{
+		{tenant: "", refused: true},
+		{tenant: sessionwire.TenantID(strings.Repeat("t", 4096)), refused: true},
+		// Accepted by Core's identity rule. These are the control AND the
+		// disclosure: the refusal above is the identity rule's and is not a
+		// sanitizer.
+		{tenant: "tenant-a"},
+		{tenant: " "},
+		{tenant: "tenant a"},
+		{tenant: "tenant/a"},
+		{tenant: "tenant\na"},
+	} {
+		set, built := stubLinks(t, 8)
+		_, err := set.resolve(test.tenant)
+		if refused := err != nil; refused != test.refused {
+			t.Errorf("resolve(%q) = %v, want refused=%v", test.tenant, err, test.refused)
+		}
+		want := 1
+		if test.refused {
+			want = 0
+		}
+		if *built != want {
+			t.Errorf("resolve(%q) built %d links, want %d", test.tenant, *built, want)
+		}
 	}
 }
 

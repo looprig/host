@@ -63,6 +63,72 @@ type resident struct {
 		leaseGone bool
 		dropped   bool
 	}
+
+	// The four steps above these are guarded ON ATTEMPT; these four are guarded
+	// ON SUCCESS, and the split is a decision rather than an oversight.
+	//
+	// A DESTRUCTIVE STEP LATCHES ON ATTEMPT. stopWork, stopOwnership,
+	// releaseLease and dropState hand something back, and a step that errored
+	// may have handed it back anyway; retrying one of those is a release of
+	// somebody else's grant if the session has since been re-acquired, which is
+	// worse than a release that never retries.
+	//
+	// A DURABLE OR IDEMPOTENT STEP LATCHES ON SUCCESS, so that this layer never
+	// turns a failed step into a nil return of its own. That matters most for
+	// FinishRelease: internal/lifecycle reports `drained` unless FinishRelease
+	// failed, because Core defines that state as "the observed scope has
+	// finished release" and a Factory DELETES a dedicated workload on it. A
+	// guard here that latched on attempt would let a warm release whose
+	// tombstone write failed turn a later drain's FinishRelease into a silent
+	// success, and the Host would report `drained` with nothing written.
+	//
+	// TWO OF THESE FOUR ARE BELT OVER AN EXISTING BRACE, AND THAT IS MEASURED
+	// RATHER THAN ASSUMED. residency.Heartbeat — the only production
+	// releaseHalves — already guards BeginRelease and FinishRelease itself
+	// (heartbeat.go:408 and :433) and latches on ATTEMPT, returning its first
+	// verdict forever; issuing halves.FinishRelease twice writes ONE tombstone,
+	// which is why doubling that call is an equivalent mutation here and not a
+	// live defect. What these two guards buy is independence from that: releaseHalves
+	// is an INTERFACE and its contract states no such property, so a composition
+	// that relied on one implementation's internals would be relying on
+	// something nothing holds it to. They do not weaken the dependency's own
+	// guard, which is the stricter of the two.
+	//
+	// The other two are load-bearing today. Checkpoint is the PRODUCT's seam and
+	// ReleaseResidency is the runtime's, and neither promises idempotence;
+	// without these guards a warm countdown firing during a drain checkpoints
+	// twice and releases the runtime twice, and internal/lifecycle's own drain
+	// test already treats a second runtime release as wrong.
+	//
+	// Neither seam retries a step within its own sequence — both run each step
+	// exactly once and record the failure — so these guards only ever fire
+	// ACROSS the two seams, which is the race they exist for.
+	checkpointOnce onceOnSuccess
+	beginOnce      onceOnSuccess
+	finishOnce     onceOnSuccess
+	residencyOnce  onceOnSuccess
+}
+
+// onceOnSuccess runs an action at most once SUCCESSFULLY, serializing concurrent
+// callers so that a warm release and a drain reaching the same step at the same
+// instant run it once between them rather than twice.
+type onceOnSuccess struct {
+	mu   sync.Mutex
+	done bool
+}
+
+// run performs the action unless a previous call already completed it.
+func (o *onceOnSuccess) run(action func() error) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.done {
+		return nil
+	}
+	if err := action(); err != nil {
+		return err
+	}
+	o.done = true
+	return nil
 }
 
 // sessionWork is the per-session machinery ownership started: the durable
@@ -83,8 +149,11 @@ func (r *resident) Lost() <-chan struct{} { return r.lease.Lost() }
 // WaitIdle blocks until the runtime has no work in flight.
 func (r *resident) WaitIdle(ctx context.Context) error { return r.runtime.WaitIdle(ctx) }
 
-// BeginRelease marks the residency releasing, durably, without terminating it.
-func (r *resident) BeginRelease(ctx context.Context) error { return r.halves.BeginRelease(ctx) }
+// BeginRelease marks the residency releasing, durably, without terminating it,
+// once.
+func (r *resident) BeginRelease(ctx context.Context) error {
+	return r.beginOnce.run(func() error { return r.halves.BeginRelease(ctx) })
+}
 
 // Checkpoint commits the checkpoints the release requires, through the
 // product's seam.
@@ -96,7 +165,9 @@ func (r *resident) BeginRelease(ctx context.Context) error { return r.halves.Beg
 // sessions had lost whatever was not already durable. The constructor refuses a
 // composition without one, so this field is never nil.
 func (r *resident) Checkpoint(ctx context.Context) error {
-	return r.checkpoint(ctx, r.key.TenantID, r.key.SessionID)
+	return r.checkpointOnce.run(func() error {
+		return r.checkpoint(ctx, r.key.TenantID, r.key.SessionID)
+	})
 }
 
 // ReleaseResidency stops this session's process-local work and releases the
@@ -110,7 +181,7 @@ func (r *resident) Checkpoint(ctx context.Context) error {
 // release — go through it.
 func (r *resident) ReleaseResidency(ctx context.Context) error {
 	r.stopWork()
-	return r.runtime.ReleaseResidency(ctx)
+	return r.residencyOnce.run(func() error { return r.runtime.ReleaseResidency(ctx) })
 }
 
 // stopWork ends the consumer and the tail, once.
@@ -124,6 +195,15 @@ func (r *resident) stopWork() {
 	if r.work != nil && r.work.stop != nil {
 		r.work.stop()
 	}
+}
+
+// finishRelease writes the epoch-fenced tombstone, once.
+//
+// It is the step BOTH SEAMS name FinishRelease and neither means the same thing
+// by; see the two views below. What is common to them is this one durable
+// write, so the guard lives here rather than in either view.
+func (r *resident) finishRelease(ctx context.Context) error {
+	return r.finishOnce.run(func() error { return r.halves.FinishRelease(ctx) })
 }
 
 // stopOwnership ends the heartbeat, once.
@@ -207,7 +287,7 @@ var _ lifecycle.Session = releaseSession{}
 // and drops local state, which is what this seam's FinishRelease means.
 func (s releaseSession) FinishRelease(ctx context.Context) error {
 	var failures []error
-	if err := s.halves.FinishRelease(ctx); err != nil {
+	if err := s.finishRelease(ctx); err != nil {
 		failures = append(failures, err)
 	}
 	if err := s.stopOwnership(ctx); err != nil {
@@ -234,7 +314,7 @@ var _ residency.WarmSession = warmSession{}
 // FinishRelease writes the epoch-fenced tombstone and ends the heartbeat. It
 // does NOT release the lease: this seam gives that its own step.
 func (s warmSession) FinishRelease(ctx context.Context) error {
-	if err := s.halves.FinishRelease(ctx); err != nil {
+	if err := s.finishRelease(ctx); err != nil {
 		return err
 	}
 	return s.stopOwnership(ctx)

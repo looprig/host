@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 const (
 	tenantA  = sessionwire.TenantID("tenant-a")
+	tenantB  = sessionwire.TenantID("tenant-b")
 	sessionA = sessionwire.SessionID("session-a")
 )
 
@@ -37,6 +40,13 @@ var keyA = registry.Key{TenantID: tenantA, SessionID: sessionA}
 // that is hardest to see from either side. The assertion is on the rows the
 // durable directory received, one per Department LaunchTarget, before Start
 // returned.
+//
+// THE "BEFORE IT RETURNS" HALF IS CARRIED BY THE NEXT TEST AND NOT BY THIS ONE,
+// which is written down because this test's own assertion is a COUNT read after
+// Start returned, and a count cannot see an ordering.
+// TestStartFailsWhenTheFirstPublicationIsRefused is the ordering probe: a Start
+// that published on a goroutine would return nil against a refusing directory,
+// and that test fails on it deterministically. Measured as MF3.
 func TestStartPublishesEveryTargetBeforeItReturns(t *testing.T) {
 	f := newFixture(t)
 
@@ -56,6 +66,45 @@ func TestStartPublishesEveryTargetBeforeItReturns(t *testing.T) {
 	}
 	if row.Report.HostGeneration != testGen {
 		t.Errorf("published generation = %d, want the run's %d", row.Report.HostGeneration, testGen)
+	}
+}
+
+// TestNewBuildsAndDoesNotStart asserts the constructor's own claim.
+//
+// compose.New says "IT BUILDS AND DOES NOT START … either a Service with
+// nothing running or an error and nothing at all", and until this existed the
+// only probe of it was that an unstarted Host had published no rows — one
+// observable of "nothing running", not the claim. A goroutine count is the
+// claim. The comparison is one-sided on purpose: goroutines left over from
+// EARLIER tests in this package go on exiting while this runs, so a count that
+// falls is ordinary and only a count that RISES is New having started
+// something.
+//
+// Start is the control. Without it a probe that could see no goroutine at all
+// would pass the first assertion for the wrong reason.
+func TestNewBuildsAndDoesNotStart(t *testing.T) {
+	f := newFixture(t)
+
+	before := runtime.NumGoroutine()
+	built, err := New(f.svc.options)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Errorf("New left %d more goroutines running (%d -> %d); it must build and not start", after-before, before, after)
+	}
+
+	beforeStart := runtime.NumGoroutine()
+	if err := built.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The control: Start opens the advertisement heartbeat and the work
+	// sampler, so this probe can see a started Host.
+	if after := runtime.NumGoroutine(); after <= beforeStart {
+		t.Errorf("Start left the goroutine count at %d (was %d), so this probe cannot see a running Host and the assertion above is vacuous", after, beforeStart)
+	}
+	if _, err := built.Stop(t.Context()); err != nil {
+		t.Errorf("Stop: %v", err)
 	}
 }
 
@@ -327,10 +376,31 @@ func TestTheDrainAcknowledgesAfterNonacceptingIsDurableAndBeforeAnyCheckpoint(t 
 // through the link, so a link closed when the drain began would leave it
 // inferring completion from a disconnect — the inference the status observation
 // exists to replace.
+//
+// LAST IS ASSERTED AND NOT ONLY CLOSED. An earlier version of this test ended
+// at "no transport survived the drain", which is a statement about the END
+// STATE and says nothing about the word in its own name; a Stop that closed
+// every transport as its FIRST statement, before StartDrain, passed it. The
+// probe is therefore a POSITION: every durable step of the drain is observed as
+// it runs, and each one must find the transports still open.
 func TestStopReleasesTheSessionAndClosesEveryTransportLast(t *testing.T) {
 	f := newFixture(t)
 	f.start()
 	f.attach(tenantA, sessionA)
+
+	var (
+		mu          sync.Mutex
+		observed    []string
+		afterClosed []string
+	)
+	f.trace.watch(func(step string) {
+		mu.Lock()
+		defer mu.Unlock()
+		observed = append(observed, step)
+		if len(f.svc.links.all()) == 0 {
+			afterClosed = append(afterClosed, step)
+		}
+	})
 
 	report, err := f.svc.Stop(t.Context())
 	if err != nil {
@@ -349,6 +419,19 @@ func TestStopReleasesTheSessionAndClosesEveryTransportLast(t *testing.T) {
 	if released := f.runtime.Released(); released != 1 {
 		t.Errorf("the runtime was released %d times, want 1", released)
 	}
+
+	mu.Lock()
+	ran, early := append([]string(nil), observed...), append([]string(nil), afterClosed...)
+	mu.Unlock()
+	// The non-vacuity closer: an observer that saw nothing would report no step
+	// running after the close, which is the same green as the correct order.
+	if len(ran) == 0 {
+		t.Fatal("no drain step was observed while it ran, so the ordering below is vacuous")
+	}
+	if len(early) != 0 {
+		t.Errorf("the tenant transports were already closed when the drain ran %v; they must close LAST: %v", early, ran)
+	}
+	// And they do close, after the drain, which is the other half of "last".
 	if held := f.svc.links.all(); len(held) != 0 {
 		t.Errorf("%d tenant transports survived the drain", len(held))
 	}
@@ -475,15 +558,16 @@ func TestTheCompatibilityWaitReturnsAtAGateBoundary(t *testing.T) {
 	// TIMEOUT-SHAPED ONE, and the two bounds are fired in sequence rather than
 	// together on purpose. Firing both at once would leave the wait's select
 	// with two ready cases and Go picks among those uniformly at random, so the
-	// test would be flaky in the direction that hides the defect. Firing the
-	// poll and then waiting for the wait to ARM A FRESH POLL is the signal that
-	// it did not return at the gate; only then is the timeout released, and a
-	// composition that had lost the gate case reports timed_out promptly
-	// instead of hanging.
+	// test would be flaky in the direction that hides the defect. The poll is
+	// fired first; the timeout is released only once the wait has gone round its
+	// loop, which is the discriminator this needs — a composition that had lost
+	// the gate case reports timed_out instead of hanging. An earlier version
+	// took ANY fresh WorkPoll arming as that signal, and the arming it saw was
+	// the work sampler's rather than the wait's, because both arm WorkPoll on
+	// the one fake clock; see awaitOutcome for the count that tells them apart.
 	outcome, err := f.awaitOutcome(t, t.Context(), func() {
 		f.clock.fire(f.svc.options.WorkPoll)
-		f.clock.fireIfRearmed(f.svc.options.WorkPoll, f.svc.options.CompatibilityTimeout)
-	})
+	}, f.svc.options.CompatibilityTimeout)
 	if err != nil || outcome != CompatibilityGateBoundary {
 		t.Fatalf("AwaitSessionIdle at a gate = (%q, %v), want (%q, nil)", outcome, err, CompatibilityGateBoundary)
 	}
@@ -506,8 +590,7 @@ func TestAGateBoundaryIsUnreachableWithNoWorkStateSource(t *testing.T) {
 
 	outcome, err := f.awaitOutcome(t, t.Context(), func() {
 		f.clock.fire(f.svc.options.WorkPoll)
-		f.clock.fireIfRearmed(f.svc.options.WorkPoll, f.svc.options.CompatibilityTimeout)
-	})
+	}, f.svc.options.CompatibilityTimeout)
 	if err != nil || outcome != CompatibilityTimedOut {
 		t.Fatalf("AwaitSessionIdle with no work-state source = (%q, %v), want (%q, nil)", outcome, err, CompatibilityTimedOut)
 	}
@@ -531,8 +614,7 @@ func TestTheCompatibilityWaitReturnsAtTheConfiguredTimeout(t *testing.T) {
 
 	outcome, err := f.awaitOutcome(t, t.Context(), func() {
 		f.clock.fire(f.svc.options.WorkPoll)
-		f.clock.fireIfRearmed(f.svc.options.WorkPoll, f.svc.options.CompatibilityTimeout)
-	})
+	}, f.svc.options.CompatibilityTimeout)
 	if err != nil || outcome != CompatibilityTimedOut {
 		t.Fatalf("AwaitSessionIdle at the bound = (%q, %v), want (%q, nil)", outcome, err, CompatibilityTimedOut)
 	}
@@ -675,9 +757,18 @@ func TestTheDrainSeamsFinishReleaseReleasesTheLease(t *testing.T) {
 // once.
 //
 // Both a drain and a warm release can reach one session — a warm countdown that
-// fires while a drain is running is an ordinary race — and a lease released
-// twice is a release of somebody else's grant if the session has since been
-// re-acquired.
+// fires while a drain is running is an ordinary race — and a session released
+// twice must not release a lease twice, write a tombstone twice, checkpoint
+// twice or release the runtime twice.
+//
+// EVERY MEANS ALL SIX, AND THE TWO VIEWS ARE INTERLEAVED. An earlier version of
+// this test drove two of the warm seam's six steps and asserted three counts,
+// while Checkpoint, BeginRelease, FinishRelease and the runtime release had no
+// guard at all: issuing the epoch-fenced tombstone write twice left the whole
+// suite green. Both halves of that are fixed here — the steps are guarded in
+// session.go, and this drives each of them three times and then crosses the
+// seams, because a warm release and a drain reaching one resident is the whole
+// reason there are two views of it.
 func TestEveryReleaseStepIsIdempotent(t *testing.T) {
 	f := newFixture(t)
 	f.start()
@@ -686,25 +777,64 @@ func TestEveryReleaseStepIsIdempotent(t *testing.T) {
 	f.svc.mu.Lock()
 	held := f.svc.sessions[keyA]
 	f.svc.mu.Unlock()
+	if held == nil {
+		t.Fatal("the composition holds no session after an attach")
+	}
 
 	warm := warmSession{resident: held}
-	for attempt := 0; attempt < 3; attempt++ {
-		if err := warm.ReleaseLease(t.Context()); err != nil {
-			t.Fatalf("ReleaseLease attempt %d: %v", attempt+1, err)
+	drain := releaseSession{resident: held}
+	steps := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{name: "BeginRelease", run: warm.BeginRelease},
+		{name: "Checkpoint", run: warm.Checkpoint},
+		{name: "ReleaseResidency", run: warm.ReleaseResidency},
+		{name: "FinishRelease", run: warm.FinishRelease},
+		{name: "ReleaseLease", run: warm.ReleaseLease},
+		{name: "DropState", run: warm.DropState},
+		// The interleaving. This one view runs the tombstone, the heartbeat
+		// stop, both grants and the local state as ONE step, which is what makes
+		// it the crossing rather than a seventh warm step.
+		{name: "drain FinishRelease", run: drain.FinishRelease},
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		for _, step := range steps {
+			if err := step.run(t.Context()); err != nil {
+				t.Fatalf("%s attempt %d: %v", step.name, attempt, err)
+			}
 		}
-		if err := warm.DropState(t.Context()); err != nil {
-			t.Fatalf("DropState attempt %d: %v", attempt+1, err)
+	}
+
+	for _, counted := range []struct {
+		step string
+		got  int
+		what string
+	}{
+		{step: "BeginRelease", got: releasingRows(f.store.published()), what: "marked the residency releasing"},
+		{step: "Checkpoint", got: f.trace.count("checkpoint"), what: "checkpointed"},
+		{step: "ReleaseResidency", got: f.runtime.Released(), what: "released the runtime"},
+		{step: "FinishRelease", got: f.trace.count("locations.tombstone"), what: "wrote the epoch-fenced tombstone"},
+		{step: "ReleaseLease", got: f.trace.count("lease.release"), what: "released the residency grant"},
+		{step: "ReleaseLease", got: f.trace.count("journal.release"), what: "released the journal grant"},
+		{step: "DropState", got: f.trace.count("workspace.release"), what: "released the workspace"},
+	} {
+		if counted.got != 1 {
+			t.Errorf("%s %s %d times across three rounds and both views, want 1: %v",
+				counted.step, counted.what, counted.got, f.trace.trace())
 		}
 	}
-	if got := f.trace.count("lease.release"); got != 1 {
-		t.Errorf("three releases released the lease %d times, want 1", got)
+}
+
+// releasingRows counts the durable rows marking a residency releasing.
+func releasingRows(rows []sessionwire.HostLinkRegistryObservation) int {
+	total := 0
+	for _, row := range rows {
+		if row.Residency == sessionwire.SessionResidencyReleasing {
+			total++
+		}
 	}
-	if got := f.trace.count("journal.release"); got != 1 {
-		t.Errorf("three releases released the journal grant %d times, want 1", got)
-	}
-	if got := f.trace.count("workspace.release"); got != 1 {
-		t.Errorf("three drops released the workspace %d times, want 1", got)
-	}
+	return total
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +883,56 @@ func TestTheHandlerGivesEachTenantItsOwnEndpoint(t *testing.T) {
 	}
 	if first.server == second.server {
 		t.Error("two tenants reached one transport, so both would authenticate as one tenant")
+	}
+}
+
+// TestEachTenantsTransportAuthenticatesAsTheTenantOnItsPath is the H8 guard at
+// the AUTHENTICATING layer, and it is the half the bind guard below does not
+// cover.
+//
+// buildTenantLink names the tenant TWICE: once on the Multiplexer, which
+// decides which sessions may be bound over a table, and once on
+// hostlink.Config, which is the tenant the transport AUTHENTICATES every
+// physical connection as. A guard over one object of a two-object invariant is
+// not a guard over the invariant. With only the Multiplexer watched, latching
+// the transport's TenantID to a constant left the whole suite green — and that
+// is a cross-tenant authorization bypass, not an untidiness: Multiplexer.Bind
+// compares the request's tenant against the table's and never consults the
+// connection's credential, so a caller holding only tenant-a's credential
+// would connect at tenant-b's path, authenticate as tenant-a, land on
+// tenant-b's table and bind tenant-b's sessions.
+//
+// The assertion is therefore on the ARGUMENT the authenticator was called
+// with, per endpoint, and on the refusal a foreign credential gets.
+func TestEachTenantsTransportAuthenticatesAsTheTenantOnItsPath(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	server := httptest.NewServer(f.svc.Handler())
+	defer server.Close()
+
+	for _, tenant := range []sessionwire.TenantID{tenantA, tenantB} {
+		if !hostLinkConnect(t, server.URL, tenant, credentialFor(tenant)) {
+			t.Fatalf("%s's own credential was refused at %s's endpoint", tenant, tenant)
+		}
+	}
+	want := []string{
+		string(tenantA) + ":" + credentialFor(tenantA),
+		string(tenantB) + ":" + credentialFor(tenantB),
+	}
+	if got := f.auth.verifications(); !slices.Equal(got, want) {
+		t.Fatalf("the transports authenticated %v, want %v: a transport asked about a tenant other than the one on its path", got, want)
+	}
+
+	// THE BYPASS ARM. tenant-a's credential at tenant-b's endpoint. A transport
+	// latched to tenant-a would ask about tenant-a, the credential would verify,
+	// and the connection would be admitted to tenant-b's Multiplexer.
+	if hostLinkConnect(t, server.URL, tenantB, credentialFor(tenantA)) {
+		t.Fatal("a tenant-a credential connected at tenant-b's endpoint, which is a cross-tenant bypass")
+	}
+	refused := f.auth.verifications()
+	last := refused[len(refused)-1]
+	if want := string(tenantB) + ":" + credentialFor(tenantA); last != want {
+		t.Errorf("the refusing transport asked about %q, want %q", last, want)
 	}
 }
 

@@ -15,8 +15,16 @@ package residency
 // supersession recorded through this view is visible to the heartbeat, and the
 // reverse, because there is one piece of state and not two.
 //
-// THE ZERO VALUE FAILS CLOSED. A Guard holding no fence reports ownership gone
-// and runs no write, rather than dereferencing nil at the first write. That
+// THE ZERO VALUE FAILS CLOSED ON THE TWO METHODS THAT DECIDE, AND OPEN ON THE
+// ONE THAT NOTIFIES. Held and Write are the authorizing pair: a Guard holding
+// no fence reports ownership gone and runs no write, rather than dereferencing
+// nil at the first write. Lost cannot answer that way — it returns a channel,
+// and the only "already lost" channel is a closed one, which would make every
+// select watching it spin. It returns nil instead, which blocks forever and
+// therefore reads as "not lost". A caller that watched Lost ALONE would
+// therefore learn nothing from a zero Guard; it must ask Held, or let Write
+// refuse. This is stated in the heading because a heading that said only "fails
+// closed" would be the wider-than-true sentence. That
 // state is not reachable through BeginOwnership, which refuses a nil fence
 // before any of this; it is reachable because Guard is a method on an exported
 // struct, and the safe answer for a guard with nothing to guard is the refusing

@@ -7,8 +7,13 @@
 // refuses a product import from anywhere in this module, tests included, so a
 // binary that named Carbon's agents could not be built here at all.
 //
-// A product ships its own main, a dozen lines long, that supplies a Bootstrap
-// and calls Run.
+// A PRODUCT CANNOT YET SHIP ITS OWN MAIN AGAINST THIS. Bootstrap and Run live
+// in package main, and four of Bootstrap's seven methods name internal/ types —
+// hostlink.Authenticator, residency.Workspaces, commands.Inbox and
+// commands.Cursors — which no other module can implement. So today a product
+// vendors this file, or Host grows an exported composition surface. Which of
+// those it will be is not decided here; what is decided is that this comment
+// does not claim the second one already exists.
 package main
 
 import (
@@ -37,7 +42,9 @@ import (
 
 // Bootstrap is the product-specific seam this binary is constructed through.
 //
-// THE THREE METHODS ARE THE THREE THINGS HOST CANNOT KNOW. Which durable store
+// THE SEVEN METHODS ARE THE THINGS HOST CANNOT KNOW, and the first three are
+// the ones that are product knowledge by nature rather than by an owed release;
+// the last three are below, with their reason. Which durable store
 // this deployment runs against is an operational decision — Host names no
 // storage backend and must not, since choosing one here would make every
 // deployment carry every provider; which agents it serves is the product's; and

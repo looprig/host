@@ -204,14 +204,31 @@ func (b *countingBootstrap) Store(ctx context.Context) (*sessionstore.Store, err
 	return b.unconfiguredBootstrap.Store(ctx)
 }
 
-// TestTheBinaryNamesNoProductAndRegistersNoAgent is the structural half of step
-// 4, and it is derived from the SOURCE rather than from a list.
+// TestTheBinaryNamesNoProductAndRegistersNoAgent is the structural half of "this
+// binary is generic".
 //
-// The import half is already held module-wide by import_boundary_test.go. What
-// is left, and what only this package can check, is that the binary contains no
-// department.Registration literal of its own: a product's agents could be
-// hardcoded here without importing anything a boundary guard would notice,
-// because a Registration is an agent id and an interface value.
+// It parses every production file in the package and fails on any composite
+// literal whose TYPE EXPRESSION names department.Registration, at any depth: a
+// bare literal, a slice of them written []department.Registration{{…}} — whose
+// elements carry no type of their own at all — a variadic ...department.Registration,
+// a pointer, a map value. Classification is by parsed structure and never by a
+// source-text search, which a newline or an alias defeats.
+//
+// THIS LIST IS A RESIDUE AND NOT A CLOSURE. What it does NOT catch, stated so
+// that nobody reads the guard as a proof:
+//
+//   - a registration built field-by-field into a var and returned, with no
+//     composite literal anywhere;
+//   - a dot-import or a local type alias, which removes the selector this
+//     matches on;
+//   - a registration constructed in another package this binary imports, since
+//     the walk is over this package's own files;
+//   - a product named in DATA — an agent id in a string constant, a config
+//     file, a build tag — which is not a registration at compile time at all;
+//   - department.New called with a slice assembled at run time.
+//
+// The import boundary is what actually stops a product dependency; this stops
+// the one spelling that would otherwise look ordinary in review.
 func TestTheBinaryNamesNoProductAndRegistersNoAgent(t *testing.T) {
 	t.Parallel()
 
@@ -235,19 +252,85 @@ func TestTheBinaryNamesNoProductAndRegistersNoAgent(t *testing.T) {
 			if !ok {
 				return true
 			}
-			selector, ok := literal.Type.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			if selector.Sel.Name == "Registration" {
+			if named := namesRegistration(literal.Type); named != "" {
 				t.Errorf("%s constructs a %s literal; this binary is generic and a product supplies its registrations",
-					name, selector.Sel.Name)
+					name, named)
 			}
 			return true
 		})
 	}
 	if inspected == 0 {
 		t.Fatal("no production file was inspected; this guard reached nothing")
+	}
+}
+
+// namesRegistration reports the selector a type expression resolves to if that
+// selector is Registration, unwrapping the element-type spellings a composite
+// literal can hide one behind.
+//
+// A []department.Registration{{…}} literal is the reason this exists: the outer
+// literal's type is an *ast.ArrayType, and its ELEMENTS have no Type field at
+// all, so a check that looked only at literal.Type for a *ast.SelectorExpr saw
+// nothing. Measured: without this, that spelling compiled and the guard stayed
+// green.
+func namesRegistration(expression ast.Expr) string {
+	switch typed := expression.(type) {
+	case *ast.SelectorExpr:
+		if typed.Sel != nil && typed.Sel.Name == "Registration" {
+			return typed.Sel.Name
+		}
+	case *ast.Ident:
+		if typed.Name == "Registration" {
+			return typed.Name
+		}
+	case *ast.ArrayType:
+		return namesRegistration(typed.Elt)
+	case *ast.Ellipsis:
+		return namesRegistration(typed.Elt)
+	case *ast.StarExpr:
+		return namesRegistration(typed.X)
+	case *ast.MapType:
+		if named := namesRegistration(typed.Key); named != "" {
+			return named
+		}
+		return namesRegistration(typed.Value)
+	}
+	return ""
+}
+
+// TestTheRegistrationGuardSeesTheSpellingsItClaims is the guard's own control.
+//
+// A structural guard that matched nothing would pass the test above for the
+// wrong reason — the package legitimately contains no registration — so the
+// matcher is exercised directly against each spelling it claims to catch and
+// against one it must not.
+func TestTheRegistrationGuardSeesTheSpellingsItClaims(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		source string
+		caught bool
+	}{
+		{source: "department.Registration{}", caught: true},
+		{source: "[]department.Registration{{}}", caught: true},
+		{source: "[2]department.Registration{}", caught: true},
+		{source: "[]*department.Registration{}", caught: true},
+		{source: "map[string]department.Registration{}", caught: true},
+		{source: "Registration{}", caught: true},
+		{source: "department.Capabilities{}", caught: false},
+		{source: "[]string{}", caught: false},
+	} {
+		expression, err := parser.ParseExpr(test.source)
+		if err != nil {
+			t.Fatalf("parse %q: %v", test.source, err)
+		}
+		literal, ok := expression.(*ast.CompositeLit)
+		if !ok {
+			t.Fatalf("%q did not parse as a composite literal", test.source)
+		}
+		if caught := namesRegistration(literal.Type) != ""; caught != test.caught {
+			t.Errorf("the guard catching %q = %v, want %v", test.source, caught, test.caught)
+		}
 	}
 }
 
