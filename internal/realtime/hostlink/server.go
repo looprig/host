@@ -53,5 +53,20 @@ type Server interface {
 	// the upgrade; see selectsJSONProtocol for the rule and its provenance.
 	Handler() http.Handler
 
+	// Publish puts one payload on one channel.
+	//
+	// IT REPORTS TRANSPORT ACCEPTANCE AND NOT DELIVERY. A channel nobody has
+	// subscribed is not an error: a Factory link that has dropped and not yet
+	// reconnected is an ordinary state, and a transport that refused it would
+	// make an idle route indistinguishable from a broken one to the caller that
+	// decides whether to invalidate it.
+	//
+	// It is the production side of the seam the live event relay declares. That
+	// seam takes a channel and a payload and nothing else, so this signature
+	// carries no link, no replica set and no context — the fan-out belongs to
+	// the transport, which owns a queue per physical connection, and Host owns
+	// the decision to publish once.
+	Publish(channel string, payload []byte) error
+
 	Close(context.Context) error
 }

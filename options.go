@@ -500,3 +500,50 @@ func (o Options) validatePlacement() error {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// The product seam
+// ---------------------------------------------------------------------------
+//
+// Host is a GENERIC runtime host and the agents it serves are a product's. The
+// two types below are the whole of what a product supplies, and they are
+// declared here rather than in the composition for one reason: internal/ is
+// not importable from outside this module, so a seam declared there could only
+// ever be satisfied by this module's own binary. A product implements these.
+
+// Registrar produces the Department registrations one deployment serves.
+//
+// IT IS CALLED ONCE, AT STARTUP, AND ITS RESULT IS IMMUTABLE. Department.New
+// validates the registrations and fixes them for the life of the process, so a
+// Registrar that answered differently later would be answering a question
+// nobody asks again. It takes a context because building a launch target may
+// require I/O — reading a model catalogue, resolving a runtime build — and a
+// startup that can block must be cancellable.
+type Registrar interface {
+	Register(context.Context) ([]department.Registration, error)
+}
+
+// RegistrarFunc adapts a function to Registrar.
+type RegistrarFunc func(context.Context) ([]department.Registration, error)
+
+// Register calls f.
+func (f RegistrarFunc) Register(ctx context.Context) ([]department.Registration, error) {
+	return f(ctx)
+}
+
+// Checkpointer commits the checkpoints a nonterminal release requires.
+//
+// IT HAS NO IMPLEMENTATION IN THIS MODULE AND THAT IS A STATEMENT ABOUT WHERE
+// THE KNOWLEDGE LIVES, not an omission to be filled in with a no-op. A release
+// checkpoint is the runtime's conversation state and the workspace's contents,
+// and Host holds neither: department.Runtime exposes no checkpoint method and
+// WorkspaceProvider materializes a workspace without ever committing one. A
+// composition that silently treated the step as done would report a drained
+// Host whose sessions had lost whatever was not already durable, which is the
+// one drain failure that destroys work.
+//
+// So the seam is REQUIRED rather than optional. A Host composed without one
+// does not start.
+type Checkpointer interface {
+	Checkpoint(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+}

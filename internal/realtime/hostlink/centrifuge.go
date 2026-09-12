@@ -146,6 +146,18 @@ func NewCentrifugeServer(config Config) (Server, error) {
 
 func (s *centrifugeServer) Handler() http.Handler { return s.handler }
 
+// Publish puts one payload on one channel through the node's in-process broker.
+//
+// The PublishResult the node returns is deliberately discarded. It carries the
+// broker's stream offset and epoch, which exist for history recovery, and this
+// node runs with no history at all — application durability is SessionStore's,
+// never transport history. Returning an offset a caller could resume from would
+// advertise a recovery this transport cannot perform.
+func (s *centrifugeServer) Publish(channel string, payload []byte) error {
+	_, err := s.node.Publish(channel, payload)
+	return err
+}
+
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 
 // selectsJSONProtocol reports whether the request explicitly selects the JSON
