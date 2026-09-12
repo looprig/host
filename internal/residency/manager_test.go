@@ -983,6 +983,18 @@ type fixture struct {
 	// fixedSession, when set, builds a DEDICATED Host bound to that session.
 	fixedSession sessionwire.SessionID
 
+	// isolation overrides the advertised class, which is H8's pooled admission
+	// rule and the ledger's cross-tenant backstop. Empty takes
+	// tenant_exclusive, which is what every row before O6.2 assumed.
+	isolation sessionwire.HostIsolationClass
+
+	// capacity overrides the POOLED capacity. Zero takes testCapacity. A
+	// dedicated Host is pinned to 1 whatever this says, because host.Options
+	// refuses any other value — which is exactly why a pooled arm of a
+	// placement-sameness row has to be able to ask for 1 as well, so that the
+	// two arms differ in placement and nothing else.
+	capacity uint64
+
 	// afterBuild runs once the Host, the ledger and the Manager exist, for the
 	// rows that must configure something built by newFixture rather than
 	// something handed to it.
@@ -1028,13 +1040,20 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 		t.Fatalf("department.New: %v", err)
 	}
 	placement, capacity := sessionwire.HostPlacementPooled, testCapacity
+	if f.capacity != 0 {
+		capacity = f.capacity
+	}
 	if f.fixedSession != "" {
 		placement, capacity = sessionwire.HostPlacementDedicated, 1
+	}
+	isolation := sessionwire.HostIsolationClassTenantExclusive
+	if f.isolation != "" {
+		isolation = f.isolation
 	}
 	built, err := host.New(host.Options{
 		HostID:            testHost,
 		InternalEndpoint:  testEndpoint,
-		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
+		IsolationClass:    isolation,
 		Department:        dept,
 		SessionStore:      stubSessionStore{},
 		Workspaces:        stubHostWorkspaces{},

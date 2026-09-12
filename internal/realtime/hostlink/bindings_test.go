@@ -156,7 +156,13 @@ func residencyKey(session sessionwire.SessionID) registry.Key {
 
 // newFixture builds a Multiplexer over a real registry holding three resident
 // sessions, with a two-per-link and three-per-Host binding budget.
-func newFixture(t *testing.T) *fixture {
+//
+// The variadic configure is O6.2's: it lets one scenario be driven over a
+// POOLED multiplexer and a DEDICATED one — the only difference between the two
+// being MultiplexerOptions.FixedSessionID — so that step 2's "same HostLink
+// behavior as pooled mode" can be asserted as equality between the two runs
+// rather than as two independent per-mode assertions.
+func newFixture(t *testing.T, configure ...func(*hostlink.MultiplexerOptions)) *fixture {
 	t.Helper()
 	index := registry.New(frozenClock{at: time.Unix(1_700_000_000, 0).UTC()})
 	residencies := &recordingResidencies{inner: index}
@@ -172,7 +178,7 @@ func newFixture(t *testing.T) *fixture {
 		}
 		consumers.consumers[residencyKey(session)] = &stubConsumer{}
 	}
-	mux, err := hostlink.NewMultiplexer(hostlink.MultiplexerOptions{
+	options := hostlink.MultiplexerOptions{
 		TenantID:           testTenant,
 		HostID:             testHostID,
 		HostGeneration:     testGeneration,
@@ -181,7 +187,11 @@ func newFixture(t *testing.T) *fixture {
 		Consumers:          consumers,
 		MaxBindingsPerLink: 2,
 		MaxBindings:        3,
-	})
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	mux, err := hostlink.NewMultiplexer(options)
 	if err != nil {
 		t.Fatalf("NewMultiplexer: %v", err)
 	}
