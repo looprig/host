@@ -10,10 +10,14 @@
 // driven, and the record is then terminally settled. Every one of those steps
 // exists because the process can stop between any two of them.
 //
-// THE SEAMS ARE NARROW LOCAL INTERFACES OVER METHODS THAT EXIST. That is worth
-// stating precisely, because an earlier version of this file claimed the
-// opposite. sessionstore v0.6.0 HAS all of them — GetCommand, the inbox record's
-// private Payload/PayloadRef with GetObject behind a reference,
+// THE SEAMS ARE NARROW LOCAL INTERFACES OVER METHODS THAT EXIST IN THE LEGACY
+// FAMILY, AND ONLY THERE. That qualification is the whole of this paragraph and
+// an earlier version of it was missing — it said flatly that "sessionstore
+// v0.6.0 HAS all of them", which is true of one family and misleads exactly the
+// reader trying to work out why apply does not work in disposition mode.
+//
+// sessionstore v0.7.0 has all of them for a LEGACY session — GetCommand, the
+// inbox record's private Payload/PayloadRef with GetObject behind a reference,
 // FindCommandApplication, ReadGates, ClaimCommand, BeginApplyingCommand,
 // CompleteCommand, RejectCommand, and the journal's application-prefix envelope
 // — and the shapes below are modelled on those rather than invented beside them.
@@ -24,6 +28,26 @@
 // module lacks the operation; consulting the module is what shows a shape is
 // wrong, and not consulting it is what let a terminal transition the store
 // refuses sit behind a green test.
+//
+// A HOST CANNOT REACH THAT FAMILY. A Host takes residency through
+// AcquireResidency, which pins ProtocolModeDisposition, and a disposition
+// session refuses the journal grant this protocol appends its prefix under. So
+// every seam below is bound to calls that exist and that this Host cannot use on
+// a session it can actually hold. The disposition family has no counterpart to
+// bind to yet either: it has NO CLAIM EDGE — pending -> claimed has no entry
+// point and there is no in-package writer of a DispositionClaim at all — and it
+// settles from durable evidence the caller does not supply, which harness
+// v0.33.0 cannot produce because runtimecommand.Admitted carries no attempt
+// identity. Closing this is a three-repository sequence and not a Host change;
+// the README's limitations section is where that is stated for a release reader.
+//
+// ONE CONSEQUENCE BELONGS HERE RATHER THAN ONLY THERE, because this file is
+// where "exactly once" is claimed. In disposition mode THE STORE DECIDES THE
+// TERMINAL ARM, so there is no Host-authored rejection once an attempt exists,
+// and MISSING EVIDENCE IS NOT PROOF THAT NOTHING WAS APPLIED — a Host must never
+// re-dispatch on its absence. The honest claim for a disposition Host is "at
+// most one authorized attempt, settled only from the runtime's durable
+// disposition", which is narrower than what this file's legacy shapes express.
 //
 // WHAT SETTLES A COMMAND AS APPLIED IS DURABLE EVIDENCE, not this Host's
 // confidence. §10.4 ends an application at a correlated journal effect and the
