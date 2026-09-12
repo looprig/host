@@ -8,12 +8,13 @@
 // binary that named Carbon's agents could not be built here at all.
 //
 // A PRODUCT CANNOT YET SHIP ITS OWN MAIN AGAINST THIS. Bootstrap and Run live
-// in package main, and four of Bootstrap's seven methods name internal/ types —
-// hostlink.Authenticator, residency.Workspaces, commands.Inbox and
-// commands.Cursors — which no other module can implement. So today a product
-// vendors this file, or Host grows an exported composition surface. Which of
-// those it will be is not decided here; what is decided is that this comment
-// does not claim the second one already exists.
+// in package main, and two of Bootstrap's five methods name internal/ types —
+// hostlink.Authenticator and residency.Workspaces — which no other module can
+// implement. So today a product vendors this file, or Host grows an exported
+// composition surface. Which of those it will be is not decided here; what is
+// decided is that this comment does not claim the second one already exists.
+// It was four of seven until sessionstore v0.7.0 let the composition bind the
+// durable inbox and its cursor itself.
 package main
 
 import (
@@ -33,7 +34,6 @@ import (
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
-	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/compose"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/residency"
@@ -42,9 +42,9 @@ import (
 
 // Bootstrap is the product-specific seam this binary is constructed through.
 //
-// THE SEVEN METHODS ARE THE THINGS HOST CANNOT KNOW, and the first three are
+// THE FIVE METHODS ARE THE THINGS HOST CANNOT KNOW, and the first three are
 // the ones that are product knowledge by nature rather than by an owed release;
-// the last three are below, with their reason. Which durable store
+// the last two are below, with their reason. Which durable store
 // this deployment runs against is an operational decision — Host names no
 // storage backend and must not, since choosing one here would make every
 // deployment carry every provider; which agents it serves is the product's; and
@@ -70,21 +70,20 @@ type Bootstrap interface {
 	// replace it an open Host.
 	Auth() hostlink.Authenticator
 
-	// Workspaces, Inbox and Cursors are supplied by the deployment BECAUSE THE
-	// RELEASED STORE DOES NOT SATISFY THEM, which is a finding rather than a
-	// design.
+	// Workspaces is supplied by the deployment because workspace
+	// materialization is not the session store's business and never was.
 	//
-	// sessionstore v0.6.0 has no per-session ORDERED INBOX LISTING and no
-	// durable CONSUMPTION CURSOR: its command surface is Admit/Claim/
-	// BeginApplying/Complete/Reject plus a cross-session due queue, and §10.4's
-	// "read the inbox in immutable acceptance order, strictly after the cursor"
-	// has no released counterpart at all. Workspace materialization is not that
-	// store's business in the first place. Rather than fake any of the three in
-	// production, they are injected and the gap is reported upward; see the
-	// O7.1 result's owed list.
+	// INBOX AND CURSORS USED TO BE HERE AND ARE GONE, which is a release
+	// landing rather than a design change. They were injected because
+	// sessionstore v0.6.0 had no per-session ORDERED INBOX LISTING and no
+	// durable CONSUMPTION CURSOR, so §10.4's "read the inbox in immutable
+	// acceptance order, strictly after the cursor" had no released counterpart
+	// and the alternative was faking one in production. v0.7.0 publishes both
+	// over the DISPOSITION family — ListSessionDispositionCommands,
+	// LoadDispositionCommandCursor and SaveDispositionCommandCursor — and
+	// sessionstoreadapter binds them, so Run wires the adapted store and a
+	// product supplies neither.
 	Workspaces() residency.Workspaces
-	Inbox() commands.Inbox
-	Cursors() commands.Cursors
 }
 
 func main() {
@@ -169,8 +168,14 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 		OpenSession: func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (compose.JournalGrant, error) {
 			return adapted.OpenSession(ctx, tenant, session)
 		},
-		Inbox:                bootstrap.Inbox(),
-		Cursors:              bootstrap.Cursors(),
+		// THE ADAPTED STORE IS BOTH SEAMS. Before sessionstore v0.7.0 these
+		// were the product's to supply and the generic binary's default
+		// refused; the release closed the gap and the composition now names
+		// one object for the durable inbox and its cursor, which is what makes
+		// "the stream Host consumes is the stream its cursor indexes" true by
+		// construction rather than by a convention a deployment could break.
+		Inbox:                adapted,
+		Cursors:              adapted,
 		Records:              adapted,
 		Applications:         adapted,
 		Gates:                adapted,
@@ -295,12 +300,6 @@ func (unconfiguredBootstrap) Auth() hostlink.Authenticator { return unconfigured
 // Workspaces refuses.
 func (unconfiguredBootstrap) Workspaces() residency.Workspaces { return unconfiguredBootstrap{} }
 
-// Inbox refuses.
-func (unconfiguredBootstrap) Inbox() commands.Inbox { return unconfiguredBootstrap{} }
-
-// Cursors refuses.
-func (unconfiguredBootstrap) Cursors() commands.Cursors { return unconfiguredBootstrap{} }
-
 // VerifyTenant refuses.
 func (unconfiguredBootstrap) VerifyTenant(context.Context, sessionwire.TenantID, string) error {
 	return errNoBootstrap
@@ -313,21 +312,6 @@ func (unconfiguredBootstrap) EnsureWorkspace(context.Context, sessionwire.Tenant
 
 // ReleaseWorkspace refuses.
 func (unconfiguredBootstrap) ReleaseWorkspace(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
-	return errNoBootstrap
-}
-
-// ListOrdered refuses.
-func (unconfiguredBootstrap) ListOrdered(context.Context, sessionwire.TenantID, sessionwire.SessionID, uint64, int) ([]commands.Command, error) {
-	return nil, errNoBootstrap
-}
-
-// LoadCursor refuses.
-func (unconfiguredBootstrap) LoadCursor(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uint64, error) {
-	return 0, errNoBootstrap
-}
-
-// SaveCursor refuses.
-func (unconfiguredBootstrap) SaveCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, order uint64, epoch uint64) error {
 	return errNoBootstrap
 }
 

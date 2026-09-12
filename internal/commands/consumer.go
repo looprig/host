@@ -127,9 +127,15 @@ type Command struct {
 // Each is a NARROW LOCAL interface, for the reason department.Rig and
 // host.SessionStore are: naming a looprig module in go.mod is the same decision
 // as depending on it, and publishedLooprigVersions is where that decision is
-// recorded. sessionstore v0.6.0 implements neither OrderedIndex's ListOrdered
-// nor a per-session consumption cursor. These describe what Host requires; the
-// concrete edges are later tasks.
+// recorded.
+//
+// THEY NO LONGER DESCRIBE SOMETHING OWED. This paragraph used to say
+// "sessionstore v0.6.0 implements neither OrderedIndex's ListOrdered nor a
+// per-session consumption cursor … the concrete edges are later tasks". v0.7.0
+// implements both — ListSessionDispositionCommands and the durable disposition
+// consumption cursor — and internal/sessionstoreadapter binds them. They stay
+// narrow and local anyway, because the concrete edge is one package's business
+// rather than every consumer's.
 
 // Inbox is the durable per-session command inbox, read in acceptance order.
 type Inbox interface {
@@ -177,7 +183,28 @@ type CursorWrites interface {
 // lease holder, through the fence.
 type Cursors interface {
 	// LoadCursor returns the greatest acceptance order durably consumed for a
-	// session, or zero when none has been recorded.
+	// session THIS STORE WILL VOUCH FOR, or zero when that session has recorded
+	// none.
+	//
+	// THE QUALIFICATION REPLACES A SENTENCE THAT WAS WIDER THAN THE STORE — it
+	// used to read "or zero when none has been recorded", full stop, and
+	// sessionstore v0.7.0's reader does not behave that way. A session with no
+	// disposition catalog — absent, or bound to another protocol — is REFUSED
+	// rather than answered about, and the store says why: absence licenses a
+	// save to create a fresh record at whatever epoch and order the caller
+	// names, so a reader that reported an unvouched-for session as absence
+	// would let any caller reset the fence.
+	//
+	// SO ZERO AND A REFUSAL ARE TWO DIFFERENT ANSWERS AND A CALLER MUST NOT
+	// COLLAPSE THEM. Zero means "this session exists and has consumed nothing",
+	// and the correct response is to list from the head of its stream. A
+	// refusal means the stream is not this Host's to read, and the correct
+	// response is to stop and report — never to list from the head, which would
+	// re-drive every command in a session this Host has no authority over.
+	//
+	// Both of Host's call sites now do that: Consumer.loadCursor propagates,
+	// and Service.cursorFor propagates into the warm release's step 1, which
+	// aborts and names the step. See finding C-1.
 	LoadCursor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (uint64, error)
 
 	CursorWrites

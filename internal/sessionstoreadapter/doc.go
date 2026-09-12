@@ -1,5 +1,5 @@
 // Package sessionstoreadapter binds Host's narrow local store seams to the
-// released github.com/looprig/sessionstore v0.6.0 Store.
+// released github.com/looprig/sessionstore v0.7.0 Store.
 //
 // EVERY ADAPTER HERE DELEGATES. Where residency and commands describe a concept
 // the released module owns — the epoch fence, the inbox compare-and-swap, the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -422,9 +423,16 @@ func (i *fakeInbox) ListOrdered(context.Context, sessionwire.TenantID, sessionwi
 }
 
 // fakeCursors is the durable consumption cursor.
+//
+// IT CARRIES BOTH HIGH-WATER MARKS, for the reason regression_test.go's
+// durableCommands now does: sessionstore fences the epoch and then the order,
+// and a fake modelling only the order cannot produce either refusal. A fake
+// looser than its dependency makes every test over it silent about the cases the
+// dependency actually has.
 type fakeCursors struct {
-	mu     sync.Mutex
-	cursor uint64
+	mu          sync.Mutex
+	cursor      uint64
+	cursorEpoch uint64
 }
 
 func (c *fakeCursors) LoadCursor(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uint64, error) {
@@ -440,10 +448,16 @@ func (c *fakeCursors) LoadCursor(context.Context, sessionwire.TenantID, sessionw
 // in this file read the value back, so nothing failed — which is exactly why it
 // survived, and why a double whose stored value nobody reads is worth getting
 // right anyway: the next test to read it inherits the defect.
-func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, _ uint64, order uint64) error {
+func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, epoch uint64, order uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cursor = order
+	if epoch < c.cursorEpoch {
+		return fmt.Errorf("fakeCursors: epoch %d is below the committed %d", epoch, c.cursorEpoch)
+	}
+	if order < c.cursor {
+		return fmt.Errorf("fakeCursors: order %d is below the committed %d", order, c.cursor)
+	}
+	c.cursorEpoch, c.cursor = epoch, order
 	return nil
 }
 

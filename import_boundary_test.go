@@ -48,7 +48,7 @@ var forbiddenLooprigModules = map[string]string{
 var publishedLooprigVersions = map[string]string{
 	"core":         "v0.7.0",
 	"storage":      "v0.6.0",
-	"sessionstore": "v0.6.0",
+	"sessionstore": "v0.7.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
 	"harness":      "v0.33.0",
@@ -650,7 +650,7 @@ func TestRequireViolations(t *testing.T) {
 	}{
 		{
 			name:   "published pins",
-			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/sessionstore v0.6.0\n\tgithub.com/looprig/storage v0.6.0\n)\n",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.7.0\n\tgithub.com/looprig/sessionstore v0.7.0\n\tgithub.com/looprig/storage v0.6.0\n)\n",
 		},
 		{
 			name:   "non-looprig dependency is unconstrained",
@@ -664,7 +664,7 @@ func TestRequireViolations(t *testing.T) {
 		{
 			name:   "pseudo-version",
 			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/sessionstore v0.0.0-20260901060329-a34464c893e6\n",
-			want:   []string{`requires github.com/looprig/sessionstore at v0.0.0-20260901060329-a34464c893e6, which is not the published version v0.6.0`},
+			want:   []string{`requires github.com/looprig/sessionstore at v0.0.0-20260901060329-a34464c893e6, which is not the published version v0.7.0`},
 		},
 		{
 			name:   "unpublished version of a released module",

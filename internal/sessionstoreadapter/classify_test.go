@@ -28,10 +28,12 @@ import (
 // type, so it is tested as one.
 //
 // EVERY ARM BELOW IS ENUMERATED BY HAND, AND THE TABLES REMAIN COMPLETE AS OF
-// sessionstore v0.6.0 — 10 JournalErrorCode, 19 InboxErrorCode and 13
+// sessionstore v0.7.0 — 10 JournalErrorCode, 20 InboxErrorCode and 13
 // RegistryErrorCode constants, of which 12 are passthrough and one, epoch, is
 // mapped; plus 5 InboxState and 5 CommandApplicationOutcome. The O3.3 rebind
-// re-counted these against v0.6.0 and none of the three vocabularies grew.
+// re-counted these against v0.6.0 and none of the three vocabularies grew; the
+// v0.7.0 bump grew the inbox vocabulary by one, InboxErrorOrder, and codeset_test.go
+// failed closed on it rather than this paragraph being remembered.
 //
 // THESE SLICES STILL DO NOT WALK ANYTHING, and saying they did would be worse
 // than saying nothing: Go cannot enumerate a package's constants at run time, so

@@ -70,24 +70,62 @@ var _ residency.JournalFencer = (*journalFencer)(nil)
 func (s *Service) journal() *journalFencer { return &journalFencer{service: s} }
 
 // CommitOpeningFence opens the session and retains its journal grant.
+//
+// A REFUSED STASH RELEASES THE GRANT IT JUST TOOK, and that half is as
+// load-bearing as the refusal. Returning while still holding the grant would
+// trade the stranded grant stashGrant now refuses for a leaked one nobody has a
+// handle to — the same defect with a different name — and the released store
+// retains a Store admission for a live journal writer, so Close would wait on it
+// forever.
 func (f *journalFencer) CommitOpeningFence(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
 	grant, err := f.service.options.OpenSession(ctx, tenant, session)
 	if err != nil {
 		return err
 	}
-	f.service.stashGrant(registry.Key{TenantID: tenant, SessionID: session}, grant)
+	key := registry.Key{TenantID: tenant, SessionID: session}
+	if err := f.service.stashGrant(key, grant); err != nil {
+		return errors.Join(err, grant.Release(ctx))
+	}
 	return nil
 }
 
 // stashGrant records the journal grant an opening fence produced, to be taken
 // by the ownership that follows it in the same attach.
-func (s *Service) stashGrant(key registry.Key, grant JournalGrant) {
+//
+// IT REFUSES A SECOND GRANT FOR ONE KEY rather than overwriting the first, and
+// the guard is HERE rather than only at the caller for the reason O7.1's
+// cross-tenant bypass is a live lesson in this module: that defect survived its
+// own guard because the guard was a caller's discipline asserted in another
+// package, with the object that depended on it asserting nothing. The map is
+// this package's, the invariant is about the map, and so the check is on the map.
+//
+// IT IS DEFENCE IN DEPTH AND NOT A LIVE FIX, said plainly. residency.Manager's
+// per-key attach slot means one opening per key today, so nothing in this module
+// can reach the refusal through an attach; the two tests that drive it call the
+// fencer directly. What changes is that the property no longer depends on a
+// promise made somewhere else.
+func (s *Service) stashGrant(key registry.Key, grant JournalGrant) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pendingGrants == nil {
 		s.pendingGrants = map[registry.Key]JournalGrant{}
 	}
+	if _, held := s.pendingGrants[key]; held {
+		return &PendingGrantHeldError{Key: key}
+	}
 	s.pendingGrants[key] = grant
+	return nil
+}
+
+// PendingGrantHeldError reports a second opening fence for a session whose first
+// grant has not yet been taken by an ownership.
+type PendingGrantHeldError struct {
+	Key registry.Key
+}
+
+func (e *PendingGrantHeldError) Error() string {
+	return "compose: session " + string(e.Key.TenantID) + "/" + string(e.Key.SessionID) +
+		" already holds an untaken journal grant, so a second opening fence would strand it"
 }
 
 // takeGrant removes and returns the grant stashed for a key.
@@ -278,28 +316,41 @@ func (s *Service) forgetConsumer(key registry.Key) {
 // a command accepted by another component since this session went idle is
 // visible here and would not be in any local queue depth.
 func (s *Service) AcceptedWork(ctx context.Context, key registry.Key) (bool, error) {
-	records, err := s.options.Inbox.ListOrdered(ctx, key.TenantID, key.SessionID, s.cursorFor(ctx, key), 1)
+	cursor, err := s.cursorFor(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	records, err := s.options.Inbox.ListOrdered(ctx, key.TenantID, key.SessionID, cursor, 1)
 	if err != nil {
 		return false, err
 	}
 	return len(records) > 0, nil
 }
 
-// cursorFor reads the durable consumption cursor, treating an unreadable one as
-// zero.
+// cursorFor reads the durable consumption cursor.
 //
-// ZERO IS THE CONSERVATIVE ANSWER HERE and that is why the error is dropped
-// rather than returned. A cursor that cannot be read makes the inbox re-read
-// start from the beginning, which reports accepted work where there may be
-// none — and the consequence of that is a session NOT released, which is the
-// safe side of this decision. Reporting the error instead would abandon the
-// warm release entirely.
-func (s *Service) cursorFor(ctx context.Context, key registry.Key) uint64 {
-	cursor, err := s.options.Cursors.LoadCursor(ctx, key.TenantID, key.SessionID)
-	if err != nil {
-		return 0
-	}
-	return cursor
+// IT PROPAGATES AND NO LONGER SWALLOWS, which is finding C-1 and a reversal of
+// what this function used to do. The old reasoning was that zero is the
+// conservative answer — the re-read starts from the beginning, reports work
+// where there may be none, and the session is NOT released, which is the safe
+// side. That holds for a TRANSIENT read failure and does not hold for the
+// refusal sessionstore v0.7.0 actually makes: a session with no disposition
+// catalog, absent or bound to another protocol, is refused rather than answered
+// about, permanently. Swallowing it holds such a session resident on every warm
+// release attempt for the whole life of the process, on a Host that cannot
+// consume one command in it, with nothing anywhere naming the cause.
+//
+// FAILING IS NOT ABANDONING THE WARM RELEASE. WarmReleaser's step 1 already
+// aborts on an unreadable inbox and records WarmFailure{Step: WarmStepInbox},
+// so the refusal reaches an operator with the session named — which is strictly
+// more than the silent non-release the zero produced. A transient failure gets
+// the same abort it always got, and the next tick tries again.
+//
+// ZERO IS NOT A FALLBACK POSITION. It is the answer for a session that EXISTS
+// and has consumed nothing, and it is the store that draws that line: "a caller
+// must not translate [the refusal] into 'no commands'".
+func (s *Service) cursorFor(ctx context.Context, key registry.Key) (uint64, error) {
+	return s.options.Cursors.LoadCursor(ctx, key.TenantID, key.SessionID)
 }
 
 // Wake resumes durable command consumption for a session whose release was

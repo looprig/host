@@ -335,8 +335,19 @@ var (
 		string(sessionstore.JournalErrorCursor),
 	}
 
-	inboxMapped      = map[string]error{string(sessionstore.InboxErrorEpoch): residency.ErrEpochSuperseded}
+	inboxMapped = map[string]error{string(sessionstore.InboxErrorEpoch): residency.ErrEpochSuperseded}
+	// THE TWENTIETH CODE IS InboxErrorOrder, added by sessionstore v0.7.0, and
+	// this guard failed closed on it exactly as it was built to. It is
+	// PASSTHROUGH and the decision is the release's own: it means RE-READ AND
+	// RETRY — the caller's consumed position is behind the record's committed
+	// one, which is a statement about the caller's DATA and not about its
+	// ownership. Mapping it onto ErrEpochSuperseded would make a consumer that
+	// retried an ambiguous save surrender a session it still holds, permanently,
+	// because residency's fence never reopens. The behavioural arm of that claim
+	// is TestSaveCursorDoesNotReportAStalePositionAsALostSession, against the
+	// released store rather than a constructed error.
 	inboxPassthrough = []string{
+		string(sessionstore.InboxErrorOrder),
 		string(sessionstore.InboxErrorInvalid),
 		string(sessionstore.InboxErrorCursor),
 		string(sessionstore.InboxErrorCommandMismatch),
@@ -665,5 +676,114 @@ func TestEveryDeclaredKeyspaceCodeIsConsidered(t *testing.T) {
 		if got != wantAbsent {
 			t.Fatalf("isCatalogAbsent(keyspace %q) = %v, want %v", code, got, wantAbsent)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The sixth and seventh arms: the disposition-catalog refusal
+// ---------------------------------------------------------------------------
+//
+// isDispositionCatalogRefusal in cursor.go is a SECOND predicate over the same
+// two vocabularies with a DIFFERENT answer, which is why it gets its own closed
+// lists rather than sharing isCatalogAbsent's. The two disagree on exactly one
+// code — CatalogErrorInvalid — and the disagreement is the substance: absence
+// and "bound to another protocol" are the same conclusion for a disposition
+// read and are not the same conclusion for a hydration, which must not treat a
+// wrongly-bound session as a fresh one to create.
+//
+// A predicate added over these vocabularies without closed lists of its own is
+// the gap the first version of this file left for isCatalogAbsent. This is that
+// lesson applied on the next occasion rather than after the next review.
+
+var (
+	dispositionRefused = map[string]error{
+		string(sessionstore.CatalogErrorNotFound): nil,
+		string(sessionstore.CatalogErrorDeleted):  nil,
+		string(sessionstore.CatalogErrorInvalid):  nil,
+	}
+	dispositionNotRefused = []string{
+		string(sessionstore.CatalogErrorCursor),
+		string(sessionstore.CatalogErrorIdentity),
+		string(sessionstore.CatalogErrorEpoch),
+		string(sessionstore.CatalogErrorSequence),
+		string(sessionstore.CatalogErrorTooSoon),
+		string(sessionstore.CatalogErrorConflict),
+		string(sessionstore.CatalogErrorUnknown),
+		string(sessionstore.CatalogErrorBackend),
+		string(sessionstore.CatalogErrorMalformed),
+		string(sessionstore.CatalogErrorVersion),
+		string(sessionstore.CatalogErrorTooLarge),
+	}
+
+	dispositionKeyspaceRefused = map[string]error{
+		string(sessionstore.KeyspaceBindingNotFound): nil,
+	}
+	dispositionKeyspaceNotRefused = []string{
+		string(sessionstore.KeyspaceBackend),
+		string(sessionstore.KeyspaceMarkerMalformed),
+		string(sessionstore.KeyspaceLayoutMismatch),
+		string(sessionstore.KeyspaceMarkerAmbiguous),
+		string(sessionstore.KeyspaceBindingAmbiguous),
+		string(sessionstore.KeyspaceScopeInvalid),
+		string(sessionstore.KeyspaceHashCollision),
+		string(sessionstore.KeyspaceLegacyTenant),
+		string(sessionstore.KeyspaceLegacySession),
+	}
+)
+
+// TestEveryDeclaredCatalogCodeIsConsideredByTheDispositionRefusal closes
+// isDispositionCatalogRefusal's catalog arm over the derived set.
+func TestEveryDeclaredCatalogCodeIsConsideredByTheDispositionRefusal(t *testing.T) {
+	codes := declaredCodes(t, pinnedSessionstoreDir(t), "CatalogErrorCode")
+	requireDerivedSet(t, "CatalogErrorCode", codes, string(sessionstore.CatalogErrorInvalid))
+	requireConsidered(t, "CatalogErrorCode", codes, dispositionRefused, dispositionNotRefused)
+
+	for _, code := range codes {
+		_, wantRefused := dispositionRefused[code]
+		got := isDispositionCatalogRefusal(&sessionstore.CatalogError{Code: sessionstore.CatalogErrorCode(code)})
+		if got != wantRefused {
+			t.Fatalf("isDispositionCatalogRefusal(catalog %q) = %v, want %v", code, got, wantRefused)
+		}
+	}
+}
+
+// TestEveryDeclaredKeyspaceCodeIsConsideredByTheDispositionRefusal closes its
+// keyspace arm.
+func TestEveryDeclaredKeyspaceCodeIsConsideredByTheDispositionRefusal(t *testing.T) {
+	codes := declaredCodes(t, pinnedSessionstoreDir(t), "KeyspaceErrorCode")
+	requireDerivedSet(t, "KeyspaceErrorCode", codes, string(sessionstore.KeyspaceBindingNotFound))
+	requireConsidered(t, "KeyspaceErrorCode", codes, dispositionKeyspaceRefused, dispositionKeyspaceNotRefused)
+
+	for _, code := range codes {
+		_, wantRefused := dispositionKeyspaceRefused[code]
+		got := isDispositionCatalogRefusal(&sessionstore.KeyspaceError{Code: sessionstore.KeyspaceErrorCode(code)})
+		if got != wantRefused {
+			t.Fatalf("isDispositionCatalogRefusal(keyspace %q) = %v, want %v", code, got, wantRefused)
+		}
+	}
+}
+
+// TestTheTwoCatalogPredicatesDisagreeOnExactlyOneCode is the assertion that
+// makes the duplication above load-bearing rather than copied.
+//
+// If the two predicates agreed everywhere, one of them would be redundant and a
+// maintainer would eventually merge them — losing the distinction a hydration
+// depends on. This states the difference as a property, so a change that
+// collapses it fails here with the reason rather than silently.
+func TestTheTwoCatalogPredicatesDisagreeOnExactlyOneCode(t *testing.T) {
+	codes := declaredCodes(t, pinnedSessionstoreDir(t), "CatalogErrorCode")
+	requireDerivedSet(t, "CatalogErrorCode", codes, string(sessionstore.CatalogErrorInvalid))
+
+	var disagreements []string
+	for _, code := range codes {
+		constructed := &sessionstore.CatalogError{Code: sessionstore.CatalogErrorCode(code)}
+		if isCatalogAbsent(constructed) != isDispositionCatalogRefusal(constructed) {
+			disagreements = append(disagreements, code)
+		}
+	}
+	sort.Strings(disagreements)
+	if len(disagreements) != 1 || disagreements[0] != string(sessionstore.CatalogErrorInvalid) {
+		t.Fatalf("the two catalog predicates disagree on %v, want exactly [%s]: a hydration must not read a wrongly-bound session as an absent one, and a disposition read must refuse both",
+			disagreements, sessionstore.CatalogErrorInvalid)
 	}
 }

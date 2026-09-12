@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"net/http/httptest"
+	"reflect"
 
 	"github.com/looprig/sessionstore"
 	"os"
@@ -364,5 +365,55 @@ func TestAProbeAnswers200WhenTrueAnd503WhenFalse(t *testing.T) {
 				t.Errorf("probe(%v) body = %q, want %q", test.ok, got, test.body)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The Bootstrap seam narrows as the store grows
+// ---------------------------------------------------------------------------
+
+// TestBootstrapAsksAProductForNothingTheReleasedStoreCanAnswer holds the seam to
+// the things Host genuinely cannot know.
+//
+// THREE OF THE SEVEN METHODS WERE THERE BECAUSE OF A MISSING RELEASE, not
+// because of a design: Inbox and Cursors were injected because sessionstore
+// v0.6.0 had no per-session ordered listing and no durable consumption cursor,
+// and Bootstrap.Store's own doc said so. v0.7.0 publishes both, so the
+// composition binds the adapted store and the two seams leave the product's
+// surface. Workspaces stays, because workspace materialization is still not
+// that store's business.
+//
+// THE ASSERTION IS ON THE METHOD SET AND IS EXACT IN BOTH DIRECTIONS. A method
+// this list does not name is a new thing being asked of every product and must
+// be reviewed as one; a method it names that is gone is a stale obligation. The
+// count alone would not do it — two methods could be swapped — so the names are
+// compared as a set.
+func TestBootstrapAsksAProductForNothingTheReleasedStoreCanAnswer(t *testing.T) {
+	t.Parallel()
+
+	seam := reflect.TypeOf((*Bootstrap)(nil)).Elem()
+	if seam.NumMethod() == 0 {
+		t.Fatal("Bootstrap declares no methods, so this guard read nothing")
+	}
+	got := map[string]bool{}
+	for index := range seam.NumMethod() {
+		got[seam.Method(index).Name] = true
+	}
+	want := map[string]bool{
+		"Store":        true,
+		"Registrar":    true,
+		"Checkpointer": true,
+		"Auth":         true,
+		"Workspaces":   true,
+	}
+	for name := range want {
+		if !got[name] {
+			t.Errorf("Bootstrap no longer declares %s, which a product still has to supply", name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("Bootstrap declares %s, which this file does not account for: either the released store cannot answer it and this list must say so, or it can and the composition should bind it", name)
+		}
 	}
 }

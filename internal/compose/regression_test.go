@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -614,8 +615,13 @@ type durableCommands struct {
 	mu      sync.Mutex
 	records map[sessionwire.CommandID]*durableRecord
 	order   []sessionwire.CommandID
-	cursor  uint64
-	lists   int
+	// cursor and cursorEpoch are the two high-water marks
+	// SaveDispositionCommandCursor keeps, and NEITHER EVER FALLS. Modelling
+	// only the order — which this double did — makes the epoch fence
+	// unrepresentable and every test over it vacuous.
+	cursor      uint64
+	cursorEpoch uint64
+	lists       int
 }
 
 // durableRecord is one inbox record and everything the journal proves about it.
@@ -706,12 +712,32 @@ func (d *durableCommands) LoadCursor(context.Context, sessionwire.TenantID, sess
 // silently skipped every command below order 9 — see the finding recorded
 // against fixture_test.go's fakeCursors, which still had the same transposition
 // when this was written.
-func (d *durableCommands) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, _ uint64, order uint64) error {
+//
+// IT NOW APPLIES BOTH FENCES, IN THE STORE'S ORDER, and the two arms were added
+// because the differential in inbox_differential_test.go found them missing.
+// Before that this method accepted everything: a position behind the committed
+// one was a silent no-op where sessionstore refuses with InboxErrorOrder, and
+// there was NO EPOCH FENCE AT ALL, so a save from a superseded lease was
+// accepted and walked the committed mark FORWARD to the epoch's own value. A
+// double that cannot produce its dependency's refusals is looser than the
+// dependency, and the composed test that ran against it established nothing
+// about either property.
+//
+// THE EPOCH IS FENCED BEFORE THE ORDER, which is the store's order and is
+// load-bearing for exactly one caller: the one below BOTH marks. Epoch-first
+// tells it "you have lost the session", which is terminal and correct;
+// order-first would tell it "your position is stale", which invites it to fetch
+// newer data and retry forever against a session it no longer owns.
+func (d *durableCommands) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, epoch uint64, order uint64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if order > d.cursor {
-		d.cursor = order
+	if epoch < d.cursorEpoch {
+		return fmt.Errorf("%w: epoch %d is below the committed %d", errStaleDoubleSave, epoch, d.cursorEpoch)
 	}
+	if order < d.cursor {
+		return fmt.Errorf("%w: order %d is below the committed %d", errStaleDoubleSave, order, d.cursor)
+	}
+	d.cursorEpoch, d.cursor = epoch, order
 	return nil
 }
 
@@ -1493,11 +1519,16 @@ var harnessReadPlaneMethods = []string{
 //     and its control is that the parse found them at all — a parse that
 //     matched nothing would otherwise satisfy "none of them is a read".
 //
-// The three interlock. The source arm alone would miss a read method dispatched
-// from a string literal; the RPC arm alone would miss a read method that HAPPENS
-// not to be in the list above; together, any method not one of the four declared
-// constants is resolved as a channel and needs a binding, which is what the RPC
-// arm's refusals demonstrate for names nobody declared.
+// THE THREE OVERLAP; THEY DO NOT CLOSE. The source arm misses a read method
+// dispatched from a string literal or from a constant that does not begin with
+// "Method"; the RPC arm misses any name absent from harnessReadPlaneMethods,
+// which is eight literals and not a derivation. An earlier version of this
+// comment claimed the two combine into a closure — "any method not one of the
+// four declared constants is resolved as a channel and needs a binding" — and
+// that is not true of the dispatch switch this Host actually has: a new read
+// method arrives as a new CASE and never reaches the default arm that resolves
+// a name as a channel. What the three arms give is a bound on the defect, not
+// its absence; reservedHostLinkMethods' doc states the residue in full.
 func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 	runtime := newPublishingSession()
 	f := newFixture(t)
@@ -1604,10 +1635,31 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 //   - anything in a file this walk does not read: it reads the named directory
 //     only, non-recursively, and skips _test.go files.
 //
-// The behavioural arm of TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise
-// is what covers the first, second and fourth of those, because a method that
-// is not one of the four is resolved as a channel and refused without a
-// binding whatever it is spelled.
+// WHAT THE BEHAVIOURAL ARM ACTUALLY COVERS, AND WHAT IT DOES NOT. An earlier
+// version of this comment said the behavioural arm of
+// TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise covers the first,
+// second and fourth items above, "because a method that is not one of the four
+// is resolved as a channel and refused without a binding whatever it is
+// spelled". THAT SENTENCE IS FALSE AND IT IS FALSE IN THE DIRECTION THAT
+// MATTERS. Multiplexer.dispatch is a switch, and a new read method arrives as a
+// new CASE: it never reaches the default arm, so it is never resolved as a
+// channel and never meets the binding check the arm's refusals demonstrate. A
+// two-line session-listing RPC added as a case, spelled from a string literal or
+// from a constant whose name does not begin with "Method", is invisible to the
+// source arm AND to the behavioural arm, and survives this whole suite green.
+// The hole is narrow — the case has to be added, and it has to avoid the naming
+// convention — and it is a hole.
+//
+// STATED AS A RESIDUE RATHER THAN A BOUNDARY, which is what the list above is:
+// the behavioural arm refutes only the SPELLINGS IT ENUMERATES in
+// harnessReadPlaneMethods, by driving each one over a real bound link and
+// requiring a refusal. It establishes nothing about a name it does not name.
+// Residue items 1, 2 and 4 are therefore UNEXAMINED, not excluded, and the two
+// arms together bound the defect rather than closing it: a new read plane is
+// caught if it is declared as a Method-prefixed constant (source arm) or if it
+// is spelled as one of the eight names enumerated here (behavioural arm), and
+// is missed otherwise. Closing it properly needs a third arm over the dispatch
+// switch's own case values, which is not written.
 func reservedHostLinkMethods(directory string) (map[string]string, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
