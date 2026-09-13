@@ -78,6 +78,29 @@ type DrainObserver interface {
 	ObserveDrain(DrainScope) (DrainStatus, bool)
 }
 
+// DrainScopeReporter reports the scope the call that BEGAN the drain named.
+//
+// IT IS A SEGREGATED CAPABILITY DISCOVERED BY ASSERTION and deliberately NOT a
+// method on DrainObserver: a state machine that cannot answer it is a state
+// machine this package still observes, and widening the observer interface
+// would break every implementation for one rung's benefit.
+//
+// WHY IT EXISTS. rung 8 of drainScope refuses a fixed-session drain unless the
+// requesting tenant currently HOLDS that session. That is right for BEGINNING a
+// Host-wide drain and wrong for OBSERVING one that has finished: release drops
+// the residency, so the terminal `drained` answer becomes unreachable to the
+// only caller entitled to it at the instant it becomes true. The observation
+// path therefore accepts EITHER a current holder OR the caller that began this
+// very drain.
+//
+// A REPORTER THAT IS ABSENT CHANGES NOTHING. Without one the observation path
+// is exactly rung 8 as R-1 wrote it.
+type DrainScopeReporter interface {
+	// BegunScope reports the scope the drain was begun with, and whether a
+	// drain has begun that named one at all.
+	BegunScope() (registry.Key, bool)
+}
+
 // ---------------------------------------------------------------------------
 // Transport dispatch
 // ---------------------------------------------------------------------------
@@ -151,7 +174,7 @@ func drainReply(observation sessionwire.HostLinkDrainObservation, err error) ([]
 // once it has finished — and the handler neither waits for nor infers the
 // second from the first.
 func (m *Multiplexer) StartDrain(request sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
-	scope, err := m.drainScope(request)
+	scope, err := m.drainScope(request, false)
 	if err != nil {
 		return sessionwire.HostLinkDrainObservation{}, err
 	}
@@ -184,7 +207,7 @@ func (m *Multiplexer) StartDrain(request sessionwire.HostLinkDrainRequest) (sess
 // that never received the drain request must not read "no drain here" as "the
 // drain finished" and delete the workload.
 func (m *Multiplexer) ObserveDrain(request sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error) {
-	scope, err := m.drainScope(request)
+	scope, err := m.drainScope(request, true)
 	if err != nil {
 		return sessionwire.HostLinkDrainObservation{}, err
 	}
@@ -261,7 +284,7 @@ func (m *Multiplexer) drainObservation(scope DrainScope, status DrainStatus) (se
 // key.
 // That is also why the key is not carried onto DrainScope, where a state
 // machine could branch on it.
-func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (DrainScope, error) {
+func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest, observing bool) (DrainScope, error) {
 	if err := request.Validate(); err != nil {
 		return DrainScope{}, &BindError{
 			Refusal: RefusalMalformedRequest,
@@ -384,7 +407,18 @@ func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (Drai
 	// nothing, and a Host holding nothing yet refuses every drain that reaches
 	// here — which is fail-closed and correct, because a Host holding nothing
 	// has nothing for a HostLink drain to cover.
-	if _, held := m.residencies.Get(key); !held {
+	//
+	// ONE CALLER IS ATTRIBUTED WITHOUT HOLDING IT, and only on the OBSERVATION
+	// path: the caller that BEGAN this very drain. Release drops the residency,
+	// so without this the terminal `drained` answer is unreachable to the only
+	// caller entitled to it at exactly the instant it becomes true — and a
+	// Factory reading completion from the disconnect instead is reading a
+	// signal that is identical whether release finished or FinishRelease
+	// refused. See DrainScopeReporter for why this discloses nothing new: the
+	// match requires naming the tenant AND session that began the drain, and
+	// only that caller ever received the acknowledgement. A tenant that held
+	// nothing began nothing and is refused here exactly as before.
+	if _, held := m.residencies.Get(key); !held && !(observing && m.beganDrainFor(key)) {
 		return DrainScope{}, &BindError{
 			Refusal: RefusalWrongDrainScope,
 			Key:     key,
@@ -393,4 +427,19 @@ func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (Drai
 		}
 	}
 	return DrainScope{Key: key}, nil
+}
+
+// beganDrainFor reports whether this Host's drain was begun by a caller naming
+// exactly this key.
+//
+// IT IS FALSE WHEN THE STATE MACHINE CANNOT ANSWER, which is the whole point of
+// discovering the capability rather than requiring it: an observer without a
+// DrainScopeReporter leaves rung 8 exactly as R-1 wrote it.
+func (m *Multiplexer) beganDrainFor(key registry.Key) bool {
+	reporter, reports := m.drainObserver.(DrainScopeReporter)
+	if !reports {
+		return false
+	}
+	begun, named := reporter.BegunScope()
+	return named && begun == key
 }

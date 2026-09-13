@@ -136,15 +136,30 @@ type Residents interface {
 	ResidentSessions() []Session
 }
 
-// Link is the HostLink server, narrowed to its shutdown.
+// THIS PACKAGE OWNS NO TRANSPORT SHUTDOWN, and the absence is load-bearing
+// rather than an omission. It used to hold a Link seam and close it as the
+// drain's last step. That was wrong for a HostLink-INITIATED drain, and wrong
+// in a way no test caught, because the close and the answer raced nothing — the
+// close simply came FIRST. `run` closed the link BEFORE it assigned
+// `settledState()`, so the terminal answer a Factory polls for came into
+// existence only after the transport carrying it was gone.
 //
-// It is OPTIONAL and it closes LAST. Factory reaches the bounded drain-status
-// observation through this link, so a link closed when the drain began would
-// leave Factory inferring completion from a disconnect — which is the inference
-// O5.4's status observation exists to replace.
-type Link interface {
-	Close(context.Context) error
-}
+// WHY THAT WAS NOT MERELY WEAK. The disconnect a Factory was left with is
+// Centrifuge `DisconnectShutdown` (3001) in EVERY outcome, including the one
+// `settledState` deliberately withholds `drained` for. So the one signal
+// reaching a Factory was AMBIGUOUS between "release finished, delete the
+// workload" and "FinishRelease refused, this Host still holds the lease". On
+// that signal a Factory either deletes work whose lease is still held or waits
+// forever. Core says so directly: HostLinkDrainObservation exists "for a
+// Factory to observe without inferring release completion from a transport
+// close" (core/sessionwire/v1/hostlink.go).
+//
+// SO THE TRANSPORT CLOSES WHEN THE PROCESS STOPS, NEVER AS A DRAIN STEP. The
+// composition's Stop closes it after Wait returns, which keeps "the transport
+// closes LAST" — it is still after every release step — while leaving a
+// link-drained Host alive and answering. StepCloseLink survives as the step
+// name that caller records under; see its own comment.
+// TestTheDrainOwnsNoTransportShutdown is the trip-wire over this paragraph.
 
 // ---------------------------------------------------------------------------
 // Options
@@ -160,10 +175,6 @@ type Options struct {
 	Admissions Admissions
 	Advertiser Advertiser
 	Residents  Residents
-
-	// Link is the HostLink server to close once the Host is drained. It is
-	// optional; a Host composed without one still drains.
-	Link Link
 
 	// Grace is the whole drain's bound — the platform's termination grace, less
 	// whatever margin the composition keeps for its own shutdown. When it
@@ -226,7 +237,13 @@ const (
 	StepCheckpoint       Step = "checkpoint"
 	StepReleaseResidency Step = "release_residency"
 	StepFinishRelease    Step = "finish_release"
-	StepCloseLink        Step = "close_link"
+
+	// StepCloseLink is the transport shutdown, and THIS PACKAGE NEVER RECORDS
+	// IT. The drain does not close a transport at all; the process-lifecycle
+	// caller closes one after Wait returns and books its failure under this
+	// name, so an operator reading a Report sees the same vocabulary wherever
+	// the step ran. It stays here because Report is this package's type.
+	StepCloseLink Step = "close_link"
 )
 
 // Failure is one step that did not succeed.
@@ -308,6 +325,12 @@ type Drainer struct {
 	begun      bool
 	drainState sessionwire.HostLinkDrainState
 	failures   []Failure
+
+	// begunScope is the scope the call that BEGAN this drain named, kept so the
+	// caller that began it can still be attributed after its session has been
+	// released. It is the zero Key for the process-lifecycle drain, which names
+	// no scope, and the zero Key must never be treated as a match.
+	begunScope registry.Key
 
 	// ledgerStopped records that Admissions.BeginDrain has been called, so a
 	// retry after a refused publication does not stop admission twice. It is
@@ -399,7 +422,7 @@ func NewDrainer(options Options) (*Drainer, error) {
 // tenant-authenticated link, and a fixed session the requesting tenant does not
 // hold. A dedicated Host holds one session (its placement pins Capacity to 1),
 // so draining that session and draining the Host are then the same work.
-func (d *Drainer) StartDrain(hostlink.DrainScope) (hostlink.DrainStatus, error) {
+func (d *Drainer) StartDrain(scope hostlink.DrainScope) (hostlink.DrainStatus, error) {
 	d.mu.Lock()
 	if d.begun {
 		status := hostlink.DrainStatus{Generation: d.options.Generation, State: d.drainState}
@@ -460,6 +483,7 @@ func (d *Drainer) StartDrain(hostlink.DrainScope) (hostlink.DrainStatus, error) 
 	}
 
 	d.begun = true
+	d.begunScope = scope.Key
 	d.done = make(chan struct{})
 	sessions := d.options.Residents.ResidentSessions()
 	status := hostlink.DrainStatus{Generation: d.options.Generation, State: d.drainState}
@@ -501,6 +525,38 @@ func (d *Drainer) ObserveDrain(hostlink.DrainScope) (hostlink.DrainStatus, bool)
 		return hostlink.DrainStatus{}, false
 	}
 	return hostlink.DrainStatus{Generation: d.options.Generation, State: d.drainState}, true
+}
+
+// BegunScope reports the scope the call that BEGAN this drain named.
+//
+// IT EXISTS FOR ONE ATTRIBUTION AND NOT AS A GENERAL ACCESSOR. hostlink's drain
+// resolver refuses a fixed-session drain unless the requesting tenant currently
+// HOLDS that session — R-1's rung 8 — and that read is correct for BEGINNING a
+// Host-wide drain. Applied unchanged to the read-only observation it makes the
+// TERMINAL answer unreachable: the drain releases the session, so the tenant
+// that began the drain stops holding it at exactly the moment `drained` becomes
+// true, and is refused the one answer it is waiting for.
+//
+// WHAT IT LETS THROUGH IS A STRICT SUBSET OF WHO ALREADY KNOWS. A caller
+// matches only by naming the tenant AND session that BEGAN this drain, and only
+// that caller ever received the acknowledgement. A tenant that never held the
+// fixed session began nothing, matches nothing, and is refused exactly as
+// before and indistinguishably. So this discloses nothing to anyone who did not
+// already have it, which is why it may relax a rung whose whole purpose is
+// non-disclosure.
+//
+// THE SECOND RETURN IS NOT "a drain has begun". It is "a drain has begun AND it
+// named a scope". The process-lifecycle drain passes the zero DrainScope, so a
+// zero Key would otherwise match a caller that named nothing — and rungs above
+// guarantee a real caller's key is never zero, so a zero match could only ever
+// be an accident.
+func (d *Drainer) BegunScope() (registry.Key, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.begun || d.begunScope == (registry.Key{}) {
+		return registry.Key{}, false
+	}
+	return d.begunScope, true
 }
 
 // Wait blocks until the drain has finished and returns its report. On a
@@ -554,12 +610,6 @@ func (d *Drainer) run(sessions []Session) {
 	wait.Wait()
 	endGrace()
 
-	if d.options.Link != nil {
-		if err := d.options.Link.Close(context.Background()); err != nil {
-			d.record(Failure{Step: StepCloseLink, Err: err})
-		}
-	}
-
 	d.mu.Lock()
 	d.drainState = d.settledState()
 	done := d.done
@@ -585,10 +635,12 @@ func (d *Drainer) run(sessions []Session) {
 // `draining`, so a Factory waits and eventually escalates instead of deleting.
 // A leaked workload is visible to an operator; deleted work is not.
 //
-// ONLY FinishRelease WITHHOLDS IT. A failed checkpoint, a missed idle boundary,
-// a refused ReleaseResidency and a link that would not close are all recorded
-// and none of them means release did not finish — the tombstone is written and
-// the lease is released in every one of those.
+// ONLY FinishRelease WITHHOLDS IT. A failed checkpoint, a missed idle boundary
+// and a refused ReleaseResidency are all recorded and none of them means
+// release did not finish — the tombstone is written and the lease is released
+// in every one of those. A transport that would not close is not in this list
+// at all any more: the drain closes none, and the caller that does books its
+// failure after this state was already settled.
 func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
 	for _, failure := range d.failures {
 		if failure.Step == StepFinishRelease {

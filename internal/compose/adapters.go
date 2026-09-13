@@ -186,6 +186,27 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		tail.Stop()
 		consumer.Stop()
 		s.forgetConsumer(request.Key)
+		// AND EVERY ROUTE TO THIS SESSION GOES WITH IT.
+		//
+		// It is NOT redundant with Tails.invalidate, which drops routes only
+		// when a tail is LOST or REFUSED; relay deliberately treats Host's own
+		// stop as neither, because "a cancellation races the close, and
+		// attributing Host's own stop to a loss would invalidate routes nobody
+		// lost". That reasoning is about the CAUSE recorded on the tail. The
+		// route is a different question: the session is no longer resident
+		// here, whoever ended it.
+		//
+		// IT USED TO BE DONE BY A SIDE EFFECT. Until the drain stopped closing
+		// transports, every release was immediately followed by a transport
+		// close that dropped the link's routes with it. A link-drained Host now
+		// stays up, so a binding released this way would outlive its residency
+		// on a Host that is still answering. Measured before this line existed.
+		//
+		// IT IS SCOPED TO THE SESSION AND NOT TO THE LINK. InvalidateSession
+		// takes the key; dropping the link's whole table would cut a Factory's
+		// routes to every OTHER session it holds on the same connection. See
+		// TestReleasingOneSessionLeavesEveryOtherSessionSRoutesAlone.
+		link.mux.InvalidateSession(request.Key)
 	}}, nil
 }
 

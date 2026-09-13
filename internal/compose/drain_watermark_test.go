@@ -2,6 +2,7 @@ package compose
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host"
+	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 )
@@ -111,18 +113,32 @@ func dedicatedDrainFixture(t *testing.T) *fixture {
 // true is what makes the assertion FIRE and demand a re-measurement.
 func hostLinkHandshakeAccepted(t *testing.T, serverURL string, tenant sessionwire.TenantID) bool {
 	t.Helper()
+	accepted, _ := hostLinkHandshake(t, serverURL, tenant)
+	return accepted
+}
+
+// hostLinkHandshake reports whether the upgrade was accepted and, when it was
+// not, the HTTP status it was refused with.
+//
+// THE STATUS IS RETURNED BECAUSE IT IS A CONTRACT AND NOT A DETAIL. A Host that
+// has stopped is UNAVAILABLE; it used to answer 400 "HostLink requires a valid
+// tenant", because resolve returned an anonymous error and the handler's
+// fall-through claimed the caller's credential was the problem. A Factory
+// reading a 4xx looks at itself and stops retrying.
+func hostLinkHandshake(t *testing.T, serverURL string, tenant sessionwire.TenantID) (bool, int) {
+	t.Helper()
 	endpoint := "ws" + strings.TrimPrefix(serverURL, "http") + HostLinkPathPrefix + string(tenant)
 	connection, response, err := websocket.DefaultDialer.Dial(endpoint, http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json"}})
 	if err != nil {
-		status := "no response"
+		status := 0
 		if response != nil {
-			status = response.Status
+			status = response.StatusCode
 		}
-		t.Logf("the HostLink handshake for %s was refused after the drain (%s): %v", tenant, status, err)
-		return false
+		t.Logf("the HostLink handshake for %s was refused with %d: %v", tenant, status, err)
+		return false, status
 	}
 	t.Cleanup(func() { _ = connection.Close() })
-	return true
+	return true, http.StatusSwitchingProtocols
 }
 
 // fixedSessionDrainRequest is the one drain request this Host answers.
@@ -242,54 +258,42 @@ func TestAnAuthenticatedHostLinkDrainIsNonacceptingBeforeItReportsInitiation(t *
 	}
 }
 
-// TestAnAuthenticatedHostLinkDrainIsIdempotentlyObservableUpToRelease is the
-// SECOND half of O7.3's gate line, measured — and it does NOT reach the gate's
-// wording. Its name says "up to release" and not "through release" because
-// that is what the module does, and the difference is the finding this file
-// exists to record rather than paper over. The last subtest below asserts the
-// boundary itself, so the day it moves this test fails and says so.
+// TestAnAuthenticatedHostLinkDrainIsIdempotentlyObservableThroughRelease is the
+// SECOND half of O7.3's gate line.
 //
-// WHAT IS TRUE, AND IS ASSERTED HERE. While the drain runs, an authenticated
-// HostLink drain is idempotent and observable in all three senses the gate
-// wants:
+// IT USED TO BE NAMED "UpToRelease" AND TO ASSERT THE OPPOSITE, which is worth
+// knowing before trusting it. The drain closed every transport as its last
+// cleanup step, BEFORE settledState assigned the terminal state, so the
+// `drained` answer was unreachable over HostLink by construction — and the
+// Centrifuge 3001 disconnect that replaced it is IDENTICAL whether release
+// finished or FinishRelease refused, which is the one case Core's contract and
+// settledState both exist to keep apart. This test recorded that as a boundary;
+// the drain now closes nothing and the boundary is gone.
 //
-//  1. IDEMPOTENT. A repeat drain begins nothing new: the generation is
-//     unchanged, no second target withdrawal is written, and — the assertion
-//     that would catch a repeat which actually re-ran the drain — the runtime
-//     is released exactly ONCE across the whole sequence.
-//  2. OBSERVABLE. hostlink.drain_status answers with the same generation and
-//     starts nothing. The separate-method design exists so that "no drain
-//     here" can never be read as "the drain finished".
-//  3. NOT KEY-SCOPED. Every request below carries a DIFFERENT idempotency key
-//     on purpose. drainScope does not consult the key at all, and a Host that
-//     answered from a key-scoped cache would be making a statement about the
-//     PAST. Reusing one key here would let such a cache pass.
+// FOUR CLAIMS, in the order the sequence makes them:
 //
-// WHAT IS NOT TRUE, AND IS ALSO ASSERTED HERE. The drained state is NOT
-// observable over HostLink at all — not late, not racily, NEVER — and it is a
-// structural impossibility rather than a timing one. Drainer.run closes
-// options.Link BEFORE it assigns d.drainState = d.settledState() and before it
-// closes d.done, so the ONLY transport a Factory could ask on is gone strictly
-// before the answer it would ask for exists. Measured, not read: after Wait
-// returns, links.all() is empty and a fresh WebSocket handshake to the same
-// HostLink path is refused with 400. In-process ObserveDrain reports
-// state "drained" at the same instant, so the state is real and it is the
-// TRANSPORT that is missing, which is what makes this a gap and not an absence
-// of behaviour.
+//  1. IDEMPOTENT. A repeat drain begins nothing new: same generation, same
+//     state, no second target withdrawal, and the runtime released exactly ONCE
+//     across the whole sequence.
+//  2. OBSERVABLE. hostlink.drain_status answers the same generation and runs no
+//     checkpoint. The separate-method design exists so "no drain here" can never
+//     be read as "the drain finished".
+//  3. THROUGH RELEASE, over THE SAME LINK, including the TERMINAL answer. This
+//     is the half the gate line is really about: a Factory deletes a dedicated
+//     workload on `drained` and must READ it.
+//  4. AND THE LINK IS STILL OPEN AFTERWARDS, because three assertions about
+//     answers could all be satisfied by a Host that answered once and then
+//     dropped its Factory.
 //
-// WHY THAT MATTERS AND IS NOT TIDIED AWAY. The stop-order test's own comment
-// gives the reason the link is held open across the drain: "Factory reaches the
-// bounded drain-status observation through the link, so a link closed when the
-// drain began would leave it inferring completion from a disconnect — the
-// inference the status observation exists to replace." At COMPLETION that is
-// exactly what a Factory is left with. For the process-lifecycle drain it is
-// arguably moot, since the process is leaving; for a HostLink-INITIATED drain
-// of a dedicated Host it is not, because the Host is still running. Whether to
-// keep HostLink serving after a link-initiated drain is a DESIGN decision about
-// Host's lifecycle, not a test fix, and it is root's to make. Until it is made,
-// O7.3's gate line is not satisfied in its second half. See
-// CODEX_RESULT_O7.3_WATERMARK.md.
-func TestAnAuthenticatedHostLinkDrainIsIdempotentlyObservableUpToRelease(t *testing.T) {
+// NOT KEY-SCOPED. Every request carries a DIFFERENT idempotency key on purpose.
+// drainScope does not consult the key at all, and a Host answering from a
+// key-scoped cache would be making a statement about the PAST. Reusing one key
+// would let such a cache pass.
+//
+// THE MUTATOR PATH IS NOT PART OF THIS. hostlink.drain after release is refused
+// and that is asserted inline where it happens; see the comment there and
+// TestRelaxingRungEightForObservationDisclosesNothingToAnyoneElse.
+func TestAnAuthenticatedHostLinkDrainIsIdempotentlyObservableThroughRelease(t *testing.T) {
 	f := dedicatedDrainFixture(t)
 	f.start()
 	f.store.holdReleasing()
@@ -356,34 +360,185 @@ func TestAnAuthenticatedHostLinkDrainIsIdempotentlyObservableUpToRelease(t *test
 		t.Errorf("the runtime was released %d times across two drain requests and one observation, want 1", released)
 	}
 
-	// THE BOUNDARY. This is the half of the gate line the module does not
-	// reach, asserted as the fact it is so that the day it changes this test
-	// fails loudly rather than a gate line being ticked on a stale reading.
-	t.Run("the drained state is unreachable over HostLink because the drain closed the transport first", func(t *testing.T) {
-		// The state EXISTS. Without this the two absences below would be
-		// satisfied by a drain that simply never finished.
-		settled, begun := f.svc.drainer.ObserveDrain(hostlink.DrainScope{})
-		if !begun || settled.State != sessionwire.HostLinkDrainStateDrained {
-			t.Fatalf("in process the drain reports (begun %v, state %q), want a begun drain in state %q: "+
-				"the transport absences below are only a GAP if the answer a Factory wants exists",
-				begun, settled.State, sessionwire.HostLinkDrainStateDrained)
-		}
-		if settled.Generation != initiation.DrainGeneration {
-			t.Errorf("the settled drain carries generation %d, want the initiation's %d", settled.Generation, initiation.DrainGeneration)
-		}
+	// (2) AND (1) THROUGH RELEASE, over the SAME link, which is the half of the
+	// gate line that was unreachable until the drain stopped closing the
+	// transport. The terminal answer is the point: a Factory deletes a
+	// dedicated workload on `drained` and must read it, not infer it from a
+	// disconnect that is ambiguous between success and a refused FinishRelease.
+	afterRelease := drainObservationOf(t, link.rpc(5, hostlink.MethodDrainStatus, fixedSessionDrainRequest("o73-idempotent-after")))
+	if afterRelease.DrainGeneration != initiation.DrainGeneration {
+		t.Errorf("drain_status after release answered with generation %d, want the initiation's %d: the generation is not stable through release",
+			afterRelease.DrainGeneration, initiation.DrainGeneration)
+	}
+	if afterRelease.State != sessionwire.HostLinkDrainStateDrained {
+		t.Errorf("drain_status after release answered with state %q, want the terminal %q", afterRelease.State, sessionwire.HostLinkDrainStateDrained)
+	}
+	// AND BEGINNING IS STILL NOT OBSERVING. `hostlink.drain` after release is
+	// REFUSED, and the asymmetry is deliberate rather than an oversight: R-1's
+	// rung 8 attributes the right to BEGIN a Host-wide drain to the tenant that
+	// HOLDS the fixed session, and release ends that. The observation path is
+	// relaxed because it begins nothing and tells only the caller that already
+	// received the acknowledgement; the mutator path is not relaxed at all.
+	// A Factory whose retry spans completion must ask drain_status, which is
+	// the method whose entire purpose is to look without initiating.
+	postRelease := link.rpc(6, hostlink.MethodDrain, fixedSessionDrainRequest("o73-idempotent-post"))
+	if refusal, isRefusal := refusalOf(t, postRelease); !isRefusal {
+		t.Errorf("hostlink.drain after release was ACCEPTED (%s); beginning a Host-wide drain is attributed to the tenant that HOLDS the fixed session and this one no longer does", mustJSON(t, postRelease))
+	} else if refusal.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
+		t.Errorf("hostlink.drain after release was refused with %q, want %q", refusal.Code, sessionwire.HostLinkErrorRuntimeUnavailable)
+	}
 
-		// AND NO LINK SURVIVES TO CARRY IT. Drainer.run closes options.Link
-		// before it assigns the settled state, so this is an ordering the drain
-		// guarantees and not a race this test won.
-		if live := len(f.svc.links.all()); live != 0 {
-			t.Fatalf("%d tenant links survived the drain. IF THIS FIRES, THE DRAINED STATE MAY NOW BE OBSERVABLE OVER HOSTLINK "+
-				"AND O7.3's GATE LINE MAY BE SATISFIABLE THROUGH RELEASE. Re-measure it: ask hostlink.drain_status over the "+
-				"surviving link and assert the generation is the initiation's and the state is %q.", live, sessionwire.HostLinkDrainStateDrained)
+	if released := f.runtime.Released(); released != 1 {
+		t.Errorf("the runtime was released %d times across the whole sequence, want 1: a drain after release re-ran it or the refusal above ran one", released)
+	}
+	if withdrawnNow := len(f.directory.withdrawals()); withdrawnNow != withdrawnAfterFirst {
+		t.Errorf("%d targets were withdrawn in total, want the first drain's %d: a drain after release re-published", withdrawnNow, withdrawnAfterFirst)
+	}
+
+	// AND THE TRANSPORT IS STILL OPEN, because it is not the drain's to close.
+	// Without this the four assertions above could be satisfied by a Host that
+	// answered once and then dropped the link, which is the disconnect the
+	// observation exists to replace.
+	if live := len(f.svc.links.all()); live == 0 {
+		t.Error("no tenant link survived the drain, so the answers above came from a Host that has already dropped its Factory")
+	}
+}
+
+// TestRelaxingRungEightForObservationDisclosesNothingToAnyoneElse is the
+// security row for the one rung this work relaxed, and it is the row that must
+// not be deleted.
+//
+// WHAT WAS RELAXED. drainScope's rung 8 refuses a fixed-session drain unless
+// the requesting tenant currently HOLDS that session. Release drops the
+// residency, so under that rule the terminal `drained` answer was unreachable
+// to the only caller entitled to it at exactly the instant it became true. The
+// OBSERVATION path — and only it — now also admits the caller that BEGAN this
+// drain, matched on the tenant AND session the drain was begun with.
+//
+// WHY THAT DISCLOSES NOTHING NEW, asserted rather than argued. The relaxation's
+// match set is a subset of "callers that already received the acknowledgement".
+// A tenant that never held the fixed session began nothing, so it matches
+// nothing — and this test is the measurement, over the hardest case available:
+// the drain has ALREADY completed, so the holder check fails for BOTH tenants
+// and the relaxation is the only thing that can separate them. tenant-b must
+// still be refused, with the SAME refusal class it got before the relaxation,
+// because R-1 made that refusal deliberately indistinguishable from "another
+// tenant holds it" on a cross_tenant_isolated Host.
+//
+// THE MUTATOR PATH IS NOT RELAXED AT ALL, and the last assertion holds that:
+// tenant-a itself, which DID begin the drain, is still refused hostlink.drain
+// after release. Beginning a Host-wide drain is attributed to a holder; only
+// looking is attributed to the beginner.
+func TestRelaxingRungEightForObservationDisclosesNothingToAnyoneElse(t *testing.T) {
+	f := dedicatedDrainFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	server := f.serve()
+
+	owner := dialFactoryLink(t, server.URL, tenantA)
+	initiation := drainObservationOf(t, owner.rpc(2, hostlink.MethodDrain, fixedSessionDrainRequest("disclosure-begin")))
+	f.svc.drainer.Wait()
+
+	// THE BEGINNER READS THE TERMINAL ANSWER. Without this the refusals below
+	// would be satisfied by a Host that refuses everyone, which is the old
+	// behaviour under a new test's name.
+	settled := drainObservationOf(t, owner.rpc(3, hostlink.MethodDrainStatus, fixedSessionDrainRequest("disclosure-own")))
+	if settled.State != sessionwire.HostLinkDrainStateDrained || settled.DrainGeneration != initiation.DrainGeneration {
+		t.Fatalf("the tenant that began the drain observed %q at generation %d, want %q at %d",
+			settled.State, settled.DrainGeneration, sessionwire.HostLinkDrainStateDrained, initiation.DrainGeneration)
+	}
+
+	// AND NOBODY ELSE DOES. tenant-b holds nothing, began nothing, and names
+	// this Host's fixed session under its own tenant — every rung above 8
+	// passes.
+	stranger := dialFactoryLink(t, server.URL, tenantB)
+	attack := fixedSessionDrainRequest("disclosure-attack")
+	attack.TenantID = tenantB
+	refusal, isRefusal := refusalOf(t, stranger.rpc(4, hostlink.MethodDrainStatus, attack))
+	if !isRefusal {
+		t.Fatal("A TENANT THAT NEVER HELD THE FIXED SESSION OBSERVED THIS HOST'S DRAIN. The observation " +
+			"relaxation must match the tenant AND session the drain was BEGUN with; a match on the session " +
+			"alone, or on 'a drain has begun', hands cross-tenant occupancy to any link that can name the " +
+			"fixed session on a cross_tenant_isolated Host.")
+	}
+	if refusal.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
+		t.Errorf("the stranger's observation was refused with %q, want %q: R-1 keeps this refusal indistinguishable from the one a too-early caller gets",
+			refusal.Code, sessionwire.HostLinkErrorRuntimeUnavailable)
+	}
+
+	// AND THE MUTATOR IS UNCHANGED even for the beginner.
+	if _, isRefusal := refusalOf(t, owner.rpc(5, hostlink.MethodDrain, fixedSessionDrainRequest("disclosure-restart"))); !isRefusal {
+		t.Error("hostlink.drain after release was accepted for the tenant that began it; only the OBSERVATION path is relaxed")
+	}
+}
+
+// TestADrainThatCouldNotFinishReleaseAnswersDrainingOverTheSameLink is the
+// gate line's parenthesis — "including the terminal `drained` (or WITHHELD
+// `draining`) answer" — and it is the case the whole transport change exists
+// for.
+//
+// THE TWO OUTCOMES USED TO BE THE SAME BYTES ON THE WIRE. The drain closed
+// every transport as its last step, and `links.Close` is `node.Shutdown`, which
+// sends Centrifuge `DisconnectShutdown` 3001. It sent 3001 whether release
+// finished or FinishRelease refused — so the ONE signal reaching a Factory was
+// ambiguous between "release finished, delete the dedicated workload" and "this
+// Host still holds the lease". settledState goes to considerable trouble to
+// keep those apart, in its own words because `drained` "is the signal a Factory
+// deletes a dedicated workload on, so it destroys work whose lease this Host
+// still holds" — and then the transport threw the distinction away.
+//
+// SO THIS TEST IS THE OTHER HALF OF THE SIBLING ABOVE, and neither is worth
+// much alone: one shows the terminal `drained` crosses the link, this one shows
+// that when release did NOT finish, the SAME link carries `draining` instead.
+// A Factory can tell them apart because there are two answers, not because it
+// guesses from a socket.
+//
+// THE FAILURE IS INJECTED AT THE TOMBSTONE because that is what FinishRelease
+// does. A checkpoint failure or a refused ReleaseResidency would be recorded
+// and STILL report drained, which is settledState's rule and not this test's.
+func TestADrainThatCouldNotFinishReleaseAnswersDrainingOverTheSameLink(t *testing.T) {
+	f := dedicatedDrainFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	server := f.serve()
+	link := dialFactoryLink(t, server.URL, tenantA)
+
+	refused := errors.New("the durable store would not accept the epoch-fenced tombstone")
+	f.store.refuseTombstones(refused)
+
+	initiation := drainObservationOf(t, link.rpc(2, hostlink.MethodDrain, fixedSessionDrainRequest("withheld-begin")))
+	report := f.svc.drainer.Wait()
+
+	// NON-VACUITY: the drain really did fail at FinishRelease, and at nothing
+	// else that would have withheld `drained` for a different reason.
+	var finishFailures int
+	for _, failure := range report.Failures {
+		if failure.Step == lifecycle.StepFinishRelease {
+			finishFailures++
+			if !errors.Is(failure, refused) {
+				t.Errorf("the finish-release failure lost its cause: %v", failure)
+			}
 		}
-		if hostLinkHandshakeAccepted(t, server.URL, tenantA) {
-			t.Fatal("a fresh authenticated HostLink connection was accepted after the drain completed. IF THIS FIRES, A FACTORY " +
-				"CAN RECONNECT AND ASK FOR THE DRAINED STATE, so re-measure O7.3's second half over the reconnected link " +
-				"instead of accepting this boundary.")
-		}
-	})
+	}
+	if finishFailures != 1 {
+		t.Fatalf("failures = %v, want exactly one at %q: the injection did not take, so the answer below is not the WITHHELD one", report.Failures, lifecycle.StepFinishRelease)
+	}
+
+	// THE WITHHELD ANSWER, over the same authenticated link, after the drain
+	// has finished doing everything it is going to do.
+	settled := drainObservationOf(t, link.rpc(3, hostlink.MethodDrainStatus, fixedSessionDrainRequest("withheld-observe")))
+	if settled.State != sessionwire.HostLinkDrainStateDraining {
+		t.Errorf("a drain whose FinishRelease refused answered %q over the link, want %q. A FACTORY READING %q HERE DELETES A "+
+			"DEDICATED WORKLOAD WHOSE LEASE THIS HOST STILL HOLDS.",
+			settled.State, sessionwire.HostLinkDrainStateDraining, sessionwire.HostLinkDrainStateDrained)
+	}
+	if settled.DrainGeneration != initiation.DrainGeneration {
+		t.Errorf("the withheld answer carries generation %d, want the initiation's %d", settled.DrainGeneration, initiation.DrainGeneration)
+	}
+	// AND THE LINK IS STILL THERE TO CARRY IT, which is the whole point: this
+	// is exactly the outcome whose signal used to be a 3001 disconnect
+	// indistinguishable from success.
+	if live := len(f.svc.links.all()); live == 0 {
+		t.Error("no link survived a drain that could not finish release, so a Factory is back to inferring this outcome from a disconnect")
+	}
 }

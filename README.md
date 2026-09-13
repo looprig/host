@@ -108,6 +108,61 @@ about. The cost falls where it can be borne: a placement controller can resolve
 the ambiguity from **its own attach state**, which it has and this Host does not
 owe it. Do not "fix" this by splitting the refusal.
 
+**AMENDED (O7.3): rung (2) is relaxed on the OBSERVATION path, and only there.**
+`hostlink.drain_status` also admits the caller that **began this very drain**,
+matched on the tenant **and** session the drain was begun with. Without it the
+terminal `drained` answer was unreachable to the only caller entitled to it:
+release drops the residency, so rung (2) started refusing the beginner at
+exactly the instant the answer it was waiting for became true. **The
+mutator path is NOT relaxed** — `hostlink.drain` after release is still refused,
+because beginning a Host-wide drain is attributed to a holder. **It discloses
+nothing new**: the match set is a subset of "callers that already received the
+acknowledgement", a tenant that never held the fixed session began nothing and
+is refused identically, and that is measured, after completion, by
+`TestRelaxingRungEightForObservationDisclosesNothingToAnyoneElse`. Do not
+generalise the relaxation to "a drain has begun" or to the session alone; either
+hands cross-tenant occupancy to any link that can name the fixed session.
+
+### The transport closes when the process stops, never as a drain step
+
+**This entry replaced a design that made the terminal drain answer
+unreachable.** `internal/lifecycle` used to hold a `Link` seam and close it as
+the drain's last cleanup step — before `settledState` assigned the terminal
+state. So a HostLink-initiated drain destroyed the connection carrying the
+`drained` answer *before that answer existed*, and the disconnect a Factory was
+left with is Centrifuge `DisconnectShutdown` **3001 in every outcome** —
+**including the one `settledState` deliberately withholds `drained` for**. That
+signal is therefore **ambiguous between "release finished, delete the workload"
+and "FinishRelease refused, this Host still holds the lease"**, and Core says
+directly that `HostLinkDrainObservation` exists "for a Factory to observe
+without inferring release completion from a transport close".
+
+`compose.Service.Stop` closes the transports now, after `Wait` returns.
+**"LAST" is unchanged** — it is still after every release step — and
+`TestStopReleasesTheSessionAndClosesEveryTransportLast` still holds it. A
+failure to close is recorded under `lifecycle.StepCloseLink` rather than
+returned. `TestTheDrainOwnsNoTransportShutdown` is the reflective trip-wire: no
+field of `lifecycle.Options` may be a transport shutdown.
+
+**A link-drained Host stays up and keeps answering**, with `Ready() == false`
+and `Live() == true`. That is not a new cost — `Run` only leaves on
+`ctx.Done()`, so such a Host lingered before this change too; it simply lingered
+refusing connections. **`Live()`'s doc used to be a sentence wider than its
+probe** (it claimed liveness turns false once release finishes); the code was
+always `started && !stopped`, the **code is the correct one**, and the doc was
+fixed to match.
+
+**A released session's routes are dropped explicitly.** Closing a transport used
+to drop its links' bindings as a side effect, so nothing needed to say it. With
+the transport surviving, `sessionWork.stop` calls `InvalidateSession` for the
+released key — **scoped to the session, not the link**, so releasing one session
+does not cut a Factory's routes to the others on the same connection.
+
+**A closed Host answers 503, not 400.** `resolve` returned an anonymous error
+that the handler mapped to `400 "HostLink requires a valid tenant"`, so a
+Factory reconnecting to a stopped Host read a *client* error naming its own
+credential. It is `errHostClosed` now, answered `503`.
+
 The whole-Host drain is reachable **only** through the process-lifecycle path —
 `Service.Stop` calls `Drainer.StartDrain` with the zero scope directly and never
 passes through this resolver — which is the path a platform's termination signal

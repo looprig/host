@@ -313,6 +313,9 @@ type fakeStore struct {
 	modes  map[registry.Key]protocolMode
 	rows   []sessionwire.HostLinkRegistryObservation
 	hold   chan struct{}
+
+	// tombstoneErr makes the epoch-fenced tombstone refuse; see refuseTombstones.
+	tombstoneErr error
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -405,7 +408,22 @@ func (s *fakeStore) PublishResidency(_ context.Context, observation sessionwire.
 
 func (s *fakeStore) TombstoneResidency(context.Context, sessionwire.TenantID, sessionwire.SessionID, uint64) error {
 	s.trace.record("locations.tombstone")
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tombstoneErr
+}
+
+// refuseTombstones makes the epoch-fenced tombstone fail, which is what makes
+// FinishRelease refuse.
+//
+// IT IS THE ONE FAILURE Core's bounded drain state can express. settledState
+// withholds `drained` for a refused FinishRelease and for nothing else, because
+// that is the only one meaning release did not finish — the lease is still this
+// Host's. Every other recorded failure still reports drained.
+func (s *fakeStore) refuseTombstones(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tombstoneErr = err
 }
 
 // published returns every registry row written so far.

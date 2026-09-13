@@ -293,7 +293,6 @@ func New(options Options) (*Service, error) {
 		Admissions:   capacity,
 		Advertiser:   advertise,
 		Residents:    composed,
-		Link:         composed.links,
 		Grace:        options.Grace,
 		IdleBoundary: options.IdleBoundary,
 		PublishBound: options.PublishBound,
@@ -478,9 +477,21 @@ func (s *Service) Ready() bool {
 // IT REMAINS TRUE THROUGHOUT A DRAIN, and that is the half a platform gets
 // wrong. A liveness probe that failed when a drain began would have the
 // platform kill the process it had just asked to shut down gracefully — killing
-// it in the middle of the checkpoints the drain exists to take. Liveness turns
-// false only when this Host has finished releasing everything it owned, or has
-// been stopped.
+// it in the middle of the checkpoints the drain exists to take.
+//
+// IT ALSO REMAINS TRUE AFTER THE DRAIN HAS FINISHED, and the previous sentence
+// here said otherwise — it said liveness turns false "when this Host has
+// finished releasing everything it owned, or has been stopped". The code has
+// only ever read `started && !stopped`, which Stop alone sets, so the doc was a
+// sentence wider than the probe. THE CODE IS THE CORRECT ONE and the doc was
+// fixed to match it, not the reverse: a Host that has completed a
+// link-initiated drain stays up ANSWERING `drained` over HostLink, because that
+// terminal answer is what a placement controller deletes the workload on. A
+// liveness probe that failed the moment release finished would have the
+// platform kill the process before it could deliver it — reintroducing, as a
+// SIGKILL, exactly the disconnect-instead-of-an-answer this design removed.
+//
+// So liveness turns false when, and only when, Stop has run.
 func (s *Service) Live() bool {
 	s.mu.Lock()
 	started, stopped := s.started, s.stopped
@@ -522,8 +533,25 @@ func (s *Service) Attach(ctx context.Context, request residency.Request) (reside
 //  6. every tenant transport closes, LAST, because Factory reads the bounded
 //     drain-status observation through it.
 //
-// Step 6 is internal/lifecycle's Link and runs inside the drain's own cleanup,
-// which is why it is not a separate call here.
+// STEP 6 IS THIS FUNCTION'S, AND IT USED TO BE THE DRAIN'S. internal/lifecycle
+// held a Link seam and closed it as the drain's last step, which meant a
+// HostLink-INITIATED drain destroyed the transport carrying the terminal
+// `drained` answer before that answer existed — and the disconnect a Factory
+// was left with is the same Centrifuge 3001 whether release finished or
+// FinishRelease refused, so it is ambiguous between "delete the workload" and
+// "this Host still holds the lease". The drain now closes nothing; the PROCESS
+// stopping closes it. "LAST" is unchanged and still asserted: this runs after
+// Wait has returned, so it is after every release step.
+//
+// A LINK-DRAINED HOST THEREFORE STAYS UP AND KEEPS ANSWERING, which is not a
+// new cost: Run already only leaves on ctx.Done, so such a Host lingered
+// before this change too — it just lingered refusing connections instead of
+// reporting `drained` with Ready false and Live true.
+//
+// THE CLOSE FAILURE IS RECORDED RATHER THAN RETURNED, under the same step name
+// the drain used to book it under, because a transport that will not shut down
+// is an operator's problem and not a reason to fail a Stop whose releases all
+// succeeded.
 func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 	if _, err := s.drainer.StartDrain(hostlink.DrainScope{}); err != nil {
 		return lifecycle.Report{}, err
@@ -543,6 +571,20 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 	}
 	s.warm.Stop()
 	s.manager.Close()
+
+	// STEP 6, AND IT IS LAST BECAUSE IT IS WRITTEN LAST. The previous version
+	// of this function did not close transports at all — the drain did, inside
+	// its own cleanup — and "last" was a property of a different function's
+	// ordering. It is this one's now.
+	//
+	// IT TAKES STOP'S CONTEXT rather than a background one. The drain used a
+	// background context for its cleanup because cleanup that stopped at the
+	// platform grace would orphan a LEASE; a transport shutdown holds no lease,
+	// and a caller that has given up waiting should not be held by a
+	// counterparty's socket.
+	if err := s.links.Close(ctx); err != nil {
+		report.Failures = append(report.Failures, lifecycle.Failure{Step: lifecycle.StepCloseLink, Err: err})
+	}
 	return report, nil
 }
 

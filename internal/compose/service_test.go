@@ -1024,6 +1024,16 @@ func TestABusyTenantIsNeverEvictedByAStrangerConnecting(t *testing.T) {
 	f := newFixture(t, func(composed *Options, _ *host.Options) {
 		composed.MaxTenantLinks = 1
 	})
+	// THE RUNTIME PUBLISHES, and that is a flake repair rather than a
+	// preference. controllableSession hands back a CLOSED publication channel,
+	// so the attach's tail ends immediately as LOST and Tails.invalidate drops
+	// every route to the session ASYNCHRONOUSLY. When that landed after the
+	// bind below, the routing table was empty and this test failed at its own
+	// non-vacuity check — `the bind left the routing table empty` — which is
+	// one of the three documented internal/compose flakes. A runtime whose tail
+	// stays live removes the artefact without changing what this test is about:
+	// a link is busy because a session is BOUND to it.
+	f.rig.Session = newPublishingSession()
 	f.start()
 	held := f.attach(tenantA, sessionA)
 

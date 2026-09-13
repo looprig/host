@@ -1381,14 +1381,25 @@ func TestAComposedHostAppliesADeliveredCommandEndToEnd(t *testing.T) {
 		t.Errorf("the dispatch carried attempt %q and the record authorized %q", driven[0].AttemptID, got)
 	}
 
-	// (c) THE COMMAND SETTLED, and the state is the one the store chose from the
+	// (c) THE CURSOR ADVANCED PAST IT, AND IT IS ASSERTED BEFORE THE STATE ON
+	// PURPOSE. awaitApplied waits for the DISPATCH; settlement lands after the
+	// dispatch returns, and the cursor advances only after settlement. Sampling
+	// the durable state first was therefore a race the test usually won and
+	// occasionally lost, reported as `the durable record is "applying", want
+	// "applied"` on a loaded machine. The cursor wait is the synchronisation
+	// point that was already in this test, one assertion too late.
+	//
+	// NOT MEASURED AS A FIX. The failure was never reproduced in isolation, so
+	// this is a reasoned ordering correction rather than a demonstrated one; it
+	// cannot be worse than the original order, because every fact (d) asserted
+	// is still asserted.
+	c.awaitCursor(1)
+
+	// (d) THE COMMAND SETTLED, and the state is the one the store chose from the
 	// evidence the dispatch produced.
 	if got := c.dispositions.stateOfCommand(first); got != commands.StateApplied {
 		t.Errorf("the durable record is %q, want %q", got, commands.StateApplied)
 	}
-
-	// (d) THE CURSOR ADVANCED PAST IT.
-	c.awaitCursor(1)
 
 	// (e) THE PASS IS NOT BLOCKED.
 	if blocked := c.consumer().LastPass().Blocked; blocked != nil {

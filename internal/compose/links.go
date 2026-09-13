@@ -46,6 +46,17 @@ type tenantLink struct {
 // as many tenant links as it is willing to allocate.
 var errTooManyTenants = errors.New("compose: this Host already holds its configured number of tenant links")
 
+// errHostClosed is what a caller gets once this Host's transports have been
+// closed by Stop.
+//
+// IT IS TYPED SO THE HANDLER CAN TELL IT FROM A BAD TENANT. It used to be an
+// anonymous error, which the handler's fall-through mapped to 400 "HostLink
+// requires a valid tenant" — so a Factory reconnecting to a stopped Host read a
+// CLIENT error naming its own credential, for a condition entirely this Host's
+// and entirely retryable elsewhere. A Host that has stopped is unavailable, not
+// a tenant that is invalid.
+var errHostClosed = errors.New("compose: this Host has stopped, so it serves no HostLink connection")
+
 // links is this Host's set of per-tenant HostLink endpoints.
 //
 // IT IS THE COMPOSITION-LEVEL GUARD FOR H8 and it is the reason this type
@@ -88,7 +99,7 @@ func (l *links) resolve(tenant sessionwire.TenantID) (*tenantLink, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return nil, errors.New("compose: this Host is closed")
+		return nil, errHostClosed
 	}
 	if existing, held := l.byTenant[tenant]; held {
 		existing.lastUsed = l.clock.Now()
@@ -206,8 +217,18 @@ func (l *links) handler() http.Handler {
 		}
 		link, err := l.resolve(sessionwire.TenantID(name))
 		if err != nil {
+			// THE TWO UNAVAILABILITIES ARE ANSWERED AS UNAVAILABILITY. Both are
+			// conditions of this Host and neither is a fault in the request, so
+			// a 4xx would send a Factory looking at its own credential. They are
+			// deliberately NOT distinguished from each other in the status code
+			// — only in the message — because "how full is this Host" is the
+			// kind of occupancy a status code should not carry.
 			if errors.Is(err, errTooManyTenants) {
 				http.Error(writer, "this Host holds no room for another tenant", http.StatusServiceUnavailable)
+				return
+			}
+			if errors.Is(err, errHostClosed) {
+				http.Error(writer, "this Host has stopped and serves no HostLink connection", http.StatusServiceUnavailable)
 				return
 			}
 			http.Error(writer, "HostLink requires a valid tenant", http.StatusBadRequest)

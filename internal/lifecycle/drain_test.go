@@ -241,7 +241,6 @@ const (
 	stepCheckpoint       step = "checkpoint"
 	stepReleaseResidency step = "release_residency"
 	stepFinishRelease    step = "finish_release"
-	stepLinkClose        step = "link_close"
 )
 
 // journal is the shared, ordered record of everything the drain did, across
@@ -366,27 +365,6 @@ func (r *residents) readCount() int {
 	return r.reads
 }
 
-type fakeLink struct {
-	mu      sync.Mutex
-	journal *journal
-	closes  int
-	err     error
-}
-
-func (l *fakeLink) Close(context.Context) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.closes++
-	l.journal.record(string(stepLinkClose))
-	return l.err
-}
-
-func (l *fakeLink) closeCount() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.closes
-}
-
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -397,7 +375,6 @@ type fixture struct {
 	ledger     *fakeLedger
 	advertiser *advertiser
 	residents  *residents
-	link       *fakeLink
 	journal    *journal
 	drainer    *lifecycle.Drainer
 }
@@ -413,14 +390,12 @@ func newFixture(t *testing.T, sessions ...*fakeSession) *fixture {
 		session.journal = shared
 		index.add(session)
 	}
-	connection := &fakeLink{journal: shared}
 	drainer, err := lifecycle.NewDrainer(lifecycle.Options{
 		Generation:   testGeneration,
 		Clock:        clock,
 		Admissions:   admissions,
 		Advertiser:   ads,
 		Residents:    index,
-		Link:         connection,
 		Grace:        testGrace,
 		IdleBoundary: testIdleGrace,
 		PublishBound: testPublishBound,
@@ -430,7 +405,7 @@ func newFixture(t *testing.T, sessions ...*fakeSession) *fixture {
 	}
 	return &fixture{
 		t: t, clock: clock, ledger: admissions, advertiser: ads,
-		residents: index, link: connection, journal: shared, drainer: drainer,
+		residents: index, journal: shared, drainer: drainer,
 	}
 }
 
@@ -996,7 +971,19 @@ func TestTheAcknowledgementPrecedesCheckpointAndRelease(t *testing.T) {
 	}
 
 	// The session hangs in WaitIdle, so the drain is provably still in flight.
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
+	//
+	// THE PREDICATE WAITS FOR THE STEP AS WELL AS FOR THE TIMER, and that is a
+	// repair rather than belt-and-braces. The drain arms the idle bound and
+	// THEN calls the session's WaitIdle, which is where stepWaitIdle is
+	// recorded — so a pending timer does not imply a recorded step, and the
+	// non-vacuity check below could read a steps list of [begin_release] and
+	// fail. Observed on a loaded machine as
+	// `steps = [begin_release]: the drain reached the idle wait without
+	// recording wait_idle`. Waiting for both is the synchronisation the test
+	// always meant; it can only make the wait stricter.
+	waitFor(t, "the drain to reach the idle wait", func() bool {
+		return f.clock.pendingFor(testIdleGrace) > 0 && slices.Contains(alpha.stepsTaken(), stepWaitIdle)
+	})
 
 	// THE OBSERVABLE HAS BEEN PUMPED before the absence below is read. The
 	// drain has reached the idle wait, so these two steps MUST already be
@@ -1113,9 +1100,6 @@ func TestARefusedFinishReleaseWithholdsDrained(t *testing.T) {
 			if got := alpha.stepsTaken(); !slices.Equal(got, want) {
 				t.Fatalf("steps = %v, want %v", got, want)
 			}
-			if f.link.closeCount() != 1 {
-				t.Fatalf("link closes = %d, want one", f.link.closeCount())
-			}
 
 			// And the observation a Factory polls agrees with the report, so
 			// the two cannot disagree about whether the workload may be deleted.
@@ -1159,17 +1143,6 @@ func TestOnlyAFinishReleaseFailureWithholdsDrained(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("close_link", func(t *testing.T) {
-		t.Parallel()
-		f := newFixture(t)
-		f.link.err = errors.New("the transport would not shut down")
-		mustStart(t, f.drainer)
-		report := awaitDrained(t, f.drainer)
-		if len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepCloseLink {
-			t.Fatalf("failures = %v, want exactly the link close", report.Failures)
-		}
-	})
 }
 
 // TestDrainingNoSessionsIsStillADrain is step 1's empty case: a Host holding
@@ -1185,9 +1158,6 @@ func TestDrainingNoSessionsIsStillADrain(t *testing.T) {
 	}
 	if published, _ := f.advertiser.snapshot(); published != 1 {
 		t.Fatalf("nonaccepting publications = %d, want one", published)
-	}
-	if f.link.closeCount() != 1 {
-		t.Fatalf("link closes = %d, want one", f.link.closeCount())
 	}
 }
 
@@ -1515,7 +1485,16 @@ func TestTheIdleBoundaryAndPlatformGraceAreBothBounded(t *testing.T) {
 	f := newFixture(t, alpha)
 
 	mustStart(t, f.drainer)
-	waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
+	// THE WAIT COVERS BOTH BOUNDS, because the assertion below is about both.
+	// run() arms the platform grace on its OWN goroutine — Clock.After is
+	// called inside it — so the grace registration races the per-session
+	// release that arms the idle bound. Waiting only for the idle bound and
+	// then asserting that BOTH were requested is a race the test usually won:
+	// observed as `timers requested = [2s 5s], want both 5s and 30s`. Same
+	// family as the repair in TestTheAcknowledgementPrecedesCheckpointAndRelease.
+	waitFor(t, "the drain to arm both bounds", func() bool {
+		return f.clock.pendingFor(testIdleGrace) > 0 && f.clock.pendingFor(testGrace) > 0
+	})
 	if requested := f.clock.requested(); !slices.Contains(requested, testIdleGrace) || !slices.Contains(requested, testGrace) {
 		t.Fatalf("timers requested = %v, want both %v and %v", requested, testIdleGrace, testGrace)
 	}
@@ -1536,76 +1515,68 @@ func TestTheIdleBoundaryAndPlatformGraceAreBothBounded(t *testing.T) {
 	}
 }
 
-// TestTheLinkIsOptionalAndClosesLast is step 1's HostLink shutdown ordering.
+// TestTheDrainOwnsNoTransportShutdown is the trip-wire over the seam this
+// package DELETED, and it is structural rather than a comment.
 //
-// Factory reaches the bounded drain-status observation through this link, so a
-// link closed when the drain began would leave Factory inferring completion
-// from a disconnect — which is the inference O5.4's status observation exists to
-// replace.
-func TestTheLinkIsOptionalAndClosesLast(t *testing.T) {
+// THE DELETED SEAM. lifecycle.Options used to carry a Link, and the drain
+// closed it as its last step. That destroyed the transport carrying the
+// terminal `drained` answer BEFORE settledState assigned it, so the only signal
+// reaching a Factory was a Centrifuge 3001 disconnect — which is IDENTICAL
+// whether release finished or FinishRelease refused, the one case settledState
+// deliberately withholds `drained` for. A Factory reading completion from it
+// either deletes work whose lease this Host still holds, or waits forever.
+//
+// WHY A REFLECTIVE GUARD AND NOT A COMMENT. Re-adding the field is a two-line
+// change that nothing else in this package would fail on: the close would run
+// at the same place, every existing assertion would still pass, and the defect
+// would be back. So this asks the TYPE, not the source text: no field of
+// lifecycle.Options may be a transport shutdown.
+//
+// THE PREDICATE IS THE SHAPE AND NOT A NAME. It fails on any field whose type
+// has a `Close(context.Context) error` method, however the field is spelled,
+// because renaming Link to Transport is exactly how this guard would otherwise
+// be defeated. It is deliberately narrower than "has a Close method": an
+// io.Closer collaborator is not a transport lifecycle and is not what went
+// wrong.
+//
+// WHERE THE CLOSE LIVES NOW: compose.Service.Stop, after Wait returns, booked
+// under StepCloseLink. "LAST" is preserved and asserted there.
+func TestTheDrainOwnsNoTransportShutdown(t *testing.T) {
 	t.Parallel()
 
-	t.Run("it closes after the last release", func(t *testing.T) {
-		t.Parallel()
-		alpha := newSession("session-alpha", nil)
-		alpha.hang = true
-		f := newFixture(t, alpha)
+	shutdown := reflect.TypeOf((*interface {
+		Close(context.Context) error
+	})(nil)).Elem()
 
-		mustStart(t, f.drainer)
-		// The session hangs, so the drain is PROVABLY still in flight when
-		// this runs. Synchronising on the fake clock's state rather than on a
-		// duration is what makes the assertion below deterministic.
-		waitFor(t, "the drain to reach the idle wait", func() bool { return f.clock.pendingFor(testIdleGrace) > 0 })
-		if f.link.closeCount() != 0 {
-			t.Fatalf("the link was closed %d times during initiation, want none", f.link.closeCount())
+	options := reflect.TypeOf(lifecycle.Options{})
+	if options.NumField() == 0 {
+		t.Fatal("lifecycle.Options has no fields at all, so this guard inspected nothing")
+	}
+	// THE POSITIVE CONTROL, in the same test: the predicate must actually
+	// recognise a transport shutdown, or the sweep above is a loop that can
+	// never fire. A guard whose predicate matches nothing is the same green as
+	// a clean Options.
+	if !reflect.TypeOf(closingProbe{}).Implements(shutdown) {
+		t.Fatal("the shutdown predicate does not match a type that IS one, so the sweep below proves nothing")
+	}
+	for index := range options.NumField() {
+		field := options.Field(index)
+		if field.Type.Implements(shutdown) {
+			t.Fatalf("lifecycle.Options.%s is a transport shutdown (%s). THE DRAIN MUST NOT CLOSE A TRANSPORT: "+
+				"closing one as a drain step destroys the link carrying the terminal `drained` answer before "+
+				"settledState assigns it, and the disconnect that replaces it is identical whether release "+
+				"finished or FinishRelease refused. Close it from the process-lifecycle caller after Wait "+
+				"returns, and book a failure under StepCloseLink.", field.Name, field.Type)
 		}
-
-		f.clock.fireAll()
-		awaitDrained(t, f.drainer)
-		if f.link.closeCount() != 1 {
-			t.Fatalf("link closes = %d, want one", f.link.closeCount())
-		}
-		// The ORDER, not the count: an index comparison is independent of
-		// scheduling altogether.
-		closed := f.journal.indexOf(string(stepLinkClose))
-		finished := f.journal.indexOf("session-alpha:" + string(stepFinishRelease))
-		if closed < 0 || finished < 0 || closed < finished {
-			t.Fatalf("journal = %v: the link closed at %d and the release finished at %d", f.journal.recorded(), closed, finished)
-		}
-	})
-
-	t.Run("a Host composed without one still drains", func(t *testing.T) {
-		t.Parallel()
-		index := &residents{}
-		ledger := &fakeLedger{}
-		drainer, err := lifecycle.NewDrainer(lifecycle.Options{
-			Generation:   testGeneration,
-			Clock:        &fakeClock{},
-			Admissions:   ledger,
-			Advertiser:   &advertiser{ledger: ledger},
-			Residents:    index,
-			Grace:        testGrace,
-			IdleBoundary: testIdleGrace,
-			PublishBound: testPublishBound,
-		})
-		if err != nil {
-			t.Fatalf("NewDrainer without a link: %v", err)
-		}
-		mustStart(t, drainer)
-		awaitDrained(t, drainer)
-	})
-
-	t.Run("a failing close is recorded and the Host is still drained", func(t *testing.T) {
-		t.Parallel()
-		f := newFixture(t)
-		f.link.err = errors.New("the transport would not shut down")
-		mustStart(t, f.drainer)
-		report := awaitDrained(t, f.drainer)
-		if len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepCloseLink {
-			t.Fatalf("failures = %v, want exactly the link close", report.Failures)
-		}
-	})
+	}
 }
+
+// closingProbe is TestTheDrainOwnsNoTransportShutdown's positive control: a
+// type that IS a transport shutdown, so the predicate is shown to fire.
+type closingProbe struct{}
+
+// Close satisfies the shutdown shape and does nothing.
+func (closingProbe) Close(context.Context) error { return nil }
 
 // TestOptionsAreValidated refuses a Drainer that could not do its job, at
 // construction rather than at the drain.
@@ -1809,7 +1780,6 @@ func TestTheDrainSeamsAreNarrowerThanTheTypesBehindThem(t *testing.T) {
 		{reflect.TypeOf((*lifecycle.Admissions)(nil)).Elem(), []string{"BeginDrain", "Draining"}},
 		{reflect.TypeOf((*lifecycle.Advertiser)(nil)).Elem(), []string{"PublishNonaccepting"}},
 		{reflect.TypeOf((*lifecycle.Residents)(nil)).Elem(), []string{"ResidentSessions"}},
-		{reflect.TypeOf((*lifecycle.Link)(nil)).Elem(), []string{"Close"}},
 		{
 			reflect.TypeOf((*lifecycle.Session)(nil)).Elem(),
 			[]string{"BeginRelease", "Checkpoint", "FinishRelease", "Key", "ReleaseResidency", "WaitIdle"},
@@ -1894,9 +1864,6 @@ func TestThePlatformGraceBoundsASessionThatIgnoresCancellation(t *testing.T) {
 		if !slices.Contains(session.stepsTaken(), stepFinishRelease) {
 			t.Fatalf("%q did not reach FinishRelease", session.Key().SessionID)
 		}
-	}
-	if f.link.closeCount() != 1 {
-		t.Fatalf("link closes = %d, want one", f.link.closeCount())
 	}
 
 	// Release the abandoned goroutine so the package does not end with it
@@ -2019,4 +1986,57 @@ func TestTheDrainReadsNeitherHalfOfTheRegistryEntrySeam(t *testing.T) {
 	if production == 0 {
 		t.Fatal("no production files were parsed, so this check proves nothing")
 	}
+}
+
+// TestTheProcessLifecycleDrainIsAttributableToNobody is the zero-scope half of
+// BegunScope, and it is the half that decides whether the relaxation it feeds
+// is safe.
+//
+// hostlink's drain resolver admits an OBSERVATION from the caller that BEGAN
+// the drain, matched on the scope BegunScope reports. Service.Stop begins the
+// process-lifecycle drain with the ZERO DrainScope — a platform's termination
+// signal names no tenant and no session — so a Drainer that reported "begun,
+// and it named {}" would offer a match to any caller whose key happened to be
+// zero. Rungs above the relaxation guarantee a real request's key is not zero,
+// which means such a match could only ever be an accident; that is a reason to
+// make it impossible here rather than a reason to rely on the rungs.
+//
+// THE SECOND RETURN IS "A SCOPE WAS NAMED", NOT "A DRAIN HAS BEGUN", and the
+// two assertions below are the difference. A drain HAS begun in both arms.
+func TestTheProcessLifecycleDrainIsAttributableToNobody(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the zero scope names nobody", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, newSession("session-alpha", nil))
+		mustStart(t, f.drainer)
+		awaitDrained(t, f.drainer)
+
+		if _, begun := f.drainer.ObserveDrain(hostlink.DrainScope{}); !begun {
+			t.Fatal("no drain has begun, so the absence below is vacuous")
+		}
+		if scope, named := f.drainer.BegunScope(); named {
+			t.Errorf("the process-lifecycle drain reports it was begun for %+v. A ZERO SCOPE MUST NAME NOBODY: "+
+				"hostlink admits an observation from the caller that began the drain by comparing this against "+
+				"the request's key, and a zero match is an accident rather than an attribution.", scope)
+		}
+	})
+
+	t.Run("a named scope names exactly its caller", func(t *testing.T) {
+		t.Parallel()
+		f := newFixture(t, newSession("session-alpha", nil))
+		want := registry.Key{TenantID: "tenant-a", SessionID: "session-alpha"}
+		if _, err := f.drainer.StartDrain(hostlink.DrainScope{Key: want}); err != nil {
+			t.Fatalf("StartDrain: %v", err)
+		}
+		awaitDrained(t, f.drainer)
+
+		scope, named := f.drainer.BegunScope()
+		if !named {
+			t.Fatal("a drain begun for a named scope reports none, so the arm above proves nothing about the ZERO scope specifically")
+		}
+		if scope != want {
+			t.Errorf("the drain reports it was begun for %+v, want %+v", scope, want)
+		}
+	})
 }
