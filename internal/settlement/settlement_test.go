@@ -32,6 +32,11 @@ const (
 	settlementSession = sessionwire.SessionID("session-settlement")
 	settlementBinding = "binding-journal-1"
 	settlementCommand = sessionwire.CommandID("command-settlement-1")
+
+	// targetAcceptedOrder is the order `admit` leaves the target at, after two
+	// fillers. It is stated once and asserted in newWorld's own probe below
+	// rather than repeated as a literal at every call site.
+	targetAcceptedOrder = 3
 )
 
 // ---------------------------------------------------------------------------
@@ -56,7 +61,13 @@ type world struct {
 	runtimeID uuid.UUID
 }
 
-func newWorld(t *testing.T) *world {
+func newWorld(t *testing.T) *world { return newWorldWithReaders(t, nil) }
+
+// newWorldWithReaders builds the world with a caller-chosen routing table, which
+// is how a WIRING failure is reproduced: the stores are healthy and the table is
+// wrong, which is exactly the shape an operator cannot diagnose from a collapsed
+// refusal code.
+func newWorldWithReaders(t *testing.T, readers func(*world) map[string]sessionstore.DispositionEvidenceReader) *world {
 	t.Helper()
 
 	// (1) HARNESS'S STORE, ON ITS OWN BACKEND AND ITS OWN LAYOUT. A single
@@ -78,6 +89,35 @@ func newWorld(t *testing.T) *world {
 	if err != nil {
 		t.Fatalf("mint a rig id: %v", err)
 	}
+	// THE RUNTIME'S GRANT IS DELIBERATELY NOT 1, and the throwaway lease below is
+	// how a real one gets there.
+	//
+	// A QUALITY GATE MEASURED FOUR INDEPENDENTLY-SOURCED COUNTERS IN THIS FIXTURE
+	// AND FOUND ALL FOUR EQUAL TO 1 — the residency epoch, the journal epoch, the
+	// record's Revision and its AcceptedOrder. Three field-swap mutants in
+	// internal/sessionstoreadapter survived the WHOLE MODULE at exit 0 as a
+	// result, because this fixture was that package's only driver. The unit rows
+	// in disposition_edges_test.go are what kill them; this is the other half,
+	// because AN INTEGRATION FIXTURE IS THE WORST PLACE FOR A VALUE TO BE
+	// DEGENERATE: it is simultaneously the only driver of several packages, so
+	// one coincidence here blinds every layer at once while each layer's own
+	// suite reports green.
+	//
+	// Acquiring and RELEASING a first grant makes the second one strictly later,
+	// which is the store's own monotonicity rather than a number this test chose.
+	// Acquiring and RELEASING grants makes the next one strictly later, which is
+	// the store's own monotonicity rather than a number this test chose. Three
+	// throwaways put the runtime's grant at 4, clear of Host's residency (2), the
+	// record's first revision (1) and the target's acceptance order (3).
+	for i := 0; i < 3; i++ {
+		throwaway, err := journalStore.AcquireLease(t.Context(), rigID)
+		if err != nil {
+			t.Fatalf("acquire throwaway journal lease %d: %v", i, err)
+		}
+		if err := throwaway.Release(context.WithoutCancel(t.Context())); err != nil {
+			t.Fatalf("release throwaway journal lease %d: %v", i, err)
+		}
+	}
 	lease, err := journalStore.AcquireLease(t.Context(), rigID)
 	if err != nil {
 		t.Fatalf("acquire the runtime's journal lease: %v", err)
@@ -94,8 +134,11 @@ func newWorld(t *testing.T) *world {
 	// (2) THE EVIDENCE ROUTER, over the one journal store this deployment has.
 	// It is built BEFORE the orchestration store because the orchestration store
 	// has to be OPENED with it: a store with no reader refuses every settlement.
-	router, err := sessionstoreadapter.NewEvidenceRouter(
-		map[string]sessionstore.DispositionEvidenceReader{settlementBinding: journalStore})
+	table := map[string]sessionstore.DispositionEvidenceReader{settlementBinding: journalStore}
+	if readers != nil {
+		table = readers(&world{t: t, journal: journalStore, rigID: rigID})
+	}
+	router, err := sessionstoreadapter.NewEvidenceRouter(table)
 	if err != nil {
 		t.Fatalf("build the evidence router: %v", err)
 	}
@@ -118,6 +161,18 @@ func newWorld(t *testing.T) *world {
 		runtimeID: uuid.MustParse("44444444-4444-4444-4444-444444444444"),
 	}
 	w.createSession()
+	// AND HOST'S RESIDENCY IS MOVED OFF 1 THE SAME WAY, for the same reason: with
+	// the record's first revision also 1, a transposition between the two was
+	// invisible to this whole module. It runs after the catalog entry exists,
+	// because AcquireResidency reads the immutable binding and refuses a session
+	// that has none.
+	warmup, err := adapted.AcquireSessionLease(t.Context(), settlementTenant, settlementSession)
+	if err != nil {
+		t.Fatalf("acquire the throwaway residency grant: %v", err)
+	}
+	if err := warmup.Release(context.WithoutCancel(t.Context())); err != nil {
+		t.Fatalf("release the throwaway residency grant: %v", err)
+	}
 	return w
 }
 
@@ -154,7 +209,21 @@ func (w *world) createSession() {
 }
 
 // admit puts one pending command in the disposition inbox, as Factory would.
+//
+// IT ADMITS TWO FILLERS FIRST, so the target's immutable AcceptedOrder is 3 and
+// not 1. That is the same degeneracy the journal grant above escapes, on the
+// other pair: with AcceptedOrder and Revision both 1, a swap between them at the
+// adapter's read edge was invisible to this whole module.
 func (w *world) admit(id sessionwire.CommandID) {
+	w.t.Helper()
+	for _, filler := range []sessionwire.CommandID{"command-filler-1", "command-filler-2"} {
+		w.admitOne(filler)
+	}
+	w.admitOne(id)
+}
+
+// admitOne admits exactly one command.
+func (w *world) admitOne(id sessionwire.CommandID) {
 	w.t.Helper()
 	now := time.Now().UTC()
 	if _, _, err := w.orchestration.AdmitDispositionCommand(w.t.Context(), sessionstore.AdmitDispositionCommandRequest{
@@ -368,7 +437,7 @@ func TestACommandAppliesAndSettlesAcrossBothReleasedStores(t *testing.T) {
 
 	outcome, err := applier.Process(t.Context(), commands.Command{
 		TenantID: settlementTenant, SessionID: settlementSession, CommandID: settlementCommand,
-		AcceptedOrder: 1, State: commands.StatePending,
+		AcceptedOrder: targetAcceptedOrder, State: commands.StatePending,
 	})
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -443,7 +512,7 @@ func TestTheStoreChoosesTheTerminalArmFromTheRuntimesOwnFrame(t *testing.T) {
 
 			outcome, err := applier.Process(t.Context(), commands.Command{
 				TenantID: settlementTenant, SessionID: settlementSession, CommandID: settlementCommand,
-				AcceptedOrder: 1, State: commands.StatePending,
+				AcceptedOrder: targetAcceptedOrder, State: commands.StatePending,
 			})
 			if err != nil {
 				t.Fatalf("Process: %v", err)
@@ -476,7 +545,7 @@ func TestACommandWithNoDurableDispositionStaysApplying(t *testing.T) {
 
 	_, err := applier.Process(t.Context(), commands.Command{
 		TenantID: settlementTenant, SessionID: settlementSession, CommandID: settlementCommand,
-		AcceptedOrder: 1, State: commands.StatePending,
+		AcceptedOrder: targetAcceptedOrder, State: commands.StatePending,
 	})
 	var refusal *commands.ApplyError
 	if !errors.As(err, &refusal) {
@@ -603,3 +672,144 @@ func (unusedRig) RestoreSession(context.Context, uuid.UUID, department.RigRestor
 }
 
 var errUnusedRig = errors.New("settlement_test: this package launches no runtime")
+
+// TestTheFixturesFourCountersAreFourDifferentNumbers is the premise every other
+// test in this package rests on, asserted once and in one place.
+//
+// IT EXISTS BECAUSE THE OPPOSITE WAS TRUE AND NOBODY NOTICED. A quality gate
+// instrumented `newWorld`, read the four numbers at the moment `Process` is
+// called, and got `1, 1, 1, 1` — four independently-sourced counters, all equal.
+// Three field-swap mutants in `internal/sessionstoreadapter` survived the whole
+// module at exit 0 on the strength of it, and that package's own suite never
+// touched the code they mutated: this fixture was its only driver.
+//
+// A PROBE IS NOT A TEST AND THAT IS THE POINT OF WRITING IT DOWN. The gate's
+// measurement was a `t.Logf` that vanished with the gate. This is the same
+// measurement as an assertion, so the day one of these four collapses onto
+// another, THIS fails rather than the suite quietly going blind.
+func TestTheFixturesFourCountersAreFourDifferentNumbers(t *testing.T) {
+	w := newWorld(t)
+	w.admit(settlementCommand)
+
+	lease, err := w.adapted.AcquireSessionLease(t.Context(), settlementTenant, settlementSession)
+	if err != nil {
+		t.Fatalf("acquire residency: %v", err)
+	}
+	t.Cleanup(func() { _ = lease.Release(context.WithoutCancel(t.Context())) })
+
+	record, err := w.adapted.LoadDispositionCommand(t.Context(), settlementTenant, settlementSession, settlementCommand)
+	if err != nil {
+		t.Fatalf("LoadDispositionCommand: %v", err)
+	}
+
+	counters := map[string]uint64{
+		"Host's residency epoch":      uint64(lease.Epoch()),
+		"the runtime's journal epoch": w.lease.Epoch(),
+		"the record's Revision":       record.Revision,
+		"the record's AcceptedOrder":  record.AcceptedOrder,
+	}
+	seen := map[uint64]string{}
+	for name, value := range counters {
+		if value == 0 {
+			t.Errorf("%s is 0, which no provider assigns", name)
+		}
+		if other, clash := seen[value]; clash {
+			t.Errorf("%s and %s are both %d; a swap between them is invisible to every test in this package", name, other, value)
+		}
+		seen[value] = name
+	}
+
+	// AND THE ACCEPTANCE ORDER IS THE ONE EVERY OTHER TEST NAMES. A fixture whose
+	// order drifted from the literal those tests pass would refuse every command
+	// as foreign, which is a confusing way to discover an off-by-two.
+	if record.AcceptedOrder != targetAcceptedOrder {
+		t.Errorf("the target's AcceptedOrder is %d and this package's tests name %d", record.AcceptedOrder, targetAcceptedOrder)
+	}
+}
+
+// TestAWiringFailureIsNotReportedAsAMissingDisposition is the classification a
+// spec gate demanded and a quality gate then measured Host was already able to
+// make and was discarding.
+//
+// FOUR CAUSES COLLAPSED TO ONE REFUSAL CODE, and only one of them is the
+// runtime's fault. An operator reading `evidence_unavailable` was pointed at a
+// runtime that wrote nothing, when the cause could equally be a store this Host
+// is holding a TYPED error about:
+//
+//	benign — the runtime wrote no disposition           → the runtime's business
+//	unroutable — no reader registered for the binding    → HOST's own sentinel
+//	tenant mismatch — the reader refuses to resolve      → a released typed error
+//	mis-keyed router — a healthy store, wrong journal    → genuinely ambiguous
+//
+// THE COLLAPSE HAPPENED AT ONE PLACE and cost nothing to undo: `settle` mapped
+// every settlement failure to one refusal. Classifying leaks nothing — a refusal
+// code names no tenant, session, binding or body — and needs no upstream API.
+//
+// THE FOURTH CASE IS LEFT COLLAPSED ON PURPOSE, and that is not an omission. A
+// mis-keyed router points at a store that is healthy, at the correct tenant, and
+// truthfully reporting that it holds no such record — which is the same answer
+// the benign case gives, correctly. It needs a CONSTRUCTION-time answer (a
+// journal store declaring which bindings it serves), which no released API
+// offers. A `Tenant()` accessor would NOT close it either: that store is at the
+// right tenant.
+func TestAWiringFailureIsNotReportedAsAMissingDisposition(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		readers func(*world) map[string]sessionstore.DispositionEvidenceReader
+		refusal commands.ApplyRefusal
+	}{
+		{
+			"the binding has no registered reader",
+			func(w *world) map[string]sessionstore.DispositionEvidenceReader {
+				return map[string]sessionstore.DispositionEvidenceReader{"binding-somebody-elses": w.journal}
+			},
+			commands.RefusalEvidenceUnroutable,
+		},
+		{
+			"the registered reader serves another tenant",
+			func(w *world) map[string]sessionstore.DispositionEvidenceReader {
+				other, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant("tenant-somebody-elses"))
+				if err != nil {
+					t.Fatalf("open the other tenant's journal store: %v", err)
+				}
+				return map[string]sessionstore.DispositionEvidenceReader{settlementBinding: other}
+			},
+			commands.RefusalEvidenceUnroutable,
+		},
+		{
+			"the runtime wrote no disposition",
+			nil, // the ordinary router; the runtime simply records nothing
+			commands.RefusalEvidenceUnavailable,
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			w := newWorldWithReaders(t, row.readers)
+			w.admit(settlementCommand)
+			runtime := &conformingRuntime{t: t, log: w.log, lease: w.lease}
+			if row.refusal == commands.RefusalEvidenceUnroutable {
+				// The wiring rows dispatch a runtime that DOES write, so the
+				// refusal below cannot be explained by a missing frame.
+				runtime.kind = runtimecommand.DispositionApplied
+			}
+			applier := w.applier(runtime)
+
+			_, err := applier.Process(t.Context(), commands.Command{
+				TenantID: settlementTenant, SessionID: settlementSession, CommandID: settlementCommand,
+				AcceptedOrder: targetAcceptedOrder, State: commands.StatePending,
+			})
+			var refusal *commands.ApplyError
+			if !errors.As(err, &refusal) {
+				t.Fatalf("Process = %T (%v), want a *commands.ApplyError", err, err)
+			}
+			if refusal.Refusal != row.refusal {
+				t.Errorf("Process refused with %q, want %q", refusal.Refusal, row.refusal)
+			}
+			// EVERY OUTCOME IS STILL SAFE. Classification changes the diagnosis
+			// and must not change the durable answer: the command stays applying
+			// at an unmoved revision in all three rows.
+			if got := w.stateOf(settlementCommand); got != sessionstore.InboxStateApplying {
+				t.Errorf("the durable record is %q, want it left %q", got, sessionstore.InboxStateApplying)
+			}
+		})
+	}
+}

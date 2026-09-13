@@ -368,10 +368,24 @@ func (a *DispositionApplier) settle(ctx context.Context, record DispositionRecor
 		// revision and the pass blocks; a Host that concluded "nothing happened"
 		// from an unreadable journal would re-drive an effect that may already
 		// have committed.
+		//
+		// BUT WHICH ABSENCE IT IS, IS INFORMATION HOST HAS AND WAS DISCARDING.
+		// This mapping used to be unconditional, so a WIRING failure — a binding
+		// with no registered reader, or a reader that refuses to resolve the
+		// session — read identically to "the runtime recorded nothing", and an
+		// operator was sent to look at a runtime that had done its job. The
+		// durable answer is the same either way and must be; only the diagnosis
+		// changes.
+		refusal := RefusalEvidenceUnavailable
+		reason := "the command's durable runtime disposition could not be read or verified, so it stays applying"
+		if errors.Is(err, ErrEvidenceUnroutable) {
+			refusal = RefusalEvidenceUnroutable
+			reason = "this deployment has no settlement evidence reader that can resolve this session's journal, so the command stays applying with its effect already taken"
+		}
 		return Outcome{State: StateApplying, PrefixOwned: true}, &ApplyError{
-			Refusal:   RefusalEvidenceUnavailable,
+			Refusal:   refusal,
 			CommandID: record.CommandID,
-			Reason:    "the command's durable runtime disposition could not be read or verified, so it stays applying",
+			Reason:    reason,
 			Cause:     err,
 		}
 	}

@@ -626,6 +626,26 @@ const (
 	// re-drive an effect that may already have committed.
 	RefusalEvidenceUnavailable ApplyRefusal = "evidence_unavailable"
 
+	// RefusalEvidenceUnroutable reports a settlement whose evidence could not be
+	// OBTAINED because of this deployment's WIRING, rather than because the
+	// runtime recorded nothing.
+	//
+	// IT IS A DIFFERENT REFUSAL FROM RefusalEvidenceUnavailable BECAUSE IT NAMES A
+	// DIFFERENT PERSON. Both leave the command applying at an unmoved revision and
+	// both are safe; what differs is who has to act. `evidence_unavailable` points
+	// an operator at the runtime, which is right when the runtime wrote nothing
+	// and WRONG — expensively, since a real effect has already been committed —
+	// when the cause is a binding no reader is registered for, or a reader that
+	// refuses to resolve the session at all.
+	//
+	// IT COVERS ONLY THE CAUSES HOST CAN ACTUALLY NAME. A router pointed at the
+	// WRONG journal store is not one of them: that store is healthy, at the
+	// correct tenant, and truthfully reports it holds no such record, which is
+	// indistinguishable from the benign case at settlement time and correctly so.
+	// Closing that needs a construction-time answer no released API offers, and it
+	// is booked rather than papered over here.
+	RefusalEvidenceUnroutable ApplyRefusal = "evidence_unroutable"
+
 	// RefusalEnduringEffect reports a recovery closure refused because the
 	// runtime's journal holds a durable effect for the command.
 	//

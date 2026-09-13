@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	harnesssessionstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/sessionstore"
 
 	"github.com/looprig/host/internal/commands"
@@ -217,7 +218,7 @@ func (w *DispositionWriter) SettleDisposition(
 		ResidencyEpoch:   sessionstore.ResidencyEpoch(settlement.ResidencyEpoch),
 	})
 	if err != nil {
-		return "", classifyInbox(err)
+		return "", classifySettlement(err)
 	}
 	// THE SECOND RESULT IS DISCARDED DELIBERATELY. It reports whether THIS call
 	// wrote the terminal record, and false with a nil error is the idempotent
@@ -273,4 +274,59 @@ func adaptDispositionRecord(entry sessionstore.DispositionInboxEntry) (commands.
 		record.AttemptResidencyEpoch = uint64(attempt.ResidencyEpoch)
 	}
 	return record, nil
+}
+
+// classifySettlement marks the settlement failures that are this DEPLOYMENT's
+// wiring rather than the runtime's silence.
+//
+// EVERY OUTCOME IT TOUCHES IS ALREADY SAFE, so this changes a diagnosis and never
+// a durable answer: all four causes leave the command applying at an unmoved
+// revision, and that is unchanged. What changes is who an operator is sent to
+// look at. `evidence_unavailable` points at the runtime, which is right when the
+// runtime recorded nothing and expensively wrong when the cause is the routing
+// table — because by then a real effect has already been committed and the
+// command is stranded.
+//
+// TWO CAUSES ARE NAMEABLE AND BOTH ALREADY ARRIVE TYPED. The information was
+// being discarded by one unconditional mapping upstream, not missing:
+//
+//   - *UnroutableBindingError — HOST's own, raised by the router when no reader
+//     is registered for the session's storage binding;
+//   - *harnesssessionstore.DispositionBindingError — the RELEASED reader refusing
+//     to RESOLVE the request at all: another tenant, a non-disposition binding,
+//     or a RuntimeSessionID that is not a UUID. It is raised BEFORE any journal
+//     read, which is exactly what separates it from an empty journal.
+//
+// THE THIRD IS LEFT ALONE ON PURPOSE. A router pointed at the WRONG journal store
+// names a store that is healthy, at the correct tenant, and truthfully reporting
+// that it holds no such record — the same answer the benign case gives, and
+// correctly. Closing that needs a CONSTRUCTION-time answer (a journal store
+// declaring which storage bindings it serves) that no released API offers, and a
+// harness Tenant() accessor would not help: that store is at the right tenant.
+//
+// WHY THIS FILE NAMES harness AT ALL, since nothing else in this package does.
+// The refusal is a released typed error and its producer is the only thing that
+// can name the type; the alternative is matching a message, and a message is not
+// an API. It is a SINGLE symbol used in a SINGLE errors.As, and the cost is
+// stated rather than hidden: a deployment whose journal store is not harness's
+// needs its resolve-refusal added here, and until it is, that store's wiring
+// failures fall back to evidence_unavailable — which is the safe direction,
+// because the fallback under-claims rather than mislabels.
+func classifySettlement(err error) error {
+	if err == nil {
+		return nil
+	}
+	var unroutable *UnroutableBindingError
+	if errors.As(err, &unroutable) {
+		return errors.Join(commands.ErrEvidenceUnroutable, err)
+	}
+	var binding *harnesssessionstore.DispositionBindingError
+	if errors.As(err, &binding) {
+		return errors.Join(commands.ErrEvidenceUnroutable, err)
+	}
+	// EVERYTHING ELSE GOES THROUGH THE ORDINARY INBOX CLASSIFIER, which is what
+	// this call site used to do unconditionally. Dropping it would lose
+	// InboxErrorEpoch's promotion to ErrEpochSuperseded and leave this Host
+	// retrying a session a successor has taken.
+	return classifyInbox(err)
 }

@@ -63,12 +63,42 @@ type Bootstrap interface {
 	// cannot obtain one any other way: Host builds it, from the readers the
 	// product declares below, and hands it over at the one call that can use it.
 	//
-	// WHAT THIS STILL CANNOT ENFORCE, said plainly rather than implied: Host
-	// cannot make a product actually PASS the reader to Open, and the released
-	// store publishes no way to ask an open store whether one is configured. A
-	// product that took the parameter and dropped it gets the failure above.
-	// What the parameter buys is that the obligation is impossible to be
-	// unaware of, and that the object to satisfy it with is already in hand.
+	// WHAT THIS STILL CANNOT ENFORCE — THREE CONDITIONS, NOT ONE. An earlier
+	// version of this paragraph named only the first, and an incomplete
+	// enumeration at the seam a product must get right is worse than none: it
+	// reads as the complete list.
+	//
+	// ALL THREE SHARE ONE SIGNATURE, which is why they belong together: each
+	// fails only AFTER every dispatch has already happened, leaves the command
+	// stranded `applying` with a real runtime effect behind it, and is invisible
+	// until the first settlement.
+	//
+	//	(a) A PRODUCT TAKES THE READER AND DROPS IT. Host cannot make a product
+	//	    pass it to Open, and the released store publishes no way to ask an
+	//	    open store whether one is configured. What the parameter buys is that
+	//	    the obligation is impossible to be unaware of and the object to
+	//	    satisfy it with is already in hand.
+	//
+	//	(b) THE ORCHESTRATION TENANT AND THE JOURNAL STORE'S TENANT DISAGREE. A
+	//	    harness Store files ONE tenant's sessions for its whole life and
+	//	    refuses an evidence request naming another, because answering it from
+	//	    that keyspace would be answering the wrong question confidently. The
+	//	    two tenants are configured independently and no type relates them.
+	//	    This one is at least DIAGNOSED: it surfaces as
+	//	    commands.RefusalEvidenceUnroutable rather than as a silent runtime.
+	//
+	//	(c) A ROUTER KEY IS PRESENT BUT NAMES THE WRONG JOURNAL STORE. Host can
+	//	    check that SOME reader is registered for a binding; it cannot check
+	//	    that the reader registered actually SERVES it. That store is healthy,
+	//	    at the correct tenant, and truthfully reports it holds no such record
+	//	    — which is indistinguishable from the benign "the runtime wrote
+	//	    nothing" case at settlement time, and correctly so. It is the one
+	//	    cause that stays collapsed under RefusalEvidenceUnavailable.
+	//
+	// (c) NEEDS A CONSTRUCTION-TIME ANSWER AND IS BLOCKED UPSTREAM: a journal
+	// store would have to declare which StorageBindingIDs it serves, and no
+	// released API offers that. A harness Tenant() accessor would close (b) and
+	// NOT (c) — do not book it as the answer to both.
 	Store(ctx context.Context, evidence sessionstore.DispositionEvidenceReader) (*sessionstore.Store, error)
 
 	// JournalStores are this deployment's settlement evidence readers, one per

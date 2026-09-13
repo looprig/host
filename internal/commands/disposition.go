@@ -40,6 +40,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 	"unicode/utf8"
@@ -313,6 +314,23 @@ var (
 	// so an assertion can no longer answer the question.
 	ErrNoAttemptCloser = department.ErrNoAttemptCloser
 )
+
+// ErrEvidenceUnroutable reports a settlement whose evidence could not be OBTAINED
+// because of this deployment's wiring.
+//
+// IT IS DECLARED HERE AND RAISED BY THE CONCRETE EDGE, which is the direction the
+// other sentinels in this file do NOT go — they are department's, because a
+// runtime raises them. This one is a STORE fact, and internal/sessionstoreadapter
+// imports this package rather than the other way round, so here is the one place
+// both the raiser and the reader can name it.
+//
+// WHY IT IS A SENTINEL AT ALL. Both classifiable causes — an unregistered binding
+// and a reader that refuses to resolve the session — already arrive at the
+// applier as typed errors with their cause intact; the information was being
+// discarded by one unconditional mapping, not missing. Recovering it costs no
+// upstream API and leaks nothing: a refusal code names no tenant, session,
+// binding or body.
+var ErrEvidenceUnroutable = errors.New("commands: this session's settlement evidence could not be obtained from any configured reader, which is a wiring failure rather than a runtime that recorded nothing")
 
 // ---------------------------------------------------------------------------
 // The production minter

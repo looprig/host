@@ -23,11 +23,14 @@ and compared segment by segment, so a sibling package under
 
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` v0.8.0 store.
+`github.com/looprig/sessionstore` v0.9.0 store, and `internal/harnessadapter` to
+`github.com/looprig/harness` v0.34.0.
 
-**A composed Host attaches a disposition session and consumes its durable
-command stream. It does NOT dispatch a command into the runtime, by design and
-explicitly.** Read the next section before you plan around it; the boundary is
+**A composed Host applies a command end to end: it attaches a disposition
+session, consumes its durable command stream, claims a command under its
+residency grant, authorizes exactly one dispatch attempt, drives the runtime with
+that attempt's identity and settles the command from the runtime's own durable
+disposition.** Read the next section before you plan around it; the mechanism is
 measured, not cautionary.
 
 ## Known limitations you must read before deploying
@@ -135,75 +138,95 @@ and `TestADrainOfTheFixedSessionIsRefusedUnlessTheLinkSTenantHoldsIt` in
 
 Closed as `O7.1-hostwide-drain-crosses-tenants` / R-1.
 
-### A composed Host consumes and does not dispatch
+### A composed Host applies a command, and what that word means
 
-**This entry replaces two earlier ones, and both were wrong in the same
-direction — a sentence wider than its evidence.** The first said a Host "can
-consume its inbox against a real store", which was an ADAPTER result stated about
-a composed Host. The second said a composed Host "cannot attach a disposition
-session, so it consumes nothing", which was true until the attach-time journal
-fence was removed and is now false.
+**This entry replaces three earlier ones, and the first two were wrong in the
+same direction — a sentence wider than its evidence.** The first said a Host
+"can consume its inbox against a real store", which was an ADAPTER result stated
+about a composed Host. The second said a composed Host "cannot attach a
+disposition session, so it consumes nothing", which was true until the
+attach-time journal fence was removed. **The third said a composed Host
+deliberately refuses to dispatch, and that is now false too**: it described
+`commands.NoDispatch`, which has been **deleted**, and listed as future work the
+three-repository sequence that has since landed.
 
-**What a composed Host does.** It attaches a disposition session end to end,
-reaches `BeginOwnership`, and starts the session's durable command consumer,
-which lists the session's commands in acceptance order, steps over terminal
-records and advances the durable consumption cursor. This is measured in
-COMPOSITION — `internal/compose/attach_fence_test.go` and
-`TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt` — rather than at the
-adapter, and the adapter-level differential
-(`internal/compose/inbox_differential_test.go`) still holds the three consumption
-methods against the released store.
+**What a composed Host does.** It attaches a disposition session, reaches
+`BeginOwnership`, starts the session's durable command consumer, and for each
+command in acceptance order: **claims** it under the residency GRANT this store
+issued (`ClaimDispositionCommand` takes a `*ResidencyGrant`, not an epoch, so a
+caller cannot name one); **authorizes one attempt**, recording an immutable
+identity together with the RUNTIME's own journal grant; **dispatches** it,
+carrying that identity to the runtime; and **settles** it from the durable
+disposition the runtime wrote. It steps over terminal records and advances the
+durable consumption cursor.
 
-**What it does not do, deliberately.** It refuses to drive any command into the
-runtime. `commands.NoDispatch` is the Processor a composed Host runs; it refuses
-every non-terminal command it is handed with
-`ApplyRefusal("dispatch_unavailable")`, **before touching any durable seam**, so
-the record stays exactly where Factory put it and a later Host can still apply
-it. The pass blocks at that command and the session makes no further progress.
+This is measured in composition
+(`internal/compose.TestAComposedHostAppliesADeliveredCommandEndToEnd`) and end to
+end against both released stores on separate backends
+(`internal/settlement.TestACommandAppliesAndSettlesAcrossBothReleasedStores`).
 
-**What it looks like in production, because "by design" is not an excuse for an
-invisible state.** The delivery is answered **`accepted`**; the session then
-makes no further progress, permanently; `Consumer.Failures()` **stays at zero**
-(a blocked pass returns a nil error); and **nothing is logged**. The one signal
-that distinguishes this from an idle Host is the Prometheus gauge
-**`host_sessions_command_blocked`**, which counts resident sessions whose
-consumer has stopped at a command. **Expect it to equal the number of sessions
-holding work.** A non-zero value is not a fault today; it becomes one once an
-applier exists. Nothing on the Host side unsticks such a command — Factory's
-apply-deadline reconciler is what eventually makes the record terminal.
+**What `applied` means, exactly, and it is narrower than the word.** *Under the
+attempt's journal grant, the runtime durably recorded that it accepted this
+command into its execution path.* It does **not** mean a turn started; it does
+**not** mean a turn folded; it does **not** mean a later `TurnRejected` cannot
+follow; and it does **not** mean a queued input survives a crash — the runtime's
+loop mailbox is in memory. **Do not widen this sentence**, including in any
+user-facing vocabulary: a product-level "applied" for an input that a crash then
+discards is a claim this Host does not make.
 
-**Why the refusal is explicit rather than an omission.** In disposition mode the
-store settles a command from durable evidence: an application prefix carrying the
-attempt's identity, verified for `AttemptID` equality. `harness` v0.33.0's
-`runtimecommand.Admitted` carries **no attempt identity**, so a dispatch commits
-a prefix no settler can ever match, and the settlement design **forbids**
-converting "a legacy prefix followed by an uncertain external effect" into
-`not_applied`. A dispatched command would therefore sit in `applying` **forever,
-with a real runtime effect behind it** — strictly worse than one never
-dispatched.
+**Host authors no outcome.** `SettleDispositionCommand` takes a command, a
+revision and a residency and nothing else; the store derives what it expects from
+its own immutable record, obtains the evidence through its configured reader and
+verifies it before the write. Host reports the arm the store chose.
 
-**What unblocks dispatch**, which is a three-repository sequence and not a Host
-fix:
+**Missing evidence is not proof that nothing was applied.** A settlement that
+cannot read a disposition leaves the command `applying` at an unmoved revision
+and blocks the pass. A Host that re-dispatched on absence would re-drive an
+effect that may already have committed. Host's honest exactly-once claim is
+**"at most one authorized attempt, settled only from the runtime's durable
+disposition"**.
 
-- an **attempt-aware harness writer** that stamps the attempt identity into the
-  application prefix;
-- a Host applier bound to the **disposition family's** edges rather than to the
-  legacy CAS transitions `internal/commands/apply.go` still models.
-  `sessionstore` v0.8.0 supplies the claim and pre-attempt reject edges
-  (`ClaimDispositionCommand`, `RejectDispositionCommand`); the claim edge takes a
-  `*ResidencyGrant` rather than an epoch, so the grant must reach the adapter,
-  and it **cannot answer for a legacy session, cannot express a superseded
-  residency through the exported API, and cannot be driven across a process
-  boundary**. A rejection carries **no durable reason**, and rows written by
-  v0.8.0 can never be backfilled with one.
+**There is no Host-authored rejection once an attempt exists**, and none before
+one either: the only pre-attempt reason to reject is the apply deadline, and
+§10.4 gives that to Factory's deadline reconciler. `RejectDispositionCommand` is
+deliberately not bound.
 
-Two consequences a reader planning that work must not get wrong. **There is no
-Host-authored rejection once an attempt exists** — a runtime error with no
-durable disposition leaves the command `applying` until a **successor runtime**
-writes `not_applied` under a strictly later journal grant. And **missing evidence
-is not proof that nothing was applied**, so a Host must never re-dispatch on its
-absence. Host's honest exactly-once claim is therefore **"at most one authorized
-attempt, settled only from the runtime's durable disposition"**.
+### What a deployment must wire, and what Host cannot check
+
+A disposition session's journal is **not** in the orchestration store. The
+immutable binding says where it is, and a harness `Store` answers only for the
+keyspace it owns — it holds no registry of the bindings it serves, so it cannot
+route on `Binding.StorageBindingID`. A product therefore supplies
+`Bootstrap.JournalStores()`, one reader per binding; Host builds the router and
+hands it to `Bootstrap.Store(ctx, evidence)`, which **must** open the store with
+`sessionstore.WithDispositionEvidence`.
+
+**Three wiring conditions are unenforceable, and they share one signature** —
+each fails only after every dispatch has happened, strands the command
+`applying` with a real effect behind it, and is invisible until the first
+settlement:
+
+| # | condition | diagnosed as |
+|---|---|---|
+| (a) | the product takes the reader and drops it | `evidence_unavailable` |
+| (b) | the orchestration tenant and the journal store's tenant disagree | **`evidence_unroutable`** |
+| (c) | a router key is present but names the **wrong** journal store | `evidence_unavailable` |
+
+(b) and an unregistered binding are **machine-distinguishable inside Host** and
+are reported as `evidence_unroutable`, which points an operator at the wiring
+rather than at a runtime that did its job. **(c) is genuinely ambiguous at
+settlement time and correctly so** — that store is healthy, at the correct
+tenant, and truthfully reports it holds no such record. Closing it needs a
+construction-time answer (a journal store declaring which bindings it serves)
+that no released API offers; a harness `Tenant()` accessor would close (b) and
+**not** (c).
+
+**Operationally**, a blocked pass answers the delivery `accepted`, makes no
+further progress, leaves `Consumer.Failures()` at zero (a blocked pass returns a
+nil error) and logs nothing. The signal is the Prometheus gauge
+**`host_sessions_command_blocked`**. Unlike before, a non-zero value **is** a
+fault: it means a command this Host could not settle, not one it refused to
+start.
 
 ### Host opens no journal writer, and must not
 
