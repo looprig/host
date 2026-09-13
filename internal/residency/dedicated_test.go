@@ -245,7 +245,6 @@ type placementObservation struct {
 	Generation       uint64
 	JournalEpoch     JournalEpoch
 	JournalHeld      bool
-	Fences           int
 	ConsumedWeight   uint64
 	RuntimesLaunched int
 	LeasesHeld       int
@@ -298,7 +297,6 @@ func observePlacement(t *testing.T, fixed sessionwire.SessionID, mode Mode, spoi
 		observation.JournalEpoch = residency.JournalEpoch
 		observation.JournalHeld = residency.JournalEpochHeld
 	}
-	observation.Fences = f.journal.committed()
 	observation.ConsumedWeight = f.publisher.ConsumedWeight()
 	observation.RuntimesLaunched = len(f.target.producedRuntimes())
 	observation.LeasesHeld = f.leases.heldCount()
@@ -371,7 +369,7 @@ func TestPooledAndDedicatedUnwindAFailedAttachIdentically(t *testing.T) {
 		spoil func(*fixture)
 	}{
 		{name: "lease refused", mode: ModeCreate, spoil: func(f *fixture) { f.leases.err = sentinel }},
-		{name: "opening fence refused", mode: ModeCreate, spoil: func(f *fixture) { f.journal.err = sentinel }},
+		{name: "workspace materialization refused", mode: ModeCreate, spoil: func(f *fixture) { f.workspaces.ensureErr = sentinel }},
 		{name: "durable state unreadable", mode: ModeRestore, spoil: func(f *fixture) { f.durable.err = sentinel }},
 	} {
 		t.Run(row.name, func(t *testing.T) {

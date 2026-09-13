@@ -24,8 +24,8 @@
 //	residency.Lease.Epoch               ResidencyGrant.Epoch
 //	residency.Lease.Lost                ResidencyGrant.Lost              (F3, closed)
 //	residency.Lease.Release             ResidencyGrant.Release
-//	residency.JournalFencer.Commit…     Store.OpenJournal                (F2, fused)
-//	commands.JournalWrites.AppendAp…    JournalWriter.Append             (journal grant)
+//	Store.OpenSession                   Store.OpenJournal                (F2, unwired)
+//	commands.JournalWrites.AppendAp…    JournalWriter.Append             (F2, unwired)
 //	residency.DurableStore.LoadSess…    Store.GetCatalogEntry            (F4, F5, F13)
 //	residency.Workspaces.Ensure/Rel…    none                             (F6)
 //	host.WorkspaceProvider.Ensure…      none                             (F6)
@@ -34,16 +34,24 @@
 //	commands.Inbox.ListOrdered          none                             (F7)
 //	commands.Cursors.LoadCursor         none                             (F8)
 //	commands.CursorWrites.SaveCursor    none                             (F8)
-//	commands.CommandRecords.LoadCom…    Store.GetCommand                 (F11)
+//	commands.CommandRecords.LoadCom…    Store.GetCommand                 (F11, unwired)
 //	commands.CommandRecords.LoadPay…    Store.GetCommand                 (F9)
 //	commands.Applications.FindAppli…    Store.FindCommandApplication
 //	commands.Gates.LoadGate             Store.ReadGates                  (F10)
-//	commands.InboxWrites.ClaimComma…    Store.ClaimCommand               (F12)
-//	commands.InboxWrites.BeginApply…    Store.BeginApplyingCommand
-//	commands.InboxWrites.CompleteCo…    Store.CompleteCommand
-//	commands.InboxWrites.RejectComm…    Store.RejectCommand
-//	commands.JournalWrites.AppendAp…    JournalWriter.Append
+//	commands.InboxWrites.ClaimComma…    Store.ClaimCommand               (F12, unwired)
+//	commands.InboxWrites.BeginApply…    Store.BeginApplyingCommand       (unwired)
+//	commands.InboxWrites.CompleteCo…    Store.CompleteCommand            (unwired)
+//	commands.InboxWrites.RejectComm…    Store.RejectCommand              (unwired)
 //	commands.Fence.Held/Lost/Write      none                             (F3)
+//
+// "UNWIRED" IS A STATEMENT ABOUT THE COMPOSITION, NOT ABOUT THIS PACKAGE. Every
+// row so marked is bound, exported and tested against the released store here,
+// and no composed Host calls it: compose.Options declares no session opener and
+// no application seams, and the Processor a composed Host runs is
+// commands.NoDispatch. They are the legacy command family, which a Host cannot
+// reach on a session it can hold, and they are what the attempt-aware applier
+// will be rebuilt from rather than dead weight. Do not re-wire one without
+// reading commands/dispatch.go.
 //
 // Seams NOT in this table stand in for nothing durable: registry.LocalRegistry,
 // residency.HeartbeatRegistry, residency.TeardownObserver, residency.Ownership,
@@ -68,14 +76,17 @@
 // production caller shape (existence and classification), so the adapter
 // answers with the record's canonical JSON and callers are told not to parse it.
 //
-// F2. THE LEASE AND THE OPENING FENCE ARE ONE CALL, not two. residency models
-// AcquireSessionLease and CommitOpeningFence as separate seams, and step 3 of
-// the attach can therefore fail with the lease held. Store.OpenJournal acquires
-// the lease, reads the tip once and commits the opening fence at that tip, and
-// releases the grant itself on every failure after the grant. The direction that
-// fails is fake→store: a fake can produce "lease granted, fence refused, lease
-// still held", and the released store cannot. openSession below fuses them and
-// reports the fence conflict with the grant already gone.
+// F2. THE LEASE AND THE OPENING FENCE ARE ONE CALL, not two — AND THE FINDING IS
+// NOW MOOT FOR HOST, which is worth more than the row itself. It described
+// residency modelling AcquireSessionLease and CommitOpeningFence as separate
+// seams while Store.OpenJournal fuses them, so a fake could produce "lease
+// granted, fence refused, lease still held" and the released store could not.
+// Host no longer commits an opening fence at all: the fence bound the session
+// scope to ProtocolModeLegacy and therefore failed for every session a Host can
+// hold, and the journal grant is the RUNTIME's. residency.JournalFencer is gone
+// and nothing in a composed Host calls OpenSession. The row stays because
+// Store.OpenSession is still exported here and still has this shape, and a
+// future caller must know the fusion is the store's rather than this adapter's.
 //
 // F3. LEASE LOSS IS NOT OBSERVABLE AS AN EVENT — AND THE SIGNAL EXISTS ONE LAYER
 // DOWN. residency.Lease.Lost is a channel a heartbeat and a drain supervisor
@@ -241,7 +252,8 @@
 // F15. THE ONE LEASE HOST DECLARES IS TWO GRANTS IN THE RELEASED MODULE, IN TWO
 // EPOCH DOMAINS. residency.Lease fuses them: Epoch() is documented as the value
 // Core publishes as the registry observation's lease_epoch, and the SAME value
-// is what JournalFencer.CommitOpeningFence stamps into the in-stream fence.
+// was what residency.JournalFencer.CommitOpeningFence stamped into the in-stream
+// fence, before that seam was removed.
 // v0.6.0 splits the two deliberately and gives them distinct types —
 // ResidencyEpoch, the Host's orchestration grant, and JournalEpoch, "a runtime
 // grant in a session's bound agent journal" — and forbids the identification in
@@ -274,9 +286,11 @@
 // substitution no longer compiles. Three structural consequences are worth
 // naming, because each closes a place the fusion could come back:
 //
-//   - residency.JournalFencer.CommitOpeningFence takes NO epoch. Host holds no
-//     journal grant, so there was no number it could soundly name; the writer
-//     stamps its own, exactly as it already does for an application prefix.
+//   - residency.JournalFencer is GONE, and its removal is the completion of this
+//     line rather than a separate decision. CommitOpeningFence first lost its
+//     epoch parameter — Host holds no journal grant, so there was no number it
+//     could soundly name — and then lost its caller: Host makes no journal write
+//     at any point, so there is nothing left for the fusion to come back into.
 //   - harnessadapter's WithLeaseEpoch is GONE. It let a composition supply the
 //     epoch every admitted command was applied under, and harness compares that
 //     number for equality against the lease the runtime itself holds — right

@@ -411,7 +411,7 @@ func TestStopReleasesTheSessionAndClosesEveryTransportLast(t *testing.T) {
 	}
 
 	trace := f.trace.trace()
-	for _, expected := range []string{"checkpoint", "lease.release", "journal.release", "workspace.release"} {
+	for _, expected := range []string{"checkpoint", "lease.release", "workspace.release"} {
 		if f.trace.indexOf(expected) == -1 {
 			t.Errorf("the drain never ran %q: %v", expected, trace)
 		}
@@ -435,10 +435,11 @@ func TestStopReleasesTheSessionAndClosesEveryTransportLast(t *testing.T) {
 	if held := f.svc.links.all(); len(held) != 0 {
 		t.Errorf("%d tenant transports survived the drain", len(held))
 	}
-	// Both grants are handed back, and the journal one is the half that has no
-	// other releaser anywhere in the module.
-	if grant := f.store.grantFor(keyA); grant == nil || grant.releaseCount() != 1 {
-		t.Errorf("the journal grant was released %v times, want 1", grant)
+	// THE RESIDENCY GRANT IS HANDED BACK, and it is now the only grant an
+	// attach takes: the journal grant this used to check alongside it was the
+	// attach-time fence's, and a composed Host opens no journal writer.
+	if released := f.trace.count("lease.release"); released != 1 {
+		t.Errorf("the residency grant was released %d times, want 1", released)
 	}
 }
 
@@ -746,7 +747,7 @@ func TestTheDrainSeamsFinishReleaseReleasesTheLease(t *testing.T) {
 	if err := (releaseSession{resident: held}).FinishRelease(t.Context()); err != nil {
 		t.Fatalf("drain FinishRelease: %v", err)
 	}
-	for _, expected := range []string{"lease.release", "journal.release", "workspace.release"} {
+	for _, expected := range []string{"lease.release", "workspace.release"} {
 		if f.trace.indexOf(expected) == -1 {
 			t.Errorf("the drain seam's FinishRelease never ran %q: %v", expected, f.trace.trace())
 		}
@@ -816,7 +817,6 @@ func TestEveryReleaseStepIsIdempotent(t *testing.T) {
 		{step: "ReleaseResidency", got: f.runtime.Released(), what: "released the runtime"},
 		{step: "FinishRelease", got: f.trace.count("locations.tombstone"), what: "wrote the epoch-fenced tombstone"},
 		{step: "ReleaseLease", got: f.trace.count("lease.release"), what: "released the residency grant"},
-		{step: "ReleaseLease", got: f.trace.count("journal.release"), what: "released the journal grant"},
 		{step: "DropState", got: f.trace.count("workspace.release"), what: "released the workspace"},
 	} {
 		if counted.got != 1 {

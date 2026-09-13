@@ -203,45 +203,6 @@ func (s *fakeLeases) heldCount() int {
 
 func (s *fakeLeases) grantedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.granted) }
 
-// fakeJournal records opening fences.
-type fakeJournal struct {
-	trace *trace
-
-	mu     sync.Mutex
-	fences int
-	err    error
-}
-
-// CommitOpeningFence records that a fence happened and NOT the epoch it was
-// stamped with, because the seam no longer carries one.
-//
-// THE FAKE WAS LOOSER THAN THE DEPENDENCY IN EXACTLY THIS PLACE. It accepted an
-// epoch a caller chose and recorded it, so the whole package could assert that
-// Host stamped the journal fence with Host's own lease epoch — a write the
-// released store refuses on the one seam where it can be compared
-// (JournalWriter refuses an application prefix whose LeaseEpoch a caller chose)
-// and which, in disposition mode, no session accepts at all.
-func (j *fakeJournal) CommitOpeningFence(ctx context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID) error {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if ctx.Err() != nil {
-		j.trace.record("journal.fence-on-dead-context")
-		return errDeadContext
-	}
-	j.trace.record("journal.fence")
-	if j.err != nil {
-		return j.err
-	}
-	j.fences++
-	return nil
-}
-
-func (j *fakeJournal) committed() int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.fences
-}
-
 // fakeDurable serves durable session state.
 type fakeDurable struct {
 	trace *trace
@@ -969,7 +930,6 @@ type fixture struct {
 	publisher  *service.CapacityPublisher
 	admissions *tracingAdmissions
 	leases     *fakeLeases
-	journal    *fakeJournal
 	durable    *fakeDurable
 	workspaces *fakeWorkspaces
 	locations  *fakeLocations
@@ -1020,7 +980,6 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 		},
 		registry:   &spyRegistry{inner: registry.New(fixedClock{at: testClockAt}), trace: steps},
 		leases:     &fakeLeases{trace: steps, nextEpoch: testFirstEpoch - 1, held: map[sessionwire.SessionID]bool{}},
-		journal:    &fakeJournal{trace: steps},
 		durable:    &fakeDurable{trace: steps, state: SessionState{Exists: true, Namespace: testNamespace, CompatibilityID: testCompat, RigSessionID: testRigSessionID, HasCheckpoint: true, CheckpointSequence: 91}},
 		workspaces: &fakeWorkspaces{trace: steps, root: testWorkspaceRoot},
 		locations:  &fakeLocations{trace: steps},
@@ -1089,7 +1048,6 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 		Registry:       f.registry,
 		Admissions:     f.admissions,
 		Leases:         f.leases,
-		Journal:        f.journal,
 		Durable:        f.durable,
 		Workspaces:     f.workspaces,
 		Locations:      f.locations,
@@ -1218,7 +1176,6 @@ func (f *fixture) assertNothingHeld(t *testing.T) {
 var createSequence = []string{
 	"admit",
 	"lease.acquire",
-	"journal.fence",
 	"durable.load",
 	"workspace.ensure",
 	"target.create",
@@ -1232,7 +1189,6 @@ var createSequence = []string{
 var restoreSequence = []string{
 	"admit",
 	"lease.acquire",
-	"journal.fence",
 	"durable.load",
 	"workspace.ensure",
 	"target.restore",
@@ -1295,16 +1251,6 @@ func TestAttachCreatesUnderTheLeaseInTheSpecifiedOrder(t *testing.T) {
 	if consumed := f.publisher.ConsumedWeight(); consumed != testWeight {
 		t.Errorf("the admission ledger charges %d, want the target's weight %d", consumed, testWeight)
 	}
-	// ONE FENCE, AND NO EPOCH ON IT. This assertion used to read "the fence
-	// carries exactly the lease epoch", which was the fusion stated as a
-	// requirement: the fence is a JOURNAL record and Host holds no journal
-	// grant, so the writer stamps its own. What is left to assert is that the
-	// fence happened exactly once, before hydration; the epoch is no longer
-	// Host's to get right or wrong.
-	if fences := f.journal.committed(); fences != 1 {
-		t.Errorf("the attach committed %d opening fences, want exactly 1", fences)
-	}
-
 	// THE TWO GRANTS, SIDE BY SIDE. The residency epoch is Host's own and comes
 	// from the lease; the journal epoch is the RUNTIME's and comes from the
 	// runtime. They are 997 apart in this fixture because they are minted by
@@ -1368,37 +1314,6 @@ func TestAttachRestoresUnderTheLeaseInTheSpecifiedOrder(t *testing.T) {
 	}
 	if !residency.Attached {
 		t.Error("the restoring attach reports Attached false")
-	}
-}
-
-// TestTheOpeningFenceIsCommittedBeforeAnyHydration states step 3's ordering as
-// its own claim.
-//
-// It overlaps the whole-sequence assertion above deliberately: that one fails
-// for any reordering at all, so it cannot tell a reader WHICH rule was broken,
-// and the fence rule is the one with a correctness argument behind it. Its
-// probe is a manager that fences after hydration; the whole-sequence test dies
-// too, which is the point of having both.
-func TestTheOpeningFenceIsCommittedBeforeAnyHydration(t *testing.T) {
-	f := newFixture(t)
-	if _, err := f.manager.Attach(context.Background(), f.request(ModeRestore)); err != nil {
-		t.Fatalf("Attach: %v", err)
-	}
-	fence := f.trace.indexOf("journal.fence")
-	if fence < 0 {
-		t.Fatal("no opening fence was committed")
-	}
-	for _, hydration := range []string{"durable.load", "workspace.ensure", "target.restore"} {
-		at := f.trace.indexOf(hydration)
-		if at < 0 {
-			t.Fatalf("hydration step %q never ran, so this test asserts nothing about it", hydration)
-		}
-		if at < fence {
-			t.Errorf("%q ran at %d, before the opening fence at %d; a hydration that precedes the fence leaves two processes believing they own the journal", hydration, at, fence)
-		}
-	}
-	if lease := f.trace.indexOf("lease.acquire"); lease > fence {
-		t.Errorf("the fence was committed at %d before the lease was acquired at %d; the fence is stamped with the lease epoch", fence, lease)
 	}
 }
 
@@ -1700,34 +1615,27 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			configure: func(f *fixture) { f.afterBuild = func(f *fixture) { f.publisher.BeginDrain() } },
 			wantStep:  StepValidate,
 			wantCode:  sessionwire.HostLinkErrorNotAdmitting,
-			forbidden: []string{"lease.acquire", "journal.fence", "durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
+			forbidden: []string{"lease.acquire", "durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
 			name:      "2 lease refused",
 			mode:      ModeCreate,
 			configure: func(f *fixture) { f.leases.err = sentinel },
 			wantStep:  StepLease,
-			forbidden: []string{"journal.fence", "durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
+			forbidden: []string{"durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
 			name:      "2 lease granted with an epoch Core refuses",
 			mode:      ModeCreate,
 			configure: func(f *fixture) { f.leases.zeroEpoch = true },
 			wantStep:  StepLease,
-			forbidden: []string{"journal.fence", "durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
+			forbidden: []string{"durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
 			name:      "2 lease reported without a grant",
 			mode:      ModeCreate,
 			configure: func(f *fixture) { f.leases.nilLease = true },
 			wantStep:  StepLease,
-			forbidden: []string{"journal.fence", "durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
-		},
-		{
-			name:      "3 opening fence refused",
-			mode:      ModeCreate,
-			configure: func(f *fixture) { f.journal.err = sentinel },
-			wantStep:  StepFence,
 			forbidden: []string{"durable.load", "workspace.ensure", "target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
@@ -2583,7 +2491,6 @@ func TestNewManagerRefusesAnIncompleteConfiguration(t *testing.T) {
 		Registry:       f.registry,
 		Admissions:     f.admissions,
 		Leases:         f.leases,
-		Journal:        f.journal,
 		Durable:        f.durable,
 		Workspaces:     f.workspaces,
 		Locations:      f.locations,
@@ -2606,7 +2513,6 @@ func TestNewManagerRefusesAnIncompleteConfiguration(t *testing.T) {
 		{"Registry", func(o *Options) { o.Registry = nil }},
 		{"Admissions", func(o *Options) { o.Admissions = nil }},
 		{"Leases", func(o *Options) { o.Leases = nil }},
-		{"Journal", func(o *Options) { o.Journal = nil }},
 		{"Durable", func(o *Options) { o.Durable = nil }},
 		{"Workspaces", func(o *Options) { o.Workspaces = nil }},
 		{"Locations", func(o *Options) { o.Locations = nil }},
@@ -3685,45 +3591,6 @@ func TestAnAttachWhoseLeaseClosesMidWayDoesNotReportItselfAttached(t *testing.T)
 	}
 }
 
-// TestAJournalFenceRefusedByALaterOwnerEndsTheAttach is §10.1's OTHER fencing
-// mechanism, which had no typed error at all and so could not be classified
-// even in principle.
-//
-// The journal is fenced by an in-stream ownership record rather than an epoch
-// column, and a successor's committed fence makes this writer's sequence
-// permanently stale — "even if it has not observed Lease.Lost()". That is the
-// same fact ErrEpochSuperseded carries, arriving through the mechanism nobody's
-// frame included.
-func TestAJournalFenceRefusedByALaterOwnerEndsTheAttach(t *testing.T) {
-	f := newFixture(t, func(f *fixture) {
-		f.journal.err = fmt.Errorf("sessionstore: %w", ErrFenceConflict)
-	})
-
-	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
-	if err == nil {
-		t.Fatal("the refused journal fence was not reported")
-	}
-	var attach *AttachError
-	if !errors.As(err, &attach) {
-		t.Fatalf("error is %T, want *AttachError", err)
-	}
-	if attach.Step != StepFence {
-		t.Errorf("the failure names step %q, want %q", attach.Step, StepFence)
-	}
-	if !errors.Is(err, ErrFenceConflict) {
-		t.Errorf("the failure %v does not unwrap to ErrFenceConflict", err)
-	}
-	f.assertNothingHeld(t)
-	f.assertRouteRemoved(t)
-
-	// THE DISCRIMINATOR: a fence refused by a LATER OWNER must be classified,
-	// so nothing later in this attach writes under the stale epoch. Reaching a
-	// tombstone at all would mean the classification was dropped.
-	if tombstones := f.locations.tombstones(); len(tombstones) != 0 {
-		t.Errorf("a tombstone was written at %v after a later owner's fence refused this one", tombstones)
-	}
-}
-
 // TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState is B2.
 //
 // The two writers share the record and their epoch, so the store cannot order
@@ -4280,4 +4147,90 @@ func TestAttachValidatesTheTenantIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The fence stays removed
+// ---------------------------------------------------------------------------
+
+// TestNoProductionFileOpensAJournalWriter holds the removal itself, which the
+// behavioural tests hold only by consequence.
+//
+// THE CONSEQUENCE IS NOT THE RULE. A composed attach that succeeds proves the
+// fence is not being REFUSED; it does not prove the fence is not being made
+// against a store that happens to permit it, and the released store permits it
+// for exactly the sessions a Host cannot hold. The rule is that Host makes no
+// journal write at all — the journal grant is the RUNTIME'S, the epoch Host
+// needs arrives through department.LeaseEpochReporter, and Host holds nothing
+// the writer would be fenced by.
+//
+// IT IS A STRUCTURAL CHECK OVER PARSED CALLS rather than a text search, and it
+// fails as vacuous at zero files. Its subject is this package, which is where
+// the sequence lives and where a reinstatement would be written.
+func TestNoProductionFileOpensAJournalWriter(t *testing.T) {
+	files := parseProductionFiles(t)
+	inspected := 0
+	for name, file := range files {
+		inspected++
+		for _, opened := range journalOpenings(file) {
+			t.Errorf("%s: calls %s; Host opens no journal writer and commits no opening fence, and the epoch it needs is the runtime's", name, opened)
+		}
+	}
+	if inspected == 0 {
+		t.Fatal("no production file was inspected, so this guard is vacuous")
+	}
+
+	// THE POSITIVE CONTROL. "No file calls it" is a claim that passes when the
+	// detector is broken, so the detector is shown finding one.
+	for _, probe := range []struct {
+		name   string
+		source string
+		want   int
+	}{
+		{
+			name:   "the fence, reinstated",
+			source: "package p\nfunc (m *Manager) attach() { m.journal.CommitOpeningFence(nil, \"\", \"\") }\n",
+			want:   1,
+		},
+		{
+			name:   "the writer, opened directly",
+			source: "package p\nfunc (m *Manager) attach() { m.store.OpenJournal(nil, nil) }\n",
+			want:   1,
+		},
+		{
+			name:   "an unrelated call",
+			source: "package p\nfunc (m *Manager) attach() { m.locations.PublishResidency(nil, nil) }\n",
+			want:   0,
+		},
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", probe.source, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("%s: parsing the probe: %v", probe.name, err)
+		}
+		if got := journalOpenings(parsed); len(got) != probe.want {
+			t.Errorf("%s: the detector reported %v (%d), want %d", probe.name, got, len(got), probe.want)
+		}
+	}
+}
+
+// journalOpenings names every call in a file that takes or stakes a journal
+// writer.
+func journalOpenings(file *ast.File) []string {
+	forbidden := map[string]bool{
+		"CommitOpeningFence": true,
+		"OpenJournal":        true,
+		"OpenSession":        true,
+	}
+	var found []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		if method, isMethod := call.Fun.(*ast.SelectorExpr); isMethod && forbidden[method.Sel.Name] {
+			found = append(found, method.Sel.Name)
+		}
+		return true
+	})
+	return found
 }

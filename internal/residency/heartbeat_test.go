@@ -1003,7 +1003,7 @@ func TestTheManagerStartsARealHeartbeat(t *testing.T) {
 	}
 	manager, err := NewManager(Options{
 		Host: f.host, HostGeneration: testGeneration, Registry: f.registry,
-		Admissions: f.admissions, Leases: f.leases, Journal: f.journal,
+		Admissions: f.admissions, Leases: f.leases,
 		Durable: f.durable, Workspaces: f.workspaces, Locations: f.locations,
 		Ownership: ownership,
 	})
@@ -2102,9 +2102,13 @@ func TestEveryFencedWriteGoesThroughTheFence(t *testing.T) {
 		}
 	}
 	// FLOORED at the sites that exist, so a guard that stopped finding them
-	// fails rather than passing. Six location writes plus the journal fence.
-	if total < 7 {
-		t.Fatalf("%d fenced writes were found, want at least the seven this package makes", total)
+	// fails rather than passing. Six location writes; the journal fence that
+	// used to be the seventh is gone, and CommitOpeningFence stays in the
+	// detector's set precisely so that a reinstated one would have to pass
+	// through the fence — TestNoProductionFileOpensAJournalWriter is what says
+	// it may not be reinstated at all.
+	if total < 6 {
+		t.Fatalf("%d fenced writes were found, want at least the six this package makes", total)
 	}
 
 	for _, probe := range []struct {

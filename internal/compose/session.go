@@ -50,7 +50,6 @@ type resident struct {
 	generation uint64
 	runtime    department.Runtime
 	lease      residency.Lease
-	journal    JournalGrant
 	halves     releaseHalves
 	work       *sessionWork
 	checkpoint func(context.Context, sessionwire.TenantID, sessionwire.SessionID) error
@@ -218,13 +217,14 @@ func (r *resident) stopOwnership(ctx context.Context) error {
 	return r.halves.Stop(ctx)
 }
 
-// releaseLease hands back the residency grant and the journal grant, once.
+// releaseLease hands back the residency grant, once.
 //
-// BOTH GRANTS, AND THE JOURNAL ONE IS THE HALF THAT IS EASY TO LOSE. A session
-// holds two: Host's residency lease, whose loss a heartbeat observes, and the
-// runtime's journal grant, taken by the same attach and released by nobody
-// else. Leaving the second held would leave the session unattachable elsewhere
-// for a reason nothing in the registry or the lease records.
+// IT USED TO HAND BACK TWO. A session held Host's residency lease and, from the
+// attach-time opening fence, the runtime's journal grant; this released both,
+// because the second was taken by that attach and released by nobody else. Host
+// no longer opens a journal writer at all — see the sequence at the top of
+// internal/residency — so there is one grant, and a second release here would be
+// a release of something this Host never took.
 func (r *resident) releaseLease(ctx context.Context) error {
 	r.once.mu.Lock()
 	release := !r.once.leaseGone
@@ -233,16 +233,7 @@ func (r *resident) releaseLease(ctx context.Context) error {
 	if !release {
 		return nil
 	}
-	var failures []error
-	if r.journal != nil {
-		if err := r.journal.Release(ctx); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	if err := r.lease.Release(ctx); err != nil {
-		failures = append(failures, err)
-	}
-	return errors.Join(failures...)
+	return r.lease.Release(ctx)
 }
 
 // dropState drops the local workspace materialization, once. It never deletes
@@ -283,8 +274,8 @@ type releaseSession struct {
 // releaseSession is a lifecycle.Session.
 var _ lifecycle.Session = releaseSession{}
 
-// FinishRelease writes the tombstone, ends the heartbeat, releases both grants
-// and drops local state, which is what this seam's FinishRelease means.
+// FinishRelease writes the tombstone, ends the heartbeat, releases the residency
+// grant and drops local state, which is what this seam's FinishRelease means.
 func (s releaseSession) FinishRelease(ctx context.Context) error {
 	var failures []error
 	if err := s.finishRelease(ctx); err != nil {
@@ -320,7 +311,7 @@ func (s warmSession) FinishRelease(ctx context.Context) error {
 	return s.stopOwnership(ctx)
 }
 
-// ReleaseLease drops the residency grant and the journal grant.
+// ReleaseLease drops the residency grant.
 func (s warmSession) ReleaseLease(ctx context.Context) error { return s.releaseLease(ctx) }
 
 // DropState drops in-memory state and the local workspace materialization.

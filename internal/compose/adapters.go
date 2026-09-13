@@ -49,99 +49,6 @@ func (c warmClockAdapter) NewWarmTimer(d time.Duration) residency.WarmTimer {
 }
 
 // ---------------------------------------------------------------------------
-// The journal grant, held for the life of a residency
-// ---------------------------------------------------------------------------
-
-// journalFencer is the composition's residency.JournalFencer.
-//
-// IT KEEPS WHAT THE FENCE PRODUCED, which is the whole reason it is not a thin
-// forward. The released adapter's OpenSession takes the session's journal grant
-// AND commits the opening fence in one call, and residency's seam reports only
-// whether the fence committed — so a composition that forwarded and discarded
-// would drop the one object an applier needs to append a correlation record,
-// and the grant would stay held with nobody able to release it.
-type journalFencer struct {
-	service *Service
-}
-
-var _ residency.JournalFencer = (*journalFencer)(nil)
-
-// journal returns this Service's fencer.
-func (s *Service) journal() *journalFencer { return &journalFencer{service: s} }
-
-// CommitOpeningFence opens the session and retains its journal grant.
-//
-// A REFUSED STASH RELEASES THE GRANT IT JUST TOOK, and that half is as
-// load-bearing as the refusal. Returning while still holding the grant would
-// trade the stranded grant stashGrant now refuses for a leaked one nobody has a
-// handle to — the same defect with a different name — and the released store
-// retains a Store admission for a live journal writer, so Close would wait on it
-// forever.
-func (f *journalFencer) CommitOpeningFence(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
-	grant, err := f.service.options.OpenSession(ctx, tenant, session)
-	if err != nil {
-		return err
-	}
-	key := registry.Key{TenantID: tenant, SessionID: session}
-	if err := f.service.stashGrant(key, grant); err != nil {
-		return errors.Join(err, grant.Release(ctx))
-	}
-	return nil
-}
-
-// stashGrant records the journal grant an opening fence produced, to be taken
-// by the ownership that follows it in the same attach.
-//
-// IT REFUSES A SECOND GRANT FOR ONE KEY rather than overwriting the first, and
-// the guard is HERE rather than only at the caller for the reason O7.1's
-// cross-tenant bypass is a live lesson in this module: that defect survived its
-// own guard because the guard was a caller's discipline asserted in another
-// package, with the object that depended on it asserting nothing. The map is
-// this package's, the invariant is about the map, and so the check is on the map.
-//
-// IT IS DEFENCE IN DEPTH AND NOT A LIVE FIX, said plainly. residency.Manager's
-// per-key attach slot means one opening per key today, so nothing in this module
-// can reach the refusal through an attach; the two tests that drive it call the
-// fencer directly. What changes is that the property no longer depends on a
-// promise made somewhere else.
-func (s *Service) stashGrant(key registry.Key, grant JournalGrant) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.pendingGrants == nil {
-		s.pendingGrants = map[registry.Key]JournalGrant{}
-	}
-	if _, held := s.pendingGrants[key]; held {
-		return &PendingGrantHeldError{Key: key}
-	}
-	s.pendingGrants[key] = grant
-	return nil
-}
-
-// PendingGrantHeldError reports a second opening fence for a session whose first
-// grant has not yet been taken by an ownership.
-type PendingGrantHeldError struct {
-	Key registry.Key
-}
-
-func (e *PendingGrantHeldError) Error() string {
-	return "compose: session " + string(e.Key.TenantID) + "/" + string(e.Key.SessionID) +
-		" already holds an untaken journal grant, so a second opening fence would strand it"
-}
-
-// takeGrant removes and returns the grant stashed for a key.
-//
-// IT IS A TAKE AND NOT A READ. The grant belongs to exactly one residency, and
-// leaving it behind would let a later attach of the same session adopt a grant
-// the previous attach is still holding — which is the shape of a double release.
-func (s *Service) takeGrant(key registry.Key) (JournalGrant, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	grant, held := s.pendingGrants[key]
-	delete(s.pendingGrants, key)
-	return grant, held
-}
-
-// ---------------------------------------------------------------------------
 // Ownership: the heartbeat, the command consumer and the live tail
 // ---------------------------------------------------------------------------
 
@@ -179,12 +86,12 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 		_ = handle.Stop(ctx)
 		return nil, errNoReleaseHalves
 	}
-	work, grant, err := o.service.beginWork(ctx, request)
+	work, err := o.service.beginWork(ctx, request)
 	if err != nil {
 		_ = handle.Stop(ctx)
 		return nil, err
 	}
-	if err := o.service.trackResident(request, halves, work, grant); err != nil {
+	if err := o.service.trackResident(request, halves, work); err != nil {
 		work.stop()
 		_ = handle.Stop(ctx)
 		return nil, err
@@ -193,46 +100,36 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 }
 
 // beginWork starts one session's durable command consumer and live event relay.
-func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequest) (*sessionWork, JournalGrant, error) {
-	grant, held := s.takeGrant(request.Key)
-	if !held {
-		return nil, nil, errors.New("compose: the attach committed no opening fence, so this session holds no journal grant to write under")
-	}
+//
+// THE PROCESSOR IS commands.NoDispatch AND THAT IS THE BOUNDARY, not a stub left
+// where an applier belongs. A composed Host lists, orders and settles its
+// position in a session's durable command stream, and it refuses to drive a
+// command into the runtime; commands.NoDispatch is where the reason is written
+// out in full. Wiring commands.Applier here instead would compile — it is the
+// legacy family's protocol and every seam it needs is declared — and would
+// produce commands stuck in `applying` with a real runtime effect behind them
+// and no attempt identity any settler could match.
+func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequest) (*sessionWork, error) {
 	guard := request.Guard()
-	applier, err := commands.NewApplier(commands.ApplierOptions{
-		Host:         s.options.Host,
-		Key:          request.Key,
-		LeaseEpoch:   uint64(request.LeaseEpoch),
-		Records:      s.options.Records,
-		Applications: s.options.Applications,
-		Gates:        s.options.Gates,
-		Writes:       s.options.InboxWrites,
-		Journal:      grant,
-		Runtime:      request.Runtime,
-		Fence:        guard,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
 	consumer, err := commands.NewConsumer(commands.Options{
 		Host:       s.options.Host,
 		Key:        request.Key,
 		LeaseEpoch: uint64(request.LeaseEpoch),
 		Inbox:      s.options.Inbox,
 		Cursors:    s.options.Cursors,
-		Processor:  applier,
+		Processor:  commands.NoDispatch{},
 		Fence:      guard,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	link, err := s.links.resolve(request.Key.TenantID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	tail, err := link.tails.Publish(ctx, request.Key, request.Runtime)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	s.recordConsumer(request.Key, consumer)
 	go consumer.Run(ctx)
@@ -240,7 +137,7 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		tail.Stop()
 		consumer.Stop()
 		s.forgetConsumer(request.Key)
-	}}, grant, nil
+	}}, nil
 }
 
 // trackResident records the session this Host now holds, in the shape the drain
@@ -254,14 +151,13 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 // DEFECT: it means this Host already holds a watch for the same key, so a second
 // residency has been installed under a live one, and an attach that continued
 // past it would leave two objects believing they own one session's release.
-func (s *Service) trackResident(request residency.OwnershipRequest, halves releaseHalves, work *sessionWork, grant JournalGrant) error {
+func (s *Service) trackResident(request residency.OwnershipRequest, halves releaseHalves, work *sessionWork) error {
 	held := &resident{
 		key:        request.Key,
 		agent:      request.AgentID,
 		generation: request.Generation,
 		runtime:    request.Runtime,
 		lease:      s.leaseFor(request.Key),
-		journal:    grant,
 		halves:     halves,
 		work:       work,
 		checkpoint: s.options.Checkpointer.Checkpoint,

@@ -519,76 +519,6 @@ func enduring(key registry.Key, seq uint64, body string) sessionwire.EnduringPub
 }
 
 // ---------------------------------------------------------------------------
-// Grants, recorded per opening rather than per key
-// ---------------------------------------------------------------------------
-
-// recordingOpener is a SessionOpener that keeps EVERY grant it minted for a
-// key, in order.
-//
-// The fixture's own opener keeps one grant per key in a map and a second
-// opening overwrites the first, so a racing pair of attaches leaves the loser's
-// grant unreachable — and "the loser released its grant" is precisely the claim
-// that needs it. This also gates every opening behind a barrier, so a race is
-// arranged rather than hoped for.
-type recordingOpener struct {
-	inner func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (JournalGrant, error)
-
-	mu     sync.Mutex
-	grants map[registry.Key][]*countingGrant
-}
-
-func newRecordingOpener(inner func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (JournalGrant, error)) *recordingOpener {
-	return &recordingOpener{inner: inner, grants: map[registry.Key][]*countingGrant{}}
-}
-
-// openGrant opens one journal grant and records it under its key.
-func (o *recordingOpener) openGrant(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (JournalGrant, error) {
-	inner, err := o.inner(ctx, tenant, session)
-	if err != nil {
-		return nil, err
-	}
-	grant := &countingGrant{inner: inner}
-	key := registry.Key{TenantID: tenant, SessionID: session}
-	o.mu.Lock()
-	o.grants[key] = append(o.grants[key], grant)
-	o.mu.Unlock()
-	return grant, nil
-}
-
-// opened returns every grant minted for a key, in minting order.
-func (o *recordingOpener) opened(key registry.Key) []*countingGrant {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return append([]*countingGrant(nil), o.grants[key]...)
-}
-
-// countingGrant counts its own releases. It delegates everything else, so it is
-// never LOOSER than the grant it wraps.
-type countingGrant struct {
-	inner JournalGrant
-
-	mu       sync.Mutex
-	released int
-}
-
-func (g *countingGrant) AppendApplicationPrefix(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, prefix commands.Prefix) error {
-	return g.inner.AppendApplicationPrefix(ctx, tenant, session, prefix)
-}
-
-func (g *countingGrant) Release(ctx context.Context) error {
-	g.mu.Lock()
-	g.released++
-	g.mu.Unlock()
-	return g.inner.Release(ctx)
-}
-
-func (g *countingGrant) releaseTally() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.released
-}
-
-// ---------------------------------------------------------------------------
 // A durable command inbox, faithful to the seams it satisfies
 // ---------------------------------------------------------------------------
 
@@ -672,6 +602,27 @@ func (d *durableCommands) accept(t *testing.T, id sessionwire.CommandID, payload
 		deadline: time.Unix(1_800_000_000, 0).UTC(),
 	}
 	return id
+}
+
+// settle drives one record to a terminal state OUT OF BAND, as a predecessor
+// Host or Factory's deadline reconciler would leave it.
+//
+// It is the fixture's way of producing the one record a Host that does not
+// dispatch can still consume, which is what makes "the consumer is alive and
+// refuses only the dispatch" a falsifiable claim rather than a sentence.
+func (d *durableCommands) settle(id sessionwire.CommandID, state commands.State) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record := d.records[id]
+	record.state = state
+	record.revision++
+}
+
+// consumedCursor is the durable cursor's current value.
+func (d *durableCommands) consumedCursor() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cursor
 }
 
 // ListOrdered answers STRICTLY AFTER afterOrder, bounded by limit.
@@ -833,16 +784,6 @@ func (d *durableCommands) RejectCommand(_ context.Context, _ sessionwire.TenantI
 	return err
 }
 
-// prefix records one application prefix, which is what a later correlation
-// reads.
-func (d *durableCommands) prefix(id sessionwire.CommandID) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if record, held := d.records[id]; held {
-		record.prefixed = true
-	}
-}
-
 // commitEffect is the runtime's side: the public event that carried the effect.
 func (d *durableCommands) commitEffect(id sessionwire.CommandID, seq uint64) {
 	d.mu.Lock()
@@ -862,37 +803,25 @@ func (d *durableCommands) stateOf(id sessionwire.CommandID) commands.State {
 	return ""
 }
 
-// commandJournal is the journal grant half: it records the prefix against the
-// same store the correlation is read from, so a prefix is a durable fact rather
-// than a call that returned nil.
-type commandJournal struct {
-	inner JournalGrant
-	store *durableCommands
-}
-
-func (j *commandJournal) AppendApplicationPrefix(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, prefix commands.Prefix) error {
-	j.store.prefix(prefix.CommandID)
-	return j.inner.AppendApplicationPrefix(ctx, tenant, session, prefix)
-}
-
-func (j *commandJournal) Release(ctx context.Context) error { return j.inner.Release(ctx) }
-
 // ---------------------------------------------------------------------------
 // 1. Concurrent create: one launch, one grant, one consumer, no corpse
 // ---------------------------------------------------------------------------
 
-// TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant is the composed
+// TestConcurrentCreateLaunchesOneSessionAndStartsOneConsumer is the composed
 // form of Harness's TestServerHandleRestoreConcurrentColdRestoreYieldsToTheWinner
 // and TestServerHandleRestoreRaceLoserStartsNoWatcher (pkg/serve,
 // handlers_lifecycle_test.go).
 //
-// WHAT THE COMPOSITION ADDS TO internal/residency'S OWN RACE TESTS is the two
-// objects that package cannot see. An attach opens a JOURNAL GRANT at step 3
-// and starts a COMMAND CONSUMER at step 8, and both are the composition's: the
-// residency manager is handed a fencer and an ownership seam and has no idea
-// either exists. A second grant or a second consumer for one session is a
-// second writer on one journal and a second reader of one inbox, and neither
-// shows up in a registry count.
+// WHAT THE COMPOSITION ADDS TO internal/residency'S OWN RACE TESTS is the object
+// that package cannot see. An attach starts a COMMAND CONSUMER at its last step,
+// and that is the composition's: the residency manager is handed an ownership
+// seam and has no idea a consumer exists. A second consumer for one session is a
+// second reader of one inbox advancing one durable cursor, and it does not show
+// up in a registry count.
+//
+// IT USED TO COUNT JOURNAL GRANTS TOO, and that half is gone with the attach's
+// journal fence rather than merely unasserted: a composed Host opens no journal
+// writer, so there is no second grant to race for.
 //
 // THE MEASURED SHAPE, WHICH IS NOT THE SHAPE HARNESS HAS. Harness lets N cold
 // restores race and cleans up the N-1 losers. Host does not produce losers on
@@ -909,13 +838,9 @@ func (j *commandJournal) Release(ctx context.Context) error { return j.inner.Rel
 // claim that can pass because the counter is broken, so a second session is
 // attached concurrently in the same fixture and the same counter reports its
 // opening separately. A counter that always answered one would fail there.
-func TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant(t *testing.T) {
+func TestConcurrentCreateLaunchesOneSessionAndStartsOneConsumer(t *testing.T) {
 	const racers = 8
-	opener := newRecordingOpener(nil)
-	f := newFixture(t, func(o *Options, _ *host.Options) {
-		opener.inner = o.OpenSession
-		o.OpenSession = opener.openGrant
-	})
+	f := newFixture(t)
 	f.start()
 
 	type outcome struct {
@@ -973,18 +898,7 @@ func TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant(t *testing.T)
 		t.Errorf("%d of %d racers reported Attached true, want exactly one establishing call", attached, racers)
 	}
 
-	// (b) ONE JOURNAL GRANT, AND IT IS STILL HELD. Two grants for one session
-	// are two writers on one journal; a released grant here would mean the
-	// session that survived cannot write.
-	grants := opener.opened(keyA)
-	if len(grants) != 1 {
-		t.Fatalf("%d journal grants were opened for one session under %d concurrent creates, want 1", len(grants), racers)
-	}
-	if released := grants[0].releaseTally(); released != 0 {
-		t.Errorf("the surviving session's journal grant was released %d times", released)
-	}
-
-	// (c) ONE OF EVERYTHING THE COMPOSITION OWNS.
+	// (b) ONE OF EVERYTHING THE COMPOSITION OWNS.
 	if launches := f.rig.Launches(); launches != 1 {
 		t.Errorf("the rig was asked to launch %d times for one cold session, want 1", launches)
 	}
@@ -992,7 +906,7 @@ func TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant(t *testing.T)
 		t.Errorf("the registry holds %d residencies, want 1", len(entries))
 	}
 	f.svc.mu.Lock()
-	consumers, sessions, pending := len(f.svc.consumers), len(f.svc.sessions), len(f.svc.pendingGrants)
+	consumers, sessions := len(f.svc.consumers), len(f.svc.sessions)
 	f.svc.mu.Unlock()
 	if consumers != 1 {
 		t.Errorf("%d command consumers are registered for one session, want 1", consumers)
@@ -1000,15 +914,11 @@ func TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant(t *testing.T)
 	if sessions != 1 {
 		t.Errorf("the composition tracks %d resident sessions, want 1", sessions)
 	}
-	// A stashed grant nobody took is a grant nobody can release.
-	if pending != 0 {
-		t.Errorf("%d journal grants are still stashed unclaimed after the attach completed, want 0", pending)
-	}
 
-	// (d) THE CONTROL FOR (b). The counter is asked about a SECOND session, so
-	// a counter that answered "one" regardless would fail here. It also shows
-	// the per-key slot is per KEY: a second session is not serialized behind
-	// the first.
+	// (c) THE CONTROL FOR (b). The counters are asked about a SECOND session, so
+	// a count that answered "one" regardless would fail here. It also shows the
+	// per-key slot is per KEY: a second session is not serialized behind the
+	// first.
 	other := sessionwire.SessionID("session-control")
 	if _, err := f.svc.Attach(context.Background(), residency.Request{
 		TenantID:  tenantA,
@@ -1019,11 +929,14 @@ func TestConcurrentCreateLaunchesOneSessionAndOpensOneJournalGrant(t *testing.T)
 	}); err != nil {
 		t.Fatalf("the control attach failed: %v", err)
 	}
-	if got := len(opener.opened(registry.Key{TenantID: tenantA, SessionID: other})); got != 1 {
-		t.Fatalf("the control session recorded %d openings, want 1; the counter in (b) cannot distinguish one opening from any other number", got)
+	f.svc.mu.Lock()
+	consumers, sessions = len(f.svc.consumers), len(f.svc.sessions)
+	f.svc.mu.Unlock()
+	if consumers != 2 || sessions != 2 {
+		t.Fatalf("after an unrelated second attach the composition holds %d consumers and %d sessions, want 2 and 2; the counts in (b) cannot distinguish one from any other number", consumers, sessions)
 	}
-	if got := len(opener.opened(keyA)); got != 1 {
-		t.Fatalf("the raced session now records %d openings after an unrelated attach, want 1", got)
+	if _, running := f.svc.ConsumerFor(registry.Key{TenantID: tenantA, SessionID: other}); !running {
+		t.Fatalf("the control session started no consumer of its own")
 	}
 }
 
@@ -1260,12 +1173,14 @@ type commandFixture struct {
 	server  *httptest.Server
 }
 
-// newCommandFixture wires durableCommands into every command seam at once.
+// newCommandFixture wires durableCommands into the composition's command seams.
 //
-// It replaces SIX of the composition's seams together — Inbox, Cursors,
-// Records, Applications, Gates and InboxWrites — because they are six views of
-// one durable object and wiring them to different doubles would let a test pass
-// against a Host that read one and wrote another.
+// IT USED TO WIRE SIX AND NOW WIRES TWO. Inbox and Cursors are the consumption
+// half and are what a composed Host reads; Records, Applications, Gates and
+// InboxWrites were the APPLICATION half, and the composition no longer declares
+// them — see commands.NoDispatch. The double still implements all six, because
+// its own job is to be at least as strict as the seams it stands in for and the
+// four unwired ones are what the attempt-aware applier will be measured against.
 func newCommandFixture(t *testing.T) *commandFixture {
 	t.Helper()
 	store := newDurableCommands(keyA)
@@ -1273,20 +1188,8 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	runtime.effects = store
 
 	f := newFixture(t, func(o *Options, _ *host.Options) {
-		inner := o.OpenSession
-		o.OpenSession = func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (JournalGrant, error) {
-			grant, err := inner(ctx, tenant, session)
-			if err != nil {
-				return nil, err
-			}
-			return &commandJournal{inner: grant, store: store}, nil
-		}
 		o.Inbox = store
 		o.Cursors = store
-		o.Records = store
-		o.Applications = store
-		o.Gates = store
-		o.InboxWrites = store
 	})
 	f.rig.Session = runtime
 	f.start()
@@ -1295,87 +1198,141 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	return &commandFixture{fixture: f, store: store, runtime: runtime, server: server}
 }
 
-// awaitApplied blocks until the runtime has been driven want times, bounded by
-// a failure deadline against a real transport. It is a rendezvous on the
-// RUNTIME, which is the thing the claim is about, and not on anything that
-// merely precedes it.
-func (c *commandFixture) awaitApplied(want int) []department.RuntimeCommand {
+// awaitBlocked blocks until this session's consumer has stopped at one command
+// and reports what it stopped on.
+//
+// IT READS THE CONSUMER'S OWN LAST PASS rather than inferring a block from an
+// absence. "The runtime was never driven" is also true of a consumer that was
+// never started, of one that listed nothing, and of a link that never delivered;
+// the pass result distinguishes all four, because it names the command the pass
+// examined and the cause it stopped for.
+func (c *commandFixture) awaitBlocked(command sessionwire.CommandID) commands.BlockedCommand {
 	c.t.Helper()
+	c.svc.mu.Lock()
+	consumer := c.svc.consumers[keyA]
+	c.svc.mu.Unlock()
+	if consumer == nil {
+		c.t.Fatal("the attached session has no consumer at all")
+	}
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for {
-		applied := c.runtime.appliedCommands()
-		if len(applied) >= want {
-			return applied
+		if blocked := consumer.LastPass().Blocked; blocked != nil && blocked.CommandID == command {
+			return *blocked
 		}
 		select {
-		case <-c.runtime.drove:
+		case <-time.After(time.Millisecond):
 		case <-deadline.C:
-			c.t.Fatalf("the runtime was driven %d times, want at least %d", len(applied), want)
-			return nil
+			c.t.Fatalf("the consumer never blocked on %q; its last pass was %+v", command, consumer.LastPass())
+			return commands.BlockedCommand{}
 		}
 	}
 }
 
-// TestADuplicateCommandDeliveryAppliesTheCommandOnce is the composed form of
-// Harness's create idempotency (pkg/serve, TestServerHandleCreateIdempotentSequences,
-// TestServerHandleCreateIdempotentConcurrent and TestIdempotencyStoreLookup).
+// awaitCursor blocks until the durable consumption cursor reaches want.
+func (c *commandFixture) awaitCursor(want uint64) {
+	c.t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		if got := c.store.consumedCursor(); got >= want {
+			return
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			c.t.Fatalf("the durable cursor is %d, want at least %d", c.store.consumedCursor(), want)
+			return
+		}
+	}
+}
+
+// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt is the HARD BOUNDARY
+// measured in composition, and it replaces a test that asserted the opposite.
 //
-// THE MECHANISM IS NOT HARNESS'S AND THAT IS THE POINT. Harness deduplicates on
-// a client-supplied Idempotency-Key held in an in-memory store with a TTL. Host
-// has no such store and must not grow one: §10.4 gives every admitted command
-// an IMMUTABLE per-session acceptance order, and Host consumes strictly after a
-// DURABLE cursor. Duplication is therefore not detected, it is impossible — a
-// second delivery of a CommandID whose order the cursor has passed cannot be
-// listed at all.
+// WHAT IT REPLACED AND WHY. TestADuplicateCommandDeliveryAppliesTheCommandOnce
+// drove a whole apply through this composition — claim, payload load, journal
+// prefix, runtime, terminal settlement — against a double of the LEGACY command
+// family. A Host cannot reach that family on a session it can hold, so the
+// behaviour it measured was one no deployment could ever produce. The
+// idempotency claim underneath it is unchanged and is not this test's: a second
+// delivery of a CommandID whose order the cursor has passed cannot be listed at
+// all, which is the consumption mechanism and is measured against the RELEASED
+// store in inbox_differential_test.go.
 //
-// THE DOUBLE IS NOT WHAT MAKES THIS PASS. durableCommands deduplicates nothing
-// by CommandID; its ListOrdered honours afterOrder because that is the Inbox
-// contract. A Host that ignored its cursor, or that re-listed from zero, drives
-// the runtime twice and fails here.
+// THE PROPERTY HERE IS THAT A DELIVERED COMMAND REACHES THE CONSUMER AND STOPS.
+// A Host running commands.NoDispatch lists the command, refuses it by name
+// before touching any seam, and blocks the pass — leaving the durable record
+// exactly where Factory put it, so the Host that comes after can still apply it.
 //
-// THE CONTROL IS A SECOND, DISTINCT COMMAND, which is applied — so "applied
-// once" is a statement about duplicates rather than about a Host that applies
-// nothing.
-func TestADuplicateCommandDeliveryAppliesTheCommandOnce(t *testing.T) {
+// TWO POSITIVE CONTROLS, because every assertion below is an absence.
+//
+//	(1) the runtime CAN be driven and the counter CAN see it, shown by driving
+//	    it directly through the same instrument the absence is read from;
+//	(2) the consumer IS consuming, shown by settling the command terminally out
+//	    of band and watching the durable cursor advance past it — which also
+//	    shows the refusal is a decision about DISPATCH and not a consumer that
+//	    is wedged, asleep or never started.
+func TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt(t *testing.T) {
 	c := newCommandFixture(t)
 
 	first := c.store.accept(t, "command-one", `{"blocks":[{"text":"hello"}]}`)
 	channel := hostlink.ChannelFor(keyA)
 	link := dialFactoryLink(t, c.server.URL, tenantA)
 	accepted(t, link.rpc(2, hostlink.MethodBind, c.bindRequest(tenantA, sessionA, 9)))
-
-	// THE SAME DELIVERY, TWICE. Two Factory replicas forwarding one command is
-	// ordinary, and the wire carries nothing but the CommandID either time.
 	accepted(t, link.rpc(3, channel, sessionwire.HostLinkCommandDelivery{CommandID: first}))
-	accepted(t, link.rpc(4, channel, sessionwire.HostLinkCommandDelivery{CommandID: first}))
 
-	applied := c.awaitApplied(1)
-	if len(applied) != 1 {
-		t.Fatalf("the runtime was driven %d times for one command delivered twice, want once: %+v", len(applied), applied)
+	blocked := c.awaitBlocked(first)
+
+	// (a) THE REFUSAL IS THE NAMED ONE. An untyped error here would be
+	// indistinguishable from a store that was simply unreachable, and the whole
+	// point of a typed refusal is that a later reader can tell a boundary from
+	// an outage.
+	var refusal *commands.ApplyError
+	if !errors.As(blocked.Cause, &refusal) {
+		t.Fatalf("the pass blocked with %T (%v), want a *commands.ApplyError", blocked.Cause, blocked.Cause)
 	}
-	if applied[0].CommandID != first {
-		t.Fatalf("the runtime was driven with %q, want %q", applied[0].CommandID, first)
+	if refusal.Refusal != commands.RefusalDispatchUnavailable {
+		t.Errorf("the pass blocked with refusal %q, want %q", refusal.Refusal, commands.RefusalDispatchUnavailable)
 	}
-	if got := c.store.stateOf(first); got != commands.StateApplied {
-		t.Fatalf("the durable record settled as %q, want %q", got, commands.StateApplied)
+	if refusal.CommandID != first {
+		t.Errorf("the refusal names command %q, want %q", refusal.CommandID, first)
 	}
 
-	// THE CONTROL. A second, distinct command is admitted and delivered on the
-	// same link, and IS applied.
-	second := c.store.accept(t, "command-two", `{"blocks":[{"text":"again"}]}`)
-	accepted(t, link.rpc(5, channel, sessionwire.HostLinkCommandDelivery{CommandID: second}))
-	both := c.awaitApplied(2)
-	if len(both) != 2 {
-		t.Fatalf("the runtime was driven %d times for two distinct commands, want twice", len(both))
+	// (b) NOTHING DURABLE MOVED. A refusal that had already claimed the record,
+	// or moved it to applying, would be the exact state this boundary exists to
+	// prevent: an effect nobody can settle.
+	if got := c.store.stateOf(first); got != commands.StatePending {
+		t.Errorf("the durable record is %q, want %q; the refusal moved a record it must leave alone", got, commands.StatePending)
 	}
-	if both[1].CommandID != second {
-		t.Fatalf("the second application drove %q, want %q", both[1].CommandID, second)
+	if cursor := c.store.consumedCursor(); cursor != 0 {
+		t.Errorf("the durable cursor advanced to %d past a command that was never applied", cursor)
 	}
-	// And the duplicate still did not reappear.
-	if got := c.runtime.appliedCommands(); len(got) != 2 {
-		t.Fatalf("the runtime was driven %d times in total, want exactly the two distinct commands", len(got))
+
+	// (c) THE RUNTIME WAS NEVER DRIVEN.
+	if driven := c.runtime.appliedCommands(); len(driven) != 0 {
+		t.Fatalf("the runtime was driven %d times by a Host that does not dispatch: %+v", len(driven), driven)
 	}
+
+	// (d) CONTROL 1. The instrument in (c) can see a drive.
+	if err := c.runtime.ApplyCommand(context.Background(), department.RuntimeCommand{
+		CommandID: "command-control",
+		Kind:      string(commands.KindInput),
+		Payload:   []byte(`{"blocks":[{"text":"control"}]}`),
+	}); err != nil {
+		t.Fatalf("driving the runtime directly: %v", err)
+	}
+	if driven := c.runtime.appliedCommands(); len(driven) != 1 {
+		t.Fatalf("the runtime reports %d applications after being driven once; the absence in (c) is unfalsifiable", len(driven))
+	}
+
+	// (e) CONTROL 2. The consumer is consuming. The command is settled
+	// terminally by somebody else — a predecessor Host, or Factory's deadline
+	// reconciler — and this Host steps over it and advances its durable cursor,
+	// which is the half of the lifecycle that is fully live.
+	c.store.settle(first, commands.StateRejected)
+	c.svc.Wake(keyA)
+	c.awaitCursor(1)
 }
 
 // TestNoPrivatePayloadCrossesHostLinkInEitherDirection is the composed form of
@@ -1418,11 +1375,26 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 	}
 	accepted(t, link.rpc(4, channel, sessionwire.HostLinkCommandDelivery{CommandID: command}))
 
-	applied := c.awaitApplied(1)
-	// (a) THE RUNTIME DID GET IT. Without this the privacy claim below is
-	// satisfied by a Host that loaded nothing and applied nothing.
-	if !strings.Contains(string(applied[0].Payload), secret) {
-		t.Fatalf("the runtime was driven with payload %q, which does not carry the private body; the scan below would then prove nothing", applied[0].Payload)
+	// (a) THE HOST DID REACH THE COMMAND. Without this the privacy claim below
+	// is satisfied by a Host that listed nothing, consumed nothing and had no
+	// opportunity to leak anything.
+	//
+	// IT USED TO ASSERT THE RUNTIME WAS DRIVEN WITH THE SECRET, which is no
+	// longer a thing a composed Host does — see
+	// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt. The claim is
+	// unweakened and arguably sharper: the secret is in the durable record this
+	// Host consumed from and named in its own pass result, and it still does not
+	// cross the wire.
+	blocked := c.awaitBlocked(command)
+	if blocked.CommandID != command {
+		t.Fatalf("the consumer stopped at %q, want the command carrying the secret", blocked.CommandID)
+	}
+	stored, err := c.store.LoadPayload(context.Background(), tenantA, sessionA, command)
+	if err != nil {
+		t.Fatalf("reading the durable payload: %v", err)
+	}
+	if !strings.Contains(string(stored.Body), secret) {
+		t.Fatalf("the durable record does not carry the private body; the scan below would then prove nothing")
 	}
 
 	// (b) THE PUBLIC CONTROL CROSSES.
@@ -1463,8 +1435,8 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 		t.Fatalf("a delivery carrying a payload was neither refused at the transport nor answered with a Core class: %s", mustJSON(t, smuggled))
 	}
 
-	if got := len(c.runtime.appliedCommands()); got != 1 {
-		t.Fatalf("the runtime was driven %d times, want the one legitimate application", got)
+	if got := len(c.runtime.appliedCommands()); got != 0 {
+		t.Fatalf("the runtime was driven %d times by a Host that does not dispatch", got)
 	}
 }
 

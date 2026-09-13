@@ -310,24 +310,77 @@ type fakeStore struct {
 
 	mu     sync.Mutex
 	leases map[registry.Key]*fakeLease
-	grants map[registry.Key]*fakeGrant
+	modes  map[registry.Key]protocolMode
 	rows   []sessionwire.HostLinkRegistryObservation
 	hold   chan struct{}
 }
+
+// protocolMode is the immutable catalog binding sessionstore pins on a session,
+// modelled here because Host's behaviour differs by it and no fixture in this
+// package used to vary it.
+//
+// A FAKE THAT ANSWERS BOTH MODES THE SAME WAY IS LOOSER THAN THE STORE, and it
+// was: this fixture's opener minted a grant for anything it was asked about, so
+// every composed attach test ran against a store that cannot exist. The released
+// store binds the mode at AcquireResidency and then refuses the two families
+// against each other, and both refusals are modelled below.
+type protocolMode string
+
+const (
+	// modeDisposition is what AcquireResidency pins, and therefore the only
+	// mode a Host can ever hold a session in.
+	modeDisposition protocolMode = "disposition"
+
+	// modeLegacy is a session bound to the other family before this Host saw
+	// it. AcquireResidency refuses it outright, so a composed Host fails at
+	// step 2 and takes nothing.
+	modeLegacy protocolMode = "legacy"
+)
 
 func newFakeStore(trace *recorder) *fakeStore {
 	return &fakeStore{
 		trace:  trace,
 		leases: map[registry.Key]*fakeLease{},
-		grants: map[registry.Key]*fakeGrant{},
+		modes:  map[registry.Key]protocolMode{},
 	}
 }
 
+// bind pins one session's catalog protocol mode. An unbound session is in
+// disposition mode, which is what AcquireResidency would pin for it.
+func (s *fakeStore) bind(key registry.Key, mode protocolMode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modes[key] = mode
+}
+
+// mode reports the binding a session carries.
+func (s *fakeStore) mode(key registry.Key) protocolMode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bound, held := s.modes[key]; held {
+		return bound
+	}
+	return modeDisposition
+}
+
+// AcquireSessionLease grants residency, and REFUSES A SESSION BOUND TO THE OTHER
+// FAMILY.
+//
+// That is finding F16(a) modelled rather than restated: AcquireResidency reads
+// the immutable catalog binding and refuses anything that is not
+// ProtocolModeDisposition with catalogInvalid("binding.protocol_mode"). A fake
+// that granted one would let a composed attach proceed past a step the released
+// store stops, and every assertion after it would be about a Host that cannot
+// exist.
 func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (residency.Lease, error) {
 	s.trace.record("lease.acquire")
+	key := registry.Key{TenantID: tenant, SessionID: session}
+	if mode := s.mode(key); mode != modeDisposition {
+		return nil, fmt.Errorf("catalog invalid (binding.protocol_mode): the session is bound to %s and residency is granted only in disposition mode", mode)
+	}
 	lease := &fakeLease{trace: s.trace, epoch: 9, lost: make(chan struct{})}
 	s.mu.Lock()
-	s.leases[registry.Key{TenantID: tenant, SessionID: session}] = lease
+	s.leases[key] = lease
 	s.mu.Unlock()
 	return lease, nil
 }
@@ -373,41 +426,6 @@ func (s *fakeStore) ReleaseWorkspace(context.Context, sessionwire.TenantID, sess
 
 func (s *fakeStore) LoadSession(context.Context, sessionwire.TenantID, sessionwire.SessionID) ([]byte, error) {
 	return nil, nil
-}
-
-// openSession is the composition's SessionOpener.
-func (s *fakeStore) openSession(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (JournalGrant, error) {
-	s.trace.record("journal.open")
-	grant := &fakeGrant{trace: s.trace}
-	s.mu.Lock()
-	s.grants[registry.Key{TenantID: tenant, SessionID: session}] = grant
-	s.mu.Unlock()
-	return grant, nil
-}
-
-// fakeGrant is one session's journal writer.
-type fakeGrant struct {
-	trace    *recorder
-	mu       sync.Mutex
-	released int
-}
-
-func (g *fakeGrant) AppendApplicationPrefix(context.Context, sessionwire.TenantID, sessionwire.SessionID, commands.Prefix) error {
-	return nil
-}
-
-func (g *fakeGrant) Release(context.Context) error {
-	g.mu.Lock()
-	g.released++
-	g.mu.Unlock()
-	g.trace.record("journal.release")
-	return nil
-}
-
-func (g *fakeGrant) releaseCount() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.released
 }
 
 // fakeInbox is the durable per-session command inbox.
@@ -458,43 +476,6 @@ func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ se
 		return fmt.Errorf("fakeCursors: order %d is below the committed %d", order, c.cursor)
 	}
 	c.cursorEpoch, c.cursor = epoch, order
-	return nil
-}
-
-// fakeCommands is the private command-record half an applier reads and writes.
-// Nothing in these tests drives an application, so every method reports an
-// absent record rather than inventing one.
-type fakeCommands struct{}
-
-func (fakeCommands) LoadCommand(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID) (commands.Record, error) {
-	return commands.Record{}, errors.New("no command")
-}
-
-func (fakeCommands) LoadPayload(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID) (commands.Payload, error) {
-	return commands.Payload{}, errors.New("no payload")
-}
-
-func (fakeCommands) FindApplication(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID) (commands.Application, error) {
-	return commands.Application{}, nil
-}
-
-func (fakeCommands) LoadGate(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.GateID) (commands.Gate, bool, error) {
-	return commands.Gate{}, false, nil
-}
-
-func (fakeCommands) ClaimCommand(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID, commands.Claim) (uint64, error) {
-	return 0, nil
-}
-
-func (fakeCommands) BeginApplying(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID, commands.Applying) (uint64, error) {
-	return 0, nil
-}
-
-func (fakeCommands) CompleteCommand(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID, commands.Completion) error {
-	return nil
-}
-
-func (fakeCommands) RejectCommand(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID, commands.Rejection) error {
 	return nil
 }
 
@@ -693,13 +674,8 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		Durable:              store,
 		Locations:            store,
 		Workspaces:           store,
-		OpenSession:          store.openSession,
 		Inbox:                &fakeInbox{},
 		Cursors:              &fakeCursors{},
-		Records:              fakeCommands{},
-		Applications:         fakeCommands{},
-		Gates:                fakeCommands{},
-		InboxWrites:          fakeCommands{},
 		Targets:              directory,
 		Checkpointer:         &fakeCheckpointer{trace: trace},
 		Auth:                 auth,
@@ -824,13 +800,6 @@ func (s *fakeStore) releaseHold() {
 	if hold != nil {
 		close(hold)
 	}
-}
-
-// grantFor returns the journal grant taken for one session.
-func (s *fakeStore) grantFor(key registry.Key) *fakeGrant {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.grants[key]
 }
 
 // controllableSession is the launched runtime every composition test drives.

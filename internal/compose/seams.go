@@ -4,9 +4,6 @@ import (
 	"context"
 	"time"
 
-	sessionwire "github.com/looprig/core/sessionwire/v1"
-
-	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/service"
@@ -33,31 +30,6 @@ type TargetDirectory interface {
 	// advertisement would still be ranked and still be due.
 	WithdrawTarget(context.Context, service.Advertisement) error
 }
-
-// JournalGrant is one session's journal writer, held for the life of its
-// residency.
-//
-// IT IS NOT THE RESIDENCY GRANT and the two are never assigned across. This
-// one's Epoch is the runtime-facing journal epoch; the residency grant's is
-// Host's own lease epoch, and sessionstore's own documentation says a residency
-// epoch "must never be compared with, or used as, a journal epoch".
-type JournalGrant interface {
-	commands.JournalWrites
-
-	// Release hands the journal grant back.
-	Release(context.Context) error
-}
-
-// SessionOpener takes a session's journal grant and commits its opening fence
-// in one call.
-//
-// IT IS A FUNCTION RATHER THAN AN INTERFACE for a reason worth stating, because
-// the shape looks arbitrary otherwise. The released adapter's OpenSession
-// returns its own concrete *Grant, and Go has no covariant result, so no
-// interface with this method could be satisfied by it without changing that
-// signature. A function type is satisfied by a three-line closure at the
-// binary, which keeps the adapter's return concrete for its own callers.
-type SessionOpener func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (JournalGrant, error)
 
 // WorkStates reports what one resident session is currently doing.
 //

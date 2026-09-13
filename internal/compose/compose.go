@@ -39,18 +39,23 @@ type Options struct {
 	Clock Clock
 
 	// Durable seams, each already declared by the package that consumes it.
-	Leases       residency.SessionLeases
-	Durable      residency.DurableStore
-	Locations    residency.Locations
-	Workspaces   residency.Workspaces
-	OpenSession  SessionOpener
-	Inbox        commands.Inbox
-	Cursors      commands.Cursors
-	Records      commands.CommandRecords
-	Applications commands.Applications
-	Gates        commands.Gates
-	InboxWrites  commands.InboxWrites
-	Targets      TargetDirectory
+	//
+	// THE APPLICATION SEAMS ARE ABSENT AND THAT IS THE BOUNDARY. An earlier
+	// composition took Records, Applications, Gates, InboxWrites and a
+	// SessionOpener, and wired them into commands.Applier. All five are over
+	// sessionstore's LEGACY command family, which a Host cannot reach —
+	// AcquireResidency pins ProtocolModeDisposition — and the opener's journal
+	// writer was refused outright for every session this Host can hold. They are
+	// not retained as unread options: an option a composition validates and never
+	// consults is a configuration a deployment can get wrong with no consequence
+	// and no signal. commands.NoDispatch says what replaced them.
+	Leases     residency.SessionLeases
+	Durable    residency.DurableStore
+	Locations  residency.Locations
+	Workspaces residency.Workspaces
+	Inbox      commands.Inbox
+	Cursors    commands.Cursors
+	Targets    TargetDirectory
 
 	// Checkpointer is the product's release checkpoint. It is REQUIRED; see
 	// host.Checkpointer for why an absent one may not become a no-op.
@@ -139,13 +144,12 @@ type Service struct {
 	drainer   *lifecycle.Drainer
 	links     *links
 
-	mu            sync.Mutex
-	started       bool
-	stopped       bool
-	sessions      map[registry.Key]*resident
-	consumers     map[registry.Key]*commands.Consumer
-	leases        map[registry.Key]residency.Lease
-	pendingGrants map[registry.Key]JournalGrant
+	mu        sync.Mutex
+	started   bool
+	stopped   bool
+	sessions  map[registry.Key]*resident
+	consumers map[registry.Key]*commands.Consumer
+	leases    map[registry.Key]residency.Lease
 
 	// stopping closes when this Host is stopped, so a compatibility wait ends
 	// with the process rather than outliving it.
@@ -184,15 +188,14 @@ func New(options Options) (*Service, error) {
 	}
 
 	composed := &Service{
-		options:       options,
-		registry:      index,
-		capacity:      capacity,
-		advertise:     advertise,
-		sessions:      map[registry.Key]*resident{},
-		consumers:     map[registry.Key]*commands.Consumer{},
-		leases:        map[registry.Key]residency.Lease{},
-		pendingGrants: map[registry.Key]JournalGrant{},
-		stopping:      make(chan struct{}),
+		options:   options,
+		registry:  index,
+		capacity:  capacity,
+		advertise: advertise,
+		sessions:  map[registry.Key]*resident{},
+		consumers: map[registry.Key]*commands.Consumer{},
+		leases:    map[registry.Key]residency.Lease{},
+		stopping:  make(chan struct{}),
 	}
 
 	composed.warm, err = residency.NewWarmReleaser(residency.WarmOptions{
@@ -230,7 +233,6 @@ func New(options Options) (*Service, error) {
 		Registry:       index,
 		Admissions:     capacity,
 		Leases:         &leaseRecorder{service: composed, inner: options.Leases},
-		Journal:        composed.journal(),
 		Durable:        options.Durable,
 		Workspaces:     options.Workspaces,
 		Locations:      options.Locations,
@@ -291,13 +293,8 @@ func (o Options) validate() error {
 		{"Durable", o.Durable != nil},
 		{"Locations", o.Locations != nil},
 		{"Workspaces", o.Workspaces != nil},
-		{"OpenSession", o.OpenSession != nil},
 		{"Inbox", o.Inbox != nil},
 		{"Cursors", o.Cursors != nil},
-		{"Records", o.Records != nil},
-		{"Applications", o.Applications != nil},
-		{"Gates", o.Gates != nil},
-		{"InboxWrites", o.InboxWrites != nil},
 		{"Targets", o.Targets != nil},
 		{"Checkpointer", o.Checkpointer != nil},
 		{"Auth", o.Auth != nil},

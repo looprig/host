@@ -23,11 +23,12 @@ and compared segment by segment, so a sibling package under
 
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` v0.7.0 store.
+`github.com/looprig/sessionstore` v0.8.0 store.
 
-**Durable command consumption is bound at the adapter and does not run in a
-composed Host.** Read the next section before you plan around it; the
-distinction is measured, not cautionary.
+**A composed Host attaches a disposition session and consumes its durable
+command stream. It does NOT dispatch a command into the runtime, by design and
+explicitly.** Read the next section before you plan around it; the boundary is
+measured, not cautionary.
 
 ## Known limitations you must read before deploying
 
@@ -59,66 +60,80 @@ is a statement to Factory and does not close it.
 
 Tracked as `O7.1-hostwide-drain-crosses-tenants`.
 
-### A composed Host cannot attach a disposition session, so it consumes nothing
+### A composed Host consumes and does not dispatch
 
-**This entry replaces a narrower one that was wider than its evidence.** The
-first version of it said a Host "can consume its inbox against a real store and
-cannot yet apply a command end to end". The second half is right; **the first
-half is not true of a composed Host**, and a limitations section that overstates
-what works is the same defect it exists to disclose.
+**This entry replaces two earlier ones, and both were wrong in the same
+direction — a sentence wider than its evidence.** The first said a Host "can
+consume its inbox against a real store", which was an ADAPTER result stated about
+a composed Host. The second said a composed Host "cannot attach a disposition
+session, so it consumes nothing", which was true until the attach-time journal
+fence was removed and is now false.
 
-**What is measured.**
+**What a composed Host does.** It attaches a disposition session end to end,
+reaches `BeginOwnership`, and starts the session's durable command consumer,
+which lists the session's commands in acceptance order, steps over terminal
+records and advances the durable consumption cursor. This is measured in
+COMPOSITION — `internal/compose/attach_fence_test.go` and
+`TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt` — rather than at the
+adapter, and the adapter-level differential
+(`internal/compose/inbox_differential_test.go`) still holds the three consumption
+methods against the released store.
 
-- A Host can take a **residency** grant on a disposition session.
-  `AcquireResidency` requires `ProtocolModeDisposition` and succeeds.
-  (`internal/sessionstoreadapter/residency_test.go`.)
-- A Host **cannot** take that session's **journal** grant. `OpenSession` is
-  refused: `Store.OpenJournal` binds the session scope through
-  `bindSessionScopeMode(..., ProtocolModeLegacy)`
-  (`sessionstore@v0.7.0 keyspace.go:320-327` → `bindProtocolMode`), which
-  conflicts with a disposition witness. Measured by
-  `TestTheResidencyGrantAndTheJournalGrantAreDifferentLeases`.
-- **An attach commits the opening journal fence at step 3, before hydration**
-  (`internal/residency/manager.go:1129-1133`, through
-  `internal/compose/adapters.go:80` → `adapted.OpenSession`). So an attach of a
-  disposition session **fails at `StepFence`**, every time.
-- Steps 4 through 9 therefore never run. **Step 8 is where the command consumer
-  is started** (`manager.go:1343`), so in a composed Host **no consumer exists
-  and no command is consumed**.
+**What it does not do, deliberately.** It refuses to drive any command into the
+runtime. `commands.NoDispatch` is the Processor a composed Host runs; it refuses
+every non-terminal command it is handed with
+`ApplyRefusal("dispatch_unavailable")`, **before touching any durable seam**, so
+the record stays exactly where Factory put it and a later Host can still apply
+it. The pass blocks at that command and the session makes no further progress.
 
-**What "consumption works" is and is not.** `ListOrdered`, `LoadCursor` and
-`SaveCursor` are bound to the released store and are verified against it —
-including the strictly-after bound the idempotency property rests on and both of
-`SaveDispositionCommandCursor`'s fences — by a **differential test that drives
-the three adapter methods directly**
-(`internal/compose/inbox_differential_test.go`). That is an **adapter-level**
-result. **It is not a statement about a composed Host**, which never reaches
-those methods.
+**Why the refusal is explicit rather than an omission.** In disposition mode the
+store settles a command from durable evidence: an application prefix carrying the
+attempt's identity, verified for `AttemptID` equality. `harness` v0.33.0's
+`runtimecommand.Admitted` carries **no attempt identity**, so a dispatch commits
+a prefix no settler can ever match, and the settlement design **forbids**
+converting "a legacy prefix followed by an uncertain external effect" into
+`not_applied`. A dispatched command would therefore sit in `applying` **forever,
+with a real runtime effect behind it** — strictly worse than one never
+dispatched.
 
-**Applying a command is a three-repository sequence, not a Host fix.** Even with
-the attach unblocked, two things the apply path needs do not exist:
+**What unblocks dispatch**, which is a three-repository sequence and not a Host
+fix:
 
-- **`sessionstore` has no disposition claim edge.** `pending -> claimed` has no
-  entry point (`disposition_settlement.go:89`) and there is **no in-package
-  writer of a `DispositionClaim` at all** (`disposition_inbox.go:594-600`).
-- **No evidence reader exists.** In disposition mode **the store decides the
-  terminal arm from injected durable evidence**, and a caller supplies nothing
-  an outcome is built from; `harness` v0.33.0's `runtimecommand.Admitted`
-  carries no attempt identity, so nothing can produce that evidence today.
+- an **attempt-aware harness writer** that stamps the attempt identity into the
+  application prefix;
+- a Host applier bound to the **disposition family's** edges rather than to the
+  legacy CAS transitions `internal/commands/apply.go` still models.
+  `sessionstore` v0.8.0 supplies the claim and pre-attempt reject edges
+  (`ClaimDispositionCommand`, `RejectDispositionCommand`); the claim edge takes a
+  `*ResidencyGrant` rather than an epoch, so the grant must reach the adapter,
+  and it **cannot answer for a legacy session, cannot express a superseded
+  residency through the exported API, and cannot be driven across a process
+  boundary**. A rejection carries **no durable reason**, and rows written by
+  v0.8.0 can never be backfilled with one.
 
-Two consequences follow that a reader planning this work must not get wrong.
-**There is no Host-authored rejection once an attempt exists** — a runtime error
-with no durable disposition leaves the command `applying` until a **successor
-runtime** writes `not_applied` under a strictly later journal grant. And
-**missing evidence is not proof that nothing was applied**, so a Host must never
-re-dispatch on its absence. Host's honest exactly-once claim is therefore **"at
-most one authorized attempt, settled only from the runtime's durable
-disposition"**.
+Two consequences a reader planning that work must not get wrong. **There is no
+Host-authored rejection once an attempt exists** — a runtime error with no
+durable disposition leaves the command `applying` until a **successor runtime**
+writes `not_applied` under a strictly later journal grant. And **missing evidence
+is not proof that nothing was applied**, so a Host must never re-dispatch on its
+absence. Host's honest exactly-once claim is therefore **"at most one authorized
+attempt, settled only from the runtime's durable disposition"**.
 
-Migrating the transitions is **not** attempted here: it cannot be completed
-against released dependencies, and a half-migration that removes the journal
-grant from attach is a `residency.Manager` and `compose` change. Both are
-v0.2.0 work.
+### Host opens no journal writer, and must not
+
+The attach sequence used to commit an **opening in-stream journal fence at step
+3, before hydration**. It is gone. `Store.OpenJournal` binds the session scope
+through `bindSessionScopeMode(..., ProtocolModeLegacy)`, which conflicts with the
+disposition witness `AcquireResidency` pins — so that fence failed for **every**
+session a Host can hold, and no composed Host ever reached `BeginOwnership`.
+
+Under Bundle B, where disposition is the only supported mode, **the journal grant
+is the runtime's and Host never takes one**. The journal epoch Host needs is read
+from the launched runtime through `department.LeaseEpochReporter` and reported as
+`residency.Residency.JournalEpoch`. `compose.Options` declares no session opener,
+so the absence is held by the compiler, and
+`internal/residency.TestNoProductionFileOpensAJournalWriter` holds it
+structurally. **Do not reinstate it.**
 
 ## Build and test
 

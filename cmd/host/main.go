@@ -165,21 +165,23 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 		Durable:        adapted,
 		Locations:      adapted,
 		Workspaces:     bootstrap.Workspaces(),
-		OpenSession: func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (compose.JournalGrant, error) {
-			return adapted.OpenSession(ctx, tenant, session)
-		},
 		// THE ADAPTED STORE IS BOTH SEAMS. Before sessionstore v0.7.0 these
 		// were the product's to supply and the generic binary's default
 		// refused; the release closed the gap and the composition now names
 		// one object for the durable inbox and its cursor, which is what makes
 		// "the stream Host consumes is the stream its cursor indexes" true by
 		// construction rather than by a convention a deployment could break.
+		//
+		// THE APPLICATION SEAMS ARE NO LONGER WIRED, and the adapter still
+		// exports them. This binary composed a journal opener and the four
+		// legacy-family command seams into an applier; a composed Host now
+		// consumes and does not dispatch, so compose.Options names none of
+		// them. The adapter's methods stay because they are tested against the
+		// released store and are what the attempt-aware applier will be built
+		// from — but nothing wires them, and adding a wire here is the change
+		// commands.NoDispatch exists to make visible.
 		Inbox:                adapted,
 		Cursors:              adapted,
-		Records:              adapted,
-		Applications:         adapted,
-		Gates:                adapted,
-		InboxWrites:          adapted,
 		Targets:              adapted,
 		Checkpointer:         bootstrap.Checkpointer(),
 		Auth:                 bootstrap.Auth(),

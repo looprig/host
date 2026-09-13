@@ -7,28 +7,33 @@
 //
 //  1. validate AgentID/runtime compatibility and Host admission;
 //  2. obtain the SessionStore lease and its new epoch;
-//  3. commit the opening journal fence before hydration;
-//  4. construct/restore the runtime and its workspace/checkpoint;
-//  5. validate the required runtime capabilities;
-//  6. atomically install the local registry winner;
-//  7. write the epoch-fenced durable Host registry/residency projection;
-//  8. begin inbox/event/heartbeat ownership;
-//  9. only then report attached.
+//  3. construct/restore the runtime and its workspace/checkpoint;
+//  4. validate the required runtime capabilities and read the runtime's own
+//     journal grant;
+//  5. atomically install the local registry winner;
+//  6. write the epoch-fenced durable Host registry/residency projection;
+//  7. begin inbox/event/heartbeat ownership;
+//  8. only then report attached.
 //
-// Step 3 is the one most easily read as bookkeeping. It is not: spec §10.1
-// fences the journal with an IN-STREAM ownership record rather than an epoch
-// column, and a writer's first append is that fence, committed by sequence CAS
-// against the tip it read immediately beforehand. Committing it BEFORE
-// hydration is what makes a predecessor's every later append fail even if the
-// predecessor has not yet observed Lease.Lost(). Hydrating first would leave a
-// window in which two processes both believe they own the stream and neither
-// has staked it.
+// THERE USED TO BE A STEP BETWEEN 2 AND 3, and its removal is the one thing a
+// reader of an older revision of this file must know. An opening in-stream
+// journal fence was committed BEFORE hydration, on §10.1's reasoning that a
+// predecessor's later appends must fail even before it observes Lease.Lost().
+// That reasoning is sound and it is not Host's to act on. The fence is a
+// JOURNAL write, Host does not hold the journal grant, and the released store
+// binds a journal writer to ProtocolModeLegacy while AcquireResidency pins
+// ProtocolModeDisposition — so the fence conflicted on binding.protocol_mode for
+// EVERY session a Host can hold, and no composed Host reached step 7 at all.
+// Under Bundle B, where disposition is the only supported mode, Host never opens
+// that writer; the journal epoch it needs is the RUNTIME'S, read at step 4
+// through department.LeaseEpochReporter, and the runtime's own composition root
+// is what stakes the stream. Do not reinstate it here.
 //
-// Nothing here is durable except the fence and the projection, and neither is
-// this package's to adjudicate: the LEASE is authoritative, the local registry
-// is an optimization, and the projection is a routing hint Factory may find
-// stale. What this package guarantees is narrower and is the thing a caller can
-// rely on: an Attach that returns an error took nothing that is still held.
+// Nothing here is durable except the projection, and that is not this package's
+// to adjudicate: the LEASE is authoritative, the local registry is an
+// optimization, and the projection is a routing hint Factory may find stale.
+// What this package guarantees is narrower and is the thing a caller can rely
+// on: an Attach that returns an error took nothing that is still held.
 package residency
 
 import (
@@ -179,33 +184,6 @@ func (e *LeaseCleanupError) Release(ctx context.Context) error {
 	return e.Cleanup(ctx)
 }
 
-// JournalFencer commits the opening in-stream ownership record.
-type JournalFencer interface {
-	// CommitOpeningFence appends the fence, committed by sequence CAS against
-	// the tip read immediately beforehand.
-	//
-	// IT TAKES NO EPOCH, and the removal is the structural half of O3.4's split.
-	// The fence is a JOURNAL record and Host does not hold the journal grant, so
-	// there is no number Host could soundly name here — the only epoch in Host's
-	// hand at this point in the sequence is its residency grant, which is the
-	// one value that must never reach a journal fence. The writer stamps its
-	// own, which is what the released store does anyway: JournalWriter refuses
-	// an application prefix whose epoch a caller chose, for the same reason.
-	// Removing the parameter means Host cannot get this wrong rather than
-	// meaning Host currently gets it right.
-	//
-	// A REFUSED CAS RETURNS ErrFenceConflict, and that is a contract rather
-	// than a courtesy. §10.1 fences the journal with an in-stream ownership
-	// record and not an epoch column, so a successor's committed fence makes
-	// this writer's sequence permanently stale and every later append fails
-	// "even if it has not observed Lease.Lost()". That is the same fact
-	// ErrEpochSuperseded carries on the mutable records; a fencer that reports
-	// it as an untyped error leaves the one write that is not a location write
-	// unclassifiable, which is where the next occurrence of this defect would
-	// have been.
-	CommitOpeningFence(context.Context, sessionwire.TenantID, sessionwire.SessionID) error
-}
-
 // SessionState is the durable state a hydration reads. It is deliberately not
 // host.SessionStore's opaque []byte: this package needs the fields, and
 // decoding them here would put a wire format in a state machine.
@@ -316,9 +294,9 @@ type OwnershipRequest struct {
 	// IT CLOSES A REAL HOLE, and an earlier version of this comment called it
 	// equivalent on a reason that was simply wrong — that a heartbeat ends its
 	// own fence only after the attach has returned. It does not: the heartbeat
-	// starts at step 8 and TWO fenced writes follow it inside the same attach.
+	// starts at step 7 and TWO fenced writes follow it inside the same attach.
 	// So a beat refused with ErrEpochSuperseded ends the heartbeat's fence
-	// without closing Lost(); step 9 then fails for some other reason; and the
+	// without closing Lost(); step 8 then fails for some other reason; and the
 	// unwinder's tombstone goes through a Manager fence that knows nothing, at
 	// an epoch a successor has already superseded. That closure's own comment
 	// calls that the worst case in the file, because a tombstone is a route
@@ -360,11 +338,11 @@ type Admissions interface {
 	// object and the same rule: internal/service owns exactly one of each, and
 	// two sources of "draining" is a Host that stops accepting in one place
 	// while advertising Accepting from the other. This Manager WAS that second
-	// place — step 9 published accepting as a literal true — so an attach
+	// place — step 8 published accepting as a literal true — so an attach
 	// admitted a moment before a drain began went on to advertise an accepting
 	// route on a draining Host. The window is not narrow: Admit refuses new
 	// sessions once draining, but an already-admitted attach spans the lease,
-	// the journal fence and the whole of hydration.
+	// and the whole of hydration.
 	Draining() bool
 }
 
@@ -514,7 +492,6 @@ type Step string
 const (
 	StepValidate     Step = "validate"
 	StepLease        Step = "lease"
-	StepFence        Step = "fence"
 	StepHydrate      Step = "hydrate"
 	StepCapabilities Step = "capabilities"
 	StepInstall      Step = "install"
@@ -608,7 +585,6 @@ type Options struct {
 	Admissions Admissions
 
 	Leases     SessionLeases
-	Journal    JournalFencer
 	Durable    DurableStore
 	Workspaces Workspaces
 	Locations  Locations
@@ -634,7 +610,6 @@ type Manager struct {
 	registry   LocalRegistry
 	admissions Admissions
 	leases     SessionLeases
-	journal    JournalFencer
 	durable    DurableStore
 	workspaces Workspaces
 	locations  Locations
@@ -677,7 +652,6 @@ func NewManager(options Options) (*Manager, error) {
 		{"Registry", options.Registry != nil},
 		{"Admissions", options.Admissions != nil},
 		{"Leases", options.Leases != nil},
-		{"Journal", options.Journal != nil},
 		{"Durable", options.Durable != nil},
 		{"Workspaces", options.Workspaces != nil},
 		{"Locations", options.Locations != nil},
@@ -694,7 +668,6 @@ func NewManager(options Options) (*Manager, error) {
 		registry:   options.Registry,
 		admissions: options.Admissions,
 		leases:     options.Leases,
-		journal:    options.Journal,
 		durable:    options.Durable,
 		workspaces: options.Workspaces,
 		locations:  options.Locations,
@@ -785,16 +758,16 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 	}
 
 	// THE FAST IDEMPOTENCY PATH IS GATED ON THE SESSION RECORD, which exists
-	// only from step 9. Gating it on the REGISTRY was a live escape: Insert
-	// marks an entry resident and accepting at step 6, so a concurrent Attach
-	// arriving in the 6-to-9 window bypassed the serialization entirely and
+	// only from step 8. Gating it on the REGISTRY was a live escape: Insert
+	// marks an entry resident and accepting at step 5, so a concurrent Attach
+	// arriving in the 5-to-8 window bypassed the serialization entirely and
 	// returned success carrying the winner's runtime — which the winner then
-	// released when its own step 7, 8 or 9 failed. The erroring call took
+	// released when its own step 6, 7 or 8 failed. The erroring call took
 	// nothing and the SUCCEEDING one was left holding a corpse: a Runtime whose
 	// ReleaseResidency had already been called and whose lease was gone.
 	//
 	// The record is written last, under the same mutex, so it reports attached
-	// only for a residency that reached step 9.
+	// only for a residency that reached step 8.
 	if existing, attached := m.attachedResidency(key); attached {
 		return existingResidency(existing, key, request)
 	}
@@ -826,7 +799,7 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 }
 
 // attachedResidency reports the residency of a session this Manager has
-// ATTACHED — one that reached step 9 — and nothing else.
+// ATTACHED — one that reached step 8 — and nothing else.
 //
 // It is deliberately narrower than "the registry holds an entry". A registry
 // entry exists from step 6, and between 6 and 9 the attach that installed it
@@ -1104,8 +1077,8 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 	unwound.own("session lease", lease.Release)
 
-	// THE ONE MECHANISM, for this attach's four fenced writes. Three of them
-	// were unclassified: a step 9 publish refused for a later epoch was seen
+	// THE ONE MECHANISM, for this attach's three fenced writes. All of them
+	// were unclassified: a step 8 publish refused for a later epoch was seen
 	// and then the unwinder tombstoned at the same epoch anyway — and a
 	// tombstone is a ROUTE REMOVAL, so under a store that fences removals less
 	// strictly than publishes that takes the SUCCESSOR's route away. The
@@ -1119,26 +1092,17 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	epoch := lease.Epoch()
 	if epoch == 0 {
-		// Refused HERE rather than at step 7. Core rejects a zero lease_epoch
+		// Refused HERE rather than at step 6. Core rejects a zero lease_epoch
 		// on the registry observation, so a Host that carried one this far
-		// would discover it having already fenced the journal and launched a
-		// runtime.
+		// would discover it having already launched a runtime.
 		return fail(StepLease, "", "the lease was granted with epoch 0, which Core refuses on every fenced record", nil)
 	}
 
-	// -- 3. the opening journal fence, BEFORE hydration ----------------------
-	if err := fence.write(func() error {
-		return m.journal.CommitOpeningFence(sessionCtx, key.TenantID, key.SessionID)
-	}); err != nil {
-		return fail(StepFence, "", "the opening journal fence could not be committed", err)
-	}
-	// A COMMITTED FENCE IS NOT COMPENSATED, and that is the design rather than
-	// an omission: §10.1 makes a fence permanent on purpose, so that a
-	// successor's fence — not a predecessor's tidying up — is what makes the
-	// predecessor's sequence stale. There is nothing to undo and undoing it
-	// would be the bug.
-
-	// -- 4. hydration: durable state, workspace, runtime ---------------------
+	// -- 3. hydration: durable state, workspace, runtime ---------------------
+	//
+	// HYDRATION FOLLOWS THE LEASE DIRECTLY, with no journal write between them.
+	// See the sequence at the top of this file for why the fence that used to
+	// sit here is gone and must not come back.
 	state, err := m.durable.LoadSessionState(sessionCtx, key.TenantID, key.SessionID)
 	if err != nil {
 		return fail(StepHydrate, "", "the durable session state could not be read", err)
@@ -1217,7 +1181,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 	unwound.own("runtime residency", runtime.ReleaseResidency)
 
-	// -- 5. the required runtime capabilities --------------------------------
+	// -- 4. the required runtime capabilities --------------------------------
 	//
 	// The five CAPABILITY assertions are department's, made before it will
 	// produce a Runtime at all, and they cannot be repeated here: Runtime
@@ -1237,8 +1201,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	// THE RUNTIME'S OWN JOURNAL GRANT, read here and nowhere else in this
 	// sequence. It is a capability of the launched runtime, so it cannot be read
-	// before step 4 and must not be guessed before then — which is precisely why
-	// step 3's fence no longer names an epoch at all.
+	// before step 3 and must not be guessed before then — which is one of the two
+	// reasons the attach-time journal fence could not soundly exist here: it ran
+	// BEFORE hydration and so before any runtime grant was readable.
 	//
 	// A RUNTIME REPORTING NO GRANT IS NOT REFUSED. harness gates the report on
 	// the lease still being held and answers (0, false) for a headless session,
@@ -1251,7 +1216,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	reportedEpoch, journalHeld := runtime.LeaseEpoch()
 	journalEpoch := JournalEpoch(reportedEpoch)
 
-	// -- 6. the atomic local registry winner ---------------------------------
+	// -- 5. the atomic local registry winner ---------------------------------
 	entry, won := m.registry.Insert(key, registry.Admission{
 		AgentID:         request.AgentID,
 		Target:          target.target,
@@ -1319,7 +1284,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		return nil
 	})
 
-	// -- 7. the epoch-fenced durable residency projection --------------------
+	// -- 6. the epoch-fenced durable residency projection --------------------
 	observation := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyAttaching, false)
 	if err := fence.write(func() error { return m.locations.PublishResidency(sessionCtx, observation) }); err != nil {
 		return fail(StepPublish, "", "the durable residency projection could not be written", err)
@@ -1340,7 +1305,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		})
 	})
 
-	// -- 8. inbox, event and heartbeat ownership -----------------------------
+	// -- 7. inbox, event and heartbeat ownership -----------------------------
 	handle, err := m.ownership.BeginOwnership(sessionCtx, OwnershipRequest{
 		Key:             key,
 		AgentID:         request.AgentID,
@@ -1362,7 +1327,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 	unwound.own("ownership", handle.Stop)
 
-	// -- 9. only then, attached ----------------------------------------------
+	// -- 8. only then, attached ----------------------------------------------
 	//
 	// §9's state machine is cold -> ATTACHING -> resident, and the second
 	// fenced write is what moves it. Publishing `resident` at step 7 would
@@ -1388,7 +1353,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// as a literal and accepting as `!Draining()` while the beat built
 	// residencyOf(entry.State) and entry.Accepting && !Draining() — two of the
 	// three content axes divergent, so a heartbeat that had already surrendered
-	// between step 8 and here would have its releasing, not-accepting record
+	// between step 7 and here would have its releasing, not-accepting record
 	// overwritten with resident and accepting.
 	live, stillHeld := m.registry.Get(key)
 	if !stillHeld || live.Generation != entry.Generation {
