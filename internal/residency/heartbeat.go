@@ -39,11 +39,21 @@ var ErrEpochSuperseded = errors.New("residency: a later lease epoch has already 
 // IT HAS NOT OBSERVED Lease.Lost()". That is the same meaning ErrEpochSuperseded
 // carries on the mutable records, and this module had no sentinel for it at all.
 //
-// HOST NO LONGER MAKES THE WRITE THAT FIRST NEEDED IT — the attach-time opening
-// journal fence is gone — and the sentinel is NOT dead residue with it. The
-// released store answers a refused cursor compare-and-swap with the same
-// JournalErrorFenced code, so internal/sessionstoreadapter still classifies onto
-// this value and the consumer's own fence still branches on it.
+// NOTHING WIRED PRODUCES IT TODAY, and an earlier version of this paragraph said
+// otherwise — which was a worse defect than leaving the arm unexplained. It
+// claimed the released store answers a refused durable CURSOR compare-and-swap
+// with the same JournalErrorFenced code. It does not. Store.SaveCursor
+// classifies through classifyInbox, which produces ErrEpochSuperseded and
+// nothing else; the ONLY producer of this sentinel is classifyJournal, whose
+// only callers are the journal-writer file Host declares unwired. With the
+// attach-time fence removed this sentinel therefore has NO production producer
+// at all.
+//
+// IT IS KEPT ANYWAY, and the reason is the honest one rather than a reachability
+// it does not have. The arm becomes load-bearing the moment this package makes a
+// fenced journal write again — the attempt-aware applier's correlation prefix is
+// exactly that — and a sentinel deleted here would have to be rediscovered along
+// with the classification rule that belongs to it. See epochFence.write.
 var ErrFenceConflict = errors.New("residency: the journal fence was refused by a later owner's committed sequence")
 
 // epochFence is the ONE mechanism every fenced write goes through.
@@ -143,18 +153,21 @@ func (f *epochFence) write(run func() error) error {
 	return err
 }
 
-// MEASURED, AND ONE ARM IS EQUIVALENT WITHIN THIS PACKAGE. Removing
-// ErrFenceConflict from the classification above changes nothing this package
-// can observe: it makes no journal write at all now that the attach-time
-// opening fence is gone, so no write here can be refused for a stale sequence.
-// It is kept because the sentinel is NOT dead — the released store answers a
-// refused durable cursor compare-and-swap with the same JournalErrorFenced
-// code, internal/sessionstoreadapter classifies onto this value, and the
-// command consumer's own fence branches on it — and because an arm removed here
-// would have to be rediscovered when the attempt-aware applier adds this
-// package's next fenced write. What holds it today is the structural guard: a
-// fenced write must be routed through here whether or not the classification
-// can yet be observed from this package.
+// MEASURED, AND THE ErrFenceConflict ARM IS EQUIVALENT EVERYWHERE, not merely
+// within this package. Removing it from the classification above changes no
+// observable behaviour anywhere in the module: the sentinel has no production
+// producer at all now that the attach-time journal fence is gone, because the
+// one function that raises it — internal/sessionstoreadapter's classifyJournal —
+// is called only from the unwired journal writer. It is NOT reached through the
+// durable cursor; that path classifies through classifyInbox, which raises
+// ErrEpochSuperseded only.
+//
+// AN EQUIVALENCE IS DECLARED, NOT REPAIRED BY NARRATIVE. It is stated here so
+// that the next reader does not discover it as a surviving mutant and conclude
+// the classification is broken, and the arm is kept for the two reasons on
+// ErrFenceConflict itself. What holds the RULE today is the structural guard: a
+// fenced write must be routed through here whether or not its classification can
+// yet be raised.
 
 // HeartbeatRegistry is the local index a heartbeat reads and, on loss or
 // release, claims.

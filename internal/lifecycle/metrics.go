@@ -44,6 +44,34 @@ type GateWaits interface {
 	GateWaiting() uint64
 }
 
+// BlockedConsumers reports how many resident sessions have a durable command
+// consumer that has stopped at a command it will not process.
+//
+// IT IS THE WEDGE'S ONLY OPERATIONAL SIGNATURE, and it exists because that
+// condition had none. A composed Host runs commands.NoDispatch and therefore
+// stops at the first non-terminal command in every session, permanently and BY
+// DESIGN — but a blocked pass returns a nil error, so Consumer.Failures() stays
+// at zero; nothing in internal/commands logs; and the HostLink delivery that
+// triggered it was answered `accepted`. Without this gauge a Host in its
+// designed steady state is indistinguishable on every exported signal from a
+// healthy Host with an empty inbox, and the first operator to meet it would have
+// to diagnose it from source.
+//
+// IT IS OPTIONAL IN SHAPE AND WIRED IN FACT, which is the difference between it
+// and GateWaits below. GateWaits has no production source at all; this one is
+// satisfied by the composition, so the gauge is live in a real binary rather
+// than reserved for a later one.
+//
+// A NON-ZERO VALUE IS NOT AN ERROR. It says work is durably present and this
+// Host is not advancing past it — which is expected while dispatch is refused,
+// and is a fault only once an applier exists. Alert on it changing meaning, not
+// on it being non-zero.
+type BlockedConsumers interface {
+	// BlockedSessions returns the number of resident sessions whose last
+	// consumption pass ended blocked at a command.
+	BlockedSessions() uint64
+}
+
 // CommandBacklog reports how far behind durable command consumption is and how
 // deep the local queue has grown. It is OPTIONAL for the same reason GateWaits
 // is: internal/commands owns both numbers and the composition that wires them
@@ -132,6 +160,10 @@ type Snapshot struct {
 	// is composed, which is not the same as none; see GateWaits.
 	GateWaiting uint64
 
+	// BlockedSessions is resident sessions whose consumer has stopped at a
+	// command. See BlockedConsumers for why a non-zero value is expected today.
+	BlockedSessions uint64
+
 	AdmissionWeightConsumed uint64
 	AdmissionWeightCapacity uint64
 
@@ -165,9 +197,10 @@ type MetricsOptions struct {
 	// narrow-interface posture the rest of the module has.
 	Capacity uint64
 
-	// GateWaits and Backlog are optional.
+	// GateWaits, Backlog and Blocked are optional.
 	GateWaits GateWaits
 	Backlog   CommandBacklog
+	Blocked   BlockedConsumers
 
 	// Budget is the weighted memory limit. Its zero value is UNKNOWN.
 	Budget MemoryBudget
@@ -238,6 +271,9 @@ func (m *Metrics) Snapshot() Snapshot {
 	if m.options.GateWaits != nil {
 		snapshot.GateWaiting = m.options.GateWaits.GateWaiting()
 	}
+	if m.options.Blocked != nil {
+		snapshot.BlockedSessions = m.options.Blocked.BlockedSessions()
+	}
 	if m.options.Backlog != nil {
 		snapshot.CommandLag, snapshot.QueueDepth = m.options.Backlog.Backlog()
 	}
@@ -256,6 +292,11 @@ var (
 		"host_sessions",
 		"Sessions this Host holds, by local residency state.",
 		[]string{"state"}, nil,
+	)
+	blockedSessionsDesc = prometheus.NewDesc(
+		"host_sessions_command_blocked",
+		"Resident sessions whose durable command consumer has stopped at a command it will not process. EXPECTED to equal the number of sessions holding work while this Host refuses to dispatch; see commands.NoDispatch. It is the only signal that distinguishes that designed state from an idle Host.",
+		nil, nil,
 	)
 	gateWaitingDesc = prometheus.NewDesc(
 		"host_sessions_gate_waiting",
@@ -302,8 +343,9 @@ var (
 // whether a descriptor happened to be composed.
 func (m *Metrics) Describe(out chan<- *prometheus.Desc) {
 	for _, desc := range []*prometheus.Desc{
-		sessionsDesc, gateWaitingDesc, admissionConsumedDesc, admissionCapacityDesc,
-		commandLagDesc, queueDepthDesc, releaseFailuresDesc, memoryBudgetDesc,
+		sessionsDesc, gateWaitingDesc, blockedSessionsDesc, admissionConsumedDesc,
+		admissionCapacityDesc, commandLagDesc, queueDepthDesc, releaseFailuresDesc,
+		memoryBudgetDesc,
 	} {
 		out <- desc
 	}
@@ -322,6 +364,7 @@ func (m *Metrics) Collect(out chan<- prometheus.Metric) {
 	// an unknown memory budget is the absence of one.
 	gauge(sessionsDesc, snapshot.Draining, string(registry.StateDraining))
 	gauge(gateWaitingDesc, snapshot.GateWaiting)
+	gauge(blockedSessionsDesc, snapshot.BlockedSessions)
 	gauge(admissionConsumedDesc, snapshot.AdmissionWeightConsumed)
 	gauge(admissionCapacityDesc, snapshot.AdmissionWeightCapacity)
 	gauge(commandLagDesc, snapshot.CommandLag)

@@ -37,11 +37,11 @@ import (
 // written by the fake that received the call.
 //
 // WHAT IT CANNOT SEE, stated because the ordering assertion would otherwise
-// read as covering nine steps when it observes seven. Step 1's AgentID and
-// compatibility validation and step 5's capability validation reach no
+// read as covering eight steps when it observes six. Step 1's AgentID and
+// compatibility validation and step 4's capability validation reach no
 // collaborator that could record a call — they are decisions over values
 // already held. Step 1's position is pinned instead by the tests asserting an
-// EMPTY trace on a refusal, and step 5's by runtime.done, which only the
+// EMPTY trace on a refusal, and step 4's by runtime.done, which only the
 // liveness check calls.
 type trace struct {
 	mu    sync.Mutex
@@ -399,7 +399,7 @@ type fakeOwnership struct {
 	stopErr  error
 	// nilHandle makes BeginOwnership report success and return nothing.
 	nilHandle bool
-	// inWindow runs while the attach is between step 6 and step 9: the
+	// inWindow runs while the attach is between step 5 and step 8: the
 	// registry entry exists and the session is not attached yet. It is the only
 	// seam that reaches that window, and no other collaborator is called inside
 	// it.
@@ -2137,7 +2137,7 @@ func TestProductionCodeNeverDerivesASessionFromARequestContext(t *testing.T) {
 // TestTheCompatibilityIDIsSnapshottedOnceAndNotReRead holds the rule
 // internal/service learned the hard way: a LaunchTarget is caller code and may
 // answer differently on every call, so a value VALIDATED at step 1 does not
-// bind the value RE-READ at step 4 or step 7.
+// bind the value RE-READ at step 3 or step 6.
 func TestTheCompatibilityIDIsSnapshottedOnceAndNotReRead(t *testing.T) {
 	const drifted department.CompatibilityID = "rig-2027-01-drifted"
 	f := newFixture(t)
@@ -2584,14 +2584,14 @@ func TestTheSessionRecordHoldsWhatO32WillNeed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The 6-to-9 window
+// The 5-to-8 window
 // ---------------------------------------------------------------------------
 
 // TestNothingIsReportableAsAttachedInsideTheInstallWindow is the deterministic
 // half of the guard over a live escape.
 //
-// registry.Insert marks an entry resident and accepting at step 6, and the
-// attach can still fail at 7, 8 or 9 and take it away again. A fast path gated
+// registry.Insert marks an entry resident and accepting at step 5, and the
+// attach can still fail at 6, 7 or 8 and take it away again. A fast path gated
 // on the REGISTRY therefore returned success, carrying the winner's runtime, to
 // a caller arriving inside that window — and when the winner then rolled back,
 // that caller was left holding a Runtime whose ReleaseResidency had already
@@ -2660,7 +2660,7 @@ func TestAttachReadsResidencyOnlyThroughTheAttachedPredicate(t *testing.T) {
 			}
 			examined++
 			for _, reached := range registryFieldSelections(function) {
-				t.Errorf("%s: Attach reads m.registry.%s directly; a registry entry exists from step 6 and may still be withdrawn, so residency must be read through attachedResidency", name, reached)
+				t.Errorf("%s: Attach reads m.registry.%s directly; a registry entry exists from step 5 and may still be withdrawn, so residency must be read through attachedResidency", name, reached)
 			}
 		}
 	}
@@ -2733,7 +2733,7 @@ func registryFieldSelections(function *ast.FuncDecl) []string {
 // with running ownership, whichever branch it took.
 //
 // It drives a second Attach into the install window through the ownership hook
-// while the winner is failing at step 9, and asserts the invariant whichever
+// while the winner is failing at step 8, and asserts the invariant whichever
 // branch that second call took. The DECIDABLE form of the same window is
 // TestASecondAttachCannotReturnFromInsideTheInstallWindow; this one is the
 // end-to-end statement of what a caller is guaranteed.
@@ -2757,7 +2757,7 @@ func TestNoSuccessfulAttachEverReportsAReleasedRuntime(t *testing.T) {
 
 	_, winnerErr := f.manager.Attach(context.Background(), f.request(ModeCreate))
 	if winnerErr == nil {
-		t.Fatal("the winner's injected step 9 failure was not reported")
+		t.Fatal("the winner's injected step 8 failure was not reported")
 	}
 	result := <-second
 
@@ -2777,7 +2777,7 @@ func TestNoSuccessfulAttachEverReportsAReleasedRuntime(t *testing.T) {
 		}
 	}
 	if _, live := f.manager.SessionContext(result.residency.Key); !live {
-		t.Error("a successful attach left no session context, so it did not reach step 9")
+		t.Error("a successful attach left no session context, so it did not reach step 8")
 	}
 	if running := f.ownership.runningCount(); running == 0 {
 		t.Error("a successful attach reported a residency with no ownership running")
@@ -2928,7 +2928,7 @@ func TestARollbackThatCannotReleaseNamesWhatIsStillHeld(t *testing.T) {
 
 	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
 	if err == nil {
-		t.Fatal("the injected step 9 failure was not reported")
+		t.Fatal("the injected step 8 failure was not reported")
 	}
 	var attach *AttachError
 	if !errors.As(err, &attach) {
@@ -3029,7 +3029,7 @@ func TestAStaleSessionRecordIsNotReportableAsAttached(t *testing.T) {
 // F1 named, without a race and without a timing assertion.
 //
 // The move that makes it decidable is making PARKING OBSERVABLE. A second
-// Attach arriving while the winner sits between step 6 and step 9 does exactly
+// Attach arriving while the winner sits between step 5 and step 8 does exactly
 // one of two things — it parks on the key slot, which is correct, or it returns
 // from inside the window, which is the escape — so a select between a
 // "parked" signal and the call's own result is total. No sleep, no deadline,
@@ -3043,7 +3043,7 @@ func TestAStaleSessionRecordIsNotReportableAsAttached(t *testing.T) {
 // exists to fix is not a guard.
 func TestASecondAttachCannotReturnFromInsideTheInstallWindow(t *testing.T) {
 	f := newFixture(t, func(f *fixture) {
-		// The winner fails at step 9, so a residency reported from inside the
+		// The winner fails at step 8, so a residency reported from inside the
 		// window would be one that is about to be withdrawn.
 		f.locations.publishErr = errors.New("injected")
 		f.locations.failOnCall = 2
@@ -3081,14 +3081,14 @@ func TestASecondAttachCannotReturnFromInsideTheInstallWindow(t *testing.T) {
 	}
 
 	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err == nil {
-		t.Fatal("the winner's injected step 9 failure was not reported")
+		t.Fatal("the winner's injected step 8 failure was not reported")
 	}
 	second := <-returned
 	if second.err == nil {
 		// Having waited for the slot, the second attach ran cold and won. Its
 		// residency must be a real one, not the withdrawn one.
 		if _, live := f.manager.SessionContext(second.residency.Key); !live {
-			t.Error("the second attach reported success without reaching step 9")
+			t.Error("the second attach reported success without reaching step 8")
 		}
 	}
 }
@@ -3178,7 +3178,7 @@ func TestALosingAttachThatCannotReleaseIsNotReportedAsSuccess(t *testing.T) {
 // reason for existing, defeated by taking the snapshot on the wrong side of the
 // lock.
 //
-// The winner is made to fail at step 9 so the parked attach runs COLD when it
+// The winner is made to fail at step 8 so the parked attach runs COLD when it
 // wakes; if the winner succeeded the parked call would take the warm path and
 // launch nothing, which is a different rule.
 func TestAParkedAttachLaunchesOnTheTargetAsItIsWhenItRuns(t *testing.T) {
@@ -3227,7 +3227,7 @@ func TestAParkedAttachLaunchesOnTheTargetAsItIsWhenItRuns(t *testing.T) {
 	}
 
 	if _, err := f.manager.Attach(context.Background(), f.requestWithoutBuild(ModeCreate)); err == nil {
-		t.Fatal("the winner's injected step 9 failure was not reported")
+		t.Fatal("the winner's injected step 8 failure was not reported")
 	}
 	second := <-returned
 	if second.err != nil {
@@ -3294,7 +3294,7 @@ func TestAColdCreateIsLaunchedWithItsDurableNamespace(t *testing.T) {
 // won is not the one this request describes" — and on that exit the shared
 // admission and workspace have already been skipped and are genuinely still
 // held. Returning existingResidency's refusal unchanged named step "validate"
-// for a failure at step 6, carried no Unreleased, and left an admission charge
+// for a failure at step 5, carried no Unreleased, and left an admission charge
 // and a materialized workspace behind in silence: the package's own headline
 // guarantee, falsified.
 //
@@ -3439,7 +3439,7 @@ func TestACompensationThatReportsItDidNothingIsNamed(t *testing.T) {
 //
 // internal/service names two sources of "draining" as the defect — a Host that
 // stops accepting in one place while advertising Accepting from the other — and
-// the Manager WAS that second place: step 9 passed accepting as a literal true
+// the Manager WAS that second place: step 8 passed accepting as a literal true
 // while the heartbeat ANDs the entry's flag with the Host's. Admit refuses new
 // sessions once draining, but an already-admitted attach spans the lease, the
 // journal fence and the whole of hydration, so a drain lands inside it
@@ -3487,7 +3487,7 @@ func TestAnAttachThatFinishesOnADrainingHostDoesNotAdvertiseAccepting(t *testing
 // TestASupersededEpochDuringAnAttachStopsTheRollbackTombstoning is the
 // Manager's half of the rule the heartbeat has enforced three times.
 //
-// Step 9's publish is refused for a later epoch — SEEN — and the unwinder then
+// Step 8's publish is refused for a later epoch — SEEN — and the unwinder then
 // wrote the tombstone at that same epoch anyway. The consequence is worse here
 // than on the handle: a tombstone is a route REMOVAL, so under any store that
 // fences removals less strictly than publishes it takes the SUCCESSOR's route
@@ -3595,10 +3595,10 @@ func TestAnAttachWhoseLeaseClosesMidWayDoesNotReportItselfAttached(t *testing.T)
 //
 // The two writers share the record and their epoch, so the store cannot order
 // them; what keeps them from contradicting each other is publishing the SAME
-// FUNCTION of the SAME STATE. Step 9 used to build `resident` as a literal and
+// FUNCTION of the SAME STATE. Step 8 used to build `resident` as a literal and
 // accepting as !Draining(), while the beat builds residencyOf(entry.State) and
 // entry.Accepting && !Draining() — so a residency moved to releasing between
-// step 8 and step 9 had that state overwritten with resident and accepting.
+// step 7 and step 8 had that state overwritten with resident and accepting.
 //
 // The registry is moved through the inWindow seam, which is by construction
 // between the install and the resident publish.
@@ -3624,10 +3624,10 @@ func TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState(t *testing
 		t.Fatal("the residency is gone")
 	}
 	if last.Accepting != entry.Accepting {
-		t.Errorf("step 9 published Accepting %t while the registry says %t", last.Accepting, entry.Accepting)
+		t.Errorf("step 8 published Accepting %t while the registry says %t", last.Accepting, entry.Accepting)
 	}
 	if entry.State == registry.StateReleasing && last.Residency != sessionwire.SessionResidencyReleasing {
-		t.Errorf("step 9 published residency %q while the registry says %q; the two writers must publish the same function of the same state", last.Residency, entry.State)
+		t.Errorf("step 8 published residency %q while the registry says %q; the two writers must publish the same function of the same state", last.Residency, entry.State)
 	}
 
 	// The CONTROL, one position over: with the registry left alone the same
@@ -3647,8 +3647,8 @@ func TestTheAttachAndTheHeartbeatPublishTheSameFunctionOfTheSameState(t *testing
 // TestTheHeartbeatsFenceIsTheAttachsFence is the shared-fence hole, which an
 // earlier disclosure called equivalent on a reason that was false.
 //
-// The heartbeat starts at step 8 and TWO fenced writes follow it inside the
-// same attach: step 9's publish and the unwinder's tombstone. So a beat refused
+// The heartbeat starts at step 7 and TWO fenced writes follow it inside the
+// same attach: step 8's publish and the unwinder's tombstone. So a beat refused
 // with ErrEpochSuperseded ends the heartbeat's fence WITHOUT closing Lost() —
 // which is the case the fence exists for — and with a fence of its own the
 // Manager knows nothing and tombstones at an epoch a successor has superseded.
@@ -3722,10 +3722,10 @@ func TestTheHeartbeatsFenceIsTheAttachsFence(t *testing.T) {
 	}
 }
 
-// TestAResidencyRemovedBeforeStep9IsNotReportedAttached pins the branch B2's
-// fix introduced: step 9 re-reads the registry, so it can find the residency
+// TestAResidencyRemovedBeforeStep8IsNotReportedAttached pins the branch B2's
+// fix introduced: step 8 re-reads the registry, so it can find the residency
 // gone or replaced.
-func TestAResidencyRemovedBeforeStep9IsNotReportedAttached(t *testing.T) {
+func TestAResidencyRemovedBeforeStep8IsNotReportedAttached(t *testing.T) {
 	f := newFixture(t)
 	f.ownership.inWindow = func() {
 		entry, held := f.registry.Get(f.key())
@@ -3738,7 +3738,7 @@ func TestAResidencyRemovedBeforeStep9IsNotReportedAttached(t *testing.T) {
 
 	_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
 	if err == nil {
-		t.Fatal("an attach whose residency vanished before step 9 reported itself attached")
+		t.Fatal("an attach whose residency vanished before step 8 reported itself attached")
 	}
 	var attach *AttachError
 	if !errors.As(err, &attach) {
@@ -3759,7 +3759,7 @@ func TestAResidencyRemovedBeforeStep9IsNotReportedAttached(t *testing.T) {
 		t.Errorf("the rollback does not name the registry entry among what it could not release: %v", attach.Unreleased)
 	}
 	if _, live := f.manager.SessionContext(f.key()); live {
-		t.Error("a session context survives an attach that never reached step 9")
+		t.Error("a session context survives an attach that never reached step 8")
 	}
 }
 
@@ -4164,16 +4164,31 @@ func TestAttachValidatesTheTenantIdentity(t *testing.T) {
 // needs arrives through department.LeaseEpochReporter, and Host holds nothing
 // the writer would be fenced by.
 //
-// IT IS A STRUCTURAL CHECK OVER PARSED CALLS rather than a text search, and it
-// fails as vacuous at zero files. Its subject is this package, which is where
-// the sequence lives and where a reinstatement would be written.
+// ITS REACH IS ONE PACKAGE, AND THE RESIDUE IS STATED RATHER THAN IMPLIED. It
+// is a structural check over parsed calls rather than a text search, and it
+// fails as vacuous at zero files — but it reads THIS DIRECTORY only, so it is
+// not the module-wide rule the sentence above states. Three routes, three
+// holders:
+//
+//   - in this package, this guard;
+//   - in internal/compose and cmd/host — where two thirds of the removed wiring
+//     actually lived — the COMPILER, because compose.Options declares no opener
+//     to supply one to. That arm is stronger than this one;
+//   - internal/sessionstoreadapter.Store.OpenSession, the module's only live
+//     OpenJournal call, is outside BOTH. It is an exported adapter method with
+//     no production caller, and wiring it from internal/compose would be caught
+//     by neither. Nothing here prevents that; what prevents it is that adding a
+//     field to compose.Options is a visible diff and dispatch.go says not to.
+//
+// A seam of FUNC type under another name also evades this detector, which
+// matches on the selector — measured, and the shape compose.SessionOpener had.
 func TestNoProductionFileOpensAJournalWriter(t *testing.T) {
 	files := parseProductionFiles(t)
 	inspected := 0
 	for name, file := range files {
 		inspected++
 		for _, opened := range journalOpenings(file) {
-			t.Errorf("%s: calls %s; Host opens no journal writer and commits no opening fence, and the epoch it needs is the runtime's", name, opened)
+			t.Errorf("%s: calls %s; no file in THIS PACKAGE opens a journal writer or commits an opening fence, and the epoch Host needs is the runtime's", name, opened)
 		}
 	}
 	if inspected == 0 {

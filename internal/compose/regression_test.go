@@ -552,6 +552,8 @@ type durableCommands struct {
 	cursor      uint64
 	cursorEpoch uint64
 	lists       int
+	// payloadLoads counts private-body reads. See payloadLoadCount.
+	payloadLoads int
 }
 
 // durableRecord is one inbox record and everything the journal proves about it.
@@ -715,11 +717,41 @@ func (d *durableCommands) LoadCommand(_ context.Context, _ sessionwire.TenantID,
 func (d *durableCommands) LoadPayload(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, id sessionwire.CommandID) (commands.Payload, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.payloadLoads++
 	record, held := d.records[id]
 	if !held {
 		return commands.Payload{}, errors.New("durableCommands: no such command")
 	}
 	return commands.Payload{Body: append([]byte(nil), record.payload...)}, nil
+}
+
+// payloadLoadCount reports how many times Host asked this store for a private
+// command body.
+//
+// IT IS THE MEASUREMENT BEHIND A CLAIM THAT WOULD OTHERWISE BE STRUCTURAL. A
+// composed Host runs commands.NoDispatch, and the only production reader of a
+// payload is commands.Applier, which has no production call site — so "the
+// private body did not cross HostLink" is true because the body never enters the
+// process. That is a strong property and a weak assertion: it cannot fail for
+// any implementation of the code under test. This counter turns the premise into
+// something a run observes, and it fires the moment an applier is wired back in.
+func (d *durableCommands) payloadLoadCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.payloadLoads
+}
+
+// storedPayload reads a record's private body WITHOUT counting the read, so a
+// test can establish that the store really holds the secret without spending the
+// measurement above.
+func (d *durableCommands) storedPayload(id sessionwire.CommandID) []byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, held := d.records[id]
+	if !held {
+		return nil
+	}
+	return append([]byte(nil), record.payload...)
 }
 
 func (d *durableCommands) FindApplication(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, id sessionwire.CommandID) (commands.Application, error) {
@@ -1344,12 +1376,23 @@ func TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt(t *testing.T) {
 // HARNESS FILTERS AND HOST STRUCTURALLY CANNOT CARRY IT. Harness's live plane
 // serves both public and private material and refuses the private half at the
 // encoder. Host's HostLink carries IDENTIFIERS: a command delivery is a
-// CommandID and nothing else, and the private body is loaded from SessionStore
-// AFTER the claim, on Host's own side, and handed to the runtime. So the
-// property re-established here is stronger and simpler than a filter — the
-// secret is never on the wire at all — and it is asserted on BYTES, over every
-// frame the link was ever sent, because a filter that decoded and re-encoded
-// could reintroduce it in a shape a struct comparison would not see.
+// CommandID and nothing else. So the property re-established here is stronger
+// and simpler than a filter — the secret is never on the wire at all — and it is
+// asserted on BYTES, over every frame the link was ever sent, because a filter
+// that decoded and re-encoded could reintroduce it in a shape a struct
+// comparison would not see.
+//
+// THE TWO HALVES ARE NOT HELD THE SAME WAY, AND SAYING SO IS THE POINT. This
+// comment used to end "the private body is loaded from SessionStore AFTER the
+// claim, on Host's own side, and handed to the runtime". A composed Host does
+// none of that: commands.Command carries no payload, the only production reader
+// of one is commands.Applier, and NewApplier has no production call site. The
+// body therefore never enters the process, and the OUTBOUND assertion (c) cannot
+// fail for any implementation of the code under test — it is held by
+// CONSTRUCTION. It is kept as a forward guard against a Host that loads payloads
+// again, and the construction itself is MEASURED by (a2) rather than asserted:
+// the store counts private-body reads and the count must be zero. The INBOUND
+// half (d) is a live assertion and fails closed today.
 //
 // THE INBOUND HALF MATTERS TOO. A Factory that could smuggle a body into a
 // delivery would bypass the durable record the applier reads, so a delivery
@@ -1379,22 +1422,27 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 	// is satisfied by a Host that listed nothing, consumed nothing and had no
 	// opportunity to leak anything.
 	//
-	// IT USED TO ASSERT THE RUNTIME WAS DRIVEN WITH THE SECRET, which is no
-	// longer a thing a composed Host does — see
-	// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt. The claim is
-	// unweakened and arguably sharper: the secret is in the durable record this
-	// Host consumed from and named in its own pass result, and it still does not
-	// cross the wire.
+	// IT USED TO ASSERT THE RUNTIME WAS DRIVEN WITH THE SECRET, which a composed
+	// Host no longer does — see
+	// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt. That is a
+	// WEAKENING of (c) and the header says so; what is asserted instead is that
+	// the Host reached this command at all, and that the store really holds the
+	// secret, so the scan below has something to find.
 	blocked := c.awaitBlocked(command)
 	if blocked.CommandID != command {
 		t.Fatalf("the consumer stopped at %q, want the command carrying the secret", blocked.CommandID)
 	}
-	stored, err := c.store.LoadPayload(context.Background(), tenantA, sessionA, command)
-	if err != nil {
-		t.Fatalf("reading the durable payload: %v", err)
-	}
-	if !strings.Contains(string(stored.Body), secret) {
+	if !strings.Contains(string(c.store.storedPayload(command)), secret) {
 		t.Fatalf("the durable record does not carry the private body; the scan below would then prove nothing")
+	}
+
+	// (a2) AND THE HOST NEVER ASKED FOR THE BODY. This is the measured form of
+	// "the secret never enters the process", which is what (c) actually rests on
+	// now. It is a live assertion: wiring commands.Applier back into the
+	// composition makes it fail, which is exactly when (c) stops being held by
+	// construction and has to start being held by the scan.
+	if loads := c.store.payloadLoadCount(); loads != 0 {
+		t.Fatalf("the Host read the private command body %d times; a composed Host that does not dispatch reads none", loads)
 	}
 
 	// (b) THE PUBLIC CONTROL CROSSES.
@@ -1406,7 +1454,11 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 		t.Fatalf("the public marker was not found in %d bytes of received frames; the scan cannot see what crosses and the negative below is unfalsifiable", len(wire))
 	}
 
-	// (c) THE SECRET DID NOT.
+	// (c) THE SECRET DID NOT. HELD BY CONSTRUCTION TODAY — see the header and
+	// (a2) — and retained as a forward guard rather than as a measurement of
+	// this build. Control (b) proves the scanner can see, but it proves it on
+	// the runtime-to-tail EVENT path, which is not the command-payload path;
+	// no production code joins the two any more.
 	if strings.Contains(string(wire), secret) {
 		t.Fatalf("the private command payload crossed HostLink; found in the %d bytes this link received", len(wire))
 	}
@@ -1437,6 +1489,16 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 
 	if got := len(c.runtime.appliedCommands()); got != 0 {
 		t.Fatalf("the runtime was driven %d times by a Host that does not dispatch", got)
+	}
+
+	// (e) THE CONTROL FOR (a2). "The Host read no payload" is a zero, and a zero
+	// is what a broken counter also reports. One read through the same method
+	// must move it, or (a2) is the very thing this test is here to stop being.
+	if _, err := c.store.LoadPayload(context.Background(), tenantA, sessionA, command); err != nil {
+		t.Fatalf("the control read of the private payload failed: %v", err)
+	}
+	if loads := c.store.payloadLoadCount(); loads != 1 {
+		t.Fatalf("the payload-load counter reports %d after exactly one read; the zero asserted in (a2) cannot be distinguished from a counter that never moves", loads)
 	}
 }
 

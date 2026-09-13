@@ -198,6 +198,37 @@ func (s *Service) recordConsumer(key registry.Key, consumer *commands.Consumer) 
 	s.consumers[key] = consumer
 }
 
+// BlockedSessions counts the resident sessions whose durable command consumer
+// has stopped at a command.
+//
+// IT IS THE FIRST PRODUCTION READER OF Consumer.LastPass. That method's own doc
+// calls itself "the loop's only reader … without this a blocked predecessor is
+// reported to nobody", and until this existed a composed binary was the nobody:
+// a blocked pass returns a nil error, so Failures() never moves, and a Host
+// wedged in its designed steady state read healthy on every exported signal.
+//
+// IT COUNTS SESSIONS AND NOT COMMANDS, deliberately. A pass reports the ONE
+// command it stopped at, so a per-command count would be a count of ones; how
+// many sessions are not advancing is the question an operator is actually
+// asking, and it is the one this can answer honestly.
+func (s *Service) BlockedSessions() uint64 {
+	s.mu.Lock()
+	consumers := make([]*commands.Consumer, 0, len(s.consumers))
+	for _, consumer := range s.consumers {
+		consumers = append(consumers, consumer)
+	}
+	s.mu.Unlock()
+	var blocked uint64
+	for _, consumer := range consumers {
+		if consumer.LastPass().Blocked != nil {
+			blocked++
+		}
+	}
+	return blocked
+}
+
+var _ lifecycle.BlockedConsumers = (*Service)(nil)
+
 // forgetConsumer removes a session's consumer.
 func (s *Service) forgetConsumer(key registry.Key) {
 	s.mu.Lock()

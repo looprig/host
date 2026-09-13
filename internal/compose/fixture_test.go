@@ -429,15 +429,68 @@ func (s *fakeStore) LoadSession(context.Context, sessionwire.TenantID, sessionwi
 }
 
 // fakeInbox is the durable per-session command inbox.
+//
+// IT HONOURS THE SESSION, THE CURSOR AND THE LIMIT, and until it did this
+// package could not see a Host that got any of the three wrong. commands.Inbox
+// declares "at most limit records STRICTLY AFTER afterOrder" for one
+// (tenant, session) pair, and this double returned its whole slice to anybody
+// who asked. Two mutants survived the entire composed suite on that: a Reconcile
+// that lists from 0 instead of from its durable cursor, and a composition that
+// builds every session's consumer with one hard-coded key.
+//
+// IT IS THE SAME DEFECT THE PROTOCOL-MODE FIX CLOSED, ON A DIFFERENT AXIS. A
+// fake corrected where it was caught and left loose everywhere else is how the
+// next one of these survives, so the three parameters are honoured together
+// rather than one at a time.
 type fakeInbox struct {
 	mu      sync.Mutex
 	records []commands.Command
+	// perSession, when non-nil, serves each key its own records. records is the
+	// single-session shorthand every existing test uses; a test needing two
+	// sessions to differ populates this instead.
+	perSession map[registry.Key][]commands.Command
+
+	// asks records what this inbox was ASKED, which is a different claim from
+	// what it answered. A Host that lists from the wrong bound is visible here
+	// immediately and directly; waiting to see the consequence makes the kill a
+	// timeout and the diagnosis a guess.
+	asks []inboxAsk
 }
 
-func (i *fakeInbox) ListOrdered(context.Context, sessionwire.TenantID, sessionwire.SessionID, uint64, int) ([]commands.Command, error) {
+// inboxAsk is one ListOrdered call, as it arrived.
+type inboxAsk struct {
+	Key   registry.Key
+	After uint64
+	Limit int
+}
+
+func (i *fakeInbox) ListOrdered(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, after uint64, limit int) ([]commands.Command, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return append([]commands.Command(nil), i.records...), nil
+	key := registry.Key{TenantID: tenant, SessionID: session}
+	i.asks = append(i.asks, inboxAsk{Key: key, After: after, Limit: limit})
+	held := i.records
+	if i.perSession != nil {
+		held = i.perSession[key]
+	}
+	page := []commands.Command{}
+	for _, record := range held {
+		if record.AcceptedOrder <= after {
+			continue
+		}
+		if limit > 0 && len(page) == limit {
+			break
+		}
+		page = append(page, record)
+	}
+	return page, nil
+}
+
+// asked returns every ListOrdered call this inbox received, in order.
+func (i *fakeInbox) asked() []inboxAsk {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]inboxAsk(nil), i.asks...)
 }
 
 // fakeCursors is the durable consumption cursor.
@@ -447,15 +500,22 @@ func (i *fakeInbox) ListOrdered(context.Context, sessionwire.TenantID, sessionwi
 // and a fake modelling only the order cannot produce either refusal. A fake
 // looser than its dependency makes every test over it silent about the cases the
 // dependency actually has.
+// IT IS ALSO KEYED BY SESSION, for the reason fakeInbox now is: one cursor
+// shared by every session cannot tell a composition that names the right session
+// from one that names the same session twice.
 type fakeCursors struct {
 	mu          sync.Mutex
 	cursor      uint64
 	cursorEpoch uint64
+	perSession  map[registry.Key]uint64
 }
 
-func (c *fakeCursors) LoadCursor(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uint64, error) {
+func (c *fakeCursors) LoadCursor(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.perSession != nil {
+		return c.perSession[registry.Key{TenantID: tenant, SessionID: session}], nil
+	}
 	return c.cursor, nil
 }
 
@@ -466,9 +526,17 @@ func (c *fakeCursors) LoadCursor(context.Context, sessionwire.TenantID, sessionw
 // in this file read the value back, so nothing failed — which is exactly why it
 // survived, and why a double whose stored value nobody reads is worth getting
 // right anyway: the next test to read it inherits the defect.
-func (c *fakeCursors) SaveCursor(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, epoch uint64, order uint64) error {
+func (c *fakeCursors) SaveCursor(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, epoch uint64, order uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.perSession != nil {
+		key := registry.Key{TenantID: tenant, SessionID: session}
+		if order < c.perSession[key] {
+			return fmt.Errorf("fakeCursors: order %d is below the committed %d for %s/%s", order, c.perSession[key], tenant, session)
+		}
+		c.perSession[key] = order
+		return nil
+	}
 	if epoch < c.cursorEpoch {
 		return fmt.Errorf("fakeCursors: epoch %d is below the committed %d", epoch, c.cursorEpoch)
 	}

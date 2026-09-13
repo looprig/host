@@ -780,8 +780,8 @@ func (c *Consumer) record(result PassResult, err error) {
 // Reconcile performs ONE bounded pass over the durable order.
 //
 // It is exported because attach-time reconciliation is a caller's decision:
-// O3.1's sequence begins inbox ownership at step 8 and reports attached at step
-// 9, and a composition that wants the first pass to have completed before it
+// O3.1's sequence begins inbox ownership at step 7 and reports attached at step
+// 8, and a composition that wants the first pass to have completed before it
 // answers a Factory bind calls this directly rather than racing the loop.
 //
 // IT IS SAFE TO CALL WHILE Run IS RUNNING, and that is stated here because

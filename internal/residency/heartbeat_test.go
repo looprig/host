@@ -1894,18 +1894,18 @@ func writesALocation(function *ast.FuncDecl) bool {
 //
 // TWO VERSIONS OF THIS COMMENT CLAIMED THE WRITERS PUBLISH THE SAME CONTENT,
 // AND BOTH WERE FALSE — the second one inside the retraction of the first.
-// Step 9 built `resident` as a literal and accepting as `!Draining()`, while
+// Step 8 built `resident` as a literal and accepting as `!Draining()`, while
 // the beat built residencyOf(entry.State) and entry.Accepting && !Draining():
 // two of three content axes divergent, not the one the retraction admitted to.
 // A clause that is true — the LIFO ordering — sat beside a clause that was not,
 // lending it credibility. That is the shape this lane keeps finding, arriving
 // once more inside the sentence written to stop it.
 //
-// SO THE DIVERGENCE IS GONE RATHER THAN DOCUMENTED. Step 9 now derives from the
+// SO THE DIVERGENCE IS GONE RATHER THAN DOCUMENTED. Step 8 now derives from the
 // registry through the same functions the beat uses, so the two writers publish
 // the same function of the same state and there is nothing left for a comment
 // to be wrong about. What remains is timestamps: the two read the clock
-// independently, so a step 9 publish landing after a beat carries an earlier
+// independently, so a step 8 publish landing after a beat carries an earlier
 // ObservedAt. It is bounded by the heartbeat margin, and it is the ONLY
 // remaining axis — which is a claim with a test behind it rather than an
 // argument.

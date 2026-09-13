@@ -445,7 +445,7 @@ type Request struct {
 	// CompatibilityID is the runtime build Factory placed this session on. It
 	// is OPTIONAL, and when set it must equal the target's own. Checking it in
 	// step 1 refuses a mis-placed session before a lease is taken; the durable
-	// state's build is checked again in step 4, against a different source.
+	// state's build is checked again in step 3, against a different source.
 	CompatibilityID department.CompatibilityID
 
 	// Principal is the approved subset of the caller's identity that may reach
@@ -802,7 +802,7 @@ func (m *Manager) Attach(requestCtx context.Context, request Request) (Residency
 // ATTACHED — one that reached step 8 — and nothing else.
 //
 // It is deliberately narrower than "the registry holds an entry". A registry
-// entry exists from step 6, and between 6 and 9 the attach that installed it
+// entry exists from step 5, and between 5 and 8 the attach that installed it
 // may still fail and take it away again; an entry installed by anything other
 // than this Manager has no session record here at all and is left to the
 // registry-loser branch, which knows how to give back what it took.
@@ -1209,10 +1209,22 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// the lease still being held and answers (0, false) for a headless session,
 	// one without persistence, one not wired for durable commands, and one whose
 	// lease is already gone. The first three are legitimate configurations, and
-	// the fourth is caught by the Done() check above and by the fence, so
-	// refusing here would turn supported deployments into attach failures. What
-	// Host must never do is SUBSTITUTE its own grant, and the value below cannot
-	// be substituted: JournalEpoch and ResidencyEpoch are different types.
+	// the fourth is caught by the Done() check above, so refusing here would
+	// turn supported deployments into attach failures.
+	//
+	// WHAT HOST MUST NEVER DO IS SUBSTITUTE ITS OWN GRANT — AND THE TYPE SYSTEM
+	// DOES NOT STOP IT. An earlier version of this comment said the value below
+	// "cannot be substituted: JournalEpoch and ResidencyEpoch are different
+	// types". Go converts freely between named numeric types, so
+	// `journalEpoch := JournalEpoch(epoch)` compiles, and a mutation doing
+	// exactly that was measured compiling. The distinct types make the
+	// substitution VISIBLE — it cannot happen by assignment, only by a
+	// conversion a reviewer can see — and what REFUSES it is
+	// TestTheJournalEpochComesFromTheRuntimeAndNotTheLease plus four others,
+	// which can only refuse it because the fixtures keep the two epochs
+	// deliberately distinct — this package mints residency epochs from 1000 and
+	// its runtime reports 3; the composed suite uses 9 and 1. Credit the tests
+	// and the fixture seeding, not the compiler.
 	reportedEpoch, journalHeld := runtime.LeaseEpoch()
 	journalEpoch := JournalEpoch(reportedEpoch)
 
@@ -1330,14 +1342,14 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// -- 8. only then, attached ----------------------------------------------
 	//
 	// §9's state machine is cold -> ATTACHING -> resident, and the second
-	// fenced write is what moves it. Publishing `resident` at step 7 would
+	// fenced write is what moves it. Publishing `resident` at step 6 would
 	// advertise an accepting route before its inbox ownership existed;
 	// publishing only `attaching` would leave every session attaching until
 	// O3.2's first heartbeat, which Factory does not route to at all.
 	//
 	// WHAT `attaching` IS AND IS NOT VISIBLE FOR, so a later reader does not
-	// "fix" it: the projection is written at step 7, which is AFTER hydration,
-	// so `attaching` is externally observable only across the short 7-to-9
+	// "fix" it: the projection is written at step 6, which is AFTER hydration,
+	// so `attaching` is externally observable only across the short 6-to-8
 	// window and never during the slow part of an attach. §9.1's prose sketch
 	// orders "Host registers observed location" before construction, but the
 	// task's sequence governs and is the safer one — a crash during hydration
@@ -1387,7 +1399,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 // The snapshot is the point. A LaunchTarget is an interface a caller
 // implements, so Capabilities() and CompatibilityID() are arbitrary code that
 // may answer differently every call: the value VALIDATED at step 1 does not
-// bind the value RE-READ at step 4 or step 7. internal/service learned this as
+// bind the value RE-READ at step 3 or step 6. internal/service learned this as
 // a divide-by-zero on the heartbeat path; here a drifting compatibility id
 // would publish a route for a build the Host is not running.
 type snapshotTarget struct {

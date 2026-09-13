@@ -246,7 +246,13 @@ func New(options Options) (*Service, error) {
 		Residencies: index,
 		Ledger:      capacity,
 		Capacity:    options.Host.Capacity(),
-		Budget:      options.Budget,
+		// THE WEDGE'S SIGNATURE, and the one optional metrics seam this
+		// composition actually satisfies. A Host that refuses to dispatch stops
+		// at the first non-terminal command in every session; without this the
+		// condition moves no counter, writes no log and answers every delivery
+		// `accepted`. See lifecycle.BlockedConsumers.
+		Blocked: composed,
+		Budget:  options.Budget,
 	})
 	if err != nil {
 		return nil, err

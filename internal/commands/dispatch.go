@@ -70,10 +70,15 @@ var _ Processor = NoDispatch{}
 
 // Process refuses the command and reports the state it was handed.
 //
-// THE REPORTED STATE IS THE RECORD'S OWN AND NOT A GUESS. Reconcile reads
-// Outcome.State only when the error is nil, but a Processor that answered with a
-// zero State would be lying about a record it declined to look at, and the field
-// is the one a later caller diagnosing a wedged session reads.
+// THE REPORTED STATE IS THE RECORD'S OWN AND NOT A GUESS, AND NOTHING IN
+// PRODUCTION READS IT ON THIS PATH. Reconcile reads Outcome.State only when the
+// error is nil, and BlockedCommand.State is taken from the RECORD rather than
+// from this outcome — so no caller named here consumes it today, and an earlier
+// version of this comment implied one did. It is populated because a Processor
+// that answered with a zero State would be lying about a record it declined to
+// look at, and because the field is part of the seam's contract rather than of
+// this implementation's convenience. The unit test asserts on it, which is what
+// makes zeroing it a dying mutant rather than an invisible one.
 func (NoDispatch) Process(_ context.Context, command Command) (Outcome, error) {
 	return Outcome{State: command.State}, &ApplyError{
 		Refusal:   RefusalDispatchUnavailable,

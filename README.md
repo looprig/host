@@ -86,6 +86,17 @@ every non-terminal command it is handed with
 the record stays exactly where Factory put it and a later Host can still apply
 it. The pass blocks at that command and the session makes no further progress.
 
+**What it looks like in production, because "by design" is not an excuse for an
+invisible state.** The delivery is answered **`accepted`**; the session then
+makes no further progress, permanently; `Consumer.Failures()` **stays at zero**
+(a blocked pass returns a nil error); and **nothing is logged**. The one signal
+that distinguishes this from an idle Host is the Prometheus gauge
+**`host_sessions_command_blocked`**, which counts resident sessions whose
+consumer has stopped at a command. **Expect it to equal the number of sessions
+holding work.** A non-zero value is not a fault today; it becomes one once an
+applier exists. Nothing on the Host side unsticks such a command — Factory's
+apply-deadline reconciler is what eventually makes the record terminal.
+
 **Why the refusal is explicit rather than an omission.** In disposition mode the
 store settles a command from durable evidence: an application prefix carrying the
 attempt's identity, verified for `AttemptID` equality. `harness` v0.33.0's

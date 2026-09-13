@@ -32,6 +32,10 @@ type stubGateWaits struct{ waiting uint64 }
 
 func (s stubGateWaits) GateWaiting() uint64 { return s.waiting }
 
+type stubBlocked struct{ blocked uint64 }
+
+func (s stubBlocked) BlockedSessions() uint64 { return s.blocked }
+
 type stubBacklog struct{ lag, depth uint64 }
 
 func (s stubBacklog) Backlog() (uint64, uint64) { return s.lag, s.depth }
@@ -136,6 +140,7 @@ func TestTheOptionalSourcesReportZeroWhenAbsentAndTheirValueWhenPresent(t *testi
 	full := newMetrics(t, func(o *lifecycle.MetricsOptions) {
 		o.GateWaits = stubGateWaits{waiting: 5}
 		o.Backlog = stubBacklog{lag: 7, depth: 13}
+		o.Blocked = stubBlocked{blocked: 3}
 	})
 	snapshot := full.Snapshot()
 	if snapshot.GateWaiting != 5 {
@@ -347,6 +352,7 @@ func TestTheCollectorPublishesEverySnapshotField(t *testing.T) {
 		o.Capacity = 29
 		o.GateWaits = stubGateWaits{waiting: 5}
 		o.Backlog = stubBacklog{lag: 7, depth: 13}
+		o.Blocked = stubBlocked{blocked: 3}
 		o.Budget = lifecycle.MemoryBudget{CaptureCeilingBytes: 1 << 20, MaxParallelFallbacks: 6}
 	})
 	metrics.WarmRelease(residency.WarmOutcome{
@@ -387,6 +393,7 @@ func TestTheCollectorPublishesEverySnapshotField(t *testing.T) {
 		"host_sessions{state=releasing}": 1,
 		"host_sessions{state=draining}":  0,
 		"host_sessions_gate_waiting":     5,
+		"host_sessions_command_blocked":  3,
 		"host_admission_weight_consumed": 11,
 		"host_admission_weight_capacity": 29,
 		"host_command_lag":               7,
@@ -452,4 +459,28 @@ func newMetrics(t *testing.T, configure ...func(*lifecycle.MetricsOptions)) *lif
 		t.Fatalf("NewMetrics: %v", err)
 	}
 	return metrics
+}
+
+// TestBlockedSessionsIsZeroWithNoSourceAndReportsOneWhenComposed is the optional
+// seam's two states, and the pair is the test rather than either half.
+//
+// ZERO WITH NO SOURCE IS NOT "NO BLOCKED SESSIONS" — it is "nobody has said",
+// exactly as GateWaiting's is. The distinction matters here because the gauge's
+// whole purpose is to separate a wedged Host from an idle one, and a collector
+// that published a confident zero for an unwired composition would reinstate the
+// invisibility it exists to remove. The composition DOES wire it, so the zero
+// case is a statement about this package rather than about a deployment.
+func TestBlockedSessionsIsZeroWithNoSourceAndReportsOneWhenComposed(t *testing.T) {
+	t.Parallel()
+
+	if got := newMetrics(t).Snapshot().BlockedSessions; got != 0 {
+		t.Errorf("a collector with no blocked-consumer source reports %d, want 0", got)
+	}
+
+	wired := newMetrics(t, func(o *lifecycle.MetricsOptions) {
+		o.Blocked = stubBlocked{blocked: 2}
+	})
+	if got := wired.Snapshot().BlockedSessions; got != 2 {
+		t.Errorf("a collector wired to a source reporting 2 published %d", got)
+	}
 }
