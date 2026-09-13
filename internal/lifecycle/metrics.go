@@ -48,14 +48,19 @@ type GateWaits interface {
 // consumer that has stopped at a command it will not process.
 //
 // IT IS THE WEDGE'S ONLY OPERATIONAL SIGNATURE, and it exists because that
-// condition had none. A composed Host once refused every dispatch and therefore
-// stops at the first non-terminal command in every session, permanently and BY
-// DESIGN — but a blocked pass returns a nil error, so Consumer.Failures() stays
-// at zero; nothing in internal/commands logs; and the HostLink delivery that
-// triggered it was answered `accepted`. Without this gauge a Host in its
-// designed steady state is indistinguishable on every exported signal from a
-// healthy Host with an empty inbox, and the first operator to meet it would have
-// to diagnose it from source.
+// condition had none. A blocked pass returns a NIL ERROR, so Consumer.Failures()
+// stays at zero; nothing in internal/commands logs; and the HostLink delivery
+// that triggered it was answered `accepted`. Without this gauge a wedged session
+// is indistinguishable on every exported signal from a healthy Host with an empty
+// inbox, and the first operator to meet it would have to diagnose it from source.
+//
+// ITS MEANING INVERTED WHEN THE DISPATCH BOUNDARY WAS REMOVED, and the HELP
+// string a dashboard actually renders is the one that has to say so. A composed
+// Host once refused EVERY dispatch, so a non-zero value was the designed steady
+// state and expected to equal the number of sessions holding work. It now
+// dispatches and settles, so a non-zero value is a FAULT: a command reached the
+// runtime and could not be settled, or could not be dispatched at all. An
+// operator reading the old sentence would have treated a real wedge as normal.
 //
 // IT IS OPTIONAL IN SHAPE AND WIRED IN FACT, which is the difference between it
 // and GateWaits below. GateWaits has no production source at all; this one is
@@ -295,7 +300,7 @@ var (
 	)
 	blockedSessionsDesc = prometheus.NewDesc(
 		"host_sessions_command_blocked",
-		"Resident sessions whose durable command consumer has stopped at a command it will not process. EXPECTED to equal the number of sessions holding work while this Host refuses to dispatch; a blocked pass now means a command this Host could not settle rather than one it refused to start. It is the only signal that distinguishes a wedged session from an idle Host.",
+		"Resident sessions whose durable command consumer has stopped at a command it CANNOT COMPLETE. A non-zero value is a FAULT and should be zero in a healthy Host: it means a command was dispatched into the runtime and could not then be settled, or could not be dispatched at all. It is the only signal that distinguishes a wedged session from an idle Host, because a blocked pass returns no error and logs nothing. Check the refusal: evidence_unavailable points at the runtime, evidence_unroutable at this deployment's settlement evidence wiring.",
 		nil, nil,
 	)
 	gateWaitingDesc = prometheus.NewDesc(

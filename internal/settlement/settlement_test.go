@@ -757,6 +757,10 @@ func TestAWiringFailureIsNotReportedAsAMissingDisposition(t *testing.T) {
 		name    string
 		readers func(*world) map[string]sessionstore.DispositionEvidenceReader
 		refusal commands.ApplyRefusal
+
+		// wantCause is the typed error the refusal must still CARRY. The code
+		// says "the wiring"; this says which piece of it.
+		wantCause func(error) bool
 	}{
 		{
 			"the binding has no registered reader",
@@ -764,6 +768,10 @@ func TestAWiringFailureIsNotReportedAsAMissingDisposition(t *testing.T) {
 				return map[string]sessionstore.DispositionEvidenceReader{"binding-somebody-elses": w.journal}
 			},
 			commands.RefusalEvidenceUnroutable,
+			func(err error) bool {
+				var unroutable *sessionstoreadapter.UnroutableBindingError
+				return errors.As(err, &unroutable) && unroutable.Binding == settlementBinding
+			},
 		},
 		{
 			"the registered reader serves another tenant",
@@ -775,11 +783,22 @@ func TestAWiringFailureIsNotReportedAsAMissingDisposition(t *testing.T) {
 				return map[string]sessionstore.DispositionEvidenceReader{settlementBinding: other}
 			},
 			commands.RefusalEvidenceUnroutable,
+			func(err error) bool {
+				var binding *harnessstore.DispositionBindingError
+				return errors.As(err, &binding) && binding.Field == "TenantID"
+			},
 		},
 		{
 			"the runtime wrote no disposition",
 			nil, // the ordinary router; the runtime simply records nothing
 			commands.RefusalEvidenceUnavailable,
+			// AND THE BENIGN ROW CARRIES NEITHER, which is what stops the two
+			// checks above from being satisfied by a cause that always matches.
+			func(err error) bool {
+				var unroutable *sessionstoreadapter.UnroutableBindingError
+				var binding *harnessstore.DispositionBindingError
+				return err != nil && !errors.As(err, &unroutable) && !errors.As(err, &binding)
+			},
 		},
 	} {
 		t.Run(row.name, func(t *testing.T) {
@@ -803,6 +822,17 @@ func TestAWiringFailureIsNotReportedAsAMissingDisposition(t *testing.T) {
 			}
 			if refusal.Refusal != row.refusal {
 				t.Errorf("Process refused with %q, want %q", refusal.Refusal, row.refusal)
+			}
+			// AND THE CAUSE SURVIVES, WHICH IS THE HALF THE CODE CANNOT CARRY.
+			// A re-gate showed the classification's PAYLOAD was unpinned:
+			// replacing errors.Join(sentinel, err) with a bare sentinel kept
+			// every refusal code correct and threw away the typed error that
+			// names WHICH binding or WHICH tenant. The code tells an operator
+			// the fault is in the wiring; only the cause tells them where, and a
+			// diagnosis that stops at "somewhere in the routing table" is the
+			// diagnosis this whole classification exists to improve on.
+			if row.wantCause != nil && !row.wantCause(refusal.Cause) {
+				t.Errorf("the refusal's cause is %v, which no longer carries the typed error naming what is mis-wired", refusal.Cause)
 			}
 			// EVERY OUTCOME IS STILL SAFE. Classification changes the diagnosis
 			// and must not change the durable answer: the command stays applying

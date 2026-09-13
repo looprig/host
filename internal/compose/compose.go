@@ -267,10 +267,12 @@ func New(options Options) (*Service, error) {
 		Ledger:      capacity,
 		Capacity:    options.Host.Capacity(),
 		// THE WEDGE'S SIGNATURE, and the one optional metrics seam this
-		// composition actually satisfies. A Host that refuses to dispatch stops
-		// at the first non-terminal command in every session; without this the
-		// condition moves no counter, writes no log and answers every delivery
-		// `accepted`. See lifecycle.BlockedConsumers.
+		// composition actually satisfies. A session whose command can be
+		// dispatched but not SETTLED stops the pass at that command
+		// permanently; without this the condition moves no counter, writes no
+		// log and answers every delivery `accepted`. A non-zero value is a
+		// FAULT rather than a designed state — see lifecycle.BlockedConsumers,
+		// whose HELP string is what an operator actually reads.
 		Blocked: composed,
 		Budget:  options.Budget,
 	})
