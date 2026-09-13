@@ -53,7 +53,12 @@ var ErrEpochSuperseded = errors.New("residency: a later lease epoch has already 
 // it does not have. The arm becomes load-bearing the moment this package makes a
 // fenced journal write again — the attempt-aware applier's correlation prefix is
 // exactly that — and a sentinel deleted here would have to be rediscovered along
-// with the classification rule that belongs to it. See epochFence.write.
+// with the classification rule that belongs to it.
+//
+// UNREACHABLE IN PRODUCTION IS NOT UNTESTED. A test injects this sentinel
+// directly through the location seam, so the arm that consumes it is covered and
+// a mutant removing it dies. Do not read the paragraph above as permission to
+// delete either one; see the measurement on epochFence.write.
 var ErrFenceConflict = errors.New("residency: the journal fence was refused by a later owner's committed sequence")
 
 // epochFence is the ONE mechanism every fenced write goes through.
@@ -153,21 +158,33 @@ func (f *epochFence) write(run func() error) error {
 	return err
 }
 
-// MEASURED, AND THE ErrFenceConflict ARM IS EQUIVALENT EVERYWHERE, not merely
-// within this package. Removing it from the classification above changes no
-// observable behaviour anywhere in the module: the sentinel has no production
-// producer at all now that the attach-time journal fence is gone, because the
-// one function that raises it — internal/sessionstoreadapter's classifyJournal —
-// is called only from the unwired journal writer. It is NOT reached through the
-// durable cursor; that path classifies through classifyInbox, which raises
-// ErrEpochSuperseded only.
+// MEASURED: THE ErrFenceConflict ARM IS NOT EQUIVALENT. Deleting the two lines
+// above compiles and FAILS
+// TestALostLeaseWritesNothingThroughTheHandleEither/"a fenced write is refused by
+// a later owner's sequence" at heartbeat_test.go:1253. That is the measurement,
+// and this comment exists because two earlier versions of it asserted the
+// opposite without running it.
 //
-// AN EQUIVALENCE IS DECLARED, NOT REPAIRED BY NARRATIVE. It is stated here so
-// that the next reader does not discover it as a surviving mutant and conclude
-// the classification is broken, and the arm is kept for the two reasons on
-// ErrFenceConflict itself. What holds the RULE today is the structural guard: a
-// fenced write must be routed through here whether or not its classification can
-// yet be raised.
+// "NO PRODUCTION PRODUCER" AND "NO TEST CAN DISTINGUISH IT" ARE DIFFERENT
+// STATEMENTS, and the second does not follow from the first. Both earlier
+// versions confused them. The production claim is true and holds at source: the
+// only function that raises this sentinel is internal/sessionstoreadapter's
+// classifyJournal, whose callers are all inside the journal writer no composed
+// Host wires, and the durable cursor does NOT reach it — SaveCursor classifies
+// through classifyInbox, which raises ErrEpochSuperseded only. From that the
+// first version concluded the store's cursor path produces it (false in the
+// other direction), and the second concluded no test could see the arm (false in
+// this one). A test does not need a production producer: heartbeat_test.go:1249
+// injects the sentinel through locations.publishErr, and it reaches this fence.
+// So the arm is unreachable in production AND live under test, which is a
+// perfectly ordinary state for a classification arm and needed no defending.
+//
+// AN EQUIVALENCE IS RUN, NOT REASONED TO. That is standing rule (c), and the
+// place it is load-bearing is exactly here — where the equivalence looks obvious
+// from a reachability argument. The arm is kept for the two reasons on
+// ErrFenceConflict itself, and the RULE is held by the structural guard: a
+// fenced write must be routed through here whether or not production can yet
+// raise its classification.
 
 // HeartbeatRegistry is the local index a heartbeat reads and, on loss or
 // release, claims.
