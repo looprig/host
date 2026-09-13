@@ -87,9 +87,23 @@ HostLink drain to cover, and the alternative — acknowledging a drain of nothin
 without anything having been released. **What a controller should do** is take
 the process-lifecycle path (terminate the workload) for a Host it wants gone
 before it has been used, and reserve the HostLink drain for a Host that is
-actually holding the session it placed. Note the shape of the failure if it does
-not: the refusal is **indistinguishable from the one a foreign tenant gets**,
-deliberately, so a controller must not read it as "wrong tenant".
+actually holding the session it placed.
+
+**The too-early refusal is indistinguishable from the refusal a tenant gets when
+ANOTHER tenant holds this Host's fixed session** — same `Refusal`, same reason,
+same Core class, because both are rung (2). It is **not** the refusal a foreign
+tenant gets: a request naming a tenant other than the link's is refused three
+rungs earlier with `RefusalForeignTenant`. So the one distinction a controller
+cannot make is "nothing is attached yet" versus "someone else's session is
+resident here".
+
+**That is deliberate and must stay.** Distinguishing the two would disclose
+**cross-tenant occupancy** — telling tenant-b that *somebody* is resident on a
+Host advertising `cross_tenant_isolated` — which would pay for an availability
+fix with a confidentiality leak, and confidentiality was never what R-1 was
+about. The cost falls where it can be borne: a placement controller can resolve
+the ambiguity from **its own attach state**, which it has and this Host does not
+owe it. Do not "fix" this by splitting the refusal.
 
 The whole-Host drain is reachable **only** through the process-lifecycle path —
 `Service.Stop` calls `Drainer.StartDrain` with the zero scope directly and never
