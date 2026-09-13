@@ -206,9 +206,115 @@ func (s *boundSession) ApplyCommand(ctx context.Context, command department.Runt
 		return err
 	}
 	if _, err := applier.ApplyRuntimeCommand(ctx, admitted); err != nil {
-		return err
+		return classifyDispatch(err)
 	}
 	return nil
+}
+
+// classifyDispatch marks the ONE dispatch failure that licenses a re-offer.
+//
+// *runtimecommand.DispositionUnsupportedError is raised BEFORE any durable
+// write, so nothing happened and the command may be offered to another Host; a
+// transport failure says the opposite, and a caller that could not tell them
+// apart would either strand a re-offerable command or re-drive a real effect.
+// Host is explicitly told to act on this, which is why harness moved the type
+// into its public package — recognising a refusal by its message text is not an
+// API.
+//
+// THE RELEASED ERROR ALWAYS SURVIVES. The sentinel is JOINED rather than
+// substituted, so a caller that needs the identities harness named still reaches
+// them through errors.As, and every other failure crosses untouched.
+func classifyDispatch(err error) error {
+	var unsupported *runtimecommand.DispositionUnsupportedError
+	if errors.As(err, &unsupported) {
+		return errors.Join(department.ErrDispositionUnsupported, err)
+	}
+	return err
+}
+
+// CloseAttempt writes the recovery closure for a PREDECESSOR's stranded attempt.
+//
+// THE CAPABILITY IS DISCOVERED ON THE RELEASED APPLIER AND NOT ADVERTISED
+// UNCONDITIONALLY. runtimecommand.AttemptCloser is segregated from Applier for
+// the reason department.AttemptCloser is segregated from Runtime, and the
+// released contract says an implementation that cannot honour it must refuse AT
+// THE CALL rather than advertise a closure it cannot write. That is what this
+// does: the method exists on every bound session, and a session whose applier is
+// not a closer is refused here.
+//
+// THE AUTHOR GRANT IS NOT A PARAMETER AND IS NEVER SUPPLIED. The released closer
+// stamps it from the live lease it holds, because a caller-supplied author epoch
+// would be a caller-authored proof, and a tombstone is the one thing that must
+// never be one. What crosses is the ATTEMPT's grant, read from the durable
+// record, which is what the closer's strictly-later comparison is made against.
+func (s *boundSession) CloseAttempt(
+	ctx context.Context,
+	command sessionwire.CommandID,
+	runtimeCommand uuid.UUID,
+	kind string,
+	attempt string,
+	attemptJournalEpoch uint64,
+) error {
+	provider, ok := s.controller.(runtimecommand.Provider)
+	if !ok {
+		return &UnsupportedCommandError{
+			CommandID: command,
+			Kind:      kind,
+			Reason:    "the harness session declares no runtime-command capability, so it has no recovery closure to offer",
+		}
+	}
+	applier, ok := provider.RuntimeCommands()
+	if !ok || applier == nil {
+		return &UnsupportedCommandError{
+			CommandID: command,
+			Kind:      kind,
+			Reason:    "the harness session has no durable application-prefix log, so it has no recovery closure to offer",
+		}
+	}
+	closer, ok := applier.(runtimecommand.AttemptCloser)
+	if !ok {
+		return &UnsupportedCommandError{
+			CommandID: command,
+			Kind:      kind,
+			Reason:    "this harness session's applier is not a recovery closer, so a predecessor's stranded attempt cannot be closed here",
+		}
+	}
+	closure := runtimecommand.Closure{
+		CommandID:           runtimecommand.CommandID(command),
+		RuntimeCommandID:    runtimeCommand,
+		Kind:                runtimecommand.Kind(kind),
+		AttemptID:           runtimecommand.AttemptID(attempt),
+		AttemptJournalEpoch: attemptJournalEpoch,
+	}
+	// VALIDATED BEFORE THE CLOSER, on the released type's own rule rather than a
+	// restatement of it: a closure that cannot name an attempt is one that could
+	// tombstone the wrong command, and calling Validate here rather than
+	// re-deriving its conditions is what keeps the two from drifting.
+	if err := closure.Validate(); err != nil {
+		return err
+	}
+	if _, err := closer.CloseAttempt(ctx, closure); err != nil {
+		return classifyClosure(err)
+	}
+	return nil
+}
+
+// The bound session is the segregated closure capability.
+var _ department.AttemptCloser = (*boundSession)(nil)
+
+// classifyClosure marks the ONE closure refusal a caller must never retry.
+//
+// *runtimecommand.EnduringEffectError means the predecessor's effect COMMITTED
+// and only its evidence is missing, so a retry that became a tombstone would
+// destroy it. The two authorization refusals are ordinary failures and are left
+// alone: conflating them would send an operator looking for the wrong failure,
+// and — worse — would make a transient "no live grant" look terminal.
+func classifyClosure(err error) error {
+	var enduring *runtimecommand.EnduringEffectError
+	if errors.As(err, &enduring) {
+		return errors.Join(department.ErrEnduringEffect, err)
+	}
+	return err
 }
 
 // admit translates one Host command into the released admitted command, or
@@ -241,6 +347,14 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		RuntimeCommandID: command.RuntimeCommandID,
 		Kind:             runtimecommand.Kind(command.Kind),
 		LeaseEpoch:       epoch,
+		// CARRIED, NOT MINTED, AND NOT DEFAULTED. An empty AttemptID crosses as
+		// empty, which is the released type's own optional shape and means
+		// harness writes no disposition frame; a value this adapter chose would
+		// name an attempt the durable record never authorized, and harness would
+		// then write evidence about it that no settlement could ever match.
+		// Admitted.Validate bounds a non-empty one, and it is called below, so
+		// an identity the released type refuses is refused BEFORE the applier.
+		AttemptID: runtimecommand.AttemptID(command.AttemptID),
 	}
 	if !admitted.Kind.Valid() {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{

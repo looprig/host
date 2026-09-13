@@ -899,7 +899,14 @@ func TestTheRuntimeCommandCarriesEverythingARuntimeNeeds(t *testing.T) {
 	for index := 0; index < command.NumField(); index++ {
 		members = append(members, command.Field(index).Name)
 	}
-	want := []string{"CommandID", "RuntimeCommandID", "Kind", "Payload", "PayloadRef"}
+	// AttemptID was added, and the decision this guard prompts was made rather
+	// than waved through: it is the identity of the ONE dispatch the durable
+	// record authorized, harness writes its disposition frame only when the
+	// field is non-empty, and without it a dispatched command sits applying
+	// forever with a real effect behind it. THIS legacy Applier does not fill it
+	// — it is bound to the legacy family, which has no attempt — and
+	// TestTheLegacyApplierNamesNoAttempt below is the assertion that says so.
+	want := []string{"CommandID", "RuntimeCommandID", "Kind", "Payload", "PayloadRef", "AttemptID"}
 	if !reflect.DeepEqual(members, want) {
 		t.Errorf("department.RuntimeCommand carries %v, want %v", members, want)
 	}
@@ -2090,4 +2097,27 @@ func indexOf(values []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// TestTheLegacyApplierNamesNoAttempt is the decision the shape guard above
+// prompts, written down as an assertion rather than as a comment.
+//
+// department.RuntimeCommand gained AttemptID for the DISPOSITION family. This
+// Applier is bound to the LEGACY family, which has no attempt edge at all, so
+// there is no identity for it to carry — and an invented one would be worse than
+// none: harness writes a disposition frame for any non-empty AttemptID, so a
+// legacy dispatch that filled the field would produce evidence about an attempt
+// no record ever authorized, and would change a legacy journal's durable bytes.
+func TestTheLegacyApplierNamesNoAttempt(t *testing.T) {
+	f := newApplierFixture(t)
+	if _, err := f.process(); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	driven := f.runtime.commands()
+	if len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want once", len(driven))
+	}
+	if driven[0].AttemptID != "" {
+		t.Errorf("the legacy applier sent AttemptID %q, want it empty", driven[0].AttemptID)
+	}
 }

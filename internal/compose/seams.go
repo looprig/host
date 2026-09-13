@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/service"
@@ -48,4 +49,29 @@ type TargetDirectory interface {
 type WorkStates interface {
 	// WorkState returns the session's current state and whether it is known.
 	WorkState(registry.Key) (residency.WorkState, bool)
+}
+
+// DispositionWriters binds one session's disposition transitions to the
+// residency GRANT this Host holds for it.
+//
+// IT IS DECLARED HERE RATHER THAN IN internal/commands BECAUSE IT IS A
+// COMPOSITION CONCERN. commands consumes one session's writer and knows nothing
+// about how a Host got it; what this expresses is the step between holding a
+// residency.Lease and having something that may write under it, and that step
+// exists only because sessionstore's claim edge takes a grant rather than an
+// epoch — "the epoch comes off the grant and from nowhere else, so no number a
+// caller chose can reach the record's mark".
+//
+// A REFUSAL HERE FAILS THE ATTACH, and that is the right place for it. A Host
+// that took residency of a session and then discovered it had no writer for it
+// would be holding a session it can consume from and never apply in, which is
+// the shape the whole dispatch boundary existed to prevent.
+type DispositionWriters interface {
+	// DispositionWriterFor returns the writer bound to this lease's grant.
+	//
+	// The lease is the one this composition recorded when the grant was taken;
+	// an implementation that cannot recognise it must REFUSE rather than return
+	// a writer with no grant, because such a writer would fail at the first
+	// command of a session this Host had already taken residency of.
+	DispositionWriterFor(residency.Lease) (commands.DispositionWrites, error)
 }

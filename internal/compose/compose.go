@@ -48,7 +48,7 @@ type Options struct {
 	// writer was refused outright for every session this Host can hold. They are
 	// not retained as unread options: an option a composition validates and never
 	// consults is a configuration a deployment can get wrong with no consequence
-	// and no signal. commands.NoDispatch says what replaced them.
+	// and no signal. Records and Writers below say what replaced them.
 	Leases     residency.SessionLeases
 	Durable    residency.DurableStore
 	Locations  residency.Locations
@@ -56,6 +56,26 @@ type Options struct {
 	Inbox      commands.Inbox
 	Cursors    commands.Cursors
 	Targets    TargetDirectory
+
+	// Records and Writers are the DISPOSITION family's application seams, and
+	// they are what replaced the dispatch refusal that stood in their place.
+	//
+	// THE PARAGRAPH ABOVE USED TO SAY THE APPLICATION SEAMS WERE ABSENT AND THAT
+	// THE ABSENCE WAS THE BOUNDARY. That was true of the LEGACY five — Records,
+	// Applications, Gates, InboxWrites and a SessionOpener, all over a family a
+	// Host cannot reach — and it stays true of them: none is retained here.
+	// These two are the disposition family's, over edges this Host can actually
+	// use, and they arrived with sessionstore v0.9.0's settlement and harness
+	// v0.34.0's evidence writer.
+	//
+	// Writers IS A FACTORY AND NOT A WRITER, and that is the residency grant's
+	// doing rather than a style choice. The claim edge takes a *ResidencyGrant
+	// and derives the epoch from it, so no number a caller chose can reach the
+	// record's high-water mark; a single shared writer would therefore have to
+	// take a grant per call, handing that choice straight back. One writer is
+	// bound per session, to the grant this Host holds for it.
+	Records commands.DispositionRecords
+	Writers DispositionWriters
 
 	// Checkpointer is the product's release checkpoint. It is REQUIRED; see
 	// host.Checkpointer for why an absent one may not become a no-op.
@@ -301,6 +321,8 @@ func (o Options) validate() error {
 		{"Workspaces", o.Workspaces != nil},
 		{"Inbox", o.Inbox != nil},
 		{"Cursors", o.Cursors != nil},
+		{"Records", o.Records != nil},
+		{"Writers", o.Writers != nil},
 		{"Targets", o.Targets != nil},
 		{"Checkpointer", o.Checkpointer != nil},
 		{"Auth", o.Auth != nil},

@@ -51,8 +51,39 @@ import (
 // how a session's state is checkpointed is the runtime's, which Host holds no
 // reader for. Everything else is configuration.
 type Bootstrap interface {
-	// Store opens the durable session store this Host runs against.
-	Store(context.Context) (*sessionstore.Store, error)
+	// Store opens the durable session store this Host runs against, and MUST
+	// open it with sessionstore.WithDispositionEvidence(evidence).
+	//
+	// THE READER IS A PARAMETER RATHER THAN A DOCUMENTED OBLIGATION, and that
+	// is the whole reason this method's signature changed. Settlement refuses
+	// outright without a configured reader — "a store with no reader has no way
+	// to verify anything" — so a deployment that forgot one would attach, list,
+	// claim, authorize an attempt, DISPATCH, and then fail at every settlement,
+	// leaving each command applying with a real effect behind it. A product
+	// cannot obtain one any other way: Host builds it, from the readers the
+	// product declares below, and hands it over at the one call that can use it.
+	//
+	// WHAT THIS STILL CANNOT ENFORCE, said plainly rather than implied: Host
+	// cannot make a product actually PASS the reader to Open, and the released
+	// store publishes no way to ask an open store whether one is configured. A
+	// product that took the parameter and dropped it gets the failure above.
+	// What the parameter buys is that the obligation is impossible to be
+	// unaware of, and that the object to satisfy it with is already in hand.
+	Store(ctx context.Context, evidence sessionstore.DispositionEvidenceReader) (*sessionstore.Store, error)
+
+	// JournalStores are this deployment's settlement evidence readers, one per
+	// storage binding, and they are the product's because the JOURNALS are.
+	//
+	// A DISPOSITION SESSION'S JOURNAL IS NOT IN THE ORCHESTRATION STORE. The
+	// immutable binding says where it is, and a harness Store answers for the
+	// one keyspace it owns — it holds no registry of the bindings it serves, so
+	// it cannot route on Binding.StorageBindingID and says so. Selecting which
+	// reader serves which binding is therefore the composition root's job, and
+	// Host does that selection over this table.
+	//
+	// A HOST WITH AN EMPTY TABLE CANNOT SETTLE ANYTHING and is refused at
+	// startup rather than at the first command.
+	JournalStores() map[string]sessionstore.DispositionEvidenceReader
 
 	// Registrar produces the Department registrations this deployment serves.
 	Registrar() host.Registrar
@@ -111,7 +142,17 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 		return err
 	}
 
-	store, err := bootstrap.Store(ctx)
+	// THE EVIDENCE ROUTER IS BUILT BEFORE THE STORE IS OPENED, because the store
+	// has to be opened WITH it: sessionstore.WithDispositionEvidence is an Open
+	// option, and a store opened without one refuses every settlement. Building
+	// it first also means a deployment whose routing table cannot answer is
+	// refused before it takes a single durable admission.
+	evidence, err := sessionstoreadapter.NewEvidenceRouter(bootstrap.JournalStores())
+	if err != nil {
+		return fmt.Errorf("bind settlement evidence: %w", err)
+	}
+
+	store, err := bootstrap.Store(ctx, evidence)
 	if err != nil {
 		return fmt.Errorf("open session store: %w", err)
 	}
@@ -172,16 +213,22 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 		// "the stream Host consumes is the stream its cursor indexes" true by
 		// construction rather than by a convention a deployment could break.
 		//
-		// THE APPLICATION SEAMS ARE NO LONGER WIRED, and the adapter still
-		// exports them. This binary composed a journal opener and the four
-		// legacy-family command seams into an applier; a composed Host now
-		// consumes and does not dispatch, so compose.Options names none of
-		// them. The adapter's methods stay because they are tested against the
-		// released store and are what the attempt-aware applier will be built
-		// from — but nothing wires them, and adding a wire here is the change
-		// commands.NoDispatch exists to make visible.
+		// THE LEGACY APPLICATION SEAMS ARE STILL NOT WIRED, and the adapter
+		// still exports them. This binary once composed a journal opener and
+		// the four legacy-family command seams into an applier; a Host cannot
+		// reach that family on a session it can hold, so compose.Options names
+		// none of them and wiring one here would be the mistake the removed
+		// dispatch refusal was written to make visible.
+		//
+		// THE DISPOSITION SEAMS ARE WIRED, AND THAT IS WHAT REPLACED THE
+		// BOUNDARY. Records is the adapted store's disposition record read;
+		// Writers binds one writer per session to the RESIDENCY GRANT this Host
+		// holds for it, which is what the released claim edge requires and what
+		// a per-call epoch parameter would have handed back to a caller.
 		Inbox:                adapted,
 		Cursors:              adapted,
+		Records:              adapted,
+		Writers:              adapted,
 		Targets:              adapted,
 		Checkpointer:         bootstrap.Checkpointer(),
 		Auth:                 bootstrap.Auth(),
@@ -282,8 +329,26 @@ type unconfiguredBootstrap struct{}
 var errNoBootstrap = errors.New("this binary is generic and registers no agents; a product supplies a Bootstrap and calls Run")
 
 // Store refuses.
-func (unconfiguredBootstrap) Store(context.Context) (*sessionstore.Store, error) {
+func (unconfiguredBootstrap) Store(context.Context, sessionstore.DispositionEvidenceReader) (*sessionstore.Store, error) {
 	return nil, errNoBootstrap
+}
+
+// JournalStores is one refusing reader, and it is ONE rather than none on
+// purpose: NewEvidenceRouter refuses an empty table, so a generic binary with no
+// readers would fail at "bind settlement evidence" and never reach the refusal
+// this type exists to give. The registered reader refuses every request, which
+// is the same answer one binding late.
+func (b unconfiguredBootstrap) JournalStores() map[string]sessionstore.DispositionEvidenceReader {
+	return map[string]sessionstore.DispositionEvidenceReader{"unconfigured": b}
+}
+
+// ReadDispositionEvidence refuses, and never answers empty: the released reader
+// contract says absence is not a disposition and a zero value settles nothing,
+// so a reader with nothing to read must return an error.
+func (unconfiguredBootstrap) ReadDispositionEvidence(
+	context.Context, sessionstore.DispositionEvidenceRequest,
+) (sessionstore.DispositionEvidence, error) {
+	return sessionstore.DispositionEvidence{}, errNoBootstrap
 }
 
 // Registrar refuses.

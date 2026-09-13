@@ -1,6 +1,7 @@
 package harnessadapter
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -458,4 +459,263 @@ func TestEveryRefusalNamesItsSubject(t *testing.T) {
 			t.Fatalf("%q does not name %q", unsupported, want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The attempt identity
+// ---------------------------------------------------------------------------
+
+// THE ATTEMPT IDENTITY IS WHAT MAKES A DISPATCH SETTLEABLE, and it crosses this
+// seam or nothing is ever written. harness v0.34.0 writes the kind-5 disposition
+// frame ONLY when Admitted.AttemptID is non-empty — the field is optional by
+// design, and an empty one leaves a legacy journal's bytes unchanged — so a Host
+// that authorized an attempt and then dropped its name produces a command that
+// sits applying forever with a real effect behind it. That is the exact failure
+// the whole boundary in internal/commands/dispatch.go existed to prevent, so the
+// carry is asserted on the value harness receives rather than on the one Host
+// sent.
+func TestAdmitCarriesTheAttemptIdentityToHarness(t *testing.T) {
+	var seen []runtimecommand.Admitted
+	runtime := boundFor(t, newApplyingController(applierPart{available: true, admitted: &seen}),
+		WithBlockDecoder(func(body []byte) ([]content.Block, error) {
+			return []content.Block{&content.TextBlock{Text: string(body)}}, nil
+		}))
+
+	command := inputCommand()
+	command.AttemptID = "attempt-9"
+	if err := runtime.ApplyCommand(t.Context(), command); err != nil {
+		t.Fatalf("ApplyCommand: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("the released applier saw %d commands, want 1", len(seen))
+	}
+	if seen[0].AttemptID != runtimecommand.AttemptID("attempt-9") {
+		t.Errorf("AttemptID = %q, want %q", seen[0].AttemptID, "attempt-9")
+	}
+}
+
+// AN ABSENT ATTEMPT IS THE LEGACY SHAPE AND IS NOT INVENTED HERE. The field is
+// optional in the released type and this adapter has no authority to mint one:
+// the identity is the STORE's, written immutably by BeginDispositionAttempt
+// before the dispatch, so an adapter that substituted a value would name an
+// attempt no evidence could ever be about. The row is the negative half of the
+// one above — without it, a mapping that always wrote some non-empty identity
+// would pass the positive.
+func TestAdmitDoesNotInventAnAttemptIdentity(t *testing.T) {
+	var seen []runtimecommand.Admitted
+	runtime := boundFor(t, newApplyingController(applierPart{available: true, admitted: &seen}),
+		WithBlockDecoder(func(body []byte) ([]content.Block, error) {
+			return []content.Block{&content.TextBlock{Text: string(body)}}, nil
+		}))
+
+	if err := runtime.ApplyCommand(t.Context(), inputCommand()); err != nil {
+		t.Fatalf("ApplyCommand: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("the released applier saw %d commands, want 1", len(seen))
+	}
+	if seen[0].AttemptID != "" {
+		t.Errorf("AttemptID = %q, want it empty for a command that names no attempt", seen[0].AttemptID)
+	}
+}
+
+// A MALFORMED ATTEMPT IDENTITY IS REFUSED BEFORE THE APPLIER, on the same terms
+// as every other refusal in admit: the released Admitted.Validate bounds an
+// AttemptID at MaxAttemptIDBytes and requires valid UTF-8, and a command that
+// cannot be admitted must not reach a durable writer. The positive control is
+// that the applier saw nothing at all.
+func TestAdmitRefusesAnOversizedAttemptIdentity(t *testing.T) {
+	var seen []runtimecommand.Admitted
+	runtime := boundFor(t, newApplyingController(applierPart{available: true, admitted: &seen}),
+		WithBlockDecoder(func(body []byte) ([]content.Block, error) {
+			return []content.Block{&content.TextBlock{Text: string(body)}}, nil
+		}))
+
+	command := inputCommand()
+	command.AttemptID = strings.Repeat("a", runtimecommand.MaxAttemptIDBytes+1)
+	if err := runtime.ApplyCommand(t.Context(), command); err == nil {
+		t.Fatal("ApplyCommand admitted an attempt identity the released type refuses")
+	}
+	if len(seen) != 0 {
+		t.Errorf("the released applier saw %d commands, want 0", len(seen))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The two refusals Host is told to act on
+// ---------------------------------------------------------------------------
+
+// A DISPOSITION THE RUNTIME CANNOT RECORD IS A DIFFERENT REFUSAL FROM A
+// TRANSPORT FAILURE, and this adapter is the only place that can tell them
+// apart: harness raises *runtimecommand.DispositionUnsupportedError BEFORE any
+// durable write, so nothing happened and the command may be re-offered — while a
+// transport failure says the opposite. The control row is an ordinary failure at
+// the same seam; without it a mapping that reported EVERY dispatch failure as
+// re-offerable would pass the positive.
+func TestApplyCommandDistinguishesAnUnrecordableDisposition(t *testing.T) {
+	for _, row := range []struct {
+		name        string
+		err         error
+		reofferable bool
+	}{
+		{
+			"the session cannot record a disposition",
+			&runtimecommand.DispositionUnsupportedError{CommandID: "command-a", AttemptID: "attempt-9"},
+			true,
+		},
+		{"an ordinary transport failure", errors.New("harnessadapter_test: connection reset"), false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			controller := newApplyingController(applierPart{available: true, err: row.err})
+			runtime := boundFor(t, controller, WithBlockDecoder(func(body []byte) ([]content.Block, error) {
+				return []content.Block{&content.TextBlock{Text: string(body)}}, nil
+			}))
+			err := runtime.ApplyCommand(t.Context(), inputCommand())
+			if err == nil {
+				t.Fatal("ApplyCommand reported success for a failed dispatch")
+			}
+			if got := errors.Is(err, department.ErrDispositionUnsupported); got != row.reofferable {
+				t.Errorf("errors.Is(err, ErrDispositionUnsupported) = %v, want %v (err = %v)", got, row.reofferable, err)
+			}
+			// The original always survives: a Host that needed the identities
+			// harness named must still be able to reach them.
+			if !errors.Is(err, row.err) {
+				t.Errorf("the released error did not survive the mapping: %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The recovery closure
+// ---------------------------------------------------------------------------
+
+// THE CLOSER IS DISCOVERED BY ASSERTION ON THE RELEASED APPLIER, not advertised
+// unconditionally. A session whose applier is not a runtimecommand.AttemptCloser
+// has no closure to offer, and a Host that was told otherwise would block on a
+// capability that answers nothing.
+func TestCloseAttemptReachesTheReleasedCloser(t *testing.T) {
+	closer := &recordingAttemptCloser{}
+	controller := newApplyingController(applierPart{available: true, closer: closer})
+	runtime := boundFor(t, controller)
+
+	capability, ok := runtime.(department.AttemptCloser)
+	if !ok {
+		t.Fatal("the bound session is not a department.AttemptCloser")
+	}
+	err := capability.CloseAttempt(t.Context(), "command-a",
+		uuid.MustParse("11111111-2222-3333-4444-555555555555"), "input", "attempt-9", 40)
+	if err != nil {
+		t.Fatalf("CloseAttempt: %v", err)
+	}
+	if len(closer.seen) != 1 {
+		t.Fatalf("the released closer saw %d closures, want one", len(closer.seen))
+	}
+	got := closer.seen[0]
+	if got.AttemptID != "attempt-9" || got.AttemptJournalEpoch != 40 || got.Kind != runtimecommand.KindInput {
+		t.Errorf("the released closer saw %+v, want the attempt's own identity, kind and grant", got)
+	}
+}
+
+// AN ENDURING EFFECT IS A DIFFERENT REFUSAL FROM EVERY OTHER CLOSURE REFUSAL,
+// and it is the one a caller must NEVER retry: the predecessor's effect
+// committed and only its evidence is missing, so a retry that became a tombstone
+// would destroy it. The control rows are the two authorization refusals, which
+// are ordinary failures and must not carry the sentinel.
+func TestCloseAttemptDistinguishesAnEnduringEffect(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		err      error
+		enduring bool
+	}{
+		{"the journal holds a committed effect", &runtimecommand.EnduringEffectError{AttemptID: "attempt-9"}, true},
+		{"no live grant", &runtimecommand.ClosureNotAuthorizedError{AttemptID: "attempt-9", Held: false}, false},
+		{"a grant that is not later", &runtimecommand.ClosureNotAuthorizedError{AttemptID: "attempt-9", Held: true}, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			closer := &recordingAttemptCloser{err: row.err}
+			controller := newApplyingController(applierPart{available: true, closer: closer})
+			runtime := boundFor(t, controller)
+			capability, ok := runtime.(department.AttemptCloser)
+			if !ok {
+				t.Fatal("the bound session is not a department.AttemptCloser")
+			}
+			err := capability.CloseAttempt(t.Context(), "command-a",
+				uuid.MustParse("11111111-2222-3333-4444-555555555555"), "input", "attempt-9", 40)
+			if err == nil {
+				t.Fatal("CloseAttempt reported success for a refused closure")
+			}
+			if got := errors.Is(err, department.ErrEnduringEffect); got != row.enduring {
+				t.Errorf("errors.Is(err, ErrEnduringEffect) = %v, want %v (err = %v)", got, row.enduring, err)
+			}
+			if !errors.Is(err, row.err) {
+				t.Errorf("the released error did not survive the mapping: %v", err)
+			}
+		})
+	}
+}
+
+// A SESSION WHOSE APPLIER CANNOT CLOSE REFUSES AT THE CALL rather than
+// advertising a closure it cannot write, which is the released interface's own
+// stated rule.
+func TestCloseAttemptRefusesASessionWithNoReleasedCloser(t *testing.T) {
+	controller := newApplyingController(applierPart{available: true})
+	runtime := boundFor(t, controller)
+	capability, ok := runtime.(department.AttemptCloser)
+	if !ok {
+		t.Fatal("the bound session is not a department.AttemptCloser")
+	}
+	err := capability.CloseAttempt(t.Context(), "command-a",
+		uuid.MustParse("11111111-2222-3333-4444-555555555555"), "input", "attempt-9", 40)
+	if err == nil {
+		t.Fatal("CloseAttempt reported success for a session with no released closer")
+	}
+	if errors.Is(err, department.ErrEnduringEffect) {
+		t.Error("an unavailable capability was reported as an enduring effect, which a caller must never retry")
+	}
+}
+
+// A MALFORMED CLOSURE IS REFUSED BEFORE THE RELEASED CLOSER, on the released
+// type's own rule: a closure that cannot name an attempt is one that could
+// tombstone the wrong thing.
+func TestCloseAttemptRefusesAMalformedClosure(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		attempt string
+		kind    string
+		epoch   uint64
+	}{
+		{"no attempt identity", "", "input", 40},
+		{"an unknown kind", "attempt-9", "gate_response", 40},
+		{"no attempt grant", "attempt-9", "input", 0},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			closer := &recordingAttemptCloser{}
+			controller := newApplyingController(applierPart{available: true, closer: closer})
+			runtime := boundFor(t, controller)
+			capability := runtime.(department.AttemptCloser)
+			err := capability.CloseAttempt(t.Context(), "command-a",
+				uuid.MustParse("11111111-2222-3333-4444-555555555555"), row.kind, row.attempt, row.epoch)
+			if err == nil {
+				t.Fatal("CloseAttempt admitted a closure the released type refuses")
+			}
+			if len(closer.seen) != 0 {
+				t.Errorf("the released closer saw %d closures, want none", len(closer.seen))
+			}
+		})
+	}
+}
+
+// recordingAttemptCloser is runtimecommand.AttemptCloser.
+type recordingAttemptCloser struct {
+	seen []runtimecommand.Closure
+	err  error
+}
+
+func (c *recordingAttemptCloser) CloseAttempt(_ context.Context, closure runtimecommand.Closure) (runtimecommand.ClosureResult, error) {
+	if c.err != nil {
+		return runtimecommand.ClosureResult{}, c.err
+	}
+	c.seen = append(c.seen, closure)
+	return runtimecommand.ClosureResult{Sequence: 1, Appended: true}, nil
 }

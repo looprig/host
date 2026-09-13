@@ -171,6 +171,20 @@ type applierPart struct {
 	// Host has acknowledged the command) is the one harness says the second
 	// result is for.
 	liveApplierWhenUnavailable bool
+
+	// closer, when set, makes the applier ALSO a runtimecommand.AttemptCloser.
+	// It is an optional part rather than a method on this type for the reason
+	// the released capability is segregated at all: an applier that always had
+	// the method could not express the session that has no closure to offer, and
+	// the adapter's refusal for one would be unreachable.
+	closer runtimecommand.AttemptCloser
+}
+
+// applierWithCloser is an applier that ALSO satisfies the segregated closure
+// capability, which is what a caller's type assertion discovers.
+type applierWithCloser struct {
+	applierPart
+	runtimecommand.AttemptCloser
 }
 
 func (p applierPart) RuntimeCommands() (runtimecommand.Applier, bool) {
@@ -182,6 +196,9 @@ func (p applierPart) RuntimeCommands() (runtimecommand.Applier, bool) {
 	}
 	if p.nilApplier {
 		return nil, true
+	}
+	if p.closer != nil {
+		return applierWithCloser{applierPart: p, AttemptCloser: p.closer}, true
 	}
 	return p, true
 }

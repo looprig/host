@@ -588,6 +588,55 @@ const (
 	// RefusalRuntime reports that the runtime refused or failed the command
 	// after its application prefix was committed.
 	RefusalRuntime ApplyRefusal = "runtime_failure"
+
+	// ------------------------------------------------------------------
+	// Disposition-family refusals. See disposition.go.
+	// ------------------------------------------------------------------
+
+	// RefusalInvalidAttempt reports an attempt identity neither downstream
+	// module would accept. It is refused before any durable write, because an
+	// identity the store wrote and the runtime then refused would authorize a
+	// dispatch nothing could ever be evidence about.
+	RefusalInvalidAttempt ApplyRefusal = "invalid_attempt"
+
+	// RefusalNoJournalGrant reports a runtime holding no single-writer journal
+	// lease, so there is no grant an attempt could name.
+	//
+	// IT IS NOT A STALE EPOCH. The runtime's grant and this Host's residency are
+	// different authorities over different stores, and a Host that substituted
+	// its own would author an attempt no evidence could ever match.
+	RefusalNoJournalGrant ApplyRefusal = "no_journal_grant"
+
+	// RefusalDispositionUnsupported reports a dispatch the runtime refused
+	// because its durable log cannot record a disposition.
+	//
+	// IT IS DELIBERATELY NOT RefusalRuntime, and the distinction is the one
+	// harness exported the error type to make expressible: NOTHING DURABLE WAS
+	// WRITTEN, so the command may be re-offered elsewhere. A transport failure
+	// says the opposite — something may have happened — so collapsing the two
+	// would either strand a re-offerable command or re-drive a real effect.
+	RefusalDispositionUnsupported ApplyRefusal = "disposition_unsupported"
+
+	// RefusalEvidenceUnavailable reports a settlement that could not read the
+	// runtime's durable disposition.
+	//
+	// THE COMMAND STAYS APPLYING AT AN UNMOVED REVISION, and that is the safe
+	// failure rather than a missing feature. Absence is not a disposition: a
+	// Host that concluded "nothing happened" from an unreadable journal would
+	// re-drive an effect that may already have committed.
+	RefusalEvidenceUnavailable ApplyRefusal = "evidence_unavailable"
+
+	// RefusalEnduringEffect reports a recovery closure refused because the
+	// runtime's journal holds a durable effect for the command.
+	//
+	// IT IS TERMINAL AND MUST NOT BE RETRIED INTO A TOMBSTONE. The predecessor's
+	// effect committed and only its evidence is missing; an operator has to
+	// look, and the pass blocks until one does.
+	RefusalEnduringEffect ApplyRefusal = "enduring_effect"
+
+	// RefusalNoAttemptCloser reports a predecessor's stranded attempt this
+	// composition has no closer for. The pass blocks; nothing is concluded.
+	RefusalNoAttemptCloser ApplyRefusal = "no_attempt_closer"
 )
 
 // ApplyError reports why an applier declined to finish a command.

@@ -48,7 +48,7 @@
 // row so marked is bound, exported and tested against the released store here,
 // and no composed Host calls it: compose.Options declares no session opener and
 // no application seams, and the Processor a composed Host runs is
-// commands.NoDispatch. They are the legacy command family, which a Host cannot
+// the removed dispatch refusal. They are the legacy command family, which a Host cannot
 // reach on a session it can hold, and they are what the attempt-aware applier
 // will be rebuilt from rather than dead weight. Do not re-wire one without
 // reading commands/dispatch.go.

@@ -405,6 +405,21 @@ type publishingSession struct {
 	// effects into.
 	effects *durableCommands
 
+	// closures records the recovery closures this runtime was asked for, and its
+	// presence is what makes this session a department.AttemptCloser at all —
+	// which is the STRUCTURE the composed suite was blind to: with no composed
+	// runtime offering the capability, "discover it by assertion" and "never
+	// discover it" produced the same nil in every fixture.
+	closures []string
+
+	// disposition, when set, records this runtime's durable statement that it
+	// accepted the command into its execution path. It is a SEPARATE callback
+	// from effects, and separate for the same reason the real frame is separate
+	// from the effect: a journal append frames one envelope, so no effect can
+	// share a record with its disposition, and a double that wrote both at once
+	// would make the evidence boundary untestable.
+	disposition func(sessionwire.CommandID)
+
 	// drove announces each application. It is the rendezvous awaitApplied waits
 	// on, so a test blocks on the EVENT it is asserting about rather than
 	// polling a counter on a timer.
@@ -468,15 +483,44 @@ func (s *publishingSession) ApplyCommand(_ context.Context, command department.R
 	s.applied = append(s.applied, command)
 	count := uint64(len(s.applied))
 	effects := s.effects
+	disposition := s.disposition
 	s.mu.Unlock()
 	if effects != nil {
 		effects.commitEffect(command.CommandID, count)
+	}
+	// THE DISPOSITION IS WRITTEN AFTER THE EFFECT AND IS A SEPARATE RECORD, which
+	// is the released writer's own shape: SessionJournal.Append takes exactly one
+	// record, so no effect a runtime performs can share a frame with its
+	// disposition.
+	if disposition != nil {
+		disposition(command.CommandID)
 	}
 	select {
 	case s.drove <- struct{}{}:
 	default:
 	}
 	return nil
+}
+
+// CloseAttempt is the segregated recovery capability, discovered by assertion.
+//
+// It records the closure and then REFUSES, because a composed success would need
+// the disposition double to produce not_applied evidence and the claim under
+// test is narrower: that the composition finds this capability on its runtime
+// and hands it to the applier at all.
+func (s *publishingSession) CloseAttempt(
+	_ context.Context, command sessionwire.CommandID, _ uuid.UUID, _ string, attempt string, _ uint64,
+) error {
+	s.mu.Lock()
+	s.closures = append(s.closures, attempt)
+	s.mu.Unlock()
+	return errors.New("regression_test: this runtime's closer refuses")
+}
+
+func (s *publishingSession) closuresAsked() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.closures...)
 }
 
 func (s *publishingSession) appliedCommands() []department.RuntimeCommand {
@@ -606,20 +650,6 @@ func (d *durableCommands) accept(t *testing.T, id sessionwire.CommandID, payload
 	return id
 }
 
-// settle drives one record to a terminal state OUT OF BAND, as a predecessor
-// Host or Factory's deadline reconciler would leave it.
-//
-// It is the fixture's way of producing the one record a Host that does not
-// dispatch can still consume, which is what makes "the consumer is alive and
-// refuses only the dispatch" a falsifiable claim rather than a sentence.
-func (d *durableCommands) settle(id sessionwire.CommandID, state commands.State) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	record := d.records[id]
-	record.state = state
-	record.revision++
-}
-
 // consumedCursor is the durable cursor's current value.
 func (d *durableCommands) consumedCursor() uint64 {
 	d.mu.Lock()
@@ -729,7 +759,7 @@ func (d *durableCommands) LoadPayload(_ context.Context, _ sessionwire.TenantID,
 // command body.
 //
 // IT IS THE MEASUREMENT BEHIND A CLAIM THAT WOULD OTHERWISE BE STRUCTURAL. A
-// composed Host runs commands.NoDispatch, and the only production reader of a
+// composed Host once refused every dispatch, and the only production reader of a
 // payload is commands.Applier, which has no production call site — so "the
 // private body did not cross HostLink" is true because the body never enters the
 // process. That is a strong property and a weak assertion: it cannot fail for
@@ -826,14 +856,12 @@ func (d *durableCommands) commitEffect(id sessionwire.CommandID, seq uint64) {
 	}
 }
 
-func (d *durableCommands) stateOf(id sessionwire.CommandID) commands.State {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if record, held := d.records[id]; held {
-		return record.state
-	}
-	return ""
-}
+// THE TWO LEGACY-STATE HELPERS ARE GONE, and their removal is a finding rather
+// than tidying. durableCommands.settle and .stateOf read and wrote the LEGACY
+// family's record state, and every remaining assertion about what a command
+// became now reads the DISPOSITION double — which is the store a session this
+// Host can hold actually has. Keeping two mutable states for one command is how
+// a test ends up green about a record nobody wrote.
 
 // ---------------------------------------------------------------------------
 // 1. Concurrent create: one launch, one grant, one consumer, no corpse
@@ -1200,9 +1228,10 @@ func TestEveryCommittedEventCrossesTheLinkOnceInCommitOrderCarryingItsJoinIdenti
 // runtime that records what it was driven with, and a served HostLink endpoint.
 type commandFixture struct {
 	*fixture
-	store   *durableCommands
-	runtime *publishingSession
-	server  *httptest.Server
+	dispositions *fakeDispositions
+	store        *durableCommands
+	runtime      *publishingSession
+	server       *httptest.Server
 }
 
 // newCommandFixture wires durableCommands into the composition's command seams.
@@ -1210,7 +1239,7 @@ type commandFixture struct {
 // IT USED TO WIRE SIX AND NOW WIRES TWO. Inbox and Cursors are the consumption
 // half and are what a composed Host reads; Records, Applications, Gates and
 // InboxWrites were the APPLICATION half, and the composition no longer declares
-// them — see commands.NoDispatch. The double still implements all six, because
+// them — see this file's acceptance test. The double still implements all six, because
 // its own job is to be at least as strict as the seams it stands in for and the
 // four unwired ones are what the attempt-aware applier will be measured against.
 func newCommandFixture(t *testing.T) *commandFixture {
@@ -1219,15 +1248,30 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	runtime := newPublishingSession()
 	runtime.effects = store
 
+	var dispositions *fakeDispositions
 	f := newFixture(t, func(o *Options, _ *host.Options) {
 		o.Inbox = store
 		o.Cursors = store
+		// ONE SOURCE OF ROWS. The applier reads the records the consumer lists,
+		// so the disposition double is rebuilt over THIS fixture's inbox rather
+		// than left pointing at the default one — a composed Host applying
+		// commands from a store its consumer does not read is a fixture that
+		// cannot see a routing mistake.
+		dispositions = newFakeDispositions(o.Clock.(*fakeClock), store)
+		dispositions.payloads = store
+		o.Records = dispositions
+		o.Writers = &fakeDispositionWriters{store: dispositions}
 	})
+	// A REAL DISPATCH ENDS IN A DURABLE DISPOSITION. The runtime writes one
+	// when it is driven, which is what the settlement then reads; a fixture
+	// whose runtime recorded nothing would measure the evidence boundary's
+	// failure arm and call it the happy path.
+	runtime.disposition = func(command sessionwire.CommandID) { dispositions.setEvidence(command, "applied") }
 	f.rig.Session = runtime
 	f.start()
 	server := f.serve()
 	f.attach(tenantA, sessionA)
-	return &commandFixture{fixture: f, store: store, runtime: runtime, server: server}
+	return &commandFixture{fixture: f, store: store, runtime: runtime, server: server, dispositions: dispositions}
 }
 
 // awaitBlocked blocks until this session's consumer has stopped at one command
@@ -1279,33 +1323,33 @@ func (c *commandFixture) awaitCursor(want uint64) {
 	}
 }
 
-// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt is the HARD BOUNDARY
-// measured in composition, and it replaces a test that asserted the opposite.
+// TestAComposedHostAppliesADeliveredCommandEndToEnd is the acceptance case for
+// the whole settlement path, and it replaces a test that asserted the OPPOSITE.
 //
-// WHAT IT REPLACED AND WHY. TestADuplicateCommandDeliveryAppliesTheCommandOnce
-// drove a whole apply through this composition — claim, payload load, journal
-// prefix, runtime, terminal settlement — against a double of the LEGACY command
-// family. A Host cannot reach that family on a session it can hold, so the
-// behaviour it measured was one no deployment could ever produce. The
-// idempotency claim underneath it is unchanged and is not this test's: a second
-// delivery of a CommandID whose order the cursor has passed cannot be listed at
-// all, which is the consumption mechanism and is measured against the RELEASED
-// store in inbox_differential_test.go.
+// WHAT IT REPLACED AND WHY. TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt
+// measured the HARD BOUNDARY: a composed Host listed a delivered command,
+// refused it by name before touching any seam, and left the durable record
+// exactly where Factory put it. That refusal was correct for as long as harness
+// could not write attempt-aware evidence — a dispatch under the old writer
+// committed a prefix naming no attempt, the verifier requires the attempt's
+// identity, and such a command sat `applying` forever with a real effect behind
+// it. harness v0.34.0 writes the attempt-bearing disposition and sessionstore
+// v0.9.0 verifies it, so the boundary is REMOVED rather than relaxed, and what
+// stands in its place is this: the command actually applies.
 //
-// THE PROPERTY HERE IS THAT A DELIVERED COMMAND REACHES THE CONSUMER AND STOPS.
-// A Host running commands.NoDispatch lists the command, refuses it by name
-// before touching any seam, and blocks the pass — leaving the durable record
-// exactly where Factory put it, so the Host that comes after can still apply it.
+// THE FIVE THINGS ASSERTED ARE THE FIVE THE PROTOCOL IS MADE OF, in order: the
+// runtime was driven exactly once; the dispatch carried the ATTEMPT IDENTITY the
+// record authorized, which is the whole of what makes it settleable; the record
+// reached a terminal state the STORE chose from evidence rather than one this
+// Host asserted; the durable cursor advanced past it; and the pass is not
+// blocked.
 //
-// TWO POSITIVE CONTROLS, because every assertion below is an absence.
-//
-//	(1) the runtime CAN be driven and the counter CAN see it, shown by driving
-//	    it directly through the same instrument the absence is read from;
-//	(2) the consumer IS consuming, shown by settling the command terminally out
-//	    of band and watching the durable cursor advance past it — which also
-//	    shows the refusal is a decision about DISPATCH and not a consumer that
-//	    is wedged, asleep or never started.
-func TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt(t *testing.T) {
+// THE CONTROL IS THE EVIDENCE ARM. A second command whose runtime records no
+// disposition must NOT settle — it stays applying and blocks the pass — because
+// otherwise every assertion above would also hold for a Host that settled on its
+// own confidence, which is the exact failure the evidence boundary exists to
+// prevent.
+func TestAComposedHostAppliesADeliveredCommandEndToEnd(t *testing.T) {
 	c := newCommandFixture(t)
 
 	first := c.store.accept(t, "command-one", `{"blocks":[{"text":"hello"}]}`)
@@ -1314,57 +1358,74 @@ func TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt(t *testing.T) {
 	accepted(t, link.rpc(2, hostlink.MethodBind, c.bindRequest(tenantA, sessionA, 9)))
 	accepted(t, link.rpc(3, channel, sessionwire.HostLinkCommandDelivery{CommandID: first}))
 
-	blocked := c.awaitBlocked(first)
+	c.awaitApplied(1)
 
-	// (a) THE REFUSAL IS THE NAMED ONE. An untyped error here would be
-	// indistinguishable from a store that was simply unreachable, and the whole
-	// point of a typed refusal is that a later reader can tell a boundary from
-	// an outage.
+	// (a) THE RUNTIME WAS DRIVEN EXACTLY ONCE. More than once would be a
+	// re-dispatch of a command whose effect may already have committed.
+	driven := c.runtime.appliedCommands()
+	if len(driven) != 1 {
+		t.Fatalf("the runtime was driven %d times, want exactly one authorized dispatch: %+v", len(driven), driven)
+	}
+	if driven[0].CommandID != first {
+		t.Errorf("the runtime was driven with %q, want %q", driven[0].CommandID, first)
+	}
+
+	// (b) THE DISPATCH CARRIED THE ATTEMPT IDENTITY, and it is the one the
+	// durable record authorized rather than merely some non-empty string. An
+	// empty identity means harness writes no disposition AT ALL, by design, and
+	// the command would never settle.
+	if driven[0].AttemptID == "" {
+		t.Fatal("the dispatch carried no attempt identity, so no disposition is written and nothing can ever settle it")
+	}
+	if got := c.dispositions.attemptOf(first); commands.AttemptID(driven[0].AttemptID) != got {
+		t.Errorf("the dispatch carried attempt %q and the record authorized %q", driven[0].AttemptID, got)
+	}
+
+	// (c) THE COMMAND SETTLED, and the state is the one the store chose from the
+	// evidence the dispatch produced.
+	if got := c.dispositions.stateOfCommand(first); got != commands.StateApplied {
+		t.Errorf("the durable record is %q, want %q", got, commands.StateApplied)
+	}
+
+	// (d) THE CURSOR ADVANCED PAST IT.
+	c.awaitCursor(1)
+
+	// (e) THE PASS IS NOT BLOCKED.
+	if blocked := c.consumer().LastPass().Blocked; blocked != nil {
+		t.Errorf("the pass is blocked at %q (%v) after a command that applied", blocked.CommandID, blocked.Cause)
+	}
+
+	// (f) THE CONSUMER STEPS OVER A COMMAND SOMEBODY ELSE SETTLED. A predecessor
+	// Host, or Factory's deadline reconciler, can settle a record terminally
+	// between this Host's page and its record read; §10.4 never re-opens one, so
+	// the pass reports what it became and advances past it. Without this row,
+	// "the cursor advanced" in (d) is equally explained by a Host that only ever
+	// advances over commands it applied itself.
+	settled := c.store.accept(t, "command-settled-elsewhere", `{"blocks":[{"text":"elsewhere"}]}`)
+	c.dispositions.settleOutOfBand(settled, commands.StateRejected)
+	c.svc.Wake(keyA)
+	c.awaitCursor(2)
+	if driven := c.runtime.appliedCommands(); len(driven) != 1 {
+		t.Errorf("the runtime was driven %d times; a terminal record was driven into it", len(driven))
+	}
+
+	// (g) THE CONTROL. A command whose runtime records no disposition does NOT
+	// settle. Without this row every assertion above would equally hold for a
+	// Host that settled from its own confidence rather than from evidence.
+	c.runtime.withoutDisposition()
+	second := c.store.accept(t, "command-two", `{"blocks":[{"text":"second"}]}`)
+	accepted(t, link.rpc(4, channel, sessionwire.HostLinkCommandDelivery{CommandID: second}))
+	blocked := c.awaitBlocked(second)
 	var refusal *commands.ApplyError
 	if !errors.As(blocked.Cause, &refusal) {
 		t.Fatalf("the pass blocked with %T (%v), want a *commands.ApplyError", blocked.Cause, blocked.Cause)
 	}
-	if refusal.Refusal != commands.RefusalDispatchUnavailable {
-		t.Errorf("the pass blocked with refusal %q, want %q", refusal.Refusal, commands.RefusalDispatchUnavailable)
+	if refusal.Refusal != commands.RefusalEvidenceUnavailable {
+		t.Errorf("the pass blocked with refusal %q, want %q", refusal.Refusal, commands.RefusalEvidenceUnavailable)
 	}
-	if refusal.CommandID != first {
-		t.Errorf("the refusal names command %q, want %q", refusal.CommandID, first)
+	if got := c.dispositions.stateOfCommand(second); got != commands.StateApplying {
+		t.Errorf("the unsettleable command is %q, want it left %q at an unmoved revision", got, commands.StateApplying)
 	}
-
-	// (b) NOTHING DURABLE MOVED. A refusal that had already claimed the record,
-	// or moved it to applying, would be the exact state this boundary exists to
-	// prevent: an effect nobody can settle.
-	if got := c.store.stateOf(first); got != commands.StatePending {
-		t.Errorf("the durable record is %q, want %q; the refusal moved a record it must leave alone", got, commands.StatePending)
-	}
-	if cursor := c.store.consumedCursor(); cursor != 0 {
-		t.Errorf("the durable cursor advanced to %d past a command that was never applied", cursor)
-	}
-
-	// (c) THE RUNTIME WAS NEVER DRIVEN.
-	if driven := c.runtime.appliedCommands(); len(driven) != 0 {
-		t.Fatalf("the runtime was driven %d times by a Host that does not dispatch: %+v", len(driven), driven)
-	}
-
-	// (d) CONTROL 1. The instrument in (c) can see a drive.
-	if err := c.runtime.ApplyCommand(context.Background(), department.RuntimeCommand{
-		CommandID: "command-control",
-		Kind:      string(commands.KindInput),
-		Payload:   []byte(`{"blocks":[{"text":"control"}]}`),
-	}); err != nil {
-		t.Fatalf("driving the runtime directly: %v", err)
-	}
-	if driven := c.runtime.appliedCommands(); len(driven) != 1 {
-		t.Fatalf("the runtime reports %d applications after being driven once; the absence in (c) is unfalsifiable", len(driven))
-	}
-
-	// (e) CONTROL 2. The consumer is consuming. The command is settled
-	// terminally by somebody else — a predecessor Host, or Factory's deadline
-	// reconciler — and this Host steps over it and advances its durable cursor,
-	// which is the half of the lifecycle that is fully live.
-	c.store.settle(first, commands.StateRejected)
-	c.svc.Wake(keyA)
-	c.awaitCursor(1)
 }
 
 // TestNoPrivatePayloadCrossesHostLinkInEitherDirection is the composed form of
@@ -1382,17 +1443,16 @@ func TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt(t *testing.T) {
 // that decoded and re-encoded could reintroduce it in a shape a struct
 // comparison would not see.
 //
-// THE TWO HALVES ARE NOT HELD THE SAME WAY, AND SAYING SO IS THE POINT. This
-// comment used to end "the private body is loaded from SessionStore AFTER the
-// claim, on Host's own side, and handed to the runtime". A composed Host does
-// none of that: commands.Command carries no payload, the only production reader
-// of one is commands.Applier, and NewApplier has no production call site. The
-// body therefore never enters the process, and the OUTBOUND assertion (c) cannot
-// fail for any implementation of the code under test — it is held by
-// CONSTRUCTION. It is kept as a forward guard against a Host that loads payloads
-// again, and the construction itself is MEASURED by (a2) rather than asserted:
-// the store counts private-body reads and the count must be zero. The INBOUND
-// half (d) is a live assertion and fails closed today.
+// (c) IS A LIVE ASSERTION AGAIN, AND THE PREVIOUS TEXT HERE IS RETRACTED. It
+// said the body "never enters the process" and that (c) was therefore held by
+// CONSTRUCTION, because the only production reader of a payload was
+// commands.Applier and NewApplier had no production call site. Both halves are
+// now false: commands.DispositionApplier loads the private body after its claim
+// and hands it to the runtime, and the composition wires one for every resident
+// session. So the secret DOES enter this process, on the exact path the old text
+// said had been removed, and (a2) inverts with it — the Host must read the body
+// exactly once rather than never. A test whose strongest claim is held by an
+// absence stops being held the moment the absence ends, and this is that moment.
 //
 // THE INBOUND HALF MATTERS TOO. A Factory that could smuggle a body into a
 // delivery would bypass the durable record the applier reads, so a delivery
@@ -1418,31 +1478,33 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 	}
 	accepted(t, link.rpc(4, channel, sessionwire.HostLinkCommandDelivery{CommandID: command}))
 
-	// (a) THE HOST DID REACH THE COMMAND. Without this the privacy claim below
-	// is satisfied by a Host that listed nothing, consumed nothing and had no
-	// opportunity to leak anything.
-	//
-	// IT USED TO ASSERT THE RUNTIME WAS DRIVEN WITH THE SECRET, which a composed
-	// Host no longer does — see
-	// TestAComposedHostConsumesADeliveryAndRefusesToDispatchIt. That is a
-	// WEAKENING of (c) and the header says so; what is asserted instead is that
-	// the Host reached this command at all, and that the store really holds the
-	// secret, so the scan below has something to find.
-	blocked := c.awaitBlocked(command)
-	if blocked.CommandID != command {
-		t.Fatalf("the consumer stopped at %q, want the command carrying the secret", blocked.CommandID)
+	// (a) THE HOST DID REACH THE COMMAND, AND DROVE THE SECRET INTO THE RUNTIME.
+	// Without this the privacy claim below is satisfied by a Host that listed
+	// nothing, consumed nothing and had no opportunity to leak anything — and
+	// that is not a hypothetical: for as long as the dispatch boundary stood,
+	// this test asserted only that the consumer BLOCKED, which is the weakest
+	// version of it. The secret now travels the whole path, which is what makes
+	// (c) a measurement rather than a restatement of an absence.
+	c.awaitApplied(1)
+	driven := c.runtime.appliedCommands()
+	if len(driven) != 1 || driven[0].CommandID != command {
+		t.Fatalf("the runtime was driven with %+v, want the one command carrying the secret", driven)
+	}
+	if !strings.Contains(string(driven[0].Payload), secret) {
+		t.Fatalf("the runtime was driven with a body that does not carry the secret; the scan below would then prove nothing")
 	}
 	if !strings.Contains(string(c.store.storedPayload(command)), secret) {
 		t.Fatalf("the durable record does not carry the private body; the scan below would then prove nothing")
 	}
 
-	// (a2) AND THE HOST NEVER ASKED FOR THE BODY. This is the measured form of
-	// "the secret never enters the process", which is what (c) actually rests on
-	// now. It is a live assertion: wiring commands.Applier back into the
-	// composition makes it fail, which is exactly when (c) stops being held by
-	// construction and has to start being held by the scan.
-	if loads := c.store.payloadLoadCount(); loads != 0 {
-		t.Fatalf("the Host read the private command body %d times; a composed Host that does not dispatch reads none", loads)
+	// (a2) THE HOST READ THE BODY ONCE, and the count is asserted rather than
+	// ignored. It used to be required to be ZERO, on the ground that a composed
+	// Host never dispatched; that is retracted with the boundary. One read is
+	// the protocol — the body is loaded AFTER the claim and before the attempt —
+	// and a count above one would mean a body being re-read on a path nobody
+	// designed, which is a second place for it to escape from.
+	if loads := c.store.payloadLoadCount(); loads != 1 {
+		t.Fatalf("the Host read the private command body %d times, want exactly one read after the claim", loads)
 	}
 
 	// (b) THE PUBLIC CONTROL CROSSES.
@@ -1454,11 +1516,10 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 		t.Fatalf("the public marker was not found in %d bytes of received frames; the scan cannot see what crosses and the negative below is unfalsifiable", len(wire))
 	}
 
-	// (c) THE SECRET DID NOT. HELD BY CONSTRUCTION TODAY — see the header and
-	// (a2) — and retained as a forward guard rather than as a measurement of
-	// this build. Control (b) proves the scanner can see, but it proves it on
-	// the runtime-to-tail EVENT path, which is not the command-payload path;
-	// no production code joins the two any more.
+	// (c) THE SECRET DID NOT. THIS IS A MEASUREMENT AGAIN and no longer a
+	// forward guard: (a) proves the secret was in this process and crossed into
+	// the runtime, and (b) proves the scanner can see what does cross, so a Host
+	// that put the body on the wire would be caught here.
 	if strings.Contains(string(wire), secret) {
 		t.Fatalf("the private command payload crossed HostLink; found in the %d bytes this link received", len(wire))
 	}
@@ -1487,18 +1548,23 @@ func TestNoPrivatePayloadCrossesHostLinkInEitherDirection(t *testing.T) {
 		t.Fatalf("a delivery carrying a payload was neither refused at the transport nor answered with a Core class: %s", mustJSON(t, smuggled))
 	}
 
-	if got := len(c.runtime.appliedCommands()); got != 0 {
-		t.Fatalf("the runtime was driven %d times by a Host that does not dispatch", got)
+	// THE SMUGGLED DELIVERY DROVE NOTHING. This is a count against the ONE
+	// legitimate dispatch (a) made, not against zero: a Host that does dispatch
+	// would satisfy a zero-check only by being broken, and what is claimed here
+	// is that a refused delivery adds no second application.
+	if got := len(c.runtime.appliedCommands()); got != 1 {
+		t.Fatalf("the runtime was driven %d times, want only the one legitimate dispatch; a refused delivery drove a command", got)
 	}
 
-	// (e) THE CONTROL FOR (a2). "The Host read no payload" is a zero, and a zero
-	// is what a broken counter also reports. One read through the same method
-	// must move it, or (a2) is the very thing this test is here to stop being.
+	// (e) THE CONTROL FOR (a2). (a2) asserts a COUNT, and a count is only
+	// evidence if the counter moves. One further read through the same method
+	// must take it to two, or the one asserted in (a2) could be a counter stuck
+	// at its first increment.
 	if _, err := c.store.LoadPayload(context.Background(), tenantA, sessionA, command); err != nil {
 		t.Fatalf("the control read of the private payload failed: %v", err)
 	}
-	if loads := c.store.payloadLoadCount(); loads != 1 {
-		t.Fatalf("the payload-load counter reports %d after exactly one read; the zero asserted in (a2) cannot be distinguished from a counter that never moves", loads)
+	if loads := c.store.payloadLoadCount(); loads != 2 {
+		t.Fatalf("the payload-load counter reports %d after one further read; the count asserted in (a2) cannot be distinguished from a counter that does not move", loads)
 	}
 }
 
@@ -1744,4 +1810,101 @@ func reservedHostLinkMethods(directory string) (map[string]string, error) {
 		}
 	}
 	return found, nil
+}
+
+// awaitApplied blocks until the runtime has been driven at least want times.
+//
+// IT WAITS ON THE RENDEZVOUS THE RUNTIME ANNOUNCES, not on a timer over a
+// counter: a test that polled would be measuring its own patience, and a slow
+// pass would read as a Host that refused.
+func (c *commandFixture) awaitApplied(want int) {
+	c.t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		if len(c.runtime.appliedCommands()) >= want {
+			return
+		}
+		select {
+		case <-c.runtime.drove:
+		case <-time.After(time.Millisecond):
+		case <-deadline.C:
+			c.t.Fatalf("the runtime was driven %d times in 10s, want %d", len(c.runtime.appliedCommands()), want)
+		}
+	}
+}
+
+// consumer returns this session's durable command consumer.
+func (c *commandFixture) consumer() *commands.Consumer {
+	c.t.Helper()
+	c.svc.mu.Lock()
+	defer c.svc.mu.Unlock()
+	consumer := c.svc.consumers[keyA]
+	if consumer == nil {
+		c.t.Fatal("the attached session has no consumer at all")
+	}
+	return consumer
+}
+
+// withoutDisposition makes the runtime stop recording its durable disposition,
+// which is the case the whole evidence boundary exists for: a dispatch that
+// happened and a journal that cannot say so.
+func (s *publishingSession) withoutDisposition() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.disposition = nil
+}
+
+// TestTheComposedHostHandsItsRuntimesCloserToTheApplier closes the last
+// structural blind spot in this suite.
+//
+// A MUTANT REPLACING THE CAPABILITY ASSERTION WITH A BARE nil SURVIVED
+// everything else here, because no composed runtime implemented
+// department.AttemptCloser — so the varied axis was the VALUE and the unvaried
+// one was whether the capability existed at all. publishingSession now offers
+// one, and a PREDECESSOR's stranded attempt is what asks for it.
+//
+// THE ATTEMPT'S GRANT IS STRICTLY BELOW THE RUNTIME'S, which is the only shape a
+// successor may close: equal would be this runtime's own attempt, and a runtime
+// closing its own would tombstone work it may itself have done.
+//
+// THE CLOSER REFUSES, AND THE PASS BLOCKS RATHER THAN SETTLING. That is the
+// correct outcome and it is asserted: a composition that concluded anything from
+// a refused closure would be authoring a tombstone from a failure.
+func TestTheComposedHostHandsItsRuntimesCloserToTheApplier(t *testing.T) {
+	c := newCommandFixture(t)
+	stranded := c.store.accept(t, "command-stranded", `{"blocks":[{"text":"stranded"}]}`)
+	c.dispositions.strand(stranded, "a-predecessors-attempt", c.runtime.epoch-1)
+
+	channel := hostlink.ChannelFor(keyA)
+	link := dialFactoryLink(t, c.server.URL, tenantA)
+	accepted(t, link.rpc(2, hostlink.MethodBind, c.bindRequest(tenantA, sessionA, 9)))
+	accepted(t, link.rpc(3, channel, sessionwire.HostLinkCommandDelivery{CommandID: stranded}))
+
+	blocked := c.awaitBlocked(stranded)
+	if blocked.CommandID != stranded {
+		t.Fatalf("the pass stopped at %q, want the stranded command", blocked.CommandID)
+	}
+	// THE COUNT IS "AT LEAST ONE" AND NOT "EXACTLY ONE", because a blocked pass
+	// RETRIES: the consumer wakes again and re-offers the same command, and a
+	// closure is idempotent by design — the released closer reports
+	// Appended=false for a redelivered one rather than writing a second
+	// tombstone. What must be exactly one is the ATTEMPT being closed, which is
+	// asserted instead, because a Host asking about a second attempt would be
+	// closing something nobody stranded.
+	asked := c.runtime.closuresAsked()
+	if len(asked) == 0 {
+		t.Fatal("the runtime's closer was never asked, so the composition never handed it to the applier")
+	}
+	for _, attempt := range asked {
+		if attempt != "a-predecessors-attempt" {
+			t.Fatalf("the runtime's closer was asked about %q, want only the predecessor's stranded attempt", attempt)
+		}
+	}
+	if driven := c.runtime.appliedCommands(); len(driven) != 0 {
+		t.Errorf("a stranded attempt was re-dispatched %d times, on top of an effect that may already have committed", len(driven))
+	}
+	if got := c.dispositions.stateOfCommand(stranded); got != commands.StateApplying {
+		t.Errorf("the durable record is %q, want it left %q after a refused closure", got, commands.StateApplying)
+	}
 }

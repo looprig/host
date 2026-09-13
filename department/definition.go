@@ -13,6 +13,7 @@ package department
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strconv"
 	"unicode/utf8"
@@ -379,12 +380,91 @@ type RuntimeCommand struct {
 	// neither is set for a command that has none.
 	Payload    []byte
 	PayloadRef sessionwire.ObjectReference
+
+	// AttemptID is the immutable identity of the ONE dispatch the durable
+	// record authorized, and it is what makes this dispatch settleable.
+	//
+	// IT IS THE STORE'S AND IS NEVER MINTED ON THIS SIDE OF THE SEAM.
+	// BeginDispositionAttempt writes it immutably before any dispatch happens,
+	// so a runtime's durable disposition can name the attempt it is about and a
+	// settler can verify the two agree. A value invented here would name an
+	// attempt no evidence could ever be about.
+	//
+	// IT IS A STRING RATHER THAN A TYPED IDENTITY for the reason Kind is: this
+	// seam is Host's control path into ANY runtime, and typing it would put
+	// either sessionstore's or harness's vocabulary in department's own. It
+	// carries harness's grammar — bounded opaque UTF-8 — because both modules
+	// bound it the same way, and the adapter validates rather than assumes.
+	//
+	// EMPTY IS A LEGITIMATE VALUE AND MEANS NO ATTEMPT WAS AUTHORIZED. harness
+	// writes no disposition frame for one, by design, leaving a legacy
+	// journal's bytes unchanged. A Host driving the disposition family always
+	// sets it; a caller that does not is asking for the legacy behaviour and
+	// gets it.
+	AttemptID string
 }
 
 // CommandApplier applies one admitted runtime command. This is Host's control
 // path into a runtime.
 type CommandApplier interface {
 	ApplyCommand(context.Context, RuntimeCommand) error
+}
+
+// ErrDispositionUnsupported reports a dispatch refused because the runtime's
+// durable log cannot record a command disposition.
+//
+// IT IS DECLARED HERE, IN THE SEAM, BECAUSE BOTH SIDES MUST NAME IT. The
+// adapter raises it and the applier acts on it, and neither may import the
+// other; a refusal recognisable only by its message text is a refusal a caller
+// cannot distinguish from a transport failure, which is precisely the mistake
+// harness exported its own error type to stop.
+//
+// NOTHING DURABLE WAS WRITTEN, so the command MAY be re-offered — which a
+// transport failure does not license, because a transport failure says the
+// opposite: something may have happened.
+var ErrDispositionUnsupported = errors.New("department: this runtime's durable log cannot record a command disposition, so nothing was dispatched and nothing durable was written")
+
+// ErrEnduringEffect reports a recovery closure refused because the runtime's
+// journal holds an enduring event caused by the command being closed.
+//
+// IT IS TERMINAL FOR THE CLOSURE AND IS NEVER RETRYABLE. The predecessor's
+// effect committed and only its evidence is missing, so a tombstone over it is
+// the one error this protocol cannot recover from. A caller that retried this
+// into a closure would destroy a real effect.
+var ErrEnduringEffect = errors.New("department: the runtime's journal holds an enduring effect for this command, so its attempt may not be closed")
+
+// ErrNoAttemptCloser reports a runtime that offers no recovery closure.
+//
+// IT EXISTS BECAUSE A WRAPPER CANNOT BE ABSENT. rigRuntime forwards an optional
+// capability, and a Go wrapper that declares the method satisfies the interface
+// for every runtime it wraps — so a caller's type assertion stops being able to
+// say "this one has none". The distinction moves from the assertion to this
+// sentinel, and a caller that needs it must read the error rather than the
+// assertion.
+//
+// A BLOCKED PASS IS THE CORRECT RESPONSE, never a conclusion: a composition that
+// cannot close a predecessor's stranded attempt must leave the command where it
+// is, not decide its fate without the evidence a closure would have produced.
+var ErrNoAttemptCloser = errors.New("department: this runtime offers no recovery closure, so a predecessor's stranded attempt cannot be closed")
+
+// AttemptCloser writes the recovery closure for an attempt a PREVIOUS runtime
+// never finished, under this runtime's own strictly later journal grant.
+//
+// IT IS DISCOVERED BY ASSERTION AND IS DELIBERATELY NOT PART OF Runtime, which
+// is the shape harness's runtimecommand.AttemptCloser has for the same reason:
+// folding a recovery-only capability into the ordinary control path would make
+// every implementer of that path — the composed adapter, every test double —
+// carry a method only a successor ever calls. A composition whose runtime does
+// not satisfy it blocks on a stranded attempt rather than concluding anything.
+type AttemptCloser interface {
+	// CloseAttempt durably records that the named attempt was not applied.
+	//
+	// AttemptJournalEpoch is the grant the ATTEMPT was authorized under, read
+	// from the durable record. The author grant is NOT a parameter: the closer
+	// stamps that from the live lease it holds, because a caller-supplied author
+	// epoch would be a caller-authored proof, and a tombstone is the one thing
+	// that must never be one.
+	CloseAttempt(ctx context.Context, command sessionwire.CommandID, runtimeCommand uuid.UUID, kind string, attempt string, attemptJournalEpoch uint64) error
 }
 
 // LeaseEpochReporter reports the JOURNAL single-writer lease epoch the RUNTIME

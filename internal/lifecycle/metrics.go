@@ -48,7 +48,7 @@ type GateWaits interface {
 // consumer that has stopped at a command it will not process.
 //
 // IT IS THE WEDGE'S ONLY OPERATIONAL SIGNATURE, and it exists because that
-// condition had none. A composed Host runs commands.NoDispatch and therefore
+// condition had none. A composed Host once refused every dispatch and therefore
 // stops at the first non-terminal command in every session, permanently and BY
 // DESIGN — but a blocked pass returns a nil error, so Consumer.Failures() stays
 // at zero; nothing in internal/commands logs; and the HostLink delivery that
@@ -295,7 +295,7 @@ var (
 	)
 	blockedSessionsDesc = prometheus.NewDesc(
 		"host_sessions_command_blocked",
-		"Resident sessions whose durable command consumer has stopped at a command it will not process. EXPECTED to equal the number of sessions holding work while this Host refuses to dispatch; see commands.NoDispatch. It is the only signal that distinguishes that designed state from an idle Host.",
+		"Resident sessions whose durable command consumer has stopped at a command it will not process. EXPECTED to equal the number of sessions holding work while this Host refuses to dispatch; a blocked pass now means a command this Host could not settle rather than one it refused to start. It is the only signal that distinguishes a wedged session from an idle Host.",
 		nil, nil,
 	)
 	gateWaitingDesc = prometheus.NewDesc(

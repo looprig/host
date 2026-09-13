@@ -200,9 +200,9 @@ type countingBootstrap struct {
 }
 
 // Store counts the call and then refuses like its embedded default.
-func (b *countingBootstrap) Store(ctx context.Context) (*sessionstore.Store, error) {
+func (b *countingBootstrap) Store(ctx context.Context, evidence sessionstore.DispositionEvidenceReader) (*sessionstore.Store, error) {
 	b.opened++
-	return b.unconfiguredBootstrap.Store(ctx)
+	return b.unconfiguredBootstrap.Store(ctx, evidence)
 }
 
 // TestTheBinaryNamesNoProductAndRegistersNoAgent is the structural half of "this
@@ -405,6 +405,15 @@ func TestBootstrapAsksAProductForNothingTheReleasedStoreCanAnswer(t *testing.T) 
 		"Checkpointer": true,
 		"Auth":         true,
 		"Workspaces":   true,
+
+		// JournalStores is the SIXTH, and it is here for the same reason the
+		// first three are: a disposition session's journal is not in the
+		// orchestration store, the immutable binding says where it is, and no
+		// released reader can route on that binding — a harness Store holds no
+		// registry of the bindings it serves and answers only for the keyspace
+		// it owns. Which journal store serves which binding is a deployment
+		// fact, and there is no release that could make it Host's to know.
+		"JournalStores": true,
 	}
 	for name := range want {
 		if !got[name] {

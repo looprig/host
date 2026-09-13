@@ -735,6 +735,8 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		ReconcileInterval: time.Minute,
 		ReconcileBatch:    32,
 	}
+	inbox := &fakeInbox{}
+	dispositions := newFakeDispositions(clock, inbox)
 	composeOptions := Options{
 		HostGeneration:       testGen,
 		Clock:                clock,
@@ -742,8 +744,10 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		Durable:              store,
 		Locations:            store,
 		Workspaces:           store,
-		Inbox:                &fakeInbox{},
+		Inbox:                inbox,
 		Cursors:              &fakeCursors{},
+		Records:              dispositions,
+		Writers:              &fakeDispositionWriters{store: dispositions},
 		Targets:              directory,
 		Checkpointer:         &fakeCheckpointer{trace: trace},
 		Auth:                 auth,
@@ -1175,5 +1179,354 @@ func (f *fixture) bindRequest(tenant sessionwire.TenantID, session sessionwire.S
 		LeaseEpoch:             epoch,
 		RuntimeCompatibilityID: string(testCompat),
 		IdempotencyKey:         "idem-" + string(session),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The disposition family's application seams
+// ---------------------------------------------------------------------------
+
+// fakeDispositions is DispositionRecords and DispositionWrites for the composed
+// suite, and it READS THROUGH TO THE INBOX rather than holding a second copy of
+// the same rows.
+//
+// THAT IS THE FIXTURE-FAITHFULNESS LESSON APPLIED FORWARD. The attach-fence
+// round found a composed suite green against a fake whose opener minted a grant
+// for anything, while the released store refused every one of those sessions;
+// two stores here would be the same defect on a different axis — a consumer
+// listing rows this applier had never heard of, with a composed test unable to
+// see the disagreement. One source of rows, one set of transitions over them.
+//
+// EVERY REFUSAL BELOW IS ONE THE RELEASED STORE MAKES, in the order it makes it:
+// the claim edge derives its residency from a GRANT the caller does not name;
+// the attempt edge fences its residency to EQUAL the claim's; and settlement
+// chooses the terminal arm from EVIDENCE the caller supplies none of.
+type fakeDispositions struct {
+	mu    sync.Mutex
+	clock *fakeClock
+
+	// inbox is the SAME source the consumer lists from, held as the seam rather
+	// than as a concrete double so a fixture that replaces the inbox replaces
+	// this too. Two sources of rows would let a consumer list commands this
+	// applier had never heard of, with no composed test able to see it.
+	inbox commands.Inbox
+
+	// grantEpoch is the residency the GRANT carries. It is bound to the writer,
+	// not passed per call, exactly as the released edge requires.
+	grantEpoch uint64
+
+	// state holds the transitions made over an inbox row. A row with no entry
+	// here is pending at revision 1.
+	state map[sessionwire.CommandID]*composedDisposition
+
+	// evidence is what the bound journal holds for a command, or "" for none.
+	evidence map[sessionwire.CommandID]string
+
+	// payloads, when set, is where the private body is read from.
+	payloads dispositionPayloads
+
+	// runtimeCommandID is the durable mapping every row carries. The composed
+	// inbox's Command has none — it is the ordering decision's three fields —
+	// so the applier's record read supplies one from here.
+	runtimeCommandID uuid.UUID
+}
+
+// composedResidencyEpoch is the residency fakeStore's grant carries, stated once
+// rather than repeated: the claim edge derives the epoch from the GRANT, so a
+// double whose grant disagreed with the lease the composition recorded would
+// refuse every attempt at the equality fence and the diagnosis would be the
+// wrong one.
+const composedResidencyEpoch uint64 = 9
+
+// composedDisposition is one row's mutable durable state.
+type composedDisposition struct {
+	state          commands.State
+	revision       uint64
+	claimResidency uint64
+	claimExpires   time.Time
+	attempt        commands.AttemptID
+	attemptJournal uint64
+	deadline       time.Time
+}
+
+func newFakeDispositions(clock *fakeClock, inbox commands.Inbox) *fakeDispositions {
+	return &fakeDispositions{
+		clock:            clock,
+		inbox:            inbox,
+		grantEpoch:       composedResidencyEpoch,
+		state:            map[sessionwire.CommandID]*composedDisposition{},
+		evidence:         map[sessionwire.CommandID]string{},
+		runtimeCommandID: uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+	}
+}
+
+// rowFor finds the inbox row a command came from, which is what makes this
+// double one store rather than two.
+func (d *fakeDispositions) rowFor(tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) (commands.Command, bool) {
+	rows, err := d.inbox.ListOrdered(context.Background(), tenant, session, 0, 0)
+	if err != nil {
+		return commands.Command{}, false
+	}
+	for _, row := range rows {
+		if row.CommandID == command {
+			return row, true
+		}
+	}
+	return commands.Command{}, false
+}
+
+// held returns the mutable state for a command, creating the pending default.
+func (d *fakeDispositions) held(command sessionwire.CommandID, row commands.Command) *composedDisposition {
+	if existing, ok := d.state[command]; ok {
+		return existing
+	}
+	created := &composedDisposition{
+		state:    row.State,
+		revision: 1,
+		deadline: d.clock.Now().Add(time.Hour),
+	}
+	d.state[command] = created
+	return created
+}
+
+func (d *fakeDispositions) LoadDispositionCommand(
+	_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID,
+) (commands.DispositionRecord, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.rowFor(tenant, session, command)
+	if !ok {
+		return commands.DispositionRecord{}, fmt.Errorf("fakeDispositions: no such command %q in %s/%s", command, tenant, session)
+	}
+	held := d.held(command, row)
+	return commands.DispositionRecord{
+		TenantID:              tenant,
+		SessionID:             session,
+		CommandID:             command,
+		RuntimeCommandID:      d.runtimeCommandID,
+		Kind:                  commands.KindInput,
+		State:                 held.state,
+		AcceptedOrder:         row.AcceptedOrder,
+		Revision:              held.revision,
+		ApplyDeadline:         held.deadline,
+		ClaimResidencyEpoch:   held.claimResidency,
+		ClaimExpiresAt:        held.claimExpires,
+		AttemptID:             held.attempt,
+		AttemptJournalEpoch:   held.attemptJournal,
+		AttemptResidencyEpoch: held.claimResidency,
+	}, nil
+}
+
+// LoadDispositionPayload reads the private body FROM THE SAME STORE the rows
+// came from when there is one.
+//
+// A DEFAULT BODY WOULD MAKE EVERY PRIVACY ASSERTION OVER THIS FIXTURE VACUOUS.
+// A double that answered a constant would drive the runtime with bytes no
+// durable record ever held, so a test scanning the wire for a secret would be
+// scanning for something Host was never given — which is the same
+// fixture-looser-than-the-store defect the attach-fence round found on the
+// protocol-mode axis. The fallback exists only for the fixtures that wire no
+// payload source at all, and it carries no secret by construction.
+func (d *fakeDispositions) LoadDispositionPayload(
+	ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID,
+) (commands.Payload, error) {
+	d.mu.Lock()
+	source := d.payloads
+	d.mu.Unlock()
+	if source == nil {
+		return commands.Payload{Body: []byte(`{"blocks":[]}`)}, nil
+	}
+	return source.LoadPayload(ctx, tenant, session, command)
+}
+
+// dispositionPayloads is the private-body source a fixture wires when its rows
+// carry one.
+type dispositionPayloads interface {
+	LoadPayload(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.CommandID) (commands.Payload, error)
+}
+
+// fakeDispositionWriter is one session's writer, bound to a grant.
+type fakeDispositionWriter struct {
+	store *fakeDispositions
+}
+
+func (w *fakeDispositionWriter) ClaimDisposition(
+	_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, claim commands.DispositionClaim,
+) (uint64, error) {
+	d := w.store
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.rowFor(tenant, session, command)
+	if !ok {
+		return 0, fmt.Errorf("fakeDispositions: no such command %q", command)
+	}
+	held := d.held(command, row)
+	if claim.ExpectedRevision == 0 || held.revision != claim.ExpectedRevision {
+		return 0, fmt.Errorf("fakeDispositions: revision conflict on %q", command)
+	}
+	if held.state.Terminal() || held.attempt != "" {
+		return 0, fmt.Errorf("fakeDispositions: %q has no claim edge left", command)
+	}
+	if d.grantEpoch < held.claimResidency {
+		return 0, fmt.Errorf("fakeDispositions: residency %d is below the mark %d", d.grantEpoch, held.claimResidency)
+	}
+	held.state = commands.StateClaimed
+	held.claimResidency = d.grantEpoch
+	held.claimExpires = claim.ExpiresAt
+	held.revision++
+	return held.revision, nil
+}
+
+func (w *fakeDispositionWriter) BeginAttempt(
+	_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, attempt commands.DispositionAttempt,
+) (uint64, error) {
+	d := w.store
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.rowFor(tenant, session, command)
+	if !ok {
+		return 0, fmt.Errorf("fakeDispositions: no such command %q", command)
+	}
+	held := d.held(command, row)
+	if attempt.ExpectedRevision == 0 || held.revision != attempt.ExpectedRevision {
+		return 0, fmt.Errorf("fakeDispositions: revision conflict on %q", command)
+	}
+	if held.state != commands.StateClaimed {
+		return 0, fmt.Errorf("fakeDispositions: %q is %q and has no attempt edge", command, held.state)
+	}
+	if attempt.AttemptID == "" || attempt.JournalEpoch == 0 {
+		return 0, fmt.Errorf("fakeDispositions: the attempt names no identity or no journal grant")
+	}
+	// Fenced to EQUAL the claim's residency, which is the released edge's rule:
+	// an attempt may not raise the record's high-water mark.
+	if attempt.ResidencyEpoch != held.claimResidency {
+		return 0, fmt.Errorf("fakeDispositions: residency %d is not the claim's %d", attempt.ResidencyEpoch, held.claimResidency)
+	}
+	held.state = commands.StateApplying
+	held.attempt = attempt.AttemptID
+	held.attemptJournal = attempt.JournalEpoch
+	held.revision++
+	return held.revision, nil
+}
+
+func (w *fakeDispositionWriter) SettleDisposition(
+	_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, settlement commands.DispositionSettlement,
+) (commands.State, error) {
+	d := w.store
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.rowFor(tenant, session, command)
+	if !ok {
+		return "", fmt.Errorf("fakeDispositions: no such command %q", command)
+	}
+	held := d.held(command, row)
+	if settlement.ExpectedRevision == 0 || held.revision != settlement.ExpectedRevision {
+		return "", fmt.Errorf("fakeDispositions: revision conflict on %q", command)
+	}
+	if held.state.Terminal() {
+		return held.state, nil
+	}
+	if held.attempt == "" {
+		return "", fmt.Errorf("fakeDispositions: %q has no attempt to settle", command)
+	}
+	if settlement.ResidencyEpoch < held.claimResidency {
+		return "", fmt.Errorf("fakeDispositions: settling residency %d is below the claim's %d", settlement.ResidencyEpoch, held.claimResidency)
+	}
+	switch d.evidence[command] {
+	case "":
+		return "", fmt.Errorf("fakeDispositions: no durable disposition for %q", command)
+	case "applied", "no_op":
+		held.state = commands.StateApplied
+	default:
+		held.state = commands.StateRejected
+	}
+	held.revision++
+	return held.state, nil
+}
+
+// fakeDispositionWriters is the composition's DispositionWriters.
+//
+// IT REFUSES A LEASE IT DID NOT ISSUE, which is the released adapter's own rule:
+// a writer with no grant could claim nothing, and a composition that produced
+// one would discover that at the first command of a session it had already taken
+// residency of.
+type fakeDispositionWriters struct {
+	store  *fakeDispositions
+	refuse error
+}
+
+func (w *fakeDispositionWriters) DispositionWriterFor(lease residency.Lease) (commands.DispositionWrites, error) {
+	if w.refuse != nil {
+		return nil, w.refuse
+	}
+	if lease == nil {
+		return nil, errors.New("fakeDispositionWriters: no lease, so no grant a claim could be derived from")
+	}
+	return &fakeDispositionWriter{store: w.store}, nil
+}
+
+// stateOfCommand reports one command's durable state, for a composed test that
+// wants to see a command actually settle.
+func (d *fakeDispositions) stateOfCommand(command sessionwire.CommandID) commands.State {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	held, ok := d.state[command]
+	if !ok {
+		return ""
+	}
+	return held.state
+}
+
+// setEvidence records what the bound journal holds for a command.
+func (d *fakeDispositions) setEvidence(command sessionwire.CommandID, kind string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.evidence[command] = kind
+}
+
+// attemptOf reports the identity the durable record authorized for a command.
+func (d *fakeDispositions) attemptOf(command sessionwire.CommandID) commands.AttemptID {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	held, ok := d.state[command]
+	if !ok {
+		return ""
+	}
+	return held.attempt
+}
+
+// settleOutOfBand drives one record to a terminal state as a predecessor Host,
+// or Factory's deadline reconciler, would leave it.
+//
+// IT WRITES THE STATE DIRECTLY AND BYPASSES EVERY EDGE, which is the point: the
+// case being reproduced is one where THIS Host made no transition at all, so
+// going through the claim or settlement edges would reproduce a different case.
+func (d *fakeDispositions) settleOutOfBand(command sessionwire.CommandID, state commands.State) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	held, ok := d.state[command]
+	if !ok {
+		held = &composedDisposition{revision: 1, deadline: d.clock.Now().Add(time.Hour)}
+		d.state[command] = held
+	}
+	held.state = state
+	held.revision++
+}
+
+// strand puts a command in the shape a PREDECESSOR left behind: applying, with a
+// durably authorized attempt whose journal grant is below the one this runtime
+// holds. It is written directly because no edge on this Host produces it — a
+// predecessor did.
+func (d *fakeDispositions) strand(command sessionwire.CommandID, attempt commands.AttemptID, journalEpoch uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.state[command] = &composedDisposition{
+		state:          commands.StateApplying,
+		revision:       1,
+		claimResidency: d.grantEpoch,
+		claimExpires:   d.clock.Now().Add(time.Minute),
+		attempt:        attempt,
+		attemptJournal: journalEpoch,
+		deadline:       d.clock.Now().Add(time.Hour),
 	}
 }

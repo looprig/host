@@ -6,7 +6,9 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/realtime/hostlink"
@@ -99,25 +101,72 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 	return handle, nil
 }
 
-// beginWork starts one session's durable command consumer and live event relay.
+// beginWork starts one session's durable command consumer, its applier and the
+// live event relay.
 //
-// THE PROCESSOR IS commands.NoDispatch AND THAT IS THE BOUNDARY, not a stub left
-// where an applier belongs. A composed Host lists, orders and settles its
-// position in a session's durable command stream, and it refuses to drive a
-// command into the runtime; commands.NoDispatch is where the reason is written
-// out in full. Wiring commands.Applier here instead would compile — it is the
-// legacy family's protocol and every seam it needs is declared — and would
-// produce commands stuck in `applying` with a real runtime effect behind them
-// and no attempt identity any settler could match.
+// THE PROCESSOR IS THE DISPOSITION APPLIER, AND THAT IS WHAT REPLACED THE
+// BOUNDARY. The removed commands.NoDispatch refused before any durable seam because harness
+// could not write attempt-aware evidence: a command dispatched under the old
+// writer committed an application prefix naming no attempt, the settlement
+// verifier requires the attempt's identity, and no honest reader could supply
+// one — so such a command sat `applying` forever with a real effect behind it.
+// harness v0.34.0 writes the attempt-bearing disposition frame and sessionstore
+// v0.9.0 verifies it, so there is now a settlement for a dispatch to reach, and
+// the refusal is gone rather than relaxed.
+//
+// commands.Applier IS STILL NOT WIRED HERE, and the reason it was not before is
+// unchanged: it is the LEGACY family's protocol, and a Host takes residency
+// through AcquireResidency, which pins ProtocolModeDisposition. Both appliers
+// compile against this composition; only one of them names edges a session this
+// Host can hold actually has.
+//
+// THE WRITER IS BOUND TO THE SESSION'S GRANT AND THE ATTACH FAILS WITHOUT ONE.
+// A Host holding residency it cannot write under is the shape that produced the
+// boundary in the first place, so it is refused here rather than discovered at
+// the first command.
 func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequest) (*sessionWork, error) {
 	guard := request.Guard()
+	lease := s.leaseFor(request.Key)
+	if lease == nil {
+		return nil, errNoRecordedLease
+	}
+	writer, err := s.options.Writers.DispositionWriterFor(lease)
+	if err != nil {
+		return nil, err
+	}
+	// THE RUNTIME IS ASKED FOR ITS CLOSER RATHER THAN REQUIRED TO HAVE ONE, on
+	// the released capability's own terms: a recovery closure is segregated from
+	// the control path, and a composition whose runtime cannot offer one blocks
+	// on a predecessor's stranded attempt instead of concluding anything about
+	// it. department.Runtime does not name it, so this is the assertion.
+	closer, _ := request.Runtime.(department.AttemptCloser)
+	applier, err := commands.NewDispositionApplier(commands.DispositionApplierOptions{
+		Host:           s.options.Host,
+		Key:            request.Key,
+		ResidencyEpoch: uint64(request.LeaseEpoch),
+		Records:        s.options.Records,
+		Writes:         writer,
+		Runtime:        request.Runtime,
+		// THE JOURNAL EPOCH COMES FROM THE RUNTIME AND NEVER FROM request.LeaseEpoch,
+		// which is this Host's RESIDENCY. The two are different authorities over
+		// different stores; an attempt stamped with the wrong one names a grant no
+		// evidence could ever verify, and the numbers agreeing early in a session's
+		// life is an accident of two fresh counters rather than a relationship.
+		JournalEpochs: request.Runtime,
+		Attempts:      commands.UUIDAttemptIDs{},
+		Closer:        closerOrNil(closer),
+		Fence:         guard,
+	})
+	if err != nil {
+		return nil, err
+	}
 	consumer, err := commands.NewConsumer(commands.Options{
 		Host:       s.options.Host,
 		Key:        request.Key,
 		LeaseEpoch: uint64(request.LeaseEpoch),
 		Inbox:      s.options.Inbox,
 		Cursors:    s.options.Cursors,
-		Processor:  commands.NoDispatch{},
+		Processor:  applier,
 		Fence:      guard,
 	})
 	if err != nil {
@@ -138,6 +187,52 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		consumer.Stop()
 		s.forgetConsumer(request.Key)
 	}}, nil
+}
+
+// errNoRecordedLease is the refusal beginWork makes when the composition has no
+// grant recorded for a session it is starting ownership of.
+//
+// IT IS NOT AN IMPOSSIBLE STATE DRESSED AS A CHECK. leaseRecorder is the ONLY
+// route from the grant to this composition — residency.Manager hands onward an
+// OwnershipRequest carrying an epoch and a fence but not the Lease — so a change
+// that stopped recording, or that recorded under a different key, would produce
+// exactly this. The alternative is a nil lease reaching the writer factory and
+// being refused there as "foreign", which names the wrong fault.
+var errNoRecordedLease = errors.New("compose: no residency grant is recorded for this session, so no disposition writer can be bound to it")
+
+// closerOrNil converts an absent capability into a real nil interface.
+//
+// A TYPED NIL IS NOT AN ABSENT COLLABORATOR. A failed type assertion yields a
+// nil department.AttemptCloser, but assigning it through a second interface
+// field can produce a NON-nil interface holding nothing, and the applier's
+// "no closer" arm tests for nil. Making the conversion explicit is what stops a
+// missing capability from becoming a panic at the one command that needs it.
+func closerOrNil(closer department.AttemptCloser) commands.AttemptClosers {
+	if closer == nil {
+		return nil
+	}
+	return &closerAdapter{closer: closer}
+}
+
+// closerAdapter restates department's two-string closure in commands' own
+// vocabulary, which is where a mis-ordered pair of same-typed parameters becomes
+// a compile failure instead of a wrong tombstone.
+type closerAdapter struct {
+	closer department.AttemptCloser
+}
+
+var _ commands.AttemptClosers = (*closerAdapter)(nil)
+
+// CloseAttempt forwards one closure.
+func (a *closerAdapter) CloseAttempt(
+	ctx context.Context,
+	command sessionwire.CommandID,
+	runtimeCommand uuid.UUID,
+	kind commands.Kind,
+	attempt commands.AttemptID,
+	attemptJournalEpoch uint64,
+) error {
+	return a.closer.CloseAttempt(ctx, command, runtimeCommand, string(kind), string(attempt), attemptJournalEpoch)
 }
 
 // trackResident records the session this Host now holds, in the shape the drain

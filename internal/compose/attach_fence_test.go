@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -9,8 +10,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 
 	"github.com/looprig/host"
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
@@ -386,3 +389,124 @@ func collect(t *testing.T, collector prometheus.Collector) string {
 	}
 	return rendered.String()
 }
+
+// A HOST THAT CANNOT BIND A WRITER TO ITS RESIDENCY GRANT DOES NOT ATTACH, and
+// this test exists because two mutants proving otherwise SURVIVED the composed
+// suite: one that ignored the writer factory's refusal, and one that accepted a
+// session with no recorded grant at all.
+//
+// THE FAILURE IT PREVENTS IS THE ONE THE WHOLE DISPATCH BOUNDARY EXISTED FOR. A
+// Host that attached anyway would hold residency of a session it can list and
+// consume but never apply in: every command would reach the claim edge, be
+// refused for want of a grant, and block the pass — durably, silently, for as
+// long as this Host held the session, while a successor that could have applied
+// them is told the session is taken.
+//
+// THE REFUSAL IS AT ATTACH AND NOT AT THE FIRST COMMAND, which is the whole
+// point: the attach is the last moment at which nothing has been taken.
+func TestAnAttachIsRefusedWhenNoWriterCanBeBoundToTheGrant(t *testing.T) {
+	refusal := errors.New("compose_test: this store did not issue that residency lease")
+	f := newFixture(t, func(o *Options, _ *host.Options) {
+		o.Writers = &fakeDispositionWriters{refuse: refusal}
+	})
+	f.start()
+
+	_, err := f.svc.Attach(t.Context(), residency.Request{
+		TenantID: tenantA, SessionID: sessionA, AgentID: testAgent,
+		Mode:      residency.ModeCreate,
+		Principal: residency.Principal{TenantID: tenantA, ActorID: "actor-a"},
+	})
+	if err == nil {
+		t.Fatal("the attach succeeded with no disposition writer bound to its grant")
+	}
+	if !errors.Is(err, refusal) {
+		t.Errorf("Attach = %v, want it to carry the writer factory's own refusal", err)
+	}
+	// AND NOTHING IS LEFT HOLDING THE SESSION. An attach that failed after
+	// recording residency would be the same wedge by another route.
+	if _, held := f.svc.ConsumerFor(keyA); held {
+		t.Error("a consumer was started for a session whose writer could not be bound")
+	}
+
+	// THE CONTROL. The same fixture with a working factory attaches, so the
+	// refusal above is about the writer and not about a fixture that cannot
+	// attach at all.
+	g := newFixture(t)
+	g.start()
+	g.attach(tenantA, sessionA)
+	if _, held := g.svc.ConsumerFor(keyA); !held {
+		t.Error("the control attach started no consumer")
+	}
+}
+
+// THE COMPOSED HOST DISCOVERS ITS RUNTIME'S RECOVERY CLOSER, AND CONVERTS AN
+// ABSENT ONE INTO A REAL NIL. Three mutants covering this region all SURVIVED
+// before this test existed, and the reason was a STRUCTURAL blind spot rather
+// than a value one: no composed runtime implemented department.AttemptCloser, so
+// "discover it by assertion" and "never discover it" produced the same nil in
+// every fixture, and "wrap nil in an adapter" produced a typed nil nothing
+// called.
+//
+// ONE OF THOSE THREE ALSO SCORED A FALSE KILL. The typed-nil mutant was reported
+// KILLED by TestNewBuildsAndDoesNotStart — a known goroutine-count flake — and
+// SURVIVED on a second run. A kill attributed to a flaky test is not a kill.
+//
+// THE TWO ROWS ARE THE TWO STRUCTURES. A runtime that IS a closer must reach the
+// applier as one; a runtime that is not must reach it as a REAL nil, because the
+// applier's "no closer" arm tests for nil and a typed nil would panic at the one
+// command that needs it instead of blocking the pass.
+func TestTheComposedApplierGetsTheRuntimesCloserOrARealNil(t *testing.T) {
+	for _, row := range []struct {
+		name      string
+		closer    department.AttemptCloser
+		wantFound bool
+	}{
+		{"a runtime that offers a recovery closure", stubComposedCloser{}, true},
+		{"a runtime that does not", nil, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			got := closerOrNil(row.closer)
+			if row.wantFound {
+				if got == nil {
+					t.Fatal("closerOrNil discarded a closer the runtime offers")
+				}
+				if err := got.CloseAttempt(t.Context(), "command-a", uuid.UUID{}, commands.KindInput, "attempt-1", 1); err == nil {
+					t.Error("the adapter did not forward to the runtime's own closer")
+				}
+				return
+			}
+			// A REAL NIL AND NOT A TYPED ONE. `got == nil` is the applier's own
+			// check, so this comparison is the exact thing under test.
+			if got != nil {
+				t.Fatalf("closerOrNil returned %T for a runtime with no closer; the applier's nil check would miss it", got)
+			}
+		})
+	}
+}
+
+// stubComposedCloser is a runtime capability that refuses, which is enough to
+// show the forwarding happened.
+type stubComposedCloser struct{}
+
+func (stubComposedCloser) CloseAttempt(context.Context, sessionwire.CommandID, uuid.UUID, string, string, uint64) error {
+	return errors.New("compose_test: this runtime's closer refuses")
+}
+
+// THE `lease == nil` GUARD IN beginWork IS AN EQUIVALENT MUTANT HERE, MEASURED
+// RATHER THAN ARGUED, and it is recorded so the next reader does not spend the
+// same hour on it.
+//
+// Deleting it SURVIVES this suite, and a search over the whole domain says why
+// rather than merely that no fixture reaches it. There are exactly two routes to
+// a nil recorded lease. leaseRecorder writes the map on EVERY successful
+// acquisition and returns early on every failure, so the map cannot be missing
+// an entry for a session whose acquisition succeeded; and the other route — an
+// inner SessionLeases that reports success and grants nothing — is refused by
+// internal/residency's own step 2, which tests `lease == nil` before the runtime
+// exists and long before ownership begins. So no input reaches beginWork with a
+// nil lease.
+//
+// IT IS KEPT ANYWAY, and the reason is that the argument above is about the
+// CURRENT wiring rather than about the guard. The alternative to refusing is a
+// nil reaching the writer factory and being refused there as "foreign", which
+// names the wrong fault for a maintainer who changed the recorder.

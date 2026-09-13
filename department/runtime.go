@@ -231,6 +231,30 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	} else {
 		missing = append(missing, "LeaseEpochReporter")
 	}
+	// THE CLOSER IS FORWARDED AND IS NOT IN `missing`, and both halves matter.
+	//
+	// IT IS OPTIONAL, so its absence is not an IncapableRuntimeError: a recovery
+	// closure is a capability only a successor ever uses, and requiring it would
+	// refuse every runtime that cannot write one for a session that may never
+	// need one. What such a composition loses is the ability to close a
+	// PREDECESSOR's stranded attempt, which costs liveness on one command.
+	//
+	// IT MUST STILL BE FORWARDED, and this wrapper not forwarding it was a REAL
+	// DEFECT found by a surviving mutant rather than by reading. A composed Host
+	// asserts on the value THIS function returns, so a runtime that offered a
+	// closer had it silently dropped at the wrapper and every stranded attempt
+	// blocked forever with the capability sitting unused one layer down. That is
+	// exactly the hazard harness's own LeaseEpochReporter doc names — "a WRAPPER
+	// that fails to forward it" — arriving on the one capability whose absence
+	// is legitimate and therefore invisible.
+	//
+	// A TYPED NIL WOULD BE WORSE THAN AN ABSENT ONE. The field is left at its
+	// zero value when the assertion fails, so `runtime.(AttemptCloser)` on the
+	// result fails too; assigning the failed assertion's nil would make the
+	// wrapper advertise a capability that panics at the first use.
+	if capability, ok := session.(AttemptCloser); ok {
+		adapted.closer = capability
+	}
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
@@ -256,6 +280,41 @@ type rigRuntime struct {
 	PublicationSubscriber
 	CommandApplier
 	LeaseEpochReporter
+
+	// AttemptCloser is OPTIONAL and is nil for a runtime that offers none.
+	//
+	// EMBEDDING A NIL INTERFACE DOES NOT MAKE THIS TYPE SATISFY IT AT COMPILE
+	// TIME ONLY TO PANIC LATER — it makes *rigRuntime satisfy AttemptCloser
+	// unconditionally, which is precisely what must NOT happen: a caller's type
+	// assertion would then succeed for every runtime and the nil would be called.
+	// So this is deliberately NOT embedded, and CloseAttempt below is a method
+	// that refuses rather than a promoted one that crashes.
+	closer AttemptCloser
+}
+
+// CloseAttempt forwards to the runtime's own closer, or refuses.
+//
+// THE REFUSAL IS WHY THIS IS A METHOD AND NOT AN EMBEDDED FIELD. An embedded nil
+// interface would make every adapted runtime satisfy AttemptCloser and then
+// panic at the call; a caller cannot distinguish "this runtime has no closer"
+// from "this runtime is about to crash" by assertion, so the distinction is made
+// here, where the answer is known.
+func (r *rigRuntime) CloseAttempt(
+	ctx context.Context,
+	command sessionwire.CommandID,
+	runtimeCommand uuid.UUID,
+	kind string,
+	attempt string,
+	attemptJournalEpoch uint64,
+) error {
+	if r.closer == nil {
+		// THE SENTINEL AND NOT AN IncapableRuntimeError. That type is what an
+		// ATTACH refuses with, and an absent closer refuses no attach: the
+		// runtime is fully usable and one recovery path is unavailable. A caller
+		// reading this must block the command, not conclude anything about it.
+		return ErrNoAttemptCloser
+	}
+	return r.closer.CloseAttempt(ctx, command, runtimeCommand, kind, attempt, attemptJournalEpoch)
 }
 
 func (r *rigRuntime) SessionID() sessionwire.SessionID { return r.sessionID }
