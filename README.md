@@ -72,11 +72,24 @@ Host that could hold two tenants at once they would not be, and this rung would
 not be sufficient.
 
 **So exactly one drain is reachable over HostLink:** a **dedicated** Host's fixed
-session, asked for by the tenant that **currently holds it**. Everything else is
-refused — including, deliberately, a drain on a Host that is holding nothing
-yet, which is fail-closed and correct because such a Host has nothing for a
-HostLink drain to cover. **A pooled Host answers no HostLink drain at all**: it
-has no fixed session, so the session scope is refused too.
+session, asked for by the tenant that **currently holds it**. **A pooled Host
+answers no HostLink drain at all**: it has no fixed session, so the session
+scope is refused too.
+
+**A dedicated Host refuses every HostLink drain between process start and its
+first attach, and that is a behaviour rather than a caveat — Factory will meet
+it.** Rung (2) reads current residency, so until a session is resident there is
+no tenant that holds the fixed session and every drain request is answered
+`runtime_unavailable` with `RefusalWrongDrainScope`. **The reason is that the
+refusal is the correct answer**: a Host holding nothing has nothing for a
+HostLink drain to cover, and the alternative — acknowledging a drain of nothing
+— would hand a placement controller a generation it could poll to "drained"
+without anything having been released. **What a controller should do** is take
+the process-lifecycle path (terminate the workload) for a Host it wants gone
+before it has been used, and reserve the HostLink drain for a Host that is
+actually holding the session it placed. Note the shape of the failure if it does
+not: the refusal is **indistinguishable from the one a foreign tenant gets**,
+deliberately, so a controller must not read it as "wrong tenant".
 
 The whole-Host drain is reachable **only** through the process-lifecycle path —
 `Service.Stop` calls `Drainer.StartDrain` with the zero scope directly and never

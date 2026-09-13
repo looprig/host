@@ -1255,3 +1255,93 @@ func TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession(t *test
 		t.Fatalf("the owner's own drain checkpointed nothing, so the absence asserted above proves nothing: %v", f.trace.trace())
 	}
 }
+
+// TestRungEightsAttributionDependsOnTheDedicatedCapacityBound is the TRIP-WIRE
+// for R-1's second half, and it exists because rung 8 is a property that holds
+// today for a reason enforced in a DIFFERENT FILE.
+//
+// THE DEPENDENCY, SPELLED OUT SO IT CANNOT BE RELAXED BY ACCIDENT.
+// `drainScope`'s last rung refuses a fixed-session drain unless the requesting
+// tenant currently HOLDS that session, and it treats that as sufficient
+// attribution for a drain that covers the WHOLE HOST. It is sufficient only
+// because a dedicated Host holds AT MOST ONE resident session — which is not
+// hostlink's rule at all. It is `host.Options.validatePlacement` pinning
+// `Capacity` to 1 for dedicated placement. Relax that rule and rung 8 silently
+// stops being an attribution: a Host could hold tenant-a's session and
+// tenant-b's at once, tenant-b would hold the fixed session, pass rung 8, and
+// begin the Host-wide drain that releases tenant-a's — the exact defect R-1
+// closed, reopened with no assertion anywhere failing.
+//
+// So this test fails, by assertion and with a message that names the hole, if
+// the bound moves. It is deliberately in `internal/compose`, which is the one
+// package that can see both `host.Options` and the resolver that depends on it.
+func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
+	dedicated := func(capacity uint64) host.Options {
+		options := newFixture(t).hostOptions
+		options.Placement = sessionwire.HostPlacementDedicated
+		options.FixedSessionID = sessionA
+		options.Capacity = capacity
+		return options
+	}
+
+	// PART 1: THE RULE. A dedicated Host above capacity one must be refused at
+	// construction. This is the arm that fires when someone relaxes the bound.
+	if _, err := host.New(dedicated(2)); err == nil {
+		t.Fatal("A DEDICATED HOST WAS ACCEPTED AT CAPACITY 2, WHICH REOPENS THE R-1 DRAIN HOLE. " +
+			"hostlink's drainScope refuses a fixed-session drain unless the requesting tenant HOLDS " +
+			"that session, and treats that as attribution for a HOST-WIDE drain. That is sound only " +
+			"while a dedicated Host holds at most one resident session. At capacity 2 a link " +
+			"authenticated as tenant-b could hold the fixed session, pass the rung, and drain " +
+			"tenant-a's session. Either restore the bound or replace the rung with an attribution " +
+			"that does not depend on it.")
+	} else {
+		var invalid *host.InvalidOptionsError
+		if !errors.As(err, &invalid) || invalid.Code != host.OptionErrorCodeDedicatedCap {
+			t.Fatalf("a dedicated Host at capacity 2 was refused for the wrong reason (%v); "+
+				"rung 8 depends on the CAPACITY bound specifically, so a refusal from some other "+
+				"rule is not the guarantee it relies on", err)
+		}
+	}
+
+	// PART 2: THE POSITIVE CONTROL for that refusal. Capacity one IS accepted,
+	// so Part 1 is a statement about the bound and not about dedicated
+	// placement being unbuildable.
+	if _, err := host.New(dedicated(1)); err != nil {
+		t.Fatalf("a dedicated Host at capacity 1 was refused, so Part 1 proves nothing: %v", err)
+	}
+
+	// PART 3: THE PROPERTY ITSELF, MEASURED RATHER THAN READ OFF THE RULE. What
+	// rung 8 needs is not the spelling `Capacity != 1`; it is that a second
+	// tenant cannot become resident beside the holder. A relaxation that kept
+	// the option check and broke the enforcement would satisfy Part 1 and still
+	// open the hole, so the behaviour is asserted on a running Host.
+	f := newFixture(t, func(_ *Options, options *host.Options) {
+		options.Placement = sessionwire.HostPlacementDedicated
+		options.FixedSessionID = sessionA
+		options.Capacity = 1
+	})
+	f.start()
+	f.attach(tenantA, sessionA)
+
+	_, err := f.svc.Attach(t.Context(), residency.Request{
+		TenantID:  tenantB,
+		SessionID: sessionA,
+		AgentID:   testAgent,
+		Mode:      residency.ModeCreate,
+		Principal: residency.Principal{TenantID: tenantB, ActorID: "actor-b"},
+	})
+	if err == nil {
+		t.Fatal("A SECOND TENANT BECAME RESIDENT ON A DEDICATED HOST, WHICH REOPENS THE R-1 DRAIN HOLE. " +
+			"drainScope's last rung reads 'this tenant holds the fixed session' as 'this tenant owns " +
+			"everything a Host-wide drain would touch'. With two tenants resident those are no longer " +
+			"the same statement.")
+	}
+	held := 0
+	for range f.svc.ResidentSessions() {
+		held++
+	}
+	if held != 1 {
+		t.Fatalf("a dedicated Host holds %d resident sessions, want exactly one: rung 8's attribution "+
+			"covers one session and this Host has more than it can account for", held)
+	}
+}
