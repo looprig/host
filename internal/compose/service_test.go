@@ -23,6 +23,7 @@ const (
 	tenantA  = sessionwire.TenantID("tenant-a")
 	tenantB  = sessionwire.TenantID("tenant-b")
 	sessionA = sessionwire.SessionID("session-a")
+	sessionB = sessionwire.SessionID("session-b")
 )
 
 // keyA is the session every single-session test uses.
@@ -1042,5 +1043,109 @@ func TestABusyTenantIsNeverEvictedByAStrangerConnecting(t *testing.T) {
 	}
 	if _, stillHeld := f.svc.links.lookup(tenantA); !stillHeld {
 		t.Error("a stranger connecting evicted a tenant that held live routes")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R-1: the whole-Host drain across tenants
+// ---------------------------------------------------------------------------
+
+// TestATenantLinkCannotDrainAnotherTenantsSessions is R-1, and it is the
+// composition-level statement of the defect because no single package could see
+// it: hostlink knows one tenant per Multiplexer and lifecycle knows one drain,
+// and the hole is exactly the join — every tenant's Multiplexer is handed the
+// SAME Host-level Drainer, so a whole-Host drain begun over ANY of them covers
+// EVERY tenant's resident sessions.
+//
+// IT IS AVAILABILITY AND NOT CONFIDENTIALITY. tenant-a reads nothing of
+// tenant-b's, addresses none of its sessions and learns nothing about them; what
+// it can do is have them checkpointed and released early, which is an outage
+// tenant-b did not ask for and cannot see coming.
+//
+// THE NEGATIVE ASSERTION IS MADE NON-VACUOUS TWICE. tenant-b's session is
+// asserted RESIDENT before the drain request, so "tenant-b was not drained" is a
+// statement about a session there was something to drain; and the same session
+// is drained at the end of the test through the process-lifecycle path, so the
+// silence in between is a property of the refusal rather than of a fixture with
+// nothing in it.
+func TestATenantLinkCannotDrainAnotherTenantsSessions(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	f.attach(tenantB, sessionB)
+
+	// The premise. Both tenants hold a LIVE, RESIDENT, DRAINABLE session, so
+	// the assertions below are about a drain that could have happened.
+	resident := map[registry.Key]bool{}
+	for _, held := range f.svc.ResidentSessions() {
+		resident[held.Key()] = true
+	}
+	for _, key := range []registry.Key{{TenantID: tenantA, SessionID: sessionA}, {TenantID: tenantB, SessionID: sessionB}} {
+		if !resident[key] {
+			t.Fatalf("%v is not resident, so this test has nothing to protect", key)
+		}
+	}
+
+	link, held := f.svc.links.lookup(tenantA)
+	if !held {
+		t.Fatal("no link was built for tenant-a")
+	}
+
+	// THE ATTACK. A whole-Host drain names NO tenant and no session, and it
+	// arrives on a link that authenticated as tenant-a and nothing else.
+	whole := sessionwire.HostLinkDrainRequest{
+		Version:        sessionwire.CurrentWireVersion,
+		HostID:         testHostID,
+		HostGeneration: testGen,
+		IdempotencyKey: "tenant-a-drains-the-host",
+	}
+	beforeDrain := len(f.store.published())
+	_, err := link.mux.StartDrain(whole)
+	var refusal *hostlink.BindError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("a whole-Host drain over tenant-a's authenticated link = %v, want a refusal: "+
+			"one tenant's link can begin a drain covering every other tenant's sessions", err)
+	}
+	if refusal.Refusal != hostlink.RefusalWrongDrainScope {
+		t.Errorf("the refusal is %q, want %q", refusal.Refusal, hostlink.RefusalWrongDrainScope)
+	}
+
+	// tenant-b is untouched, on every observable this composition has.
+	duringDrain := f.store.published()[beforeDrain:]
+	if position := slices.IndexFunc(duringDrain, func(row sessionwire.HostLinkRegistryObservation) bool {
+		return row.TenantID == tenantB && row.SessionID == sessionB && !row.Accepting
+	}); position != -1 {
+		t.Errorf("tenant-a's drain published a nonaccepting row for tenant-b's session: %#v", duringDrain[position])
+	}
+	if position := f.trace.indexOf("checkpoint"); position != -1 {
+		t.Errorf("tenant-a's drain checkpointed a session at trace position %d: %v", position, f.trace.trace())
+	}
+	stillResident := map[registry.Key]bool{}
+	for _, held := range f.svc.ResidentSessions() {
+		stillResident[held.Key()] = true
+	}
+	if !stillResident[registry.Key{TenantID: tenantB, SessionID: sessionB}] {
+		t.Error("tenant-a's drain released tenant-b's session")
+	}
+	if !f.svc.Ready() {
+		t.Error("tenant-a's drain stopped the whole Host admitting, which is the outage this refusal exists to prevent")
+	}
+
+	// THE POSITIVE CONTROL, and it is two claims at once: tenant-b's session
+	// really was drainable — so the silence above is the refusal's and not the
+	// fixture's — and the PROCESS-LIFECYCLE path still drains the whole Host,
+	// which is the one path R-1 leaves open.
+	if _, err := f.svc.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	afterStop := f.store.published()[beforeDrain:]
+	if !slices.ContainsFunc(afterStop, func(row sessionwire.HostLinkRegistryObservation) bool {
+		return row.TenantID == tenantB && row.SessionID == sessionB && !row.Accepting
+	}) {
+		t.Fatalf("the process-lifecycle drain published no nonaccepting row for tenant-b's session, "+
+			"so the absence asserted above proves nothing: %#v", afterStop)
+	}
+	if f.trace.indexOf("checkpoint") == -1 {
+		t.Fatalf("the process-lifecycle drain checkpointed nothing, so the absence asserted above proves nothing: %v", f.trace.trace())
 	}
 }

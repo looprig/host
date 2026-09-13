@@ -17,10 +17,17 @@ import (
 //
 // Core spells the two scopes as an OPTIONAL tenant/session pair on the request,
 // which is a shape a caller can get half right; this is the RESOLVED form, and
-// the only thing that can produce one is drainScope below. A scope therefore
-// either names the session this Host is configured to hold or names nothing at
-// all — "a session this Host does not hold" is not a value a state machine can
-// be handed.
+// the only thing that can produce one FROM A REQUEST is drainScope below. A
+// scope therefore either names the session this Host is configured to hold or
+// names nothing at all — "a session this Host does not hold" is not a value a
+// state machine can be handed.
+//
+// THE WHOLE-HOST SCOPE IS NOT ONE drainScope CAN PRODUCE, since R-1. A request
+// naming no tenant is refused rather than resolved, because every link is
+// authenticated for one tenant and the Drainer behind them is the Host's. The
+// zero scope is still a legitimate VALUE — the process lifecycle constructs it
+// and hands it to the Drainer directly — so nothing here may read a zero Key as
+// impossible; what it may not do is accept one off the wire.
 //
 // IT CARRIES NO IDEMPOTENCY KEY, deliberately. See drainScope.
 type DrainScope struct {
@@ -236,8 +243,10 @@ func (m *Multiplexer) drainObservation(scope DrainScope, status DrainStatus) (se
 // IT IS AN ORDERED SEQUENCE OF TOTAL PREDICATES, and the order is the
 // mechanism, as it is on the bind path. Host identity is decided before scope,
 // so a request routed from a stale placement record learns nothing about which
-// session this Host holds; and the tenant is decided before the fixed session,
-// so a foreign tenant cannot probe for it either.
+// session this Host holds; the whole-Host scope is refused before the tenant is
+// compared, because there is no tenant on it to compare; and the tenant is
+// decided before the fixed session, so a foreign tenant cannot probe for it
+// either.
 // TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck enumerates the
 // predicates and holds each one as the FIRST failure, which is the property the
 // ordering buys.
@@ -275,11 +284,42 @@ func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (Drai
 		}
 	}
 	// Core's own Validate has already established that the tenant and session
-	// are both present or both absent, so one test decides the scope. A
-	// whole-Host drain is legitimate on a DEDICATED Host too: draining that
-	// Host and draining its one session are the same work.
+	// are both present or both absent, so one test decides the scope — and the
+	// WHOLE-HOST one is REFUSED HERE, before the tenant comparison below ever
+	// runs. That refusal is R-1 and it is not a tightening of an existing rule;
+	// it closes a hole.
+	//
+	// THE HOLE. This check used to RETURN the whole-Host scope, above the
+	// tenant comparison, so an empty TenantID short-circuited the tenant check
+	// entirely. Every tenant's Multiplexer is handed the SAME Host-level
+	// Drainer, so a link authenticated as tenant-a could begin a drain that
+	// checkpointed and released tenant-b's resident sessions. It is
+	// AVAILABILITY and not confidentiality — tenant-a reads nothing of
+	// tenant-b's and cannot address its sessions — and it is exactly the shape
+	// of defect the ordered ladder exists to prevent, reached by a rung that
+	// answered before the ladder got to the tenant.
+	//
+	// The comment that justified it argued HostLink "admits exactly ONE
+	// PRINCIPAL CLASS", and that premise is what H8 falsified: one principal
+	// class is not one PRINCIPAL, and a Host serving several tenants runs one
+	// Multiplexer per authenticated tenant over one drain.
+	//
+	// WHAT IS LEFT REACHABLE. A dedicated Host's fixed session, named by its
+	// own tenant, which is scoped by construction. Whole-Host drain remains
+	// reachable ONLY through the PROCESS-LIFECYCLE path — Service.Stop calls
+	// the Drainer directly and never passes through this resolver — which is
+	// the path a platform's termination signal already takes. It is not a
+	// second spelling of this one and nothing here gates it.
+	//
+	// NO SEAM IS LEFT FOR A FACTORY CONTROLLER. If one later needs a drain over
+	// this link it gets a TENANT-SCOPED or SERVICE-PRINCIPAL path of its own;
+	// re-admitting the empty tenant here would reopen the hole exactly.
 	if request.TenantID == "" {
-		return DrainScope{}, nil
+		return DrainScope{}, &BindError{
+			Refusal: RefusalWrongDrainScope,
+			Reason:  "this link is authenticated for one tenant, so it cannot drain the whole Host; a whole-Host drain is the process lifecycle's",
+			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
+		}
 	}
 	if request.TenantID != m.tenant {
 		return DrainScope{}, &BindError{

@@ -145,8 +145,16 @@ type drainFixture struct {
 	mux    *hostlink.Multiplexer
 }
 
-// newDrainFixture builds a POOLED Host with both drain seams supplied.
-func newDrainFixture(t *testing.T) *drainFixture { return newDrainFixtureFor(t, "") }
+// newDrainFixture builds a Host with both drain seams supplied and a drain a
+// tenant-authenticated link may actually begin.
+//
+// IT IS DEDICATED AND NOT POOLED, AND THAT IS R-1 RATHER THAN A PREFERENCE.
+// The only drain such a link may now begin is the one naming ITS OWN tenant and
+// this Host's fixed session; a pooled fixture answers every drain RPC with the
+// wrong-scope refusal and so could not exercise the handler at all. The
+// pooled Host's own answer — that it has no HostLink drain — is asserted where
+// it belongs, in the refusal ladder.
+func newDrainFixture(t *testing.T) *drainFixture { return newDrainFixtureFor(t, testSession) }
 
 // newDrainFixtureFor builds a Host holding the given fixed session; the empty
 // session is a pooled Host.
@@ -172,8 +180,14 @@ func newDrainFixtureFor(t *testing.T, fixed sessionwire.SessionID) *drainFixture
 	return &drainFixture{drains: drains, mux: mux}
 }
 
-// drainRequest is the whole-Host request a placement controller sends.
-func drainRequest() sessionwire.HostLinkDrainRequest {
+// wholeHostDrainRequest names NO tenant and no session, which Core reads as the
+// whole-Host scope.
+//
+// IT IS REFUSED ON EVERY TENANT-AUTHENTICATED LINK, which is every link this
+// package serves, and that is R-1. It is kept as a named shape because the
+// refusal is a property that must be asserted, not a case that has gone away:
+// Core still spells the scope and a Factory can still send it.
+func wholeHostDrainRequest() sessionwire.HostLinkDrainRequest {
 	return sessionwire.HostLinkDrainRequest{
 		Version:        sessionwire.CurrentWireVersion,
 		HostID:         testHostID,
@@ -184,11 +198,15 @@ func drainRequest() sessionwire.HostLinkDrainRequest {
 
 // sessionDrainRequest is the dedicated-Host request naming one fixed session.
 func sessionDrainRequest(session sessionwire.SessionID) sessionwire.HostLinkDrainRequest {
-	request := drainRequest()
+	request := wholeHostDrainRequest()
 	request.TenantID = testTenant
 	request.SessionID = session
 	return request
 }
+
+// drainRequest is the ONE drain a tenant-authenticated link may begin: this
+// link's own tenant, naming this Host's fixed session.
+func drainRequest() sessionwire.HostLinkDrainRequest { return sessionDrainRequest(testSession) }
 
 func mustStartDrain(t *testing.T, mux *hostlink.Multiplexer, request sessionwire.HostLinkDrainRequest) sessionwire.HostLinkDrainObservation {
 	t.Helper()
@@ -237,8 +255,9 @@ func TestDrainAcknowledgesInitiationAndNotCompletion(t *testing.T) {
 	if acknowledged.HostID != testHostID || acknowledged.HostGeneration != testGeneration {
 		t.Fatalf("acknowledgement names %q/%d, want %q/%d", acknowledged.HostID, acknowledged.HostGeneration, testHostID, testGeneration)
 	}
-	if acknowledged.TenantID != "" || acknowledged.SessionID != "" {
-		t.Fatalf("a whole-Host acknowledgement carried a scope: %+v", acknowledged)
+	if acknowledged.TenantID != testTenant || acknowledged.SessionID != testSession {
+		t.Fatalf("the acknowledgement's scope = %q/%q, want %q/%q",
+			acknowledged.TenantID, acknowledged.SessionID, testTenant, testSession)
 	}
 
 	// The SAME machine, now finished. The handler reports the new state
@@ -271,9 +290,15 @@ func TestDrainAcknowledgesInitiationAndNotCompletion(t *testing.T) {
 //     draining, begun and drained. There is no fourth value, and
 //     StartDrain is a total function of it.
 //   - the REQUEST axis, which is everything a caller may legitimately vary
-//     while still addressing this Host: the idempotency key, the scope
-//     (whole-Host or this Host's fixed session), the link the request arrives
-//     on, and the number of requests in flight at once.
+//     while still addressing this Host: the idempotency key, the link it
+//     arrives on, and the number of requests in flight at once.
+//
+// THE SCOPE IS NO LONGER ON THE REQUEST AXIS, and R-1 is why. A tenant-
+// authenticated link may name exactly one scope — its own tenant's fixed
+// session — so the axis that used to hold two values holds one, and its other
+// value moved to the refusal ladder as rung 4. That is a narrowing of the
+// ACCEPTED space and not a loss of coverage: the value that left is asserted
+// harder where it went.
 //
 // The runbook's seven cases are INSTANCES of that product — repeated is
 // (begun, same request), already drained is (drained, same request), reconnect
@@ -301,7 +326,7 @@ func TestEveryDrainRequestIsAnsweredWithTheSameGenerationAndBeginsOnce(t *testin
 			r.IdempotencyKey = "a-second-placement-controller"
 			return r
 		}},
-		{"the fixed session's own scope", func(r sessionwire.HostLinkDrainRequest) sessionwire.HostLinkDrainRequest {
+		{"the scope spelled again rather than inherited", func(r sessionwire.HostLinkDrainRequest) sessionwire.HostLinkDrainRequest {
 			return sessionDrainRequest(testSession)
 		}},
 	}
@@ -407,7 +432,7 @@ func TestEveryDrainRequestIsAnsweredWithTheSameGenerationAndBeginsOnce(t *testin
 				start.Wait()
 				request := drainRequest()
 				if index%2 == 0 {
-					request = sessionDrainRequest(testSession)
+					request.IdempotencyKey = "a-concurrent-second-controller"
 				}
 				observation, err := f.mux.StartDrain(request)
 				if err != nil {
@@ -489,10 +514,17 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 	t.Parallel()
 
 	// Every row is invalid at its own rung and at every rung below it.
+	//
+	// `control` is the row's POSITIVE CONTROL for "the machine was never
+	// reached": a request that MUST reach it on the same fixture. It is
+	// per-row since R-1, because the pooled Host has no such request at all —
+	// no drain a tenant link can send reaches its machine — so its control
+	// drives the machine directly and says so.
 	for _, test := range []struct {
 		name    string
 		fixed   sessionwire.SessionID
 		request func() sessionwire.HostLinkDrainRequest
+		control func(*testing.T, *drainFixture)
 		refusal hostlink.Refusal
 		reason  string
 		wire    sessionwire.HostLinkErrorCode
@@ -554,6 +586,18 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
 		},
 		{
+			// R-1. The whole-Host scope, which is what a placement controller
+			// sends and what every tenant's link used to be answered with.
+			// It is refused ABOVE the tenant comparison because there is no
+			// tenant on it to compare: the check it used to short-circuit.
+			name:    "4. the whole Host, on a tenant-authenticated link",
+			fixed:   testSession,
+			request: wholeHostDrainRequest,
+			refusal: hostlink.RefusalWrongDrainScope,
+			reason:  "authenticated for one tenant",
+			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
+		},
+		{
 			name:  "5. another tenant",
 			fixed: testSession,
 			request: func() sessionwire.HostLinkDrainRequest {
@@ -569,6 +613,18 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 			name:    "6. a session scope on a pooled Host",
 			fixed:   "",
 			request: func() sessionwire.HostLinkDrainRequest { return sessionDrainRequest(testSession) },
+			// A POOLED HOST ANSWERS NO HOSTLINK DRAIN AT ALL since R-1 —
+			// the whole-Host scope is refused above the tenant and the session
+			// scope is refused here — so there is no request whose reaching
+			// the machine could be the control. The machine is driven
+			// directly, which still discriminates the one thing the control
+			// exists for: a counter that cannot count.
+			control: func(t *testing.T, f *drainFixture) {
+				t.Helper()
+				if _, err := f.drains.StartDrain(hostlink.DrainScope{}); err != nil {
+					t.Fatalf("the control could not drive the machine directly: %v", err)
+				}
+			},
 			refusal: hostlink.RefusalWrongDrainScope,
 			reason:  "holds no fixed session",
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
@@ -622,11 +678,17 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 			// THE POSITIVE CONTROL FOR THAT ZERO. A counter that never counts
 			// satisfies it just as well as a refusal that never reaches the
 			// machine, and a probe stubbing counts() to 0/0/0 left this row
-			// green while every other test in the file failed. A valid
-			// whole-Host request on the SAME fixture must move it.
-			if _, err := f.mux.StartDrain(drainRequest()); err != nil {
-				t.Fatalf("the control request was refused: %v", err)
+			// green while every other test in the file failed.
+			control := test.control
+			if control == nil {
+				control = func(t *testing.T, f *drainFixture) {
+					t.Helper()
+					if _, err := f.mux.StartDrain(drainRequest()); err != nil {
+						t.Fatalf("the control request was refused: %v", err)
+					}
+				}
 			}
+			control(t, f)
 			if begins, starts, _ := f.drains.counts(); begins != 1 || starts != 1 {
 				t.Fatalf("the control did not reach the machine (begins=%d starts=%d), "+
 					"so the zero asserted above is a property of the counter and not of the refusal", begins, starts)
@@ -635,15 +697,27 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 	}
 }
 
-// TestDrainScopeReachesTheStateMachineExactlyAsRequested proves the two scopes
-// are distinguishable where they must be: a dedicated Host's fixed session
-// resolves to a populated Key and a whole-Host drain to the zero one.
+// TestDrainScopeReachesTheStateMachineExactlyAsRequested proves the scope this
+// package RESOLVES reaches the machine unaltered, and that the whole-Host scope
+// is not among the ones it can resolve.
 //
-// Both are legitimate on a dedicated Host — draining that Host and draining its
-// one session are the same work — which is why the whole-Host row is run
-// against a dedicated fixture rather than only a pooled one.
+// The two scopes are still distinguishable — DrainScope.WholeHost() is what the
+// process-lifecycle path produces, and internal/lifecycle drives that — but
+// since R-1 no REQUEST can produce the whole-Host one, so the only row a
+// tenant-authenticated link can drive is the fixed session's. The whole-Host
+// request's answer is the refusal ladder's rung 4 and the sibling test below.
 func TestDrainScopeReachesTheStateMachineExactlyAsRequested(t *testing.T) {
 	t.Parallel()
+
+	// The resolved form still tells the two scopes apart, which is what the
+	// lifecycle path depends on and what a Host with a fixed session must not
+	// collapse.
+	if !(hostlink.DrainScope{}).WholeHost() {
+		t.Fatal("the zero DrainScope is not the whole Host")
+	}
+	if (hostlink.DrainScope{Key: registry.Key{TenantID: testTenant, SessionID: testSession}}).WholeHost() {
+		t.Fatal("a scope naming a session reports itself as the whole Host")
+	}
 
 	for _, test := range []struct {
 		name    string
@@ -651,8 +725,6 @@ func TestDrainScopeReachesTheStateMachineExactlyAsRequested(t *testing.T) {
 		request sessionwire.HostLinkDrainRequest
 		want    hostlink.DrainScope
 	}{
-		{"a pooled Host drains whole", "", drainRequest(), hostlink.DrainScope{}},
-		{"a dedicated Host drains whole", testSession, drainRequest(), hostlink.DrainScope{}},
 		{
 			"a dedicated Host drains its session",
 			testSession,
@@ -718,6 +790,10 @@ func TestADrainTheStateMachineRefusesIsNotAcknowledged(t *testing.T) {
 
 	t.Run("the Host was composed without one", func(t *testing.T) {
 		t.Parallel()
+		// It holds a FIXED SESSION so that the request below is one the scope
+		// resolver accepts: without it the drain-unsupported refusal would be
+		// masked by RefusalWrongDrainScope and this subtest would assert the
+		// wrong thing while still failing for the right-looking reason.
 		mux, err := hostlink.NewMultiplexer(hostlink.MultiplexerOptions{
 			TenantID:           testTenant,
 			HostID:             testHostID,
@@ -725,6 +801,7 @@ func TestADrainTheStateMachineRefusesIsNotAcknowledged(t *testing.T) {
 			Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
 			Admission:          &stubAdmission{},
 			Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
+			FixedSessionID:     testSession,
 			MaxBindingsPerLink: 2,
 			MaxBindings:        3,
 		})
@@ -946,8 +1023,16 @@ func drainObservationOverTheLink(t *testing.T, reply rpcReply) sessionwire.HostL
 // service credential to Authenticator.VerifyTenant and a connection that fails
 // it is disconnected before any RPC handler is installed. If that ever stopped
 // being true — a second connect gate, or a gate that authenticated after
-// installing handlers — whole-Host drain would become reachable by whatever the
+// installing handlers — the drain RPC would become reachable by whatever the
 // new class is, and no assertion in the drain path would notice.
+//
+// ONE PRINCIPAL CLASS IS NOT ONE PRINCIPAL, and reading it as such is the
+// premise R-1 had to remove. A Host serving several tenants runs one
+// Multiplexer per authenticated tenant, so "the caller is a service principal"
+// never implied "the caller speaks for every tenant on this Host" — the drain
+// path relied on it anyway, and every tenant's link shared one Drainer. The
+// scope check in drainScope is what carries that now; this test carries only
+// the class.
 //
 // So the property asserted here is the one that carries the weight: there is
 // exactly one connect gate, VerifyTenant is the first thing it does, and a
@@ -1295,5 +1380,109 @@ func TestDrainSeamsExposeExactlyOneMethodEach(t *testing.T) {
 			names[index] = scope.Field(index).Name
 		}
 		t.Fatalf("DrainScope fields = %v, want exactly [Key]", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R-1: a tenant-authenticated link may not drain the whole Host
+// ---------------------------------------------------------------------------
+
+// TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink is R-1 at the
+// resolver, and it is the axis this file's fixtures could not see.
+//
+// EVERY LINK THIS PACKAGE SERVES IS TENANT-AUTHENTICATED. NewMultiplexer
+// REQUIRES a valid TenantID, so there is no such thing here as a routing table
+// without one, and the whole-Host scope therefore has no link it may arrive on.
+// It used to have every link: drainScope returned the whole-Host scope for an
+// empty TenantID ABOVE the tenant comparison, so the comparison never ran, and
+// a Host serving several tenants hands every one of their Multiplexers the SAME
+// Drainer. tenant-a's authenticated link could drain tenant-b's sessions.
+//
+// THE TENANT AXIS IS THE POINT. A suite whose fixtures all name one tenant
+// cannot distinguish "this link's tenant" from "some tenant", which is exactly
+// why this survived: every assertion in this file was true of one tenant and
+// said nothing about two. So the machine below is shared by two DIFFERENT
+// tenants' tables, the way a pooled Host shares it, and the refusal is asserted
+// from both.
+//
+// The whole-Host drain is not thereby unreachable. It is the PROCESS
+// LIFECYCLE's: Service.Stop calls Drainer.StartDrain directly with the zero
+// scope and never passes through this resolver. What is gone is the path that
+// let a tenant reach it over the wire.
+func TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink(t *testing.T) {
+	t.Parallel()
+
+	drains := newStubDrains()
+	table := func(tenant sessionwire.TenantID, fixed sessionwire.SessionID) *hostlink.Multiplexer {
+		t.Helper()
+		mux, err := hostlink.NewMultiplexer(hostlink.MultiplexerOptions{
+			TenantID:           tenant,
+			HostID:             testHostID,
+			HostGeneration:     testGeneration,
+			Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
+			Admission:          &stubAdmission{},
+			Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
+			DrainStarter:       drains,
+			DrainObserver:      drains,
+			FixedSessionID:     fixed,
+			MaxBindingsPerLink: 2,
+			MaxBindings:        3,
+		})
+		if err != nil {
+			t.Fatalf("NewMultiplexer(%q): %v", tenant, err)
+		}
+		return mux
+	}
+
+	// Two tenants over ONE machine: the pooled Host's shape, and the only
+	// arrangement in which the defect is expressible at all. The dedicated
+	// spelling is included because a fixed session is the one scope that IS
+	// still reachable, so a fix that merely reordered the checks would be
+	// caught here rather than only on the pooled table.
+	for _, link := range []struct {
+		name string
+		mux  *hostlink.Multiplexer
+	}{
+		{"tenant-alpha, pooled", table(testTenant, "")},
+		{"tenant-alpha, dedicated", table(testTenant, testSession)},
+		{"tenant-other, pooled", table("tenant-other", "")},
+		{"tenant-other, dedicated", table("tenant-other", testSession)},
+	} {
+		for method, call := range map[string]func(sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error){
+			hostlink.MethodDrain:       link.mux.StartDrain,
+			hostlink.MethodDrainStatus: link.mux.ObserveDrain,
+		} {
+			_, err := call(wholeHostDrainRequest())
+			refusal := refusedDrain(t, err)
+			if refusal.Refusal != hostlink.RefusalWrongDrainScope {
+				t.Errorf("%s over %s: refusal = %q, want %q", method, link.name, refusal.Refusal, hostlink.RefusalWrongDrainScope)
+			}
+			if !strings.Contains(refusal.Reason, "authenticated for one tenant") {
+				t.Errorf("%s over %s: reason %q does not say why", method, link.name, refusal.Reason)
+			}
+			// The refusal publishes an ordinary Core class, so a Factory
+			// retries or takes the lifecycle path rather than reading this as
+			// its own malformed request.
+			if wire, published := refusal.HostLinkError(); !published || wire.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
+				t.Errorf("%s over %s: Core class = %+v/%v, want runtime_unavailable", method, link.name, wire, published)
+			}
+		}
+	}
+
+	// NOT ONE OF THEM REACHED THE MACHINE, which is the property that makes
+	// this a refusal and not a drain that was started and then apologised for:
+	// a Drainer that has begun cannot be un-begun, so a check after the seam
+	// would leave every tenant's sessions released anyway.
+	if begins, starts, observes := drains.counts(); begins != 0 || starts != 0 || observes != 0 {
+		t.Fatalf("a whole-Host drain reached the shared machine: begins=%d starts=%d observes=%d", begins, starts, observes)
+	}
+
+	// THE POSITIVE CONTROL for that zero, and it is the scope R-1 leaves
+	// reachable: this tenant's own fixed session, over this tenant's own table.
+	if _, err := table(testTenant, testSession).StartDrain(drainRequest()); err != nil {
+		t.Fatalf("the scoped control was refused, so the zero above is a property of the counter: %v", err)
+	}
+	if begins, starts, _ := drains.counts(); begins != 1 || starts != 1 {
+		t.Fatalf("the control did not reach the machine (begins=%d starts=%d)", begins, starts)
 	}
 }

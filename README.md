@@ -36,29 +36,42 @@ These are properties of the code as it stands, not a backlog. Each is written
 here because an operator who meets it for the first time in production has been
 surprised by something this file could have told them.
 
-### A whole-Host drain is not tenant-scoped, so pooled multi-tenant is not supported
+### A HostLink drain is tenant-scoped, so whole-Host drain is the process lifecycle's alone
 
-**`internal/realtime/hostlink/drain.go:281`.** A drain request naming an empty
-`TenantID` is a WHOLE-HOST drain, and `drainScope` returns the whole-Host scope
-for it BEFORE the `request.TenantID != m.tenant` check that guards every
-tenant-scoped request. This Host holds one `Multiplexer` per authenticated
-tenant, but all of them share ONE `DrainStarter` — the Host-level `Drainer` — so
-a link authenticated as tenant-a can start a drain that covers tenant-b's
-resident sessions as well.
+**This entry replaced a deployment gate.** It used to say a whole-Host drain
+request naming an empty `TenantID` short-circuited the tenant check, so a link
+authenticated as tenant-a could start a drain covering tenant-b's resident
+sessions — availability, not confidentiality — and that **pooled multi-tenant
+deployment was gated on it**. R-1 closed the hole and **that gate is lifted**.
+What follows is what is now refused, stated no wider than it is.
 
-It is **availability, not confidentiality**: tenant-a learns nothing about
-tenant-b, reads none of its material and cannot address its sessions. What it
-can do is cause tenant-b's sessions to be checkpointed and released early.
+**`internal/realtime/hostlink/drain.go`, `drainScope`.** A drain request naming
+an empty `TenantID` is **refused** with `RefusalWrongDrainScope` and the Core
+class `runtime_unavailable`, **before the tenant comparison and before the drain
+state machine**. Every link this package serves is tenant-authenticated —
+`NewMultiplexer` requires a valid `TenantID` — so the whole-Host scope has no
+link it may arrive on. The one drain a link may begin is the one naming **its
+own tenant** and this Host's **fixed session**, which is scoped by construction.
 
-**The consequence is a deployment constraint and it is the whole point of this
-entry.** Run a Host with sessions from **one tenant only** — one Host process
-per tenant, or a placement policy that never co-locates two. In that
-configuration the defect is unreachable: the whole-Host drain covers exactly the
-tenant that asked for it. **POOLED MULTI-TENANT DEPLOYMENT IS GATED ON THIS AND
-MUST NOT BE ENABLED UNTIL IT IS FIXED.** The `IsolationClass` a Host advertises
-is a statement to Factory and does not close it.
+**A pooled Host therefore answers no HostLink drain at all.** It has no fixed
+session, so the session scope is refused too. That is the intended shape: the
+whole-Host drain is reachable **only** through the process-lifecycle path —
+`Service.Stop` calls `Drainer.StartDrain` with the zero scope directly and never
+passes through this resolver — which is the path a platform's termination signal
+already takes, and it is unchanged.
 
-Tracked as `O7.1-hostwide-drain-crosses-tenants`.
+**What this does NOT claim.** It is not a statement about confidentiality, which
+was never at issue here. It does not give a Factory `cmd/controller` a drain
+path over HostLink; if one is needed it must be **tenant-scoped or
+service-principal**, and re-admitting the empty tenant here would reopen exactly
+the hole this closed. And it says nothing about the other entries below.
+
+Measured by `TestATenantLinkCannotDrainAnotherTenantsSessions` in
+`internal/compose` — two tenants, both holding live resident sessions, over one
+shared `Drainer` — and by
+`TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink` in `hostlink`.
+
+Closed as `O7.1-hostwide-drain-crosses-tenants` / R-1.
 
 ### A composed Host consumes and does not dispatch
 
