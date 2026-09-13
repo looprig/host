@@ -389,9 +389,16 @@ func NewDrainer(options Options) (*Drainer, error) {
 // TestTheStatusObservationIsAnsweredWhileTheDrainIsStillPublishing holds the
 // half that regressed.
 //
-// The scope is recorded and not branched on. A dedicated Host holds one
-// session, so draining that session and draining the Host are the same work;
-// HostLink has already refused a scope this Host does not answer for.
+// THE SCOPE IS NEITHER RECORDED NOR BRANCHED ON, and the parameter is UNNAMED
+// so that neither is expressible. An earlier sentence here said "recorded and
+// not branched on"; the first half was never true. Every drain this type runs
+// is the whole Host's, whatever scope it is handed.
+//
+// That is sound only because HostLink refuses, above this seam, every scope
+// this Host cannot attribute to the caller — a whole-Host drain on a
+// tenant-authenticated link, and a fixed session the requesting tenant does not
+// hold. A dedicated Host holds one session (its placement pins Capacity to 1),
+// so draining that session and draining the Host are then the same work.
 func (d *Drainer) StartDrain(hostlink.DrainScope) (hostlink.DrainStatus, error) {
 	d.mu.Lock()
 	if d.begun {

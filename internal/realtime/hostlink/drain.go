@@ -305,7 +305,10 @@ func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (Drai
 	// Multiplexer per authenticated tenant over one drain.
 	//
 	// WHAT IS LEFT REACHABLE. A dedicated Host's fixed session, named by its
-	// own tenant, which is scoped by construction. Whole-Host drain remains
+	// own tenant, AND ONLY WHEN THAT TENANT CURRENTLY HOLDS IT — see the last
+	// rung below. It is NOT "scoped by construction": an earlier version of
+	// this comment said so, and it was false, because the fixed session is one
+	// bare SessionID handed to every tenant's table. Whole-Host drain remains
 	// reachable ONLY through the PROCESS-LIFECYCLE path — Service.Stop calls
 	// the Drainer directly and never passes through this resolver — which is
 	// the path a platform's termination signal already takes. It is not a
@@ -342,6 +345,50 @@ func (m *Multiplexer) drainScope(request sessionwire.HostLinkDrainRequest) (Drai
 			Refusal: RefusalWrongDrainScope,
 			Key:     key,
 			Reason:  "this Host's fixed session is not the one the drain names",
+			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
+		}
+	}
+	// AND THE REQUESTER MUST HOLD IT. This is the second half of R-1 and it
+	// closes the same defect class as the first: a drain whose scope this Host
+	// cannot attribute to the caller.
+	//
+	// THE HOLE. A dedicated Host's fixed session is ONE SessionID, and the
+	// composition hands that same value to EVERY tenant's Multiplexer. Without
+	// this rung the resolver compares the request's session against the fixed
+	// one and the request's tenant against the LINK's, and never compares the
+	// fixed session's OWNER against the requester — so a link authenticated as
+	// tenant-b, holding nothing at all, could name {tenant-b, the fixed
+	// session}, pass every rung above, and begin the HOST-WIDE drain that
+	// checkpoints and releases tenant-a's session. Measured before it was
+	// closed, not read out of the source.
+	//
+	// WHAT MAKES THE OWNER KNOWABLE IS CAPACITY, and that is why this is an
+	// attribution rather than an invention. host.Options.validatePlacement
+	// requires Capacity == 1 for dedicated placement, so a Host with a fixed
+	// session holds AT MOST ONE resident session. "the requester holds the
+	// fixed session" and "the requester owns everything the Host-wide drain
+	// would touch" are therefore the same statement, and Residencies.Get
+	// decides it. On a Host that could hold two tenants at once they would NOT
+	// be the same statement and this rung would not be sufficient.
+	//
+	// IT DISCLOSES NOTHING NEW, which is why it may sit at the bottom of an
+	// ordered ladder that otherwise refuses before reading anything. The key it
+	// reads is the caller's OWN tenant paired with a session the caller has
+	// just been told is this Host's fixed one; Bind already answers exactly
+	// that question for exactly that key. It is placed LAST for that reason:
+	// a foreign tenant and a wrong session are both refused above it, so
+	// neither reaches a residency read.
+	//
+	// IT IS A RESIDENCY READ AND NOT AN OWNERSHIP PROOF. It says this tenant
+	// holds this session on this Host NOW; it is not the lease, it grants
+	// nothing, and a Host holding nothing yet refuses every drain that reaches
+	// here — which is fail-closed and correct, because a Host holding nothing
+	// has nothing for a HostLink drain to cover.
+	if _, held := m.residencies.Get(key); !held {
+		return DrainScope{}, &BindError{
+			Refusal: RefusalWrongDrainScope,
+			Key:     key,
+			Reason:  "this link's tenant does not hold this Host's fixed session, so the Host-wide drain it would begin is not its own to begin",
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
 		}
 	}

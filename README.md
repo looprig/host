@@ -45,31 +45,66 @@ sessions — availability, not confidentiality — and that **pooled multi-tenan
 deployment was gated on it**. R-1 closed the hole and **that gate is lifted**.
 What follows is what is now refused, stated no wider than it is.
 
-**`internal/realtime/hostlink/drain.go`, `drainScope`.** A drain request naming
-an empty `TenantID` is **refused** with `RefusalWrongDrainScope` and the Core
-class `runtime_unavailable`, **before the tenant comparison and before the drain
-state machine**. Every link this package serves is tenant-authenticated —
-`NewMultiplexer` requires a valid `TenantID` — so the whole-Host scope has no
-link it may arrive on. The one drain a link may begin is the one naming **its
-own tenant** and this Host's **fixed session**, which is scoped by construction.
+**`internal/realtime/hostlink/drain.go`, `drainScope`.** Two requests are
+**refused**, each with `RefusalWrongDrainScope` and the Core class
+`runtime_unavailable`, and each **before the drain state machine** — a `Drainer`
+that has begun cannot be un-begun.
 
-**A pooled Host therefore answers no HostLink drain at all.** It has no fixed
-session, so the session scope is refused too. That is the intended shape: the
-whole-Host drain is reachable **only** through the process-lifecycle path —
+1. **A request naming an empty `TenantID`** — the whole-Host scope — is refused
+   **before the tenant comparison**, because there is no tenant on it to
+   compare. Every link this package serves is tenant-authenticated
+   (`NewMultiplexer` requires a valid `TenantID`), so that scope has no link it
+   may arrive on.
+2. **A request naming this Host's fixed session whose requesting tenant does not
+   currently hold that session** is refused at the **last** rung, on a
+   `Residencies.Get` of `{the link's tenant, the fixed session}`. Without it the
+   resolver compared a session against a session and **attributed nothing**: a
+   dedicated Host's `FixedSessionID` is one bare `SessionID` handed to *every*
+   tenant's `Multiplexer`, so a link authenticated as tenant-b holding nothing
+   could name it and begin the Host-wide drain that released tenant-a's session.
+
+**The attribution in (2) is sound because of capacity, and it is sound only
+because of capacity.** `Options.validatePlacement` pins `Capacity` to 1 for
+dedicated placement, so a Host with a fixed session holds **at most one**
+resident session; "this tenant holds the fixed session" and "this tenant owns
+everything a Host-wide drain would touch" are therefore the same statement. On a
+Host that could hold two tenants at once they would not be, and this rung would
+not be sufficient.
+
+**So exactly one drain is reachable over HostLink:** a **dedicated** Host's fixed
+session, asked for by the tenant that **currently holds it**. Everything else is
+refused — including, deliberately, a drain on a Host that is holding nothing
+yet, which is fail-closed and correct because such a Host has nothing for a
+HostLink drain to cover. **A pooled Host answers no HostLink drain at all**: it
+has no fixed session, so the session scope is refused too.
+
+The whole-Host drain is reachable **only** through the process-lifecycle path —
 `Service.Stop` calls `Drainer.StartDrain` with the zero scope directly and never
 passes through this resolver — which is the path a platform's termination signal
 already takes, and it is unchanged.
 
-**What this does NOT claim.** It is not a statement about confidentiality, which
-was never at issue here. It does not give a Factory `cmd/controller` a drain
-path over HostLink; if one is needed it must be **tenant-scoped or
-service-principal**, and re-admitting the empty tenant here would reopen exactly
-the hole this closed. And it says nothing about the other entries below.
+**What this does NOT claim.**
 
-Measured by `TestATenantLinkCannotDrainAnotherTenantsSessions` in
-`internal/compose` — two tenants, both holding live resident sessions, over one
-shared `Drainer` — and by
-`TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink` in `hostlink`.
+- **Not "scoped by construction".** An earlier version of this entry said the
+  fixed-session drain was scoped by construction. It was not, and a gate probe
+  demonstrated the hole on the tree that claimed it. What scopes it is rung (2),
+  which is a **line you can point at**, resting on the capacity rule above.
+- **Rung (2) is a residency read, not an ownership proof.** It says this tenant
+  holds this session on this Host *now*. It is not the lease, it grants nothing,
+  and it is not durable evidence of anything.
+- **Not a confidentiality claim**, which was never at issue: the defect was
+  availability. No tenant could read another's material or address its sessions.
+- **Not a Factory drain path.** A `cmd/controller` gets no drain over HostLink;
+  if one is needed it must be **tenant-scoped or service-principal**, and
+  re-admitting the empty tenant would reopen exactly what this closed.
+
+Measured, in both halves, by behaviour and not by reading:
+`TestATenantLinkCannotDrainAnotherTenantsSessions` (two tenants, both holding
+live resident sessions, one shared `Drainer`) and
+`TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession` in
+`internal/compose`; `TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink`
+and `TestADrainOfTheFixedSessionIsRefusedUnlessTheLinkSTenantHoldsIt` in
+`hostlink`.
 
 Closed as `O7.1-hostwide-drain-crosses-tenants` / R-1.
 

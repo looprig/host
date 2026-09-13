@@ -1149,3 +1149,109 @@ func TestATenantLinkCannotDrainAnotherTenantsSessions(t *testing.T) {
 		t.Fatalf("the process-lifecycle drain checkpointed nothing, so the absence asserted above proves nothing: %v", f.trace.trace())
 	}
 }
+
+// TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession is R-1's
+// second half, and it is the axis the first round and its gate BOTH missed.
+//
+// A dedicated Host's fixed session is ONE SessionID, and `buildTenantLink` hands
+// that same value to EVERY tenant's Multiplexer. The resolver then compares the
+// request's session against it and the request's tenant against the LINK's — and
+// never compares the fixed session's OWNER against the requester. So a link
+// authenticated as tenant-b, holding nothing at all, could name
+// `{tenant-b, the-fixed-session}`, pass every rung, and begin the Host-wide
+// drain that releases tenant-a's session. It is the same defect class as the
+// empty-tenant hole — a drain whose scope the Host cannot attribute to the
+// requester — surviving on the same falsified premise.
+//
+// WHAT MAKES THE OWNER KNOWABLE HERE IS CAPACITY, not a new seam.
+// `Options.validatePlacement` requires `Capacity == 1` for dedicated placement,
+// so a dedicated Host holds AT MOST ONE resident session. "the requester holds
+// the fixed session" and "the requester owns everything this Host-wide drain
+// would touch" are therefore the same statement, and `Residencies.Get` — the
+// read-only seam the bind path already uses — decides it.
+//
+// The negative assertion is non-vacuous twice, as before: tenant-a's session is
+// asserted resident first, and tenant-a's OWN link drains it at the end.
+func TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession(t *testing.T) {
+	f := newFixture(t, func(_ *Options, host *host.Options) {
+		host.Placement = sessionwire.HostPlacementDedicated
+		host.FixedSessionID = sessionA
+		host.Capacity = 1
+	})
+	f.start()
+	f.attach(tenantA, sessionA)
+
+	resident := map[registry.Key]bool{}
+	for _, held := range f.svc.ResidentSessions() {
+		resident[held.Key()] = true
+	}
+	if !resident[registry.Key{TenantID: tenantA, SessionID: sessionA}] {
+		t.Fatal("tenant-a's session is not resident, so this test has nothing to protect")
+	}
+
+	// THE ATTACK. tenant-b authenticates, holds NOTHING, and names this Host's
+	// fixed session under its OWN tenant — so the tenant rung passes, the
+	// pooled rung passes, and the fixed-session rung passes.
+	stranger, err := f.svc.links.resolve(tenantB)
+	if err != nil {
+		t.Fatalf("resolving a link for tenant-b: %v", err)
+	}
+	attack := sessionwire.HostLinkDrainRequest{
+		Version:        sessionwire.CurrentWireVersion,
+		HostID:         testHostID,
+		HostGeneration: testGen,
+		IdempotencyKey: "tenant-b-drains-tenant-a",
+		TenantID:       tenantB,
+		SessionID:      sessionA,
+	}
+	beforeDrain := len(f.store.published())
+	_, err = stranger.mux.StartDrain(attack)
+	var refusal *hostlink.BindError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("a drain naming this Host's fixed session, from a tenant holding nothing = %v, want a refusal: "+
+			"tenant-b can drain tenant-a's session on a dedicated Host", err)
+	}
+	if refusal.Refusal != hostlink.RefusalWrongDrainScope {
+		t.Errorf("the refusal is %q, want %q", refusal.Refusal, hostlink.RefusalWrongDrainScope)
+	}
+
+	duringAttack := f.store.published()[beforeDrain:]
+	if position := slices.IndexFunc(duringAttack, func(row sessionwire.HostLinkRegistryObservation) bool {
+		return row.TenantID == tenantA && row.SessionID == sessionA && !row.Accepting
+	}); position != -1 {
+		t.Errorf("tenant-b's drain published a nonaccepting row for tenant-a's session: %#v", duringAttack[position])
+	}
+	if position := f.trace.indexOf("checkpoint"); position != -1 {
+		t.Errorf("tenant-b's drain checkpointed a session at trace position %d: %v", position, f.trace.trace())
+	}
+	if !f.svc.Ready() {
+		t.Error("tenant-b's drain stopped the whole Host admitting")
+	}
+
+	// THE POSITIVE CONTROL, and it is the stronger one available: the session's
+	// OWN tenant drains it over its OWN link, through the same resolver. That
+	// proves the session was drainable over HostLink all along — so the silence
+	// above is the refusal's — and that the fix refuses the stranger WITHOUT
+	// refusing the legitimate caller, which a blanket refusal would not.
+	owner, err := f.svc.links.resolve(tenantA)
+	if err != nil {
+		t.Fatalf("resolving the owning tenant's link: %v", err)
+	}
+	legitimate := attack
+	legitimate.TenantID = tenantA
+	legitimate.IdempotencyKey = "tenant-a-drains-its-own-session"
+	if _, err := owner.mux.StartDrain(legitimate); err != nil {
+		t.Fatalf("the session's own tenant was refused its own drain: %v", err)
+	}
+	f.svc.drainer.Wait()
+	afterOwner := f.store.published()[beforeDrain:]
+	if !slices.ContainsFunc(afterOwner, func(row sessionwire.HostLinkRegistryObservation) bool {
+		return row.TenantID == tenantA && row.SessionID == sessionA && !row.Accepting
+	}) {
+		t.Fatalf("the owner's own drain published no nonaccepting row for its session, "+
+			"so the absence asserted above proves nothing: %#v", afterOwner)
+	}
+	if f.trace.indexOf("checkpoint") == -1 {
+		t.Fatalf("the owner's own drain checkpointed nothing, so the absence asserted above proves nothing: %v", f.trace.trace())
+	}
+}

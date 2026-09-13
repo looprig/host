@@ -143,6 +143,35 @@ func (d *stubDrains) scopesSeen() []hostlink.DrainScope {
 type drainFixture struct {
 	drains *stubDrains
 	mux    *hostlink.Multiplexer
+
+	// residencies is the recorder behind the mux, so a test can assert which
+	// keys a refusal looked up — and, more to the point, that a refusal above
+	// the last rung looked up none.
+	residencies *recordingResidencies
+}
+
+// residenciesHolding is the read-only residency view a drain fixture needs, with
+// the fixed session ALREADY RESIDENT for the tenant named.
+//
+// THE RESIDENCY IS PART OF THE FIXTURE SINCE R-1's SECOND HALF. drainScope's
+// last rung asks whether the requesting tenant actually holds this Host's fixed
+// session, because a dedicated Host's fixed SessionID is handed to every
+// tenant's table and a bare session comparison therefore attributes nothing. A
+// fixture with an empty registry would answer every drain with the wrong-scope
+// refusal — green for the wrong reason on every negative test in this file, and
+// unable to reach the handler on any positive one.
+//
+// It wraps the REAL registry for the reason recordingResidencies does: a
+// hand-written answer could be a row the registry cannot produce.
+func residenciesHolding(t *testing.T, tenant sessionwire.TenantID, fixed sessionwire.SessionID) *recordingResidencies {
+	t.Helper()
+	index := registry.New(frozenClock{})
+	if fixed != "" {
+		if _, inserted := index.Insert(registry.Key{TenantID: tenant, SessionID: fixed}, registry.Admission{LeaseEpoch: 1}); !inserted {
+			t.Fatalf("the fixture could not make %s/%s resident", tenant, fixed)
+		}
+	}
+	return &recordingResidencies{inner: index}
 }
 
 // newDrainFixture builds a Host with both drain seams supplied and a drain a
@@ -160,12 +189,25 @@ func newDrainFixture(t *testing.T) *drainFixture { return newDrainFixtureFor(t, 
 // session is a pooled Host.
 func newDrainFixtureFor(t *testing.T, fixed sessionwire.SessionID) *drainFixture {
 	t.Helper()
+	return newDrainFixtureHeldBy(t, fixed, testTenant)
+}
+
+// newDrainFixtureHeldBy builds the same Host with the fixed session resident for
+// SOMEONE ELSE, or for nobody when holder is empty.
+//
+// It is the only way to reach drainScope's last rung, since a request from a
+// tenant other than the link's is refused three rungs earlier: the rung asks
+// whether THIS link's tenant holds the fixed session, so the interesting
+// fixtures are the ones where it does not.
+func newDrainFixtureHeldBy(t *testing.T, fixed sessionwire.SessionID, holder sessionwire.TenantID) *drainFixture {
+	t.Helper()
 	drains := newStubDrains()
+	residencies := residenciesHolding(t, holder, fixed)
 	mux, err := hostlink.NewMultiplexer(hostlink.MultiplexerOptions{
 		TenantID:           testTenant,
 		HostID:             testHostID,
 		HostGeneration:     testGeneration,
-		Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
+		Residencies:        residencies,
 		Admission:          &stubAdmission{},
 		Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
 		DrainStarter:       drains,
@@ -177,7 +219,7 @@ func newDrainFixtureFor(t *testing.T, fixed sessionwire.SessionID) *drainFixture
 	if err != nil {
 		t.Fatalf("NewMultiplexer: %v", err)
 	}
-	return &drainFixture{drains: drains, mux: mux}
+	return &drainFixture{drains: drains, mux: mux, residencies: residencies}
 }
 
 // wholeHostDrainRequest names NO tenant and no session, which Core reads as the
@@ -391,7 +433,7 @@ func TestEveryDrainRequestIsAnsweredWithTheSameGenerationAndBeginsOnce(t *testin
 			TenantID:           testTenant,
 			HostID:             testHostID,
 			HostGeneration:     testGeneration,
-			Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
+			Residencies:        residenciesHolding(t, testTenant, testSession),
 			Admission:          &stubAdmission{},
 			Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
 			DrainStarter:       f.drains,
@@ -523,6 +565,7 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		fixed   sessionwire.SessionID
+		held    sessionwire.TenantID
 		request func() sessionwire.HostLinkDrainRequest
 		control func(*testing.T, *drainFixture)
 		refusal hostlink.Refusal
@@ -630,6 +673,30 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
 		},
 		{
+			// R-1's second half. The request is this link's OWN tenant and this
+			// Host's OWN fixed session, so every rung above passes; what fails
+			// is that the tenant does not HOLD it. The fixture gives the
+			// session to tenant-other, which is the gate's measured shape.
+			name:  "8. this Host's fixed session, held by another tenant",
+			fixed: testSession,
+			held:  "tenant-other",
+			request: func() sessionwire.HostLinkDrainRequest {
+				return sessionDrainRequest(testSession)
+			},
+			// Nothing this link can send reaches the machine, for the same
+			// reason as the pooled row: the one scope it may name is the one
+			// its tenant does not hold.
+			control: func(t *testing.T, f *drainFixture) {
+				t.Helper()
+				if _, err := f.drains.StartDrain(hostlink.DrainScope{}); err != nil {
+					t.Fatalf("the control could not drive the machine directly: %v", err)
+				}
+			},
+			refusal: hostlink.RefusalWrongDrainScope,
+			reason:  "does not hold this Host's fixed session",
+			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
+		},
+		{
 			name:    "7. the wrong fixed session",
 			fixed:   testSession,
 			request: func() sessionwire.HostLinkDrainRequest { return sessionDrainRequest(otherSession) },
@@ -640,7 +707,11 @@ func TestTheDrainRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			f := newDrainFixtureFor(t, test.fixed)
+			held := test.held
+			if held == "" {
+				held = testTenant
+			}
+			f := newDrainFixtureHeldBy(t, test.fixed, held)
 
 			// Both methods take the same ladder. A refusal reachable through
 			// one and not the other is a status RPC that discloses what the
@@ -798,7 +869,7 @@ func TestADrainTheStateMachineRefusesIsNotAcknowledged(t *testing.T) {
 			TenantID:           testTenant,
 			HostID:             testHostID,
 			HostGeneration:     testGeneration,
-			Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
+			Residencies:        residenciesHolding(t, testTenant, testSession),
 			Admission:          &stubAdmission{},
 			Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
 			FixedSessionID:     testSession,
@@ -1419,7 +1490,7 @@ func TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink(t *testing.T) {
 			TenantID:           tenant,
 			HostID:             testHostID,
 			HostGeneration:     testGeneration,
-			Residencies:        &recordingResidencies{inner: registry.New(frozenClock{})},
+			Residencies:        residenciesHolding(t, tenant, fixed),
 			Admission:          &stubAdmission{},
 			Consumers:          &stubConsumers{consumers: map[registry.Key]*stubConsumer{}},
 			DrainStarter:       drains,
@@ -1485,4 +1556,123 @@ func TestAWholeHostDrainIsRefusedOnEveryTenantAuthenticatedLink(t *testing.T) {
 	if begins, starts, _ := drains.counts(); begins != 1 || starts != 1 {
 		t.Fatalf("the control did not reach the machine (begins=%d starts=%d)", begins, starts)
 	}
+}
+
+// TestADrainOfTheFixedSessionIsRefusedUnlessTheLinkSTenantHoldsIt is R-1's
+// second half at the resolver, and it names the axis every fixture in this file
+// shared until now: THE OWNER OF THE FIXED SESSION VERSUS THE REQUESTING TENANT.
+//
+// A dedicated Host's FixedSessionID is one bare SessionID with no tenant on it,
+// and the composition hands that same value to every tenant's Multiplexer. So
+// the fixed-session rung above compares a session against a session and
+// attributes NOTHING; until this rung existed, a link authenticated as
+// tenant-b — holding nothing whatsoever — could name {tenant-b, the fixed
+// session}, satisfy every rung, and begin the HOST-WIDE drain that released
+// tenant-a's session. Every fixture in this file had the link's tenant and the
+// session's holder be the same identity, so not one of them could see it.
+//
+// THE ATTRIBUTION IS SOUND ONLY BECAUSE OF CAPACITY, and the test says so
+// rather than leaving it to the reader: host.Options.validatePlacement requires
+// Capacity == 1 for dedicated placement, so a Host with a fixed session holds at
+// most one resident session and "this tenant holds the fixed session" is the
+// same claim as "this tenant owns everything the Host-wide drain would touch".
+func TestADrainOfTheFixedSessionIsRefusedUnlessTheLinkSTenantHoldsIt(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		holder   sessionwire.TenantID
+		accepted bool
+	}{
+		{"the link's own tenant holds it", testTenant, true},
+		{"nobody holds it yet", "", false},
+		{"ANOTHER tenant holds it", "tenant-other", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			f := newDrainFixtureHeldBy(t, testSession, test.holder)
+
+			for method, call := range map[string]func(sessionwire.HostLinkDrainRequest) (sessionwire.HostLinkDrainObservation, error){
+				hostlink.MethodDrain:       f.mux.StartDrain,
+				hostlink.MethodDrainStatus: f.mux.ObserveDrain,
+			} {
+				_, err := call(drainRequest())
+				if test.accepted {
+					// The status method legitimately refuses with
+					// no_drain_in_progress until one has begun; what must NOT
+					// appear on either is the scope refusal.
+					var refusal *hostlink.BindError
+					if errors.As(err, &refusal) && refusal.Refusal == hostlink.RefusalWrongDrainScope {
+						t.Fatalf("%s: the session's own holder was refused its own drain: %v", method, refusal)
+					}
+					continue
+				}
+				refusal := refusedDrain(t, err)
+				if refusal.Refusal != hostlink.RefusalWrongDrainScope {
+					t.Fatalf("%s: refusal = %q, want %q", method, refusal.Refusal, hostlink.RefusalWrongDrainScope)
+				}
+				if !strings.Contains(refusal.Reason, "does not hold this Host's fixed session") {
+					t.Fatalf("%s: reason %q does not say why", method, refusal.Reason)
+				}
+				if wire, published := refusal.HostLinkError(); !published || wire.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
+					t.Fatalf("%s: Core class = %+v/%v, want runtime_unavailable", method, wire, published)
+				}
+			}
+
+			begins, starts, observes := f.drains.counts()
+			if test.accepted {
+				if begins != 1 {
+					t.Fatalf("the holder's own drain began %d drains, want one", begins)
+				}
+				return
+			}
+			// A REFUSAL THAT NEVER REACHED THE MACHINE. A Drainer that has begun
+			// cannot be un-begun, so a check after the seam would release every
+			// session anyway and merely apologise.
+			if begins != 0 || starts != 0 || observes != 0 {
+				t.Fatalf("a refused drain reached the machine: begins=%d starts=%d observes=%d", begins, starts, observes)
+			}
+			// THE POSITIVE CONTROL for that zero, on this same fixture: make the
+			// link's own tenant hold the session and the very same request is
+			// accepted. Without it, zero is satisfied by a handler that refuses
+			// everything.
+			holding := newDrainFixtureHeldBy(t, testSession, testTenant)
+			if _, err := holding.mux.StartDrain(drainRequest()); err != nil {
+				t.Fatalf("the control request was refused, so the zero above is a property of the handler: %v", err)
+			}
+			if begins, _, _ := holding.drains.counts(); begins != 1 {
+				t.Fatalf("the control did not reach the machine (begins=%d)", begins)
+			}
+		})
+	}
+
+	// THE READ IS THE LAST RUNG AND DISCLOSES NOTHING NEW, which is what lets it
+	// sit in a ladder that otherwise refuses before touching residency. A
+	// FOREIGN tenant is refused three rungs earlier and must reach no residency
+	// read at all; the key the rung does read is the caller's OWN tenant paired
+	// with a session it has already been told is this Host's fixed one, which
+	// Bind answers for the same key anyway.
+	t.Run("a foreign tenant reaches no residency read", func(t *testing.T) {
+		t.Parallel()
+		f := newDrainFixtureHeldBy(t, testSession, testTenant)
+		foreign := sessionDrainRequest(testSession)
+		foreign.TenantID = "tenant-other"
+		if _, err := f.mux.StartDrain(foreign); refusedDrain(t, err).Refusal != hostlink.RefusalForeignTenant {
+			t.Fatalf("a foreign tenant's drain = %v, want the foreign-tenant refusal", err)
+		}
+		if looked := f.residencies.lookedUp(); len(looked) != 0 {
+			t.Fatalf("a foreign tenant's drain read residency for %v", looked)
+		}
+
+		// THE POSITIVE CONTROL for that zero: the link's own tenant DOES reach
+		// the read, and reads exactly the one key. Without it, "no residency
+		// read" is satisfied by a rung that reads nothing ever.
+		if _, err := f.mux.StartDrain(drainRequest()); err != nil {
+			t.Fatalf("the control drain was refused: %v", err)
+		}
+		want := []registry.Key{{TenantID: testTenant, SessionID: testSession}}
+		if looked := f.residencies.lookedUp(); !reflect.DeepEqual(looked, want) {
+			t.Fatalf("the accepted drain looked up %v, want exactly %v", looked, want)
+		}
+	})
 }
