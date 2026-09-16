@@ -106,15 +106,18 @@ func (r *EvidenceRouter) Bindings() []string {
 // to fix it.
 var ErrUnroutableBinding = errors.New("sessionstoreadapter: no settlement evidence reader is registered for this session's storage binding")
 
-// UnroutableBindingError names the binding no reader serves.
+// UnroutableBindingError names the binding no reader serves. TenantID is set
+// when the router that refused was tenant-keyed (TenantEvidenceRouter), and
+// empty otherwise.
 type UnroutableBindingError struct {
+	TenantID  string
 	Binding   string
 	CommandID string
 }
 
 func (e *UnroutableBindingError) Error() string {
 	return ErrUnroutableBinding.Error() + " (binding " + strconv.Quote(e.Binding) +
-		", command " + strconv.Quote(e.CommandID) + ")"
+		tenantClause(e.TenantID) + ", command " + strconv.Quote(e.CommandID) + ")"
 }
 
 func (e *UnroutableBindingError) Unwrap() error { return ErrUnroutableBinding }

@@ -117,10 +117,24 @@ func attachRefusal(err error) *hostlink.AttachRefusal {
 	code, _ := refused.HostLinkCode()
 	refusal := &hostlink.AttachRefusal{Code: code, Reason: refused.Reason, Cause: err}
 	if code == sessionwire.HostLinkErrorEpochMismatch {
-		var held *storage.LeaseHeldError
-		if errors.As(err, &held) {
-			refusal.CurrentLeaseEpoch = held.HolderEpoch
-		}
+		refusal.CurrentLeaseEpoch, _ = LeaseHolderEpoch(err)
 	}
 	return refusal
+}
+
+// LeaseHolderEpoch lifts the OTHER holder's epoch out of a refused attach.
+//
+// It is the one mechanism for that lift, shared by the HostLink attach path
+// and the exported composition's Attach, so the two cannot read the chain
+// differently. The epoch is storage.LeaseHeldError.HolderEpoch, which the
+// store adapter joins into residency.ErrLeaseHeld's refusal and the manager
+// carries as AttachError.Cause; false means no provider error is in the chain,
+// which a SessionLeases other than the released adapter may legitimately
+// produce.
+func LeaseHolderEpoch(err error) (uint64, bool) {
+	var held *storage.LeaseHeldError
+	if !errors.As(err, &held) {
+		return 0, false
+	}
+	return held.HolderEpoch, true
 }

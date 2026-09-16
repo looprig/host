@@ -6,14 +6,14 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"net/http/httptest"
-	"reflect"
-
-	"github.com/looprig/sessionstore"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 )
 
 // environment is a Config source a test supplies without mutating the process.
@@ -189,20 +189,20 @@ func TestConfigurationIsRefusedBeforeAnythingIsOpened(t *testing.T) {
 		t.Fatalf("Run with a broken configuration = %v, want *ConfigError", err)
 	}
 	if opener.opened != 0 {
-		t.Errorf("a broken configuration opened the store %d times, want 0", opener.opened)
+		t.Errorf("a broken configuration asked for the backend %d times, want 0", opener.opened)
 	}
 }
 
-// countingBootstrap records whether the store was opened.
+// countingBootstrap records whether the backend was asked for.
 type countingBootstrap struct {
 	unconfiguredBootstrap
 	opened int
 }
 
-// Store counts the call and then refuses like its embedded default.
-func (b *countingBootstrap) Store(ctx context.Context, evidence sessionstore.DispositionEvidenceReader) (*sessionstore.Store, error) {
+// Backend counts the call and then refuses like its embedded default.
+func (b *countingBootstrap) Backend(ctx context.Context) (*storage.Composite, []sessionstore.Option, error) {
 	b.opened++
-	return b.unconfiguredBootstrap.Store(ctx, evidence)
+	return b.unconfiguredBootstrap.Backend(ctx)
 }
 
 // TestTheBinaryNamesNoProductAndRegistersNoAgent is the structural half of "this
@@ -335,39 +335,6 @@ func TestTheRegistrationGuardSeesTheSpellingsItClaims(t *testing.T) {
 	}
 }
 
-// TestAProbeAnswers200WhenTrueAnd503WhenFalse pins what each probe route puts
-// on the wire.
-//
-// 503 IS THE REFUSAL AND NOT 500. Kubernetes treats any non-2xx as a probe
-// failure, so the code is for the human reading the logs, and "deliberately not
-// taking traffic" is what 503 means. The body is asserted too, because the
-// difference between the two probes is invisible in the status alone and an
-// operator reading a log needs to know which question was answered.
-func TestAProbeAnswers200WhenTrueAnd503WhenFalse(t *testing.T) {
-	t.Parallel()
-
-	for _, test := range []struct {
-		name   string
-		ok     bool
-		status int
-		body   string
-	}{
-		{name: "accepting", ok: true, status: 200, body: "accepting"},
-		{name: "not accepting", ok: false, status: 503, body: "not accepting"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			probe(recorder, test.ok, "accepting", "not accepting")
-			if recorder.Code != test.status {
-				t.Errorf("probe(%v) = %d, want %d", test.ok, recorder.Code, test.status)
-			}
-			if got := strings.TrimSpace(recorder.Body.String()); got != test.body {
-				t.Errorf("probe(%v) body = %q, want %q", test.ok, got, test.body)
-			}
-		})
-	}
-}
-
 // ---------------------------------------------------------------------------
 // The Bootstrap seam narrows as the store grows
 // ---------------------------------------------------------------------------
@@ -379,7 +346,7 @@ func TestAProbeAnswers200WhenTrueAnd503WhenFalse(t *testing.T) {
 // because of a design: Inbox and Cursors were injected because sessionstore
 // v0.6.0 had no per-session ordered listing and no durable consumption cursor,
 // and Bootstrap.Store's own doc said so. v0.7.0 publishes both, so the
-// composition binds the adapted store and the two seams leave the product's
+// composed Host binds the adapted store and the two seams leave the product's
 // surface. Workspaces stays, because workspace materialization is still not
 // that store's business.
 //
@@ -400,20 +367,35 @@ func TestBootstrapAsksAProductForNothingTheReleasedStoreCanAnswer(t *testing.T) 
 		got[seam.Method(index).Name] = true
 	}
 	want := map[string]bool{
-		"Store":        true,
+		// Backend REPLACED Store at v0.2.0. A product used to open the store
+		// itself with the evidence reader Host handed it, and Host could not
+		// make it pass the reader to Open; host.Compose opens the store now,
+		// so what a product supplies is the backend and its options.
+		"Backend":      true,
 		"Registrar":    true,
 		"Checkpointer": true,
 		"Auth":         true,
 		"Workspaces":   true,
 
-		// JournalStores is the SIXTH, and it is here for the same reason the
-		// first three are: a disposition session's journal is not in the
-		// orchestration store, the immutable binding says where it is, and no
-		// released reader can route on that binding — a harness Store holds no
-		// registry of the bindings it serves and answers only for the keyspace
-		// it owns. Which journal store serves which binding is a deployment
-		// fact, and there is no release that could make it Host's to know.
+		// JournalStores is here for the same reason the first three are: a
+		// disposition session's journal is not in the orchestration store, the
+		// immutable binding says where it is, and no released reader can route
+		// on that binding — a harness Store holds no registry of the bindings
+		// it serves and answers only for the keyspace it owns. Which journal
+		// store serves which (tenant, binding) is a deployment fact.
 		"JournalStores": true,
+
+		// NamespaceLayout is the seventh, and it is a v0.1.0 gap made visible:
+		// the released store publishes no layout accessor and the adapter
+		// refuses every hydration without one, so the v0.1.0 binary, which
+		// supplied none, could not have attached a session. host.Compose
+		// requires it; the product is the only thing that can answer it.
+		"NamespaceLayout": true,
+
+		// RigSessionIDs is the eighth, for the same gap one step further: the
+		// adapter refuses a hydration of any session WITH a catalog record and
+		// no Harness identity, and every session Factory places has one.
+		"RigSessionIDs": true,
 	}
 	for name := range want {
 		if !got[name] {
