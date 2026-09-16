@@ -11,7 +11,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -329,7 +329,7 @@ func (c *recordingCloser) closures() []AttemptID {
 type dispositionFixture struct {
 	t        *testing.T
 	clock    *manualClock
-	host     *host.Host
+	host     *hostconfig.Host
 	store    *fakeDispositionStore
 	runtime  *fakeRuntime
 	journal  stubJournalEpochs

@@ -9,8 +9,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -406,7 +406,7 @@ const dedicatedWarmTTL = 30 * 24 * time.Hour
 // WarmOptions is the point of the helper: it is what makes "a dedicated Host
 // configures a long warm TTL" a statement about a configuration that exists,
 // rather than about a number a test invented.
-func hostWithWarmTTL(t *testing.T, fixed sessionwire.SessionID, ttl time.Duration) *host.Host {
+func hostWithWarmTTL(t *testing.T, fixed sessionwire.SessionID, ttl time.Duration) *hostconfig.Host {
 	t.Helper()
 	dept, err := department.New([]department.Registration{{AgentID: testAgent, Target: &fakeTarget{
 		trace:         &trace{},
@@ -425,7 +425,7 @@ func hostWithWarmTTL(t *testing.T, fixed sessionwire.SessionID, ttl time.Duratio
 	if fixed != "" {
 		placement, capacity = sessionwire.HostPlacementDedicated, 1
 	}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            testHost,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -447,7 +447,7 @@ func hostWithWarmTTL(t *testing.T, fixed sessionwire.SessionID, ttl time.Duratio
 		ReconcileBatch:    129,
 	})
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	return built
 }

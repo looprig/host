@@ -34,7 +34,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -383,7 +383,7 @@ type UnusableHostError struct {
 
 func (e *UnusableHostError) Error() string {
 	return "commands: the Host cannot be consumed over, because " + strings.Join(e.Accessors, ", ") +
-		" " + plural(len(e.Accessors), "is", "are") + " unusable; a *host.Host that did not come from host.New has none of them set"
+		" " + plural(len(e.Accessors), "is", "are") + " unusable; a *hostconfig.Host that did not come from hostconfig.New has none of them set"
 }
 
 // plural picks the verb form for a count. It exists so the message above reads
@@ -504,7 +504,7 @@ func (e *CursorRegressionError) Error() string {
 type Options struct {
 	// Host supplies the clock, the reconcile interval and the reconcile batch.
 	// Nothing here restates a value host.New already checked.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// Key is the session this consumer owns the inbox of.
 	Key registry.Key
@@ -520,7 +520,7 @@ type Options struct {
 
 // Consumer consumes one session's durable command inbox.
 type Consumer struct {
-	host      *host.Host
+	host      *hostconfig.Host
 	key       registry.Key
 	epoch     uint64
 	inbox     Inbox

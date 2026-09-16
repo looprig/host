@@ -67,8 +67,8 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -686,7 +686,7 @@ func (e *ApplyError) Unwrap() error { return e.Cause }
 type ApplierOptions struct {
 	// Host supplies the clock, the claim TTL and this Host's identity. Nothing
 	// here restates a value host.New already checked.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// Key is the session whose commands this applier applies.
 	Key registry.Key
@@ -713,7 +713,7 @@ type ApplierOptions struct {
 // Applier claims, applies, recovers and settles one command at a time. It is the
 // Processor the consumer hands non-terminal records to.
 type Applier struct {
-	host         *host.Host
+	host         *hostconfig.Host
 	key          registry.Key
 	epoch        uint64
 	records      CommandRecords

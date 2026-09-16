@@ -9,8 +9,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -256,7 +256,7 @@ type HeartbeatOptions struct {
 	// Host supplies the identity, endpoint, placement, clock, heartbeat
 	// interval and registry expiry every observation is derived from. Nothing
 	// here restates a value host.New already checked.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// HostGeneration is this Host process's incarnation identity, which Core
 	// requires to be non-zero on every HostLink record.

@@ -11,8 +11,8 @@ import (
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage/memstore"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/sessionstoreadapter"
 )
@@ -23,7 +23,7 @@ import (
 // side is now a compile failure rather than a fake that quietly kept agreeing
 // with a shape nothing else has.
 var (
-	_ host.SessionStore       = (*sessionstoreadapter.Store)(nil)
+	_ hostconfig.SessionStore = (*sessionstoreadapter.Store)(nil)
 	_ residency.DurableStore  = (*sessionstoreadapter.Store)(nil)
 	_ residency.Locations     = (*sessionstoreadapter.Store)(nil)
 	_ commands.CommandRecords = (*sessionstoreadapter.Store)(nil)

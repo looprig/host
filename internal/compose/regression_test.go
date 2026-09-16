@@ -24,9 +24,9 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
@@ -1249,7 +1249,7 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	runtime.effects = store
 
 	var dispositions *fakeDispositions
-	f := newFixture(t, func(o *Options, _ *host.Options) {
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
 		o.Inbox = store
 		o.Cursors = store
 		// ONE SOURCE OF ROWS. The applier reads the records the consumer lists,

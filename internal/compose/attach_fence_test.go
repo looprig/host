@@ -12,9 +12,9 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/testkit"
@@ -202,7 +202,7 @@ func TestEachAttachedSessionConsumesItsOwnStream(t *testing.T) {
 	}}
 	cursors := &fakeCursors{perSession: map[registry.Key]uint64{}}
 
-	f := newFixture(t, func(o *Options, _ *host.Options) {
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
 		o.Inbox = inbox
 		o.Cursors = cursors
 	})
@@ -245,7 +245,7 @@ func TestAComposedConsumerListsStrictlyAfterItsDurableCursor(t *testing.T) {
 	// a predecessor Host consumed part of.
 	cursors := &fakeCursors{perSession: map[registry.Key]uint64{key: 1}}
 
-	f := newFixture(t, func(o *Options, _ *host.Options) {
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
 		o.Inbox = inbox
 		o.Cursors = cursors
 	})
@@ -349,7 +349,7 @@ func TestAWedgedSessionIsVisibleOnTheMetricsSurface(t *testing.T) {
 		wedged: {{TenantID: wedged.TenantID, SessionID: wedged.SessionID, CommandID: "command-wedged", AcceptedOrder: 1, State: commands.StatePending}},
 		idle:   nil,
 	}}
-	f := newFixture(t, func(o *Options, _ *host.Options) {
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
 		o.Inbox = inbox
 		o.Cursors = &fakeCursors{perSession: map[registry.Key]uint64{}}
 	})
@@ -406,7 +406,7 @@ func collect(t *testing.T, collector prometheus.Collector) string {
 // point: the attach is the last moment at which nothing has been taken.
 func TestAnAttachIsRefusedWhenNoWriterCanBeBoundToTheGrant(t *testing.T) {
 	refusal := errors.New("compose_test: this store did not issue that residency lease")
-	f := newFixture(t, func(o *Options, _ *host.Options) {
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
 		o.Writers = &fakeDispositionWriters{refuse: refusal}
 	})
 	f.start()

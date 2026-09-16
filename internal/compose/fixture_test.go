@@ -17,9 +17,9 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/service"
@@ -742,13 +742,13 @@ type fixture struct {
 	runtime     *controllableSession
 	work        *fakeWorkStates
 	auth        *fakeAuth
-	host        *host.Host
-	hostOptions host.Options
+	host        *hostconfig.Host
+	hostOptions hostconfig.Options
 	svc         *Service
 }
 
 // newFixture composes a pooled Host over fakes and returns it unstarted.
-func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture {
+func newFixture(t *testing.T, adjust ...func(*Options, *hostconfig.Options)) *fixture {
 	t.Helper()
 
 	trace := &recorder{}
@@ -774,7 +774,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		t.Fatalf("department.New: %v", err)
 	}
 
-	hostOptions := host.Options{
+	hostOptions := hostconfig.Options{
 		HostID:            testHostID,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
@@ -824,9 +824,9 @@ func newFixture(t *testing.T, adjust ...func(*Options, *host.Options)) *fixture 
 		change(&composeOptions, &hostOptions)
 	}
 
-	built, err := host.New(hostOptions)
+	built, err := hostconfig.New(hostOptions)
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	composeOptions.Host = built
 	composed, err := New(composeOptions)
@@ -1039,11 +1039,11 @@ func (s *controllableSession) LeaseEpoch() (uint64, bool) {
 const defaultFixtureWarmTTL = 90 * time.Second
 
 // hostWithExpiry rebuilds the fixture's Host with a different registry expiry.
-func hostWithExpiry(f *fixture, expiry time.Duration) (*host.Host, error) {
+func hostWithExpiry(f *fixture, expiry time.Duration) (*hostconfig.Host, error) {
 	options := f.hostOptions
 	options.RegistryExpiry = expiry
-	options.RegistryHeartbeat = expiry / host.MinHeartbeatsBeforeExpiry
-	return host.New(options)
+	options.RegistryHeartbeat = expiry / hostconfig.MinHeartbeatsBeforeExpiry
+	return hostconfig.New(options)
 }
 
 // awaitRearming blocks until a warm countdown is armed and returns its duration.

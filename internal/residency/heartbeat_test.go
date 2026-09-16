@@ -15,8 +15,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/service"
 )
@@ -176,7 +176,7 @@ type heartbeatFixture struct {
 	t         *testing.T
 	trace     *trace
 	clock     *manualClock
-	host      *host.Host
+	host      *hostconfig.Host
 	registry  *spyRegistry
 	locations *fakeLocations
 	publisher *service.CapacityPublisher
@@ -224,7 +224,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 	if err != nil {
 		t.Fatalf("department.New: %v", err)
 	}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            testHost,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -245,7 +245,7 @@ func newHeartbeatFixture(t *testing.T, configure ...func(*heartbeatFixture)) *he
 		ReconcileBatch:    129,
 	})
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	f.host = built
 

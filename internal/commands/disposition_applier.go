@@ -7,8 +7,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -19,7 +19,7 @@ import (
 // DispositionApplierOptions configures a DispositionApplier.
 type DispositionApplierOptions struct {
 	// Host supplies the clock, the claim TTL and this Host's identity.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// Key is the session whose commands this applier applies.
 	Key registry.Key
@@ -58,7 +58,7 @@ type DispositionApplierOptions struct {
 // it replaced the commands.NoDispatch refusal, deleted in the same change,
 // when harness gained an attempt-aware journal writer.
 type DispositionApplier struct {
-	host      *host.Host
+	host      *hostconfig.Host
 	key       registry.Key
 	residency uint64
 	records   DispositionRecords

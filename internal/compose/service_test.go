@@ -13,7 +13,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
@@ -141,7 +141,7 @@ func TestACompositionRefusesAnExpiryTheDirectoryWouldRefuse(t *testing.T) {
 	wider := f.svc.options
 	widerHost, err := hostWithExpiry(f, beyond)
 	if err != nil {
-		t.Fatalf("host.New with a %v expiry: %v", beyond, err)
+		t.Fatalf("hostconfig.New with a %v expiry: %v", beyond, err)
 	}
 	wider.Host = widerHost
 
@@ -157,7 +157,7 @@ func TestACompositionRefusesAnExpiryTheDirectoryWouldRefuse(t *testing.T) {
 	// built, so the refusal is about the bound and not about the fixture.
 	withinHost, err := hostWithExpiry(f, f.svc.options.Targets.MaxAdvertisementTTL())
 	if err != nil {
-		t.Fatalf("host.New at the bound: %v", err)
+		t.Fatalf("hostconfig.New at the bound: %v", err)
 	}
 	within := f.svc.options
 	within.Host = withinHost
@@ -183,7 +183,7 @@ func TestACompositionRefusesAnExpiryTheDirectoryWouldRefuse(t *testing.T) {
 func TestTheWiredHostHandsItsWarmTTLToTheReleaser(t *testing.T) {
 	const configured = 137 * time.Second
 
-	f := newFixture(t, func(_ *Options, hostOptions *host.Options) {
+	f := newFixture(t, func(_ *Options, hostOptions *hostconfig.Options) {
 		hostOptions.WarmTTL = configured
 	})
 	f.start()
@@ -583,7 +583,7 @@ func TestTheCompatibilityWaitReturnsAtAGateBoundary(t *testing.T) {
 // outcome is then the configured timeout, and NOT a gate boundary invented from
 // no information.
 func TestAGateBoundaryIsUnreachableWithNoWorkStateSource(t *testing.T) {
-	f := newFixture(t, func(composed *Options, _ *host.Options) {
+	f := newFixture(t, func(composed *Options, _ *hostconfig.Options) {
 		composed.WorkStates = nil
 	})
 	f.start()
@@ -1021,7 +1021,7 @@ func TestEachTenantsMultiplexerIsConfiguredForThatTenant(t *testing.T) {
 // correct answer. Measured as mutant M15: without this row the rule was
 // unguarded.
 func TestABusyTenantIsNeverEvictedByAStrangerConnecting(t *testing.T) {
-	f := newFixture(t, func(composed *Options, _ *host.Options) {
+	f := newFixture(t, func(composed *Options, _ *hostconfig.Options) {
 		composed.MaxTenantLinks = 1
 	})
 	// THE RUNTIME PUBLISHES, and that is a flake repair rather than a
@@ -1183,10 +1183,10 @@ func TestATenantLinkCannotDrainAnotherTenantsSessions(t *testing.T) {
 // The negative assertion is non-vacuous twice, as before: tenant-a's session is
 // asserted resident first, and tenant-a's OWN link drains it at the end.
 func TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession(t *testing.T) {
-	f := newFixture(t, func(_ *Options, host *host.Options) {
-		host.Placement = sessionwire.HostPlacementDedicated
-		host.FixedSessionID = sessionA
-		host.Capacity = 1
+	f := newFixture(t, func(_ *Options, options *hostconfig.Options) {
+		options.Placement = sessionwire.HostPlacementDedicated
+		options.FixedSessionID = sessionA
+		options.Capacity = 1
 	})
 	f.start()
 	f.attach(tenantA, sessionA)
@@ -1286,7 +1286,7 @@ func TestADedicatedHostRefusesADrainFromATenantThatDoesNotHoldItsSession(t *test
 // the bound moves. It is deliberately in `internal/compose`, which is the one
 // package that can see both `host.Options` and the resolver that depends on it.
 func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
-	dedicated := func(capacity uint64) host.Options {
+	dedicated := func(capacity uint64) hostconfig.Options {
 		options := newFixture(t).hostOptions
 		options.Placement = sessionwire.HostPlacementDedicated
 		options.FixedSessionID = sessionA
@@ -1296,7 +1296,7 @@ func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
 
 	// PART 1: THE RULE. A dedicated Host above capacity one must be refused at
 	// construction. This is the arm that fires when someone relaxes the bound.
-	if _, err := host.New(dedicated(2)); err == nil {
+	if _, err := hostconfig.New(dedicated(2)); err == nil {
 		t.Fatal("A DEDICATED HOST WAS ACCEPTED AT CAPACITY 2, WHICH REOPENS THE R-1 DRAIN HOLE. " +
 			"hostlink's drainScope refuses a fixed-session drain unless the requesting tenant HOLDS " +
 			"that session, and treats that as attribution for a HOST-WIDE drain. That is sound only " +
@@ -1305,8 +1305,8 @@ func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
 			"tenant-a's session. Either restore the bound or replace the rung with an attribution " +
 			"that does not depend on it.")
 	} else {
-		var invalid *host.InvalidOptionsError
-		if !errors.As(err, &invalid) || invalid.Code != host.OptionErrorCodeDedicatedCap {
+		var invalid *hostconfig.InvalidOptionsError
+		if !errors.As(err, &invalid) || invalid.Code != hostconfig.OptionErrorCodeDedicatedCap {
 			t.Fatalf("a dedicated Host at capacity 2 was refused for the wrong reason (%v); "+
 				"rung 8 depends on the CAPACITY bound specifically, so a refusal from some other "+
 				"rule is not the guarantee it relies on", err)
@@ -1316,7 +1316,7 @@ func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
 	// PART 2: THE POSITIVE CONTROL for that refusal. Capacity one IS accepted,
 	// so Part 1 is a statement about the bound and not about dedicated
 	// placement being unbuildable.
-	if _, err := host.New(dedicated(1)); err != nil {
+	if _, err := hostconfig.New(dedicated(1)); err != nil {
 		t.Fatalf("a dedicated Host at capacity 1 was refused, so Part 1 proves nothing: %v", err)
 	}
 
@@ -1325,7 +1325,7 @@ func TestRungEightsAttributionDependsOnTheDedicatedCapacityBound(t *testing.T) {
 	// tenant cannot become resident beside the holder. A relaxation that kept
 	// the option check and broke the enforcement would satisfy Part 1 and still
 	// open the hole, so the behaviour is asserted on a running Host.
-	f := newFixture(t, func(_ *Options, options *host.Options) {
+	f := newFixture(t, func(_ *Options, options *hostconfig.Options) {
 		options.Placement = sessionwire.HostPlacementDedicated
 		options.FixedSessionID = sessionA
 		options.Capacity = 1

@@ -1,4 +1,4 @@
-package host_test
+package hostconfig_test
 
 import (
 	"context"
@@ -17,8 +17,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 )
 
 // ---------------------------------------------------------------------------
@@ -102,9 +102,9 @@ func testDepartment(t *testing.T, agents ...sessionwire.AgentID) *department.Dep
 // fixture whose value equalled the thing being pinned — one of them in
 // production code. No two durations here are equal, so a comparison that reads
 // the wrong field cannot accidentally agree.
-func pooledOptions(t *testing.T) host.Options {
+func pooledOptions(t *testing.T) hostconfig.Options {
 	t.Helper()
-	return host.Options{
+	return hostconfig.Options{
 		HostID:            "host-7c1",
 		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -126,7 +126,7 @@ func pooledOptions(t *testing.T) host.Options {
 	}
 }
 
-func dedicatedOptions(t *testing.T) host.Options {
+func dedicatedOptions(t *testing.T) hostconfig.Options {
 	t.Helper()
 	options := pooledOptions(t)
 	options.Placement = sessionwire.HostPlacementDedicated
@@ -144,14 +144,14 @@ func TestNewAcceptsAValidConfiguration(t *testing.T) {
 
 	for _, tt := range []struct {
 		name    string
-		options host.Options
+		options hostconfig.Options
 	}{
 		{name: "pooled", options: pooledOptions(t)},
 		{name: "dedicated", options: dedicatedOptions(t)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			built, err := host.New(tt.options)
+			built, err := hostconfig.New(tt.options)
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -187,7 +187,7 @@ func TestEveryEnumMemberIsAccepted(t *testing.T) {
 			t.Parallel()
 			options := pooledOptions(t)
 			options.IsolationClass = class
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if err != nil {
 				t.Fatalf("New with isolation class %q = %v, want acceptance: Core accepts it, so refusing it here is a Host that cannot be built for a configuration the wire permits", class, err)
 			}
@@ -210,7 +210,7 @@ func TestEveryEnumMemberIsAccepted(t *testing.T) {
 				options.Capacity = 1
 				options.FixedSessionID = "session-71c"
 			}
-			if _, err := host.New(options); err != nil {
+			if _, err := hostconfig.New(options); err != nil {
 				t.Fatalf("New with placement %q = %v, want acceptance", placement, err)
 			}
 		})
@@ -245,7 +245,7 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 		t.Parallel()
 		options := pooledOptions(t)
 		options.HostID = "h"
-		built, err := host.New(options)
+		built, err := hostconfig.New(options)
 		if err != nil {
 			t.Fatalf("New with single-character identifiers = %v, want acceptance: the rule is non-empty", err)
 		}
@@ -259,7 +259,7 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 		options := dedicatedOptions(t)
 		options.HostID = "h"
 		options.FixedSessionID = "s"
-		built, err := host.New(options)
+		built, err := hostconfig.New(options)
 		if err != nil {
 			t.Fatalf("New with a single-character FixedSessionID = %v, want acceptance", err)
 		}
@@ -270,13 +270,13 @@ func TestIdentifiersHaveNoUndocumentedMinimumLength(t *testing.T) {
 
 	// The other side stays closed at that scale, so these rows do not soften
 	// the emptiness rule they are bounding.
-	for name, spoil := range map[string]func(*host.Options){
-		"HostID": func(o *host.Options) { o.HostID = "" },
+	for name, spoil := range map[string]func(*hostconfig.Options){
+		"HostID": func(o *hostconfig.Options) { o.HostID = "" },
 	} {
 		options := pooledOptions(t)
 		options.HostID = "h"
 		spoil(&options)
-		if _, err := host.New(options); err == nil {
+		if _, err := hostconfig.New(options); err == nil {
 			t.Errorf("an empty %s was accepted", name)
 		}
 	}
@@ -305,12 +305,12 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		spoil func(*host.Options)
+		spoil func(*hostconfig.Options)
 		field string
 		code  sessionwire.IDValidationCode
 	}{
-		{name: "host id too long", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(overLong) }, field: "HostID", code: sessionwire.IDValidationCodeTooLong},
-		{name: "host id invalid utf8", spoil: func(o *host.Options) { o.HostID = sessionwire.HostID(badUTF8) }, field: "HostID", code: sessionwire.IDValidationCodeInvalidUTF8},
+		{name: "host id too long", spoil: func(o *hostconfig.Options) { o.HostID = sessionwire.HostID(overLong) }, field: "HostID", code: sessionwire.IDValidationCodeTooLong},
+		{name: "host id invalid utf8", spoil: func(o *hostconfig.Options) { o.HostID = sessionwire.HostID(badUTF8) }, field: "HostID", code: sessionwire.IDValidationCodeInvalidUTF8},
 	}
 
 	for _, tt := range tests {
@@ -318,20 +318,20 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 			t.Parallel()
 			options := pooledOptions(t)
 			tt.spoil(&options)
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if built != nil {
 				t.Error("New returned a Host alongside its error")
 			}
 
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
 			}
 			if invalid.Field != tt.field {
 				t.Errorf("Field = %q, want %q", invalid.Field, tt.field)
 			}
-			if invalid.Code != host.OptionErrorCodeInvalid {
-				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeInvalid)
+			if invalid.Code != hostconfig.OptionErrorCodeInvalid {
+				t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeInvalid)
 			}
 
 			// The TYPED CAUSE, reachable through the exported constructor. An
@@ -362,8 +362,8 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 			t.Parallel()
 			options := dedicatedOptions(t)
 			options.FixedSessionID = tt.value
-			_, err := host.New(options)
-			var invalid *host.InvalidOptionsError
+			_, err := hostconfig.New(options)
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
 			}
@@ -392,7 +392,7 @@ func TestIdentifiersEnforceCoresIdentityRule(t *testing.T) {
 		options := dedicatedOptions(t)
 		options.HostID = sessionwire.HostID(atLimit)
 		options.FixedSessionID = sessionwire.SessionID(atLimit)
-		built, err := host.New(options)
+		built, err := hostconfig.New(options)
 		if err != nil {
 			t.Fatalf("New with identifiers of exactly MaxIDBytes = %v, want acceptance: Core accepts them, so refusing them here is a Host that cannot be built for a configuration the wire permits", err)
 		}
@@ -517,12 +517,12 @@ func TestNoCollaboratorIsInvokedAtConstruction(t *testing.T) {
 	options.Clock = recordingClock{log: invoked}
 	options.Auth = recordingAuth{log: invoked}
 
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New = %v; construction must not depend on a collaborator", err)
 	}
 	if called := invoked.calls(); len(called) != 0 {
-		t.Errorf("host.New invoked %v. Construction must be pure: a New that calls Auth or SessionStore becomes network- and order-dependent, and a Host that cannot be built while a dependency is briefly unreachable is a different component from the one documented", called)
+		t.Errorf("hostconfig.New invoked %v. Construction must be pure: a New that calls Auth or SessionStore becomes network- and order-dependent, and a Host that cannot be built while a dependency is briefly unreachable is a different component from the one documented", called)
 	}
 
 	// The collaborators are STORED, not discarded — otherwise this would pass
@@ -628,7 +628,7 @@ func TestDepartmentCardinalityIsNotConstrained(t *testing.T) {
 			t.Parallel()
 			options := pooledOptions(t)
 			options.Department = testDepartment(t, agents...)
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if err != nil {
 				t.Fatalf("New with a %d-agent Department = %v, want acceptance: Host constrains the Department's CONTENTS nowhere and its SIZE nowhere either", len(agents), err)
 			}
@@ -724,7 +724,7 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		options.ClaimTTL = 7 * 24 * time.Hour
 		options.ApplyDeadline = 30 * 24 * time.Hour
 
-		built, err := host.New(options)
+		built, err := hostconfig.New(options)
 		if err != nil {
 			t.Fatalf("New with a generous but legal configuration = %v. Every rule here is a floor; a ceiling above it is an undocumented rule owing its own constant and its own boundary rows", err)
 		}
@@ -749,7 +749,7 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		options.FixedSessionID = longSession
 		options.InternalEndpoint = "ws://[2001:db8::1]:9000/"
 		options.WarmTTL = 30 * 24 * time.Hour
-		if built, err := host.New(options); err != nil {
+		if built, err := hostconfig.New(options); err != nil {
 			t.Fatalf("New with a generous dedicated configuration = %v", err)
 		} else if built.FixedSessionID() != longSession {
 			t.Error("a long FixedSessionID did not survive construction")
@@ -778,26 +778,26 @@ func TestTimingMarginsDoNotOverflow(t *testing.T) {
 	t.Run("claim", func(t *testing.T) {
 		t.Parallel()
 		options := pooledOptions(t)
-		options.ClaimTTL = time.Duration(math.MaxInt64/host.MinClaimAttemptsBeforeDeadline) + 1
+		options.ClaimTTL = time.Duration(math.MaxInt64/hostconfig.MinClaimAttemptsBeforeDeadline) + 1
 		options.ApplyDeadline = time.Second
-		var invalid *host.InvalidOptionsError
-		if _, err := host.New(options); !errors.As(err, &invalid) {
+		var invalid *hostconfig.InvalidOptionsError
+		if _, err := hostconfig.New(options); !errors.As(err, &invalid) {
 			t.Fatalf("New with an overflowing ClaimTTL = %v, want *InvalidOptionsError", err)
-		} else if invalid.Code != host.OptionErrorCodeClaimMargin {
-			t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeClaimMargin)
+		} else if invalid.Code != hostconfig.OptionErrorCodeClaimMargin {
+			t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeClaimMargin)
 		}
 	})
 
 	t.Run("heartbeat", func(t *testing.T) {
 		t.Parallel()
 		options := pooledOptions(t)
-		options.RegistryHeartbeat = time.Duration(math.MaxInt64/host.MinHeartbeatsBeforeExpiry) + 1
+		options.RegistryHeartbeat = time.Duration(math.MaxInt64/hostconfig.MinHeartbeatsBeforeExpiry) + 1
 		options.RegistryExpiry = time.Second
-		var invalid *host.InvalidOptionsError
-		if _, err := host.New(options); !errors.As(err, &invalid) {
+		var invalid *hostconfig.InvalidOptionsError
+		if _, err := hostconfig.New(options); !errors.As(err, &invalid) {
 			t.Fatalf("New with an overflowing RegistryHeartbeat = %v, want *InvalidOptionsError", err)
-		} else if invalid.Code != host.OptionErrorCodeHeartbeatMargin {
-			t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeHeartbeatMargin)
+		} else if invalid.Code != hostconfig.OptionErrorCodeHeartbeatMargin {
+			t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeHeartbeatMargin)
 		}
 	})
 
@@ -809,7 +809,7 @@ func TestTimingMarginsDoNotOverflow(t *testing.T) {
 		options := pooledOptions(t)
 		options.RegistryHeartbeat = time.Hour
 		options.RegistryExpiry = 24 * time.Hour
-		if _, err := host.New(options); err != nil {
+		if _, err := hostconfig.New(options); err != nil {
 			t.Fatalf("New with an hourly heartbeat under a daily expiry = %v, want acceptance", err)
 		}
 	})
@@ -826,7 +826,7 @@ func TestResolvedConfigurationReportsWhatItWasGiven(t *testing.T) {
 	t.Parallel()
 
 	options := dedicatedOptions(t)
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -928,7 +928,7 @@ func TestCollaboratorsAreNotSubstitutedForOneAnother(t *testing.T) {
 
 	options := pooledOptions(t)
 	options.Auth = stubAuth{id: "auth-supplied"}
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -945,7 +945,7 @@ func TestHostDoesNotAliasTheCallersOptions(t *testing.T) {
 	t.Parallel()
 
 	options := dedicatedOptions(t)
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -970,45 +970,45 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		spoil func(*host.Options)
+		spoil func(*hostconfig.Options)
 		field string
-		code  host.OptionErrorCode
+		code  hostconfig.OptionErrorCode
 	}{
-		{name: "host id", spoil: func(o *host.Options) { o.HostID = "" }, field: "HostID", code: host.OptionErrorCodeMissing},
-		{name: "internal endpoint absent", spoil: func(o *host.Options) { o.InternalEndpoint = "" }, field: "InternalEndpoint", code: host.OptionErrorCodeMissing},
-		{name: "internal endpoint malformed", spoil: func(o *host.Options) { o.InternalEndpoint = "http://host/hostlink" }, field: "InternalEndpoint", code: host.OptionErrorCodeInvalid},
-		{name: "isolation class unknown", spoil: func(o *host.Options) { o.IsolationClass = "shared" }, field: "IsolationClass", code: host.OptionErrorCodeUnknownEnum},
-		{name: "isolation class absent", spoil: func(o *host.Options) { o.IsolationClass = "" }, field: "IsolationClass", code: host.OptionErrorCodeUnknownEnum},
-		{name: "department", spoil: func(o *host.Options) { o.Department = nil }, field: "Department", code: host.OptionErrorCodeMissing},
-		{name: "session store", spoil: func(o *host.Options) { o.SessionStore = nil }, field: "SessionStore", code: host.OptionErrorCodeMissing},
-		{name: "workspaces", spoil: func(o *host.Options) { o.Workspaces = nil }, field: "Workspaces", code: host.OptionErrorCodeMissing},
-		{name: "clock", spoil: func(o *host.Options) { o.Clock = nil }, field: "Clock", code: host.OptionErrorCodeMissing},
-		{name: "auth", spoil: func(o *host.Options) { o.Auth = nil }, field: "Auth", code: host.OptionErrorCodeMissing},
-		{name: "placement unknown", spoil: func(o *host.Options) { o.Placement = "burst" }, field: "Placement", code: host.OptionErrorCodeUnknownEnum},
-		{name: "placement absent", spoil: func(o *host.Options) { o.Placement = "" }, field: "Placement", code: host.OptionErrorCodeUnknownEnum},
-		{name: "capacity zero", spoil: func(o *host.Options) { o.Capacity = 0 }, field: "Capacity", code: host.OptionErrorCodeNotPositive},
-		{name: "warm ttl zero", spoil: func(o *host.Options) { o.WarmTTL = 0 }, field: "WarmTTL", code: host.OptionErrorCodeNotPositive},
-		{name: "warm ttl negative", spoil: func(o *host.Options) { o.WarmTTL = -time.Second }, field: "WarmTTL", code: host.OptionErrorCodeNotPositive},
-		{name: "heartbeat zero", spoil: func(o *host.Options) { o.RegistryHeartbeat = 0 }, field: "RegistryHeartbeat", code: host.OptionErrorCodeNotPositive},
-		{name: "expiry zero", spoil: func(o *host.Options) { o.RegistryExpiry = 0 }, field: "RegistryExpiry", code: host.OptionErrorCodeNotPositive},
+		{name: "host id", spoil: func(o *hostconfig.Options) { o.HostID = "" }, field: "HostID", code: hostconfig.OptionErrorCodeMissing},
+		{name: "internal endpoint absent", spoil: func(o *hostconfig.Options) { o.InternalEndpoint = "" }, field: "InternalEndpoint", code: hostconfig.OptionErrorCodeMissing},
+		{name: "internal endpoint malformed", spoil: func(o *hostconfig.Options) { o.InternalEndpoint = "http://host/hostlink" }, field: "InternalEndpoint", code: hostconfig.OptionErrorCodeInvalid},
+		{name: "isolation class unknown", spoil: func(o *hostconfig.Options) { o.IsolationClass = "shared" }, field: "IsolationClass", code: hostconfig.OptionErrorCodeUnknownEnum},
+		{name: "isolation class absent", spoil: func(o *hostconfig.Options) { o.IsolationClass = "" }, field: "IsolationClass", code: hostconfig.OptionErrorCodeUnknownEnum},
+		{name: "department", spoil: func(o *hostconfig.Options) { o.Department = nil }, field: "Department", code: hostconfig.OptionErrorCodeMissing},
+		{name: "session store", spoil: func(o *hostconfig.Options) { o.SessionStore = nil }, field: "SessionStore", code: hostconfig.OptionErrorCodeMissing},
+		{name: "workspaces", spoil: func(o *hostconfig.Options) { o.Workspaces = nil }, field: "Workspaces", code: hostconfig.OptionErrorCodeMissing},
+		{name: "clock", spoil: func(o *hostconfig.Options) { o.Clock = nil }, field: "Clock", code: hostconfig.OptionErrorCodeMissing},
+		{name: "auth", spoil: func(o *hostconfig.Options) { o.Auth = nil }, field: "Auth", code: hostconfig.OptionErrorCodeMissing},
+		{name: "placement unknown", spoil: func(o *hostconfig.Options) { o.Placement = "burst" }, field: "Placement", code: hostconfig.OptionErrorCodeUnknownEnum},
+		{name: "placement absent", spoil: func(o *hostconfig.Options) { o.Placement = "" }, field: "Placement", code: hostconfig.OptionErrorCodeUnknownEnum},
+		{name: "capacity zero", spoil: func(o *hostconfig.Options) { o.Capacity = 0 }, field: "Capacity", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "warm ttl zero", spoil: func(o *hostconfig.Options) { o.WarmTTL = 0 }, field: "WarmTTL", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "warm ttl negative", spoil: func(o *hostconfig.Options) { o.WarmTTL = -time.Second }, field: "WarmTTL", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "heartbeat zero", spoil: func(o *hostconfig.Options) { o.RegistryHeartbeat = 0 }, field: "RegistryHeartbeat", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "expiry zero", spoil: func(o *hostconfig.Options) { o.RegistryExpiry = 0 }, field: "RegistryExpiry", code: hostconfig.OptionErrorCodeNotPositive},
 		// The two DIVIDENDS, negative. This is the only input class where
 		// validateTiming's division and the product it replaced disagree, and
 		// the division is the more permissive of the two — so what makes it
 		// safe is that validateShape refuses these before validateTiming ever
 		// sees them. The table had a negative row only for WarmTTL, and zero is
 		// safe for the division, so the class was untested.
-		{name: "expiry negative", spoil: func(o *host.Options) { o.RegistryExpiry = -time.Second }, field: "RegistryExpiry", code: host.OptionErrorCodeNotPositive},
-		{name: "apply deadline negative", spoil: func(o *host.Options) { o.ApplyDeadline = -time.Second }, field: "ApplyDeadline", code: host.OptionErrorCodeNotPositive},
-		{name: "heartbeat negative", spoil: func(o *host.Options) { o.RegistryHeartbeat = -time.Second }, field: "RegistryHeartbeat", code: host.OptionErrorCodeNotPositive},
-		{name: "claim ttl negative", spoil: func(o *host.Options) { o.ClaimTTL = -time.Second }, field: "ClaimTTL", code: host.OptionErrorCodeNotPositive},
-		{name: "claim ttl zero", spoil: func(o *host.Options) { o.ClaimTTL = 0 }, field: "ClaimTTL", code: host.OptionErrorCodeNotPositive},
-		{name: "apply deadline zero", spoil: func(o *host.Options) { o.ApplyDeadline = 0 }, field: "ApplyDeadline", code: host.OptionErrorCodeNotPositive},
-		{name: "queue size zero", spoil: func(o *host.Options) { o.CommandQueueSize = 0 }, field: "CommandQueueSize", code: host.OptionErrorCodeNotPositive},
-		{name: "queue size negative", spoil: func(o *host.Options) { o.CommandQueueSize = -1 }, field: "CommandQueueSize", code: host.OptionErrorCodeNotPositive},
-		{name: "queue size above bound", spoil: func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 }, field: "CommandQueueSize", code: host.OptionErrorCodeAboveBound},
-		{name: "reconcile interval zero", spoil: func(o *host.Options) { o.ReconcileInterval = 0 }, field: "ReconcileInterval", code: host.OptionErrorCodeNotPositive},
-		{name: "reconcile batch zero", spoil: func(o *host.Options) { o.ReconcileBatch = 0 }, field: "ReconcileBatch", code: host.OptionErrorCodeNotPositive},
-		{name: "reconcile batch above bound", spoil: func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch + 1 }, field: "ReconcileBatch", code: host.OptionErrorCodeAboveBound},
+		{name: "expiry negative", spoil: func(o *hostconfig.Options) { o.RegistryExpiry = -time.Second }, field: "RegistryExpiry", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "apply deadline negative", spoil: func(o *hostconfig.Options) { o.ApplyDeadline = -time.Second }, field: "ApplyDeadline", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "heartbeat negative", spoil: func(o *hostconfig.Options) { o.RegistryHeartbeat = -time.Second }, field: "RegistryHeartbeat", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "claim ttl negative", spoil: func(o *hostconfig.Options) { o.ClaimTTL = -time.Second }, field: "ClaimTTL", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "claim ttl zero", spoil: func(o *hostconfig.Options) { o.ClaimTTL = 0 }, field: "ClaimTTL", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "apply deadline zero", spoil: func(o *hostconfig.Options) { o.ApplyDeadline = 0 }, field: "ApplyDeadline", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "queue size zero", spoil: func(o *hostconfig.Options) { o.CommandQueueSize = 0 }, field: "CommandQueueSize", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "queue size negative", spoil: func(o *hostconfig.Options) { o.CommandQueueSize = -1 }, field: "CommandQueueSize", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "queue size above bound", spoil: func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxCommandQueueSize + 1 }, field: "CommandQueueSize", code: hostconfig.OptionErrorCodeAboveBound},
+		{name: "reconcile interval zero", spoil: func(o *hostconfig.Options) { o.ReconcileInterval = 0 }, field: "ReconcileInterval", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "reconcile batch zero", spoil: func(o *hostconfig.Options) { o.ReconcileBatch = 0 }, field: "ReconcileBatch", code: hostconfig.OptionErrorCodeNotPositive},
+		{name: "reconcile batch above bound", spoil: func(o *hostconfig.Options) { o.ReconcileBatch = hostconfig.MaxReconcileBatch + 1 }, field: "ReconcileBatch", code: hostconfig.OptionErrorCodeAboveBound},
 	}
 
 	if len(tests) == 0 {
@@ -1020,11 +1020,11 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 			t.Parallel()
 			options := pooledOptions(t)
 			tt.spoil(&options)
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if built != nil {
 				t.Error("New returned a Host alongside its error")
 			}
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
 			}
@@ -1063,29 +1063,29 @@ func TestNewRejectsAMissingOrInvalidOption(t *testing.T) {
 func TestEveryRuleIsReachableThroughTheExportedConstructor(t *testing.T) {
 	t.Parallel()
 
-	spoilers := []func(*host.Options){
-		func(o *host.Options) { o.HostID = "" },
-		func(o *host.Options) { o.InternalEndpoint = "http://host/x" },
-		func(o *host.Options) { o.IsolationClass = "shared" },
-		func(o *host.Options) { o.Capacity = 0 },
-		func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 },
-		func(o *host.Options) { o.RegistryExpiry = o.RegistryHeartbeat },
-		func(o *host.Options) { o.ApplyDeadline = o.ClaimTTL },
-		func(o *host.Options) { o.Placement = sessionwire.HostPlacementDedicated; o.Capacity = 1 },
-		func(o *host.Options) {
+	spoilers := []func(*hostconfig.Options){
+		func(o *hostconfig.Options) { o.HostID = "" },
+		func(o *hostconfig.Options) { o.InternalEndpoint = "http://host/x" },
+		func(o *hostconfig.Options) { o.IsolationClass = "shared" },
+		func(o *hostconfig.Options) { o.Capacity = 0 },
+		func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxCommandQueueSize + 1 },
+		func(o *hostconfig.Options) { o.RegistryExpiry = o.RegistryHeartbeat },
+		func(o *hostconfig.Options) { o.ApplyDeadline = o.ClaimTTL },
+		func(o *hostconfig.Options) { o.Placement = sessionwire.HostPlacementDedicated; o.Capacity = 1 },
+		func(o *hostconfig.Options) {
 			o.Placement = sessionwire.HostPlacementDedicated
 			o.FixedSessionID = "session-71c"
 			o.Capacity = 4
 		},
-		func(o *host.Options) { o.FixedSessionID = "session-71c" },
+		func(o *hostconfig.Options) { o.FixedSessionID = "session-71c" },
 	}
 
-	seen := map[host.OptionErrorCode]int{}
+	seen := map[hostconfig.OptionErrorCode]int{}
 	for i, spoil := range spoilers {
 		options := pooledOptions(t)
 		spoil(&options)
-		_, err := host.New(options)
-		var invalid *host.InvalidOptionsError
+		_, err := hostconfig.New(options)
+		var invalid *hostconfig.InvalidOptionsError
 		if !errors.As(err, &invalid) {
 			t.Fatalf("spoiler %d: New error = %v, want *InvalidOptionsError", i, err)
 		}
@@ -1109,7 +1109,7 @@ func TestInvalidEndpointCarriesCoresTypedCause(t *testing.T) {
 
 	options := pooledOptions(t)
 	options.InternalEndpoint = "wss://user:secret@host/hostlink"
-	_, err := host.New(options)
+	_, err := hostconfig.New(options)
 
 	var validation *sessionwire.RequestValidationError
 	if !errors.As(err, &validation) {
@@ -1164,19 +1164,19 @@ func TestHeartbeatMustBeSafelyBelowExpiry(t *testing.T) {
 			options := pooledOptions(t)
 			options.RegistryHeartbeat = tt.heartbeat
 			options.RegistryExpiry = tt.expiry
-			_, err := host.New(options)
+			_, err := hostconfig.New(options)
 			if tt.accepted {
 				if err != nil {
 					t.Fatalf("New with heartbeat %v and expiry %v = %v, want acceptance", tt.heartbeat, tt.expiry, err)
 				}
 				return
 			}
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New with heartbeat %v and expiry %v error = %v, want *InvalidOptionsError", tt.heartbeat, tt.expiry, err)
 			}
-			if invalid.Code != host.OptionErrorCodeHeartbeatMargin {
-				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeHeartbeatMargin)
+			if invalid.Code != hostconfig.OptionErrorCodeHeartbeatMargin {
+				t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeHeartbeatMargin)
 			}
 			if !strings.Contains(invalid.Reason, "RegistryExpiry") || !strings.Contains(invalid.Reason, "RegistryHeartbeat") {
 				t.Errorf("Reason = %q, want it to name both durations so the reader can see which to change", invalid.Reason)
@@ -1212,19 +1212,19 @@ func TestClaimTTLMustBeSafelyBelowApplyDeadline(t *testing.T) {
 			options := pooledOptions(t)
 			options.ClaimTTL = tt.claim
 			options.ApplyDeadline = tt.deadline
-			_, err := host.New(options)
+			_, err := hostconfig.New(options)
 			if tt.accepted {
 				if err != nil {
 					t.Fatalf("New with claim %v and deadline %v = %v, want acceptance", tt.claim, tt.deadline, err)
 				}
 				return
 			}
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New with claim %v and deadline %v error = %v, want *InvalidOptionsError", tt.claim, tt.deadline, err)
 			}
-			if invalid.Code != host.OptionErrorCodeClaimMargin {
-				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeClaimMargin)
+			if invalid.Code != hostconfig.OptionErrorCodeClaimMargin {
+				t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeClaimMargin)
 			}
 			if !strings.Contains(invalid.Reason, "ApplyDeadline") || !strings.Contains(invalid.Reason, "ClaimTTL") {
 				t.Errorf("Reason = %q, want it to name both durations", invalid.Reason)
@@ -1238,34 +1238,34 @@ func TestClaimTTLMustBeSafelyBelowApplyDeadline(t *testing.T) {
 func TestTheMarginsAreDerivedFromTheirConstants(t *testing.T) {
 	t.Parallel()
 
-	if host.MinHeartbeatsBeforeExpiry < 2 {
-		t.Fatalf("MinHeartbeatsBeforeExpiry = %d; a margin below 2 tolerates no missed heartbeat and is not a margin", host.MinHeartbeatsBeforeExpiry)
+	if hostconfig.MinHeartbeatsBeforeExpiry < 2 {
+		t.Fatalf("MinHeartbeatsBeforeExpiry = %d; a margin below 2 tolerates no missed heartbeat and is not a margin", hostconfig.MinHeartbeatsBeforeExpiry)
 	}
-	if host.MinClaimAttemptsBeforeDeadline < 2 {
-		t.Fatalf("MinClaimAttemptsBeforeDeadline = %d; below 2 a lapsed claim has no attempt left inside the deadline", host.MinClaimAttemptsBeforeDeadline)
+	if hostconfig.MinClaimAttemptsBeforeDeadline < 2 {
+		t.Fatalf("MinClaimAttemptsBeforeDeadline = %d; below 2 a lapsed claim has no attempt left inside the deadline", hostconfig.MinClaimAttemptsBeforeDeadline)
 	}
 
 	heartbeat := 7 * time.Second
 	options := pooledOptions(t)
 	options.RegistryHeartbeat = heartbeat
-	options.RegistryExpiry = heartbeat*host.MinHeartbeatsBeforeExpiry - 1
-	if _, err := host.New(options); err == nil {
+	options.RegistryExpiry = heartbeat*hostconfig.MinHeartbeatsBeforeExpiry - 1
+	if _, err := hostconfig.New(options); err == nil {
 		t.Error("an expiry one nanosecond under MinHeartbeatsBeforeExpiry intervals was accepted")
 	}
-	options.RegistryExpiry = heartbeat * host.MinHeartbeatsBeforeExpiry
-	if _, err := host.New(options); err != nil {
+	options.RegistryExpiry = heartbeat * hostconfig.MinHeartbeatsBeforeExpiry
+	if _, err := hostconfig.New(options); err != nil {
 		t.Errorf("an expiry of exactly MinHeartbeatsBeforeExpiry intervals was refused: %v", err)
 	}
 
 	claim := 3 * time.Second
 	options = pooledOptions(t)
 	options.ClaimTTL = claim
-	options.ApplyDeadline = claim*host.MinClaimAttemptsBeforeDeadline - 1
-	if _, err := host.New(options); err == nil {
+	options.ApplyDeadline = claim*hostconfig.MinClaimAttemptsBeforeDeadline - 1
+	if _, err := hostconfig.New(options); err == nil {
 		t.Error("a deadline one nanosecond under MinClaimAttemptsBeforeDeadline claims was accepted")
 	}
-	options.ApplyDeadline = claim * host.MinClaimAttemptsBeforeDeadline
-	if _, err := host.New(options); err != nil {
+	options.ApplyDeadline = claim * hostconfig.MinClaimAttemptsBeforeDeadline
+	if _, err := hostconfig.New(options); err != nil {
 		t.Errorf("a deadline of exactly MinClaimAttemptsBeforeDeadline claims was refused: %v", err)
 	}
 }
@@ -1287,26 +1287,26 @@ func TestTheMarginsAreDerivedFromTheirConstants(t *testing.T) {
 func TestSizeBoundsAcceptExactlyTheirConstant(t *testing.T) {
 	t.Parallel()
 
-	if host.MaxCommandQueueSize == host.MaxReconcileBatch {
+	if hostconfig.MaxCommandQueueSize == hostconfig.MaxReconcileBatch {
 		t.Fatal("the two size bounds are equal, so swapping one for the other in validateShape would be undetectable by any value. Keep them distinct or this test cannot do its job")
 	}
 
 	tests := []struct {
 		name     string
-		apply    func(*host.Options)
+		apply    func(*hostconfig.Options)
 		accepted bool
 	}{
-		{name: "queue at exactly its bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize }, accepted: true},
-		{name: "queue one over its bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 }},
-		{name: "queue at one", apply: func(o *host.Options) { o.CommandQueueSize = 1 }, accepted: true},
+		{name: "queue at exactly its bound", apply: func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxCommandQueueSize }, accepted: true},
+		{name: "queue one over its bound", apply: func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxCommandQueueSize + 1 }},
+		{name: "queue at one", apply: func(o *hostconfig.Options) { o.CommandQueueSize = 1 }, accepted: true},
 		// The cross rows: each size set to the OTHER bound's constant. The
 		// queue accepts it because the queue's bound is larger; the batch
 		// refuses it for the same reason. A swapped bound inverts both.
-		{name: "queue at the batch bound", apply: func(o *host.Options) { o.CommandQueueSize = host.MaxReconcileBatch }, accepted: true},
-		{name: "batch at exactly its bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch }, accepted: true},
-		{name: "batch one over its bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch + 1 }},
-		{name: "batch at one", apply: func(o *host.Options) { o.ReconcileBatch = 1 }, accepted: true},
-		{name: "batch at the queue bound", apply: func(o *host.Options) { o.ReconcileBatch = host.MaxCommandQueueSize }},
+		{name: "queue at the batch bound", apply: func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxReconcileBatch }, accepted: true},
+		{name: "batch at exactly its bound", apply: func(o *hostconfig.Options) { o.ReconcileBatch = hostconfig.MaxReconcileBatch }, accepted: true},
+		{name: "batch one over its bound", apply: func(o *hostconfig.Options) { o.ReconcileBatch = hostconfig.MaxReconcileBatch + 1 }},
+		{name: "batch at one", apply: func(o *hostconfig.Options) { o.ReconcileBatch = 1 }, accepted: true},
+		{name: "batch at the queue bound", apply: func(o *hostconfig.Options) { o.ReconcileBatch = hostconfig.MaxCommandQueueSize }},
 	}
 
 	for _, tt := range tests {
@@ -1314,7 +1314,7 @@ func TestSizeBoundsAcceptExactlyTheirConstant(t *testing.T) {
 			t.Parallel()
 			options := pooledOptions(t)
 			tt.apply(&options)
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if tt.accepted {
 				if err != nil {
 					t.Fatalf("New = %v, want acceptance. A caller who reads the exported constant and configures exactly it must be accepted, or the constant is not the bound", err)
@@ -1324,12 +1324,12 @@ func TestSizeBoundsAcceptExactlyTheirConstant(t *testing.T) {
 			if built != nil {
 				t.Error("New returned a Host alongside its error")
 			}
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
 			}
-			if invalid.Code != host.OptionErrorCodeAboveBound {
-				t.Errorf("Code = %q, want %q", invalid.Code, host.OptionErrorCodeAboveBound)
+			if invalid.Code != hostconfig.OptionErrorCodeAboveBound {
+				t.Errorf("Code = %q, want %q", invalid.Code, hostconfig.OptionErrorCodeAboveBound)
 			}
 		})
 	}
@@ -1357,11 +1357,11 @@ func TestDurationsHaveNoUndocumentedMinimum(t *testing.T) {
 	options.WarmTTL = 1
 	options.ReconcileInterval = 1
 	options.RegistryHeartbeat = 1
-	options.RegistryExpiry = host.MinHeartbeatsBeforeExpiry
+	options.RegistryExpiry = hostconfig.MinHeartbeatsBeforeExpiry
 	options.ClaimTTL = 1
-	options.ApplyDeadline = host.MinClaimAttemptsBeforeDeadline
+	options.ApplyDeadline = hostconfig.MinClaimAttemptsBeforeDeadline
 
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New with nanosecond-scale durations = %v, want acceptance: the rule is positive, and any floor above that is an undocumented rule", err)
 	}
@@ -1375,7 +1375,7 @@ func TestDurationsHaveNoUndocumentedMinimum(t *testing.T) {
 	// The other side stays closed: zero is still refused at that scale, so this
 	// row does not soften the positivity rule it is bounding.
 	options.WarmTTL = 0
-	if _, err := host.New(options); err == nil {
+	if _, err := hostconfig.New(options); err == nil {
 		t.Error("a zero WarmTTL was accepted")
 	}
 }
@@ -1393,14 +1393,14 @@ func TestEachBoundExplainsItself(t *testing.T) {
 	t.Parallel()
 
 	reasons := map[string]string{}
-	for field, spoil := range map[string]func(*host.Options){
-		"CommandQueueSize": func(o *host.Options) { o.CommandQueueSize = host.MaxCommandQueueSize + 1 },
-		"ReconcileBatch":   func(o *host.Options) { o.ReconcileBatch = host.MaxReconcileBatch + 1 },
+	for field, spoil := range map[string]func(*hostconfig.Options){
+		"CommandQueueSize": func(o *hostconfig.Options) { o.CommandQueueSize = hostconfig.MaxCommandQueueSize + 1 },
+		"ReconcileBatch":   func(o *hostconfig.Options) { o.ReconcileBatch = hostconfig.MaxReconcileBatch + 1 },
 	} {
 		options := pooledOptions(t)
 		spoil(&options)
-		_, err := host.New(options)
-		var invalid *host.InvalidOptionsError
+		_, err := hostconfig.New(options)
+		var invalid *hostconfig.InvalidOptionsError
 		if !errors.As(err, &invalid) {
 			t.Fatalf("%s: New error = %v, want *InvalidOptionsError", field, err)
 		}
@@ -1426,17 +1426,17 @@ func TestResolvedSizesSurviveAtTheBound(t *testing.T) {
 	t.Parallel()
 
 	options := pooledOptions(t)
-	options.CommandQueueSize = host.MaxCommandQueueSize
-	options.ReconcileBatch = host.MaxReconcileBatch
-	built, err := host.New(options)
+	options.CommandQueueSize = hostconfig.MaxCommandQueueSize
+	options.ReconcileBatch = hostconfig.MaxReconcileBatch
+	built, err := hostconfig.New(options)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := built.CommandQueueSize(); got != host.MaxCommandQueueSize {
-		t.Errorf("CommandQueueSize() = %d, want %d", got, host.MaxCommandQueueSize)
+	if got := built.CommandQueueSize(); got != hostconfig.MaxCommandQueueSize {
+		t.Errorf("CommandQueueSize() = %d, want %d", got, hostconfig.MaxCommandQueueSize)
 	}
-	if got := built.ReconcileBatch(); got != host.MaxReconcileBatch {
-		t.Errorf("ReconcileBatch() = %d, want %d", got, host.MaxReconcileBatch)
+	if got := built.ReconcileBatch(); got != hostconfig.MaxReconcileBatch {
+		t.Errorf("ReconcileBatch() = %d, want %d", got, hostconfig.MaxReconcileBatch)
 	}
 }
 
@@ -1455,16 +1455,16 @@ func TestPlacementBindingRules(t *testing.T) {
 		placement sessionwire.HostPlacement
 		capacity  uint64
 		fixed     sessionwire.SessionID
-		code      host.OptionErrorCode
+		code      hostconfig.OptionErrorCode
 	}{
 		{name: "dedicated, bound, capacity one", placement: sessionwire.HostPlacementDedicated, capacity: 1, fixed: "session-71c"},
-		{name: "dedicated without a fixed session", placement: sessionwire.HostPlacementDedicated, capacity: 1, fixed: "", code: host.OptionErrorCodeDedicatedFixed},
-		{name: "dedicated with capacity above one", placement: sessionwire.HostPlacementDedicated, capacity: 2, fixed: "session-71c", code: host.OptionErrorCodeDedicatedCap},
-		{name: "dedicated with large capacity", placement: sessionwire.HostPlacementDedicated, capacity: 64, fixed: "session-71c", code: host.OptionErrorCodeDedicatedCap},
+		{name: "dedicated without a fixed session", placement: sessionwire.HostPlacementDedicated, capacity: 1, fixed: "", code: hostconfig.OptionErrorCodeDedicatedFixed},
+		{name: "dedicated with capacity above one", placement: sessionwire.HostPlacementDedicated, capacity: 2, fixed: "session-71c", code: hostconfig.OptionErrorCodeDedicatedCap},
+		{name: "dedicated with large capacity", placement: sessionwire.HostPlacementDedicated, capacity: 64, fixed: "session-71c", code: hostconfig.OptionErrorCodeDedicatedCap},
 		{name: "pooled, unbound", placement: sessionwire.HostPlacementPooled, capacity: 8, fixed: ""},
 		{name: "pooled with capacity one", placement: sessionwire.HostPlacementPooled, capacity: 1, fixed: ""},
-		{name: "pooled with a fixed session", placement: sessionwire.HostPlacementPooled, capacity: 8, fixed: "session-71c", code: host.OptionErrorCodePooledFixed},
-		{name: "pooled with a fixed session and capacity one", placement: sessionwire.HostPlacementPooled, capacity: 1, fixed: "session-71c", code: host.OptionErrorCodePooledFixed},
+		{name: "pooled with a fixed session", placement: sessionwire.HostPlacementPooled, capacity: 8, fixed: "session-71c", code: hostconfig.OptionErrorCodePooledFixed},
+		{name: "pooled with a fixed session and capacity one", placement: sessionwire.HostPlacementPooled, capacity: 1, fixed: "session-71c", code: hostconfig.OptionErrorCodePooledFixed},
 	}
 
 	accepted := 0
@@ -1476,7 +1476,7 @@ func TestPlacementBindingRules(t *testing.T) {
 			options.Capacity = tt.capacity
 			options.FixedSessionID = tt.fixed
 
-			built, err := host.New(options)
+			built, err := hostconfig.New(options)
 			if tt.code == "" {
 				if err != nil {
 					t.Fatalf("New = %v, want acceptance", err)
@@ -1489,7 +1489,7 @@ func TestPlacementBindingRules(t *testing.T) {
 			if built != nil {
 				t.Error("New returned a Host alongside its error")
 			}
-			var invalid *host.InvalidOptionsError
+			var invalid *hostconfig.InvalidOptionsError
 			if !errors.As(err, &invalid) {
 				t.Fatalf("New error = %v, want *InvalidOptionsError", err)
 			}
@@ -1511,7 +1511,7 @@ func TestPlacementBindingRules(t *testing.T) {
 		placement sessionwire.HostPlacement
 		capacity  uint64
 		fixed     sessionwire.SessionID
-		code      host.OptionErrorCode
+		code      hostconfig.OptionErrorCode
 	}) bool {
 		return tt.placement == sessionwire.HostPlacementDedicated && tt.code == ""
 	}) {
@@ -1545,18 +1545,18 @@ func TestPlacementBindingRules(t *testing.T) {
 func TestHostExposesNoTenantAccessor(t *testing.T) {
 	t.Parallel()
 
-	hostType := reflect.TypeOf((*host.Host)(nil))
+	hostType := reflect.TypeOf((*hostconfig.Host)(nil))
 	if hostType.NumMethod() == 0 {
-		t.Fatal("*host.Host has no methods at all, so this guard is vacuous")
+		t.Fatal("*hostconfig.Host has no methods at all, so this guard is vacuous")
 	}
 	// The control: a method this type DOES have, so a guard that could never
 	// find anything is distinguishable from one that found nothing wrong.
 	if _, present := hostType.MethodByName("IsolationClass"); !present {
-		t.Fatal("*host.Host has no IsolationClass method, so the lookup used below does not work")
+		t.Fatal("*hostconfig.Host has no IsolationClass method, so the lookup used below does not work")
 	}
 	for _, banned := range []string{"TenantID", "Tenant"} {
 		if _, present := hostType.MethodByName(banned); present {
-			t.Errorf("*host.Host exposes %s. H8 removed the fixed tenant from this type; a Host is tenant-exclusive by PLACEMENT, not by construction, and re-adding this is how a composition feeds one tenant to a Host-wide hostlink.Multiplexer and reverses H8 without any behavioural test failing. If a caller needs a tenant, it is the one the REQUEST or the LINK names", banned)
+			t.Errorf("*hostconfig.Host exposes %s. H8 removed the fixed tenant from this type; a Host is tenant-exclusive by PLACEMENT, not by construction, and re-adding this is how a composition feeds one tenant to a Host-wide hostlink.Multiplexer and reverses H8 without any behavioural test failing. If a caller needs a tenant, it is the one the REQUEST or the LINK names", banned)
 		}
 	}
 }

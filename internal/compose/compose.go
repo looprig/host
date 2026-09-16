@@ -10,9 +10,9 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
@@ -27,7 +27,7 @@ import (
 // identity, endpoint, placement, capacity and timing is read from it.
 type Options struct {
 	// Host is the validated Host this composition runs.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// HostGeneration is this process's incarnation identity. Core refuses a
 	// zero generation on every HostLink record, and the value belongs to the
@@ -79,7 +79,7 @@ type Options struct {
 
 	// Checkpointer is the product's release checkpoint. It is REQUIRED; see
 	// host.Checkpointer for why an absent one may not become a no-op.
-	Checkpointer host.Checkpointer
+	Checkpointer hostconfig.Checkpointer
 
 	// Auth verifies the service credential on every HostLink connection.
 	Auth hostlink.Authenticator

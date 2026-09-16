@@ -12,7 +12,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
@@ -92,7 +92,7 @@ func drainObservationOf(t *testing.T, reply wireReply) sessionwire.HostLinkDrain
 // trip-wire that fires if the capacity bound is ever relaxed.
 func dedicatedDrainFixture(t *testing.T) *fixture {
 	t.Helper()
-	return newFixture(t, func(_ *Options, options *host.Options) {
+	return newFixture(t, func(_ *Options, options *hostconfig.Options) {
 		options.Placement = sessionwire.HostPlacementDedicated
 		options.FixedSessionID = sessionA
 		options.Capacity = 1

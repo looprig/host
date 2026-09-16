@@ -9,9 +9,9 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/sessionstoreadapter"
@@ -124,13 +124,13 @@ func (r *recordingRuntime) ApplyCommand(_ context.Context, command department.Ru
 	return nil
 }
 
-func newApplierHost(t *testing.T) *host.Host {
+func newApplierHost(t *testing.T) *hostconfig.Host {
 	t.Helper()
 	dept, err := department.New([]department.Registration{{AgentID: testAgent, Target: stubTarget{}}})
 	if err != nil {
 		t.Fatalf("department.New: %v", err)
 	}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            sessionwire.HostID("host-adapter"),
 		InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -151,7 +151,7 @@ func newApplierHost(t *testing.T) *host.Host {
 		ReconcileBatch:    16,
 	})
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	return built
 }

@@ -14,8 +14,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -450,13 +450,13 @@ func (stubAuth) VerifyTenant(context.Context, sessionwire.TenantID, string) erro
 
 // newTestHost builds the Host whose clock, reconcile interval and reconcile
 // batch the consumer derives everything from.
-func newTestHost(t *testing.T, clock host.Clock) *host.Host {
+func newTestHost(t *testing.T, clock hostconfig.Clock) *hostconfig.Host {
 	t.Helper()
 	dept, err := department.New([]department.Registration{{AgentID: testAgent, Target: stubTarget{}}})
 	if err != nil {
 		t.Fatalf("department.New: %v", err)
 	}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            sessionwire.HostID("host-inbox"),
 		InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -477,7 +477,7 @@ func newTestHost(t *testing.T, clock host.Clock) *host.Host {
 		ReconcileBatch:    testBatch,
 	})
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	return built
 }
@@ -486,7 +486,7 @@ func newTestHost(t *testing.T, clock host.Clock) *host.Host {
 type consumerFixture struct {
 	t         *testing.T
 	clock     *manualClock
-	host      *host.Host
+	host      *hostconfig.Host
 	inbox     *fakeInbox
 	cursors   *fakeCursors
 	processor *fakeProcessor
@@ -621,7 +621,7 @@ func TestNewConsumerRefusesAnIncompleteComposition(t *testing.T) {
 func TestNewConsumerRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 	t.Parallel()
 
-	options := func(built *host.Host) Options {
+	options := func(built *hostconfig.Host) Options {
 		return Options{
 			Host:       built,
 			Key:        registry.Key{TenantID: testTenant, SessionID: testSession},
@@ -635,7 +635,7 @@ func TestNewConsumerRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 
 	t.Run("an unvalidated Host", func(t *testing.T) {
 		t.Parallel()
-		_, err := NewConsumer(options(&host.Host{}))
+		_, err := NewConsumer(options(&hostconfig.Host{}))
 		var unusable *UnusableHostError
 		if !errors.As(err, &unusable) {
 			t.Fatalf("want *UnusableHostError, got %v", err)
@@ -646,10 +646,10 @@ func TestNewConsumerRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 		}
 	})
 
-	t.Run("a Host from host.New", func(t *testing.T) {
+	t.Run("a Host from hostconfig.New", func(t *testing.T) {
 		t.Parallel()
 		if _, err := NewConsumer(options(newTestHost(t, newManualClock(testClockAt)))); err != nil {
-			t.Fatalf("a Host that came from host.New was refused: %v", err)
+			t.Fatalf("a Host that came from hostconfig.New was refused: %v", err)
 		}
 	})
 }
@@ -672,7 +672,7 @@ func TestAFullPageIsWellDefinedBecauseTheBatchIsPositive(t *testing.T) {
 		t.Fatalf("department.New: %v", err)
 	}
 	for _, batch := range []int{0, -1} {
-		options := host.Options{
+		options := hostconfig.Options{
 			HostID:            sessionwire.HostID("host-inbox"),
 			InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
 			IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -692,8 +692,8 @@ func TestAFullPageIsWellDefinedBecauseTheBatchIsPositive(t *testing.T) {
 			ReconcileInterval: testReconcileInterval,
 			ReconcileBatch:    batch,
 		}
-		if _, err := host.New(options); err == nil {
-			t.Errorf("host.New accepted ReconcileBatch %d; this package reads a full page as len(page) == the batch, which at zero makes an EMPTY page full and the loop spin without ever arming a timer", batch)
+		if _, err := hostconfig.New(options); err == nil {
+			t.Errorf("hostconfig.New accepted ReconcileBatch %d; this package reads a full page as len(page) == the batch, which at zero makes an EMPTY page full and the loop spin without ever arming a timer", batch)
 		}
 	}
 }

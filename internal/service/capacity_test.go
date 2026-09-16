@@ -21,8 +21,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/service"
 )
@@ -172,9 +172,9 @@ func testDepartment(t *testing.T, registrations ...department.Registration) *dep
 // distinct value so an assertion that reads the wrong one cannot agree by
 // accident, and RegistryExpiry is deliberately not a round multiple of
 // RegistryHeartbeat.
-func pooledOptions(t *testing.T, clock host.Clock) host.Options {
+func pooledOptions(t *testing.T, clock hostconfig.Clock) hostconfig.Options {
 	t.Helper()
-	return host.Options{
+	return hostconfig.Options{
 		HostID:            "host-7c1",
 		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
@@ -205,16 +205,16 @@ const testTenant sessionwire.TenantID = "tenant-9f3"
 // testHostGeneration is a non-zero incarnation identity. Core rejects zero.
 const testHostGeneration = uint64(9)
 
-func newHost(t *testing.T, options host.Options) *host.Host {
+func newHost(t *testing.T, options hostconfig.Options) *hostconfig.Host {
 	t.Helper()
-	built, err := host.New(options)
+	built, err := hostconfig.New(options)
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	return built
 }
 
-func newPublisher(t *testing.T, options host.Options) *service.CapacityPublisher {
+func newPublisher(t *testing.T, options hostconfig.Options) *service.CapacityPublisher {
 	t.Helper()
 	publisher, err := service.NewCapacityPublisher(service.CapacityOptions{
 		Host:           newHost(t, options),
@@ -387,7 +387,7 @@ func TestEveryPublishedFieldSurvivesDerivation(t *testing.T) {
 func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 	t.Parallel()
 
-	base := func(t *testing.T, mutate func(*host.Options)) map[sessionwire.AgentID]service.Advertisement {
+	base := func(t *testing.T, mutate func(*hostconfig.Options)) map[sessionwire.AgentID]service.Advertisement {
 		t.Helper()
 		options := pooledOptions(t, newFakeClock())
 		options.Department = testDepartment(t,
@@ -398,12 +398,12 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 		return byAgent(t, publish(t, newPublisher(t, options)))
 	}
 
-	first := base(t, func(*host.Options) {})
-	otherHost := base(t, func(o *host.Options) {
+	first := base(t, func(*hostconfig.Options) {})
+	otherHost := base(t, func(o *hostconfig.Options) {
 		o.HostID = "host-b42"
 		o.InternalEndpoint = "wss://host-b42.internal.example:8443/hostlink"
 	})
-	dedicated := base(t, func(o *host.Options) {
+	dedicated := base(t, func(o *hostconfig.Options) {
 		o.Placement = sessionwire.HostPlacementDedicated
 		o.Capacity = 1
 		o.FixedSessionID = "session-71c"
@@ -431,7 +431,7 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 	// derivation using only one of them is indistinguishable. A probe measured
 	// exactly that — dropping the agent from the scope survived every assertion
 	// above. These two rows break the fixture's coupling in each direction.
-	shared := byAgent(t, publish(t, newPublisher(t, func() host.Options {
+	shared := byAgent(t, publish(t, newPublisher(t, func() hostconfig.Options {
 		options := pooledOptions(t, newFakeClock())
 		options.Department = testDepartment(t,
 			department.Registration{AgentID: "planner", Target: testTarget{compatibility: "rig-shared-2026-09", capabilities: pooledCapabilities(1)}},
@@ -446,7 +446,7 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 		t.Error("two agents served by ONE runtime build share a stable key, so one advertisement would overwrite the other")
 	}
 
-	upgraded := base(t, func(o *host.Options) {
+	upgraded := base(t, func(o *hostconfig.Options) {
 		o.Department = testDepartment(t,
 			department.Registration{AgentID: "reviewer", Target: testTarget{compatibility: "rig-reviewer-2026-10", capabilities: pooledCapabilities(1)}},
 		)
@@ -462,12 +462,12 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 	// two Departments differ only in where the colon falls, and a derivation
 	// that joined the members without a length prefix would hash them
 	// identically and give two different LaunchTargets one record.
-	colonInAgent := byAgent(t, publish(t, newPublisher(t, func() host.Options {
+	colonInAgent := byAgent(t, publish(t, newPublisher(t, func() hostconfig.Options {
 		options := pooledOptions(t, newFakeClock())
 		options.Department = testDepartment(t, department.Registration{AgentID: "a:b", Target: testTarget{compatibility: "c", capabilities: pooledCapabilities(1)}})
 		return options
 	}())))
-	colonInCompatibility := byAgent(t, publish(t, newPublisher(t, func() host.Options {
+	colonInCompatibility := byAgent(t, publish(t, newPublisher(t, func() hostconfig.Options {
 		options := pooledOptions(t, newFakeClock())
 		options.Department = testDepartment(t, department.Registration{AgentID: "a", Target: testTarget{compatibility: "b:c", capabilities: pooledCapabilities(1)}})
 		return options
@@ -483,7 +483,7 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 	// lower-case segments joined by '/', and an agent id is an opaque
 	// sessionwire string that need not obey it, so the derivation may not
 	// simply interpolate one.
-	opaque := base(t, func(o *host.Options) {
+	opaque := base(t, func(o *hostconfig.Options) {
 		o.Department = testDepartment(t, registration("Rev/iewer Ünicode", pooledCapabilities(1)))
 	})
 	for agent, advertisement := range opaque {
@@ -643,7 +643,7 @@ func TestAdvertisementSurvivesTheMissedHeartbeatsItsMarginBuys(t *testing.T) {
 
 			// A missed heartbeat and its retry are both still inside the
 			// expiry. That is what the margin is FOR.
-			missable := host.MinHeartbeatsBeforeExpiry - 1
+			missable := hostconfig.MinHeartbeatsBeforeExpiry - 1
 			for missed := 1; missed <= missable; missed++ {
 				at := observed.Add(time.Duration(missed) * row.heartbeat)
 				if advertisement.Expired(at) {
@@ -1899,7 +1899,7 @@ func (*driftingTarget) Restore(context.Context, department.RestoreRequest) (depa
 func TestATargetThatChangesItsAnswersCannotBreakThePeriodicPath(t *testing.T) {
 	t.Parallel()
 
-	newDrifting := func(t *testing.T) (*driftingTarget, host.Options) {
+	newDrifting := func(t *testing.T) (*driftingTarget, hostconfig.Options) {
 		t.Helper()
 		target := &driftingTarget{compatibility: "rig-drift-2026-09", capabilities: pooledCapabilities(2)}
 		options := pooledOptions(t, newFakeClock())
@@ -2143,12 +2143,12 @@ func TestTheSnapshotCopiesEverythingItsSourcesCanHold(t *testing.T) {
 		t.Errorf("exportedFieldNames over a struct with two exported fields and one unexported = %v, want exactly the two exported", got)
 	}
 
-	built := reflect.TypeOf(host.Host{})
+	built := reflect.TypeOf(hostconfig.Host{})
 	if built.NumField() == 0 {
-		t.Fatal("host.Host has no fields, so this guard reached nothing")
+		t.Fatal("hostconfig.Host has no fields, so this guard reached nothing")
 	}
 	if got := exportedFieldNames(built); len(got) != 0 {
-		t.Errorf("host.Host exports field(s) %v; the advertisement's keys are derived from Placement() and ID() ONCE while the report reads them every heartbeat, and that snapshot/live pair is only safe while a holder cannot change the Host underneath it",
+		t.Errorf("hostconfig.Host exports field(s) %v; the advertisement's keys are derived from Placement() and ID() ONCE while the report reads them every heartbeat, and that snapshot/live pair is only safe while a holder cannot change the Host underneath it",
 			got)
 	}
 }

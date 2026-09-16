@@ -15,9 +15,9 @@ import (
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage/memstore"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/sessionstoreadapter"
 )
@@ -255,7 +255,7 @@ func (w *world) applier(runtime department.CommandApplier) *commands.Disposition
 		w.t.Fatalf("bind the disposition writer to the residency grant: %v", err)
 	}
 
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            "host-settlement",
 		InternalEndpoint:  "ws://10.0.0.1:7100/hostlink",
 		IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
@@ -276,7 +276,7 @@ func (w *world) applier(runtime department.CommandApplier) *commands.Disposition
 		ReconcileBatch:    16,
 	})
 	if err != nil {
-		w.t.Fatalf("host.New: %v", err)
+		w.t.Fatalf("hostconfig.New: %v", err)
 	}
 
 	applier, err := commands.NewDispositionApplier(commands.DispositionApplierOptions{

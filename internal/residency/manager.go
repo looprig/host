@@ -47,8 +47,8 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/service"
 )
@@ -569,7 +569,7 @@ type Options struct {
 	// Host is the validated Host whose identity, endpoint, placement, tenant,
 	// registry expiry and clock the projection is derived from. Nothing here
 	// re-states a value host.New already checked.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// HostGeneration is this Host process's incarnation identity. Core
 	// requires it to be non-zero on every HostLink record, and it belongs to
@@ -604,7 +604,7 @@ type sessionRecord struct {
 
 // Manager creates and restores sessions under the durable session lease.
 type Manager struct {
-	host       *host.Host
+	host       *hostconfig.Host
 	generation uint64
 
 	registry   LocalRegistry

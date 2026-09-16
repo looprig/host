@@ -20,8 +20,8 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/service"
 	"github.com/looprig/host/internal/testkit"
@@ -924,7 +924,7 @@ var testRigSessionID = uuid.MustParse("6f1c2b84-9a3d-4c17-b0e5-2d7f8a4c1e93")
 type fixture struct {
 	t          *testing.T
 	trace      *trace
-	host       *host.Host
+	host       *hostconfig.Host
 	target     *fakeTarget
 	registry   *spyRegistry
 	publisher  *service.CapacityPublisher
@@ -1009,7 +1009,7 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 	if f.isolation != "" {
 		isolation = f.isolation
 	}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            testHost,
 		InternalEndpoint:  testEndpoint,
 		IsolationClass:    isolation,
@@ -1031,7 +1031,7 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 		ReconcileBatch:    129,
 	})
 	if err != nil {
-		t.Fatalf("host.New: %v", err)
+		t.Fatalf("hostconfig.New: %v", err)
 	}
 	f.host = built
 

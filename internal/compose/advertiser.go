@@ -6,7 +6,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
@@ -22,7 +22,7 @@ import (
 // A drain that retired only the first would leave a Factory holding a live
 // session row advertising Accepting true on a Host that had stopped.
 type advertiser struct {
-	host       *host.Host
+	host       *hostconfig.Host
 	capacity   *service.CapacityPublisher
 	directory  TargetDirectory
 	registry   *registry.Registry

@@ -72,8 +72,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -162,7 +162,7 @@ type CapacityOptions struct {
 	// else the derivation needs — identity, endpoint, isolation class,
 	// placement, capacity, registry expiry, clock — is read from it, so there
 	// is no second copy of a value host.New already checked.
-	Host *host.Host
+	Host *hostconfig.Host
 
 	// HostGeneration is this Host process's incarnation identity, which Core
 	// requires to be non-zero on every HostLink record. It is NOT on
@@ -202,7 +202,7 @@ type admission struct {
 // from the other. Whatever the final ownership, there must be exactly one of
 // each, and this is the one that already exists.
 type CapacityPublisher struct {
-	host       *host.Host
+	host       *hostconfig.Host
 	generation uint64
 
 	// targets is the SNAPSHOT the whole package derives from, taken and

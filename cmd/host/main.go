@@ -35,6 +35,7 @@ import (
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/compose"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/sessionstoreadapter"
@@ -203,7 +204,7 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 	}
 
 	clock := compose.SystemClock{}
-	built, err := host.New(host.Options{
+	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            config.HostID,
 		InternalEndpoint:  config.InternalEndpoint,
 		IsolationClass:    config.IsolationClass,

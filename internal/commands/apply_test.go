@@ -19,8 +19,8 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
-	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -537,7 +537,7 @@ func (r *fakeRuntime) commands() []department.RuntimeCommand {
 type applierFixture struct {
 	t       *testing.T
 	clock   *manualClock
-	host    *host.Host
+	host    *hostconfig.Host
 	store   *fakeStore
 	runtime *fakeRuntime
 	fence   *fakeFence
@@ -725,7 +725,7 @@ func TestNewApplierRefusesAHostThatDidNotComeFromHostNew(t *testing.T) {
 
 	store := newFakeStore(newManualClock(testClockAt))
 	applier, err := NewApplier(ApplierOptions{
-		Host:         &host.Host{},
+		Host:         &hostconfig.Host{},
 		Key:          registry.Key{TenantID: testTenant, SessionID: testSession},
 		LeaseEpoch:   testEpoch,
 		Records:      store,
