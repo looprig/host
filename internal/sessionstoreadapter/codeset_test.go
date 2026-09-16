@@ -1,6 +1,7 @@
 package sessionstoreadapter
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,59 +76,76 @@ import (
 // guard whose subject is absent must not report success, and an empty derived
 // set is exactly the vacuous pass this repository floors everywhere else.
 
-// pinnedSessionstoreDir locates the source of the sessionstore version this test
-// binary was built against.
+// pinnedSessionstoreDir locates the source of the sessionstore version this
+// build resolves.
 //
-// It reads the version from build info rather than from go.mod, so it describes
-// the module that is actually linked in. A mismatch between the two is the state
-// a stale vendor tree used to produce, and it is not this test's job to conceal.
+// It asks `go list -m -json`, which reports the module's resolved Version and
+// its on-disk Dir in one step, rather than reading runtime/debug.BuildInfo and
+// reconstructing a GOMODCACHE path by hand. That reconstruction used to read
+// the version off the LINKED test binary's embedded build info; every released
+// go1.26.x (go1.26.0 through go1.26.8, the full patch series as of this
+// writing) does not embed a module's dependency list into a TEST binary's
+// build info at all (a `go build` of the same import produces a complete list
+// under the same toolchain — this is specific to `go test`), so under any
+// go1.26.x toolchain info.Deps was always empty and this derivation always
+// failed before it could do any work. `go list -m -json` asks the go command
+// directly instead of asking a fact the go command chose not to link in, and
+// that question is answered correctly by every toolchain in use here.
+//
+// It still fails closed on exactly the two situations the old build-info
+// check did, because `go list -m -json` reports both: an explicit `replace`
+// directive (Replace != nil) is refused, since this module forbids
+// replacements and the derivation would read the wrong source; and an ACTIVE
+// GO WORKSPACE that lists sessionstore as a member (Main == true) is refused
+// too — a workspace `use` resolves the module to its on-disk working tree with
+// no pinned version at all, which is a silent, unpinned substitution the
+// derivation must not read as if it were the released v0.9.0 source. Both are
+// reported by name rather than treated as "no version" the way the old check
+// collapsed them.
 func pinnedSessionstoreDir(t *testing.T) string {
 	t.Helper()
 
 	const modulePath = "github.com/looprig/sessionstore"
 
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		t.Fatal("no build info: the derived code set cannot establish which sessionstore version is linked in")
+	var stderr strings.Builder
+	cmd := exec.Command("go", "list", "-m", "-json", modulePath)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list -m -json %s: %v: %s", modulePath, err, stderr.String())
 	}
-	version := ""
-	for _, dep := range info.Deps {
-		if dep.Path == modulePath {
-			version = dep.Version
-			if dep.Replace != nil {
-				t.Fatalf("%s is replaced (%s => %s); this module forbids replacements and the derivation would read the wrong source", modulePath, dep.Path, dep.Replace.Path)
-			}
-			break
+
+	var mod struct {
+		Path    string
+		Main    bool
+		Version string
+		Dir     string
+		Replace *struct {
+			Path    string
+			Version string
+			Dir     string
 		}
 	}
-	if version == "" {
-		t.Fatalf("build info names no version of %s", modulePath)
+	if err := json.Unmarshal(out, &mod); err != nil {
+		t.Fatalf("parsing `go list -m -json %s` output: %v\n%s", modulePath, err, out)
 	}
 
-	cache := os.Getenv("GOMODCACHE")
-	if cache == "" {
-		out, err := exec.Command("go", "env", "GOMODCACHE").Output()
-		if err != nil {
-			t.Fatalf("locating GOMODCACHE: %v", err)
-		}
-		cache = strings.TrimSpace(string(out))
+	if mod.Replace != nil {
+		t.Fatalf("%s is replaced (%s => %s); this module forbids replacements and the derivation would read the wrong source", modulePath, modulePath, mod.Replace.Path)
 	}
-	if cache == "" {
-		t.Fatal("GOMODCACHE is empty, so the pinned module source cannot be located")
+	if mod.Main {
+		t.Fatalf("%s resolves to a workspace member at %s with no pinned version (an active go.work names it with `use`); the derivation requires the released module, not an unpinned working tree, and refuses to silently read it as if it were v0.9.0. Rerun with GOWORK=off.", modulePath, mod.Dir)
 	}
-
-	// The module path is entirely lower case, so the cache's case encoding is
-	// the identity here. Asserting that keeps the shortcut honest if the path
-	// ever changes.
-	if strings.ToLower(modulePath) != modulePath {
-		t.Fatalf("%s needs the module cache case encoding, which this helper does not apply", modulePath)
+	if mod.Version == "" {
+		t.Fatalf("`go list -m -json %s` named no version", modulePath)
 	}
-
-	dir := filepath.Join(cache, filepath.FromSlash(modulePath)+"@"+version)
-	if entry, err := os.Stat(dir); err != nil || !entry.IsDir() {
-		t.Fatalf("pinned %s@%s is not readable at %s: %v", modulePath, version, dir, err)
+	if mod.Dir == "" {
+		t.Fatalf("`go list -m -json %s` named no directory for %s", modulePath, mod.Version)
 	}
-	return dir
+	if entry, err := os.Stat(mod.Dir); err != nil || !entry.IsDir() {
+		t.Fatalf("pinned %s@%s is not readable at %s: %v", modulePath, mod.Version, mod.Dir, err)
+	}
+	return mod.Dir
 }
 
 // declaredCodes returns the VALUES of every package-level constant in dir whose

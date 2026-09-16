@@ -1,6 +1,6 @@
 module github.com/looprig/host
 
-go 1.27.1
+go 1.26.8
 
 require (
 	github.com/centrifugal/centrifuge v0.38.0
