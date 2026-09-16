@@ -1626,7 +1626,7 @@ var harnessReadPlaneMethods = []string{
 //   - the RPC arm asserts eight read-shaped method names are refused on a
 //     BOUND, authenticated link, and the control is hostlink.bind on that same
 //     link, which is accepted;
-//   - the source arm asserts the reserved method constants are exactly four,
+//   - the source arm asserts the reserved method constants are exactly five,
 //     and its control is that the parse found them at all — a parse that
 //     matched nothing would otherwise satisfy "none of them is a read".
 //
@@ -1638,7 +1638,8 @@ var harnessReadPlaneMethods = []string{
 // four declared constants is resolved as a channel and needs a binding" — and
 // that is not true of the dispatch switch this Host actually has: a new read
 // method arrives as a new CASE and never reaches the default arm that resolves
-// a name as a channel. What the three arms give is a bound on the defect, not
+// a name as a channel. (hostlink.attach, added at v0.2.0, is exactly such a
+// case — a WRITE, not a read, and reviewed as a new plane.) What the three arms give is a bound on the defect, not
 // its absence; reservedHostLinkMethods' doc states the residue in full.
 func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 	runtime := newPublishingSession()
@@ -1702,11 +1703,12 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 	want := map[string]string{
 		"MethodBind":        hostlink.MethodBind,
 		"MethodUnbind":      hostlink.MethodUnbind,
+		"MethodAttach":      hostlink.MethodAttach,
 		"MethodDrain":       hostlink.MethodDrain,
 		"MethodDrainStatus": hostlink.MethodDrainStatus,
 	}
 	if len(declared) != len(want) {
-		t.Fatalf("hostlink declares %d reserved RPC methods %v, want exactly the four in %v; a fifth reserved method is a new plane and must be reviewed as one", len(declared), declared, want)
+		t.Fatalf("hostlink declares %d reserved RPC methods %v, want exactly the five in %v; a sixth reserved method is a new plane and must be reviewed as one", len(declared), declared, want)
 	}
 	for name, value := range want {
 		got, held := declared[name]

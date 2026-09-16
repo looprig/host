@@ -1,6 +1,7 @@
 package hostlink
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -230,6 +231,39 @@ const (
 	// the distinction is what stops a Factory whose drain request never
 	// arrived from reading silence as completion.
 	RefusalNoDrainInProgress Refusal = "no_drain_in_progress"
+
+	// RefusalAttachUnsupported reports a Host composed without an Attacher. It
+	// is a DEPLOYMENT defect, as RefusalDrainUnsupported is: nothing can make a
+	// session resident on this Host over HostLink, and no retry changes that.
+	RefusalAttachUnsupported Refusal = "attach_unsupported"
+
+	// RefusalAttachRefused reports an attach the Attacher declined WITH a Core
+	// class: the class is the one it named, and the Factory branches on it.
+	// The local value is one because the classes are the Attacher's — the
+	// residency manager decides runtime_mismatch from no_capacity, and a second
+	// vocabulary for the same decisions here would be two answers to one
+	// question.
+	RefusalAttachRefused Refusal = "attach_refused"
+
+	// RefusalAttachFailed reports an attach that failed with NO placement
+	// outcome — a store that was down, a launch that failed outright, an error
+	// that was not a refusal at all. It has no wire class, by Core's own rule
+	// for such failures, and reaches the transport as this Host's error rather
+	// than as a HostLinkError. The attach is idempotent, so a retry is safe.
+	RefusalAttachFailed Refusal = "attach_failed"
+
+	// RefusalHolderEpochUnknown reports a session lease held by another owner
+	// whose epoch this Host could not read. Core requires epoch_mismatch to
+	// carry the holder's epoch and refuses a zero, so the class is downgraded
+	// to runtime_unavailable on the wire; the local value keeps the real
+	// ground, which is that the registry the caller placed from is stale.
+	RefusalHolderEpochUnknown Refusal = "holder_epoch_unknown"
+
+	// RefusalUnpublishableAttach reports an Attacher that attached and then
+	// produced an observation Core refuses to publish. The session may be
+	// resident, so no Core class is sent — re-placement would be wrong — and
+	// the failure leaves at the transport as this Host's.
+	RefusalUnpublishableAttach Refusal = "unpublishable_attach"
 )
 
 // BindError reports a declined bind, unbind or command delivery.
@@ -351,6 +385,14 @@ type MultiplexerOptions struct {
 	DrainStarter  DrainStarter
 	DrainObserver DrainObserver
 
+	// Attacher is the composition's one attach entry point, reached by the
+	// hostlink.attach RPC. It is OPTIONAL, and its absence is a refusal and not
+	// a default: a Multiplexer built without one answers every attach with
+	// RefusalAttachUnsupported, which is the same shape as the drain seams'
+	// absence. It is a seam and not a handle — see Attacher for what that
+	// keeps true about Bind.
+	Attacher Attacher
+
 	// FixedSessionID is the sole session a DEDICATED Host holds, and its zero
 	// value means this Host is pooled.
 	//
@@ -391,6 +433,7 @@ type Multiplexer struct {
 
 	drainStarter  DrainStarter
 	drainObserver DrainObserver
+	attacher      Attacher
 	fixedSession  sessionwire.SessionID
 
 	perLink int
@@ -447,6 +490,7 @@ func NewMultiplexer(options MultiplexerOptions) (*Multiplexer, error) {
 		consumers:     options.Consumers,
 		drainStarter:  options.DrainStarter,
 		drainObserver: options.DrainObserver,
+		attacher:      options.Attacher,
 		fixedSession:  options.FixedSessionID,
 		perLink:       options.MaxBindingsPerLink,
 		total:         options.MaxBindings,
@@ -917,14 +961,21 @@ var errUnroutableRPC = errors.New("hostlink: the RPC body is not a valid Core re
 // no out-of-band signal to tell them apart because an empty body cannot be a
 // valid HostLinkError — Core's own Validate refuses an absent code.
 //
-// THE TWO DRAIN METHODS ARE THE EXCEPTION and leave through their own return,
-// because an acknowledgement carries a generation and so cannot be empty. See
-// dispatchDrain for what keeps their two bodies apart.
-func (m *Multiplexer) dispatch(link LinkID, method string, data []byte) ([]byte, error) {
+// THE TWO DRAIN METHODS AND ATTACH ARE THE EXCEPTIONS and leave through their
+// own return, because an acknowledgement carries a generation, and an accepted
+// attach carries the registry observation the following bind needs, so neither
+// can be empty. See dispatchDrain and dispatchAttach for what keeps their
+// bodies apart from a refusal.
+//
+// The context is the CONNECTION's and only attach reads it; every other RPC
+// completes without blocking on anything outside this process.
+func (m *Multiplexer) dispatch(ctx context.Context, link LinkID, method string, data []byte) ([]byte, error) {
 	var err error
 	switch method {
 	case MethodDrain, MethodDrainStatus:
 		return m.dispatchDrain(method, data)
+	case MethodAttach:
+		return m.dispatchAttach(ctx, data)
 	case MethodBind:
 		var request sessionwire.HostLinkBindRequest
 		if decodeErr := json.Unmarshal(data, &request); decodeErr != nil {
@@ -978,15 +1029,36 @@ func (m *Multiplexer) dispatch(link LinkID, method string, data []byte) ([]byte,
 // reconnect is a different link and inherits nothing. It takes a Centrifuge
 // type and is unexported for that reason; nothing here crosses the package
 // boundary.
+//
+// ATTACH IS ANSWERED OFF THE CONNECTION'S COMMAND LOOP. Centrifuge invokes the
+// RPC handler on the goroutine that reads the connection and lets the callback
+// be called from any other, and an attach launches a runtime — seconds, not
+// microseconds — so answering it inline would stall every bind, delivery and
+// heartbeat on that link for the duration. Bind, unbind, deliver and the drain
+// methods stay inline: they are map reads and a map write, and answering them
+// in order is part of what a Factory relies on. The context handed to the
+// attach is the client's, which Centrifuge cancels when the connection closes;
+// the residency manager keeps a request context out of its sequence by design,
+// so a link that drops mid-attach neither cancels the launch nor leaks it.
 func (m *Multiplexer) install(client *centrifuge.Client) {
 	link := LinkID(client.ID())
 	client.OnRPC(func(event centrifuge.RPCEvent, callback centrifuge.RPCCallback) {
-		body, err := m.dispatch(link, event.Method, event.Data)
-		if err != nil {
-			callback(centrifuge.RPCReply{}, centrifuge.ErrorBadRequest)
+		answer := func() {
+			body, err := m.dispatch(client.Context(), link, event.Method, event.Data)
+			switch {
+			case errors.Is(err, errAttachFailed):
+				callback(centrifuge.RPCReply{}, centrifuge.ErrorInternal)
+			case err != nil:
+				callback(centrifuge.RPCReply{}, centrifuge.ErrorBadRequest)
+			default:
+				callback(centrifuge.RPCReply{Data: body}, nil)
+			}
+		}
+		if event.Method == MethodAttach {
+			go answer()
 			return
 		}
-		callback(centrifuge.RPCReply{Data: body}, nil)
+		answer()
 	})
 	client.OnSubscribe(func(event centrifuge.SubscribeEvent, callback centrifuge.SubscribeCallback) {
 		if !m.MaySubscribe(link, event.Channel) {

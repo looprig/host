@@ -580,6 +580,11 @@ func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 		"RefusalDrainUnsupported":    hostlink.RefusalDrainUnsupported,
 		"RefusalDrainUnavailable":    hostlink.RefusalDrainUnavailable,
 		"RefusalNoDrainInProgress":   hostlink.RefusalNoDrainInProgress,
+		"RefusalAttachUnsupported":   hostlink.RefusalAttachUnsupported,
+		"RefusalAttachRefused":       hostlink.RefusalAttachRefused,
+		"RefusalAttachFailed":        hostlink.RefusalAttachFailed,
+		"RefusalHolderEpochUnknown":  hostlink.RefusalHolderEpochUnknown,
+		"RefusalUnpublishableAttach": hostlink.RefusalUnpublishableAttach,
 	}
 	assertEveryRefusalConstantIsListed(t, named)
 
@@ -607,6 +612,7 @@ func TestRefusalsAreDistinguishableWhereTheWireIsNot(t *testing.T) {
 			hostlink.RefusalForeignTenant, hostlink.RefusalUnknownSession, hostlink.RefusalForeignHost,
 			hostlink.RefusalStaleHostGeneration, hostlink.RefusalNotBound, hostlink.RefusalWrongDrainScope,
 			hostlink.RefusalDrainUnsupported, hostlink.RefusalDrainUnavailable, hostlink.RefusalNoDrainInProgress,
+			hostlink.RefusalAttachUnsupported, hostlink.RefusalHolderEpochUnknown,
 		},
 		{hostlink.RefusalNoLinkCapacity, hostlink.RefusalNoHostCapacity},
 	} {

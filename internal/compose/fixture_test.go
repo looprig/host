@@ -15,6 +15,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/storage"
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
@@ -316,6 +317,10 @@ type fakeStore struct {
 
 	// tombstoneErr makes the epoch-fenced tombstone refuse; see refuseTombstones.
 	tombstoneErr error
+
+	// heldElsewhere makes AcquireSessionLease refuse a key as another owner's,
+	// with the error the released adapter would produce; see holdElsewhere.
+	heldElsewhere map[registry.Key]error
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -378,6 +383,12 @@ func (s *fakeStore) mode(key registry.Key) protocolMode {
 func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (residency.Lease, error) {
 	s.trace.record("lease.acquire")
 	key := registry.Key{TenantID: tenant, SessionID: session}
+	s.mu.Lock()
+	held, contended := s.heldElsewhere[key]
+	s.mu.Unlock()
+	if contended {
+		return nil, held
+	}
 	if mode := s.mode(key); mode != modeDisposition {
 		return nil, fmt.Errorf("catalog invalid (binding.protocol_mode): the session is bound to %s and residency is granted only in disposition mode", mode)
 	}
@@ -411,6 +422,36 @@ func (s *fakeStore) TombstoneResidency(context.Context, sessionwire.TenantID, se
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tombstoneErr
+}
+
+// holdElsewhere makes the store refuse the session's lease as ANOTHER owner's,
+// in the exact shape the released adapter produces: residency.ErrLeaseHeld
+// joined with the provider's *storage.LeaseHeldError carrying the holder's
+// epoch (sessionstoreadapter.classifyResidency). It is what an attach meets
+// when the registry a Factory placed from was stale.
+func (s *fakeStore) holdElsewhere(key registry.Key, holderEpoch uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.heldElsewhere == nil {
+		s.heldElsewhere = map[registry.Key]error{}
+	}
+	s.heldElsewhere[key] = errors.Join(residency.ErrLeaseHeld, &storage.LeaseHeldError{
+		Name:        string(key.TenantID) + "/" + string(key.SessionID) + "/residency",
+		HolderEpoch: holderEpoch,
+	})
+}
+
+// holdElsewhereWithoutEpoch is the contention refusal a SessionLeases
+// implementation OTHER than the released adapter might produce: the sentinel
+// alone, with no provider error and therefore no holder epoch in the chain.
+// It is the control for the epoch-lifting path.
+func (s *fakeStore) holdElsewhereWithoutEpoch(key registry.Key) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.heldElsewhere == nil {
+		s.heldElsewhere = map[registry.Key]error{}
+	}
+	s.heldElsewhere[key] = residency.ErrLeaseHeld
 }
 
 // refuseTombstones makes the epoch-fenced tombstone fail, which is what makes
@@ -1187,6 +1228,24 @@ func hostLinkConnect(t *testing.T, serverURL string, tenant sessionwire.TenantID
 }
 
 // bindRequest is one Factory route request for a resident session.
+// attachRequest is a fully valid Core attach request for one session on this
+// fixture's Host incarnation, as a Factory would send it.
+func (f *fixture) attachRequest(tenant sessionwire.TenantID, session sessionwire.SessionID) sessionwire.HostLinkAttachRequest {
+	return sessionwire.HostLinkAttachRequest{
+		Version:                sessionwire.CurrentWireVersion,
+		TenantID:               tenant,
+		SessionID:              session,
+		HostID:                 f.host.ID(),
+		HostGeneration:         testGen,
+		AgentID:                testAgent,
+		RuntimeCompatibilityID: string(testCompat),
+		Mode:                   sessionwire.HostLinkAttachModeCreate,
+		ActorID:                "factory-service",
+		TraceID:                "trace-" + string(session),
+		IdempotencyKey:         "attach-" + string(session),
+	}
+}
+
 func (f *fixture) bindRequest(tenant sessionwire.TenantID, session sessionwire.SessionID, epoch uint64) sessionwire.HostLinkBindRequest {
 	return sessionwire.HostLinkBindRequest{
 		Version:                sessionwire.CurrentWireVersion,

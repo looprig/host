@@ -1587,6 +1587,32 @@ func (m *Manager) observation(key registry.Key, agent sessionwire.AgentID, compa
 	}
 }
 
+// Observe reports the §15 projection of a residency this Manager currently
+// holds, as it stands NOW, and whether it holds one at all.
+//
+// IT IS THE ATTACH RPC'S ACCEPTED REPLY BODY. Core requires an accepted
+// hostlink.attach to answer with the HostLinkRegistryObservation the following
+// bind needs, and this is the ONE derivation of that record — the same
+// `observation` the sequence publishes durably at its publish step — read from
+// the registry rather than rebuilt from the attach result. The difference
+// matters on the warm path: an attach that found the session already resident
+// took nothing, and the entry it found may have moved on (a warm release may
+// have closed admission, or begun), so the reply says what the registry says
+// and not what the establishing call once saw. A router reading this and a
+// router reading the durable projection are reading one derivation.
+//
+// The second result is false for a session this Manager does not hold, which a
+// caller reaches only in the window between an attach returning and the
+// residency being released; it is a fact and not a refusal, and the caller
+// decides what to do with it.
+func (m *Manager) Observe(key registry.Key) (sessionwire.HostLinkRegistryObservation, bool) {
+	entry, resident := m.registry.Get(key)
+	if !resident {
+		return sessionwire.HostLinkRegistryObservation{}, false
+	}
+	return m.observation(key, entry.AgentID, entry.CompatibilityID, ResidencyEpoch(entry.LeaseEpoch), residencyOf(entry.State), entry.Accepting), true
+}
+
 // admissionCode carries service's own HostLink refusal class through, rather
 // than re-deciding it here. Two places deciding what "no capacity" means is how
 // the two drift.

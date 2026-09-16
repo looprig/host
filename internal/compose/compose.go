@@ -616,6 +616,7 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 		Consumers:          s,
 		DrainStarter:       s.drainer,
 		DrainObserver:      s.drainer,
+		Attacher:           linkAttacher{service: s},
 		FixedSessionID:     s.options.Host.FixedSessionID(),
 		MaxBindingsPerLink: s.options.MaxBindingsPerLink,
 		MaxBindings:        s.options.MaxBindings,
