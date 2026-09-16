@@ -844,7 +844,14 @@ func sortedBindings(bindings map[string]Binding) []Binding {
 //
 // Every reserved RPC method name is a constant that does not begin with it, so
 // dispatch can tell a method from a channel without parsing either.
-const ChannelPrefix = "hostlink.v1."
+//
+// IT IS CORE'S NAME AND NOT A LOCAL SPELLING OF IT, since core v0.8.0. Factory
+// and Host each used to hold their own copy of the framing, and the two had
+// already disagreed once — Factory delivered commands under a method name Host
+// treated as a channel (B6). Core's hostlink_framing.go is the one home for
+// these strings now, and TestFramingNamesAndChannelBytesArePinned holds the
+// bytes themselves so the move here could be shown to change nothing.
+const ChannelPrefix = sessionwire.HostLinkChannelPrefix
 
 // ChannelFor returns the channel a session's publications travel on.
 //
@@ -857,14 +864,18 @@ const ChannelPrefix = "hostlink.v1."
 // rather than unlikely. Its alphabet is A-Za-z0-9-_ and the prefix, so a
 // channel also needs no escaping wherever it is later logged or compared.
 //
+// THE ENCODING IS CORE'S, through sessionwire.HostLinkChannel; this is the
+// registry.Key spelling of it and nothing more. Core's goldens for that
+// function were derived by running this function on a Host pinned to core
+// v0.7.0, so the two are byte-identical by construction and by test.
+//
 // This says nothing about characters centrifuge@v0.38.0 treats specially,
 // because it treats none specially: its own channel handling is exact string
 // comparison and map keys, and the ':' and '#' conventions belong to
 // Centrifugo, which this Host does not run. The one channel rule the library
 // does enforce is a length ceiling, and MaxChannelBytes is what answers it.
 func ChannelFor(key registry.Key) string {
-	encoding := base64.RawURLEncoding
-	return ChannelPrefix + encoding.EncodeToString([]byte(key.TenantID)) + "." + encoding.EncodeToString([]byte(key.SessionID))
+	return sessionwire.HostLinkChannel(key.TenantID, key.SessionID)
 }
 
 // MaxChannelBytes is the longest channel ChannelFor can mint.
@@ -887,9 +898,12 @@ var MaxChannelBytes = len(ChannelPrefix) + 1 + 2*base64.RawURLEncoding.EncodedLe
 // method is treated as a channel and resolved by exact lookup against the
 // routes this link holds, so a command delivery names its binding and carries
 // only a CommandID in its body.
+//
+// THE NAMES ARE CORE'S. See ChannelPrefix for why this package no longer holds
+// its own spelling of any framing string.
 const (
-	MethodBind   = "hostlink.bind"
-	MethodUnbind = "hostlink.unbind"
+	MethodBind   = sessionwire.HostLinkMethodBind
+	MethodUnbind = sessionwire.HostLinkMethodUnbind
 )
 
 // errUnroutableRPC is returned to Centrifuge when a refusal has no Core class,

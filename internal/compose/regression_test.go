@@ -1738,9 +1738,12 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 //     through a Method-prefixed constant;
 //   - a constant whose name does not begin with "Method" — the prefix is the
 //     convention this package follows and not a rule the compiler enforces;
-//   - a value built by concatenation or from another constant, which is skipped
-//     because it is not a basic string literal, and which is REPORTED as an
-//     error rather than passed over, so it cannot become a silent hole;
+//   - a value built by concatenation or from a constant other than one of
+//     Core's HostLink framing names, which is REPORTED as an error rather than
+//     passed over, so it cannot become a silent hole. Since core v0.8.0 the
+//     constants are declared as `sessionwire.HostLinkMethod*` selectors, and
+//     the parse resolves those through coreFramingNames — a selector absent
+//     from that table is the same error a concatenation is;
 //   - a method reached by a handler registered directly on the Centrifuge
 //     client outside the dispatch switch;
 //   - anything in a file this walk does not read: it reads the named directory
@@ -1806,21 +1809,56 @@ func reservedHostLinkMethods(directory string) (map[string]string, error) {
 						if index >= len(value.Values) {
 							return nil, errors.New(path + ": " + name.Name + " declares no value of its own")
 						}
-						literal, ok := value.Values[index].(*ast.BasicLit)
-						if !ok || literal.Kind != token.STRING {
-							return nil, errors.New(path + ": " + name.Name + " is not a basic string literal, so this guard cannot read its wire value")
-						}
-						unquoted, err := strconv.Unquote(literal.Value)
+						wire, err := hostLinkMethodValue(path, name.Name, value.Values[index])
 						if err != nil {
 							return nil, err
 						}
-						found[name.Name] = unquoted
+						found[name.Name] = wire
 					}
 				}
 			}
 		}
 	}
 	return found, nil
+}
+
+// coreFramingNames resolves the Core framing selector a hostlink method
+// constant may be declared from. It is the WHOLE of what the source arm will
+// resolve: a selector not listed here is reported, not skipped, so a method
+// declared from some other Core constant — or from a Host-local one — fails the
+// parse rather than passing through it unread.
+var coreFramingNames = map[string]string{
+	"HostLinkMethodBind":        sessionwire.HostLinkMethodBind,
+	"HostLinkMethodUnbind":      sessionwire.HostLinkMethodUnbind,
+	"HostLinkMethodAttach":      sessionwire.HostLinkMethodAttach,
+	"HostLinkMethodDrain":       sessionwire.HostLinkMethodDrain,
+	"HostLinkMethodDrainStatus": sessionwire.HostLinkMethodDrainStatus,
+}
+
+// hostLinkMethodValue reads one Method constant's wire value from its
+// declaration: a basic string literal, or a `sessionwire.<Name>` selector onto
+// one of Core's framing names. Anything else is an error, for the reason
+// reservedHostLinkMethods gives.
+func hostLinkMethodValue(path, name string, expression ast.Expr) (string, error) {
+	switch value := expression.(type) {
+	case *ast.BasicLit:
+		if value.Kind != token.STRING {
+			return "", errors.New(path + ": " + name + " is not a string literal, so this guard cannot read its wire value")
+		}
+		return strconv.Unquote(value.Value)
+	case *ast.SelectorExpr:
+		pkg, ok := value.X.(*ast.Ident)
+		if !ok || pkg.Name != "sessionwire" {
+			return "", errors.New(path + ": " + name + " is declared from a selector that is not sessionwire.<Name>, so this guard cannot read its wire value")
+		}
+		wire, known := coreFramingNames[value.Sel.Name]
+		if !known {
+			return "", errors.New(path + ": " + name + " is declared from sessionwire." + value.Sel.Name + ", which is not a Core HostLink framing name this guard resolves")
+		}
+		return wire, nil
+	default:
+		return "", errors.New(path + ": " + name + " is neither a string literal nor a Core framing selector, so this guard cannot read its wire value")
+	}
 }
 
 // awaitApplied blocks until the runtime has been driven at least want times.

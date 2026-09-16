@@ -111,9 +111,12 @@ type DrainScopeReporter interface {
 // the difference between them is exactly the difference a Factory must not get
 // wrong: one initiates and the other only looks. A mode flag would put that
 // distinction in a body a retry could corrupt.
+//
+// THE NAMES ARE CORE'S, as every framing string in this package is since core
+// v0.8.0; see ChannelPrefix in bindings.go.
 const (
-	MethodDrain       = "hostlink.drain"
-	MethodDrainStatus = "hostlink.drain_status"
+	MethodDrain       = sessionwire.HostLinkMethodDrain
+	MethodDrainStatus = sessionwire.HostLinkMethodDrainStatus
 )
 
 // errUnpublishableDrainObservation reports a state machine whose answer Core's
