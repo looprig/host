@@ -117,8 +117,12 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		// Host answers that method from the channel arm with runtime_unavailable,
 		// indistinguishable from a real refusal (core spec F4). The set is the
 		// dispatch table's, and a test derives the table from source and holds
-		// the two equal in both directions.
-		data, err := sessionwire.EncodeHostLinkConnectReply(response.WithHostLinkMethods(advertisedMethods...))
+		// the two equal in both directions. A server without a Multiplexer has
+		// no dispatch table and therefore advertises no methods.
+		if config.Multiplexer != nil {
+			response = response.WithHostLinkMethods(advertisedMethods...)
+		}
+		data, err := sessionwire.EncodeHostLinkConnectReply(response)
 		if err != nil {
 			return centrifuge.ConnectReply{}, err
 		}

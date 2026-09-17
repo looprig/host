@@ -937,8 +937,9 @@ var MaxChannelBytes = len(ChannelPrefix) + 1 + 2*base64.RawURLEncoding.EncodedLe
 // Transport dispatch
 // ---------------------------------------------------------------------------
 
-// MethodBind and MethodUnbind are two of the four reserved RPC method names;
-// MethodDrain and MethodDrainStatus in drain.go are the others. Any other
+// MethodBind and MethodUnbind are two of the five reserved RPC method names;
+// MethodAttach in attach.go and MethodDrain and MethodDrainStatus in drain.go
+// are the others. Any other
 // method is treated as a channel and resolved by exact lookup against the
 // routes this link holds, so a command delivery names its binding and carries
 // only a CommandID in its body.

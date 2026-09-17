@@ -47,6 +47,30 @@ func TestTheConnectReplyBytesArePinned(t *testing.T) {
 	}
 }
 
+func TestConnectWithoutMultiplexerAdvertisesNoMethods(t *testing.T) {
+	auth := &recordingAuthenticator{wantToken: testCredential}
+	server, httpServer := startServer(t, auth, hostlink.Config{})
+	defer closeServers(t, server, httpServer)
+
+	connection := dial(t, httpServer.URL, "")
+	defer connection.Close()
+	reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}})
+	if reply.Connect == nil || reply.Error != nil {
+		t.Fatalf("connect reply = %#v, want successful connect", reply)
+	}
+	const want = `{"version":1}`
+	if got := string(reply.Connect.Data); got != want {
+		t.Fatalf("connect reply data = %s, want zero-capability reply %s", got, want)
+	}
+	negotiated, err := sessionwire.DecodeHostLinkConnectReply(reply.Connect.Data)
+	if err != nil {
+		t.Fatalf("Core's own decoder refuses the zero-capability reply %s: %v", reply.Connect.Data, err)
+	}
+	if methods := negotiated.HostLinkMethods(); len(methods) != 0 {
+		t.Fatalf("connect reply advertises %v without a Multiplexer", methods)
+	}
+}
+
 // TestTheAdvertisedMethodsAreExactlyTheOnesDispatchRoutes holds the connect
 // reply's hostlink_methods to the dispatch switch, in BOTH directions, and then
 // proves each advertised name is really a reserved handler over the wire.
