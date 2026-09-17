@@ -29,6 +29,7 @@ type recordingAuthenticator struct {
 	wantToken   string
 	err         error
 	credentials []string
+	contexts    []context.Context
 }
 
 type authenticatorFunc func(context.Context, sessionwire.TenantID, string) error
@@ -37,10 +38,11 @@ func (function authenticatorFunc) VerifyTenant(ctx context.Context, tenant sessi
 	return function(ctx, tenant, credential)
 }
 
-func (a *recordingAuthenticator) VerifyTenant(_ context.Context, tenant sessionwire.TenantID, credential string) error {
+func (a *recordingAuthenticator) VerifyTenant(ctx context.Context, tenant sessionwire.TenantID, credential string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.credentials = append(a.credentials, string(tenant)+":"+credential)
+	a.contexts = append(a.contexts, ctx)
 	if credential != a.wantToken {
 		return errors.New("invalid service credential")
 	}
@@ -51,6 +53,26 @@ func (a *recordingAuthenticator) calls() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.credentials...)
+}
+
+func (a *recordingAuthenticator) waitForDisconnects(t *testing.T, count int) {
+	t.Helper()
+	a.mu.Lock()
+	contexts := append([]context.Context(nil), a.contexts...)
+	a.mu.Unlock()
+	if len(contexts) < count {
+		t.Fatalf("authentication contexts = %d, want at least %d", len(contexts), count)
+	}
+	for index, ctx := range contexts[:count] {
+		// Centrifuge's websocket handler closes its ClientCloseFunc before it
+		// closes the connection context. Waiting on this event therefore waits
+		// for the server-side Hub removal rather than guessing at a sleep.
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("authentication context %d was not canceled after client close", index+1)
+		}
+	}
 }
 
 // clientReply is the subset of a Centrifuge client-protocol reply these tests
@@ -462,6 +484,7 @@ func TestReconnectAuthenticatesAndNegotiatesAgain(t *testing.T) {
 		if err := connection.Close(); err != nil {
 			t.Fatalf("attempt %d close: %v", attempt+1, err)
 		}
+		auth.waitForDisconnects(t, attempt+1)
 	}
 	if got := len(auth.calls()); got != 2 {
 		t.Fatalf("authentication calls after reconnect = %d, want 2", got)
