@@ -2,7 +2,6 @@ package hostlink
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -92,8 +91,15 @@ func NewCentrifugeServer(config Config) (Server, error) {
 				Reason: "service authentication failed",
 			}
 		}
-		var request sessionwire.VersionNegotiationRequest
-		if err := json.Unmarshal(event.Data, &request); err != nil {
+		// THE CONNECT FRAMING IS CORE'S, since core v0.9.0. Host decoded the
+		// connect Data as a bare VersionNegotiationRequest and replied bare;
+		// Factory v0.1.1 wrapped both directions as {"version_negotiation":...}
+		// (B8), and neither side could tell. Core froze the BARE shape as the
+		// contract and owns both encoders, so this Host names no shape of its
+		// own: a wrapped request is refused by Core's strict decoder as an
+		// unknown member, and the reply is whatever Core's encoder emits.
+		request, err := sessionwire.DecodeHostLinkConnectRequest(event.Data)
+		if err != nil {
 			return centrifuge.ConnectReply{}, centrifuge.Disconnect{
 				Code:   disconnectUnsupportedVersion,
 				Reason: "unsupported wire version",
@@ -106,7 +112,13 @@ func NewCentrifugeServer(config Config) (Server, error) {
 				Reason: "unsupported wire version",
 			}
 		}
-		data, err := json.Marshal(response)
+		// THE CAPABILITY ADVERTISEMENT. A Factory refuses to place on, or
+		// attach to, a Host that does not advertise hostlink.attach — a v0.1.0
+		// Host answers that method from the channel arm with runtime_unavailable,
+		// indistinguishable from a real refusal (core spec F4). The set is the
+		// dispatch table's, and a test derives the table from source and holds
+		// the two equal in both directions.
+		data, err := sessionwire.EncodeHostLinkConnectReply(response.WithHostLinkMethods(advertisedMethods...))
 		if err != nil {
 			return centrifuge.ConnectReply{}, err
 		}

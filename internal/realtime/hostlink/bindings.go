@@ -950,6 +950,18 @@ const (
 	MethodUnbind = sessionwire.HostLinkMethodUnbind
 )
 
+// advertisedMethods is the set of reserved RPC methods this Host advertises
+// in its connect reply (VersionNegotiationResponse.hostlink_methods), which a
+// Factory reads through Supports before it places on or attaches to this Host.
+//
+// IT MUST EQUAL THE METHODS dispatch ROUTES, in both directions, and a test
+// derives the dispatch table from this file's source to hold that: a method
+// added to the switch and not here is a capability a Factory never learns of,
+// and a name here with no case is a promise the channel arm answers with
+// runtime_unavailable. The order is the wire order and is part of the pinned
+// reply bytes.
+var advertisedMethods = []string{MethodBind, MethodUnbind, MethodAttach, MethodDrain, MethodDrainStatus}
+
 // errUnroutableRPC is returned to Centrifuge when a refusal has no Core class,
 // which is the malformed-body case and nothing else.
 var errUnroutableRPC = errors.New("hostlink: the RPC body is not a valid Core record")
