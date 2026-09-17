@@ -387,9 +387,7 @@ func TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip(t *testing.T) {
 		HostID: "host-a", HostGeneration: 4, LeaseEpoch: observation.LeaseEpoch,
 		RuntimeCompatibilityID: string(composeCompat), IdempotencyKey: "bind-1",
 	})
-	if bind.Error != nil {
-		t.Fatalf("bind with returned epoch %d: %#v", observation.LeaseEpoch, *bind.Error)
-	}
+	assertAcceptedRPC(t, bind, "bind")
 	channel := sessionwire.HostLinkChannel(composeTenant, composeSession)
 	subscribe := sendOver(t, link, map[string]any{
 		"id": 4, "subscribe": map[string]any{"channel": channel},
@@ -398,9 +396,7 @@ func TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip(t *testing.T) {
 		t.Fatalf("subscribe to %q: %#v", channel, *subscribe.Error)
 	}
 	command := rpcOver(t, link, 5, channel, sessionwire.HostLinkCommandDelivery{CommandID: "command-1"})
-	if command.Error != nil {
-		t.Fatalf("channel command: %#v", *command.Error)
-	}
+	assertAcceptedRPC(t, command, "channel command")
 
 	publication := sessionwire.EnduringPublication{
 		TenantID: composeTenant, SessionID: composeSession,
@@ -595,6 +591,42 @@ type linkReply struct {
 }
 
 var linkMu sync.Mutex
+
+func rpcHasEmptyAcceptedBody(reply linkReply) bool {
+	return reply.RPC == nil || len(reply.RPC.Data) == 0 || string(reply.RPC.Data) == "null"
+}
+
+func assertAcceptedRPC(t *testing.T, reply linkReply, operation string) {
+	t.Helper()
+	if reply.Error != nil {
+		t.Fatalf("%s returned a transport error: %#v", operation, *reply.Error)
+	}
+	if !rpcHasEmptyAcceptedBody(reply) {
+		t.Fatalf("%s returned RPC data %s, want the empty accepted shape", operation, reply.RPC.Data)
+	}
+}
+
+func TestRPCEmptyAcceptanceRejectsAValidHostLinkRefusalBody(t *testing.T) {
+	refusal, err := json.Marshal(sessionwire.HostLinkError{
+		Code:              sessionwire.HostLinkErrorEpochMismatch,
+		CurrentLeaseEpoch: 7,
+	})
+	if err != nil {
+		t.Fatalf("marshal refusal: %v", err)
+	}
+	var decoded sessionwire.HostLinkError
+	if err := json.Unmarshal(refusal, &decoded); err != nil {
+		t.Fatalf("the regression body is not a valid HostLinkError: %v", err)
+	}
+	reply := linkReply{
+		RPC: &struct {
+			Data json.RawMessage `json:"data"`
+		}{Data: refusal},
+	}
+	if rpcHasEmptyAcceptedBody(reply) {
+		t.Fatalf("a valid HostLink refusal body %s was classified as an accepted empty RPC", refusal)
+	}
+}
 
 func dialHostLink(t *testing.T, serverURL string, tenant sessionwire.TenantID) *websocket.Conn {
 	t.Helper()
