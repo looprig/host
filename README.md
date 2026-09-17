@@ -23,7 +23,7 @@ and compared segment by segment, so a sibling package under
 
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` v0.9.0 store, and `internal/harnessadapter` to
+`github.com/looprig/sessionstore` v0.10.0 store, and `internal/harnessadapter` to
 `github.com/looprig/harness` v0.34.0.
 
 **A composed Host applies a command end to end: it attaches a disposition

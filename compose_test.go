@@ -77,6 +77,20 @@ func (stubEvidence) ReadDispositionEvidence(context.Context, sessionstore.Dispos
 	return sessionstore.DispositionEvidence{}, errors.New("no evidence in this test")
 }
 
+// composePublishingSession keeps the real runtime capabilities from the
+// fixture, but leaves its committed-publication tail open. The ordinary
+// FullSession intentionally returns a closed channel because most composition
+// tests exercise lifecycle unwinds; the HostLink round trip needs a live tail
+// so a publication can cross the composed relay and reach a real subscriber.
+type composePublishingSession struct {
+	*testkit.FullSession
+	published chan sessionwire.EnduringPublication
+}
+
+func (s *composePublishingSession) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
+	return s.published, nil
+}
+
 // composeFixture is one blueprint's inputs, with the backend shared so a
 // test can act as another party over it.
 type composeFixture struct {
@@ -279,37 +293,19 @@ func TestComposeRefusesWhatItCannotRun(t *testing.T) {
 // The whole path, in process and over the link
 // ---------------------------------------------------------------------------
 
-// TestAComposedHostRunsTheAttachUpToTheStoresLegacyPinnedRegistration is
-// B1's acceptance AS FAR AS THE RELEASED STORE LETS IT RUN, and a GAP MARKER
-// for the rest.
-//
-// THE GAP, MEASURED HERE AND NOT READ: sessionstore v0.9.0's
-// PutHostRegistration creates a registration without binding a protocol mode
-// and UPDATES one through bindProtocolMode(ProtocolModeLegacy)
-// (registry.go:791). A disposition-bound session -- the only kind
-// AcquireResidency grants residency over -- therefore has its route created
-// `attaching` at the manager's step 6 and REFUSED `resident` at step 8 with
-// `catalog conflict (binding.protocol_mode)`, and the attach unwinds. A legacy
-// session is refused at the lease instead (F16(a)). So over the released
-// store there is no session shape a Host can make resident, whatever triggers
-// the attach; the RPC and this surface are correct and complete up to that
-// refusal, and the refusal is upstream. The adapter's own PublishResidency
-// tests never met it because they publish for the legacy fixture only.
-//
-// WHAT THIS TEST HOLDS UNTIL THE PIN IS LIFTED: a caller outside this module
-// composes a Host over a real store, starts it, and an attach of a session
-// Factory seeded runs through admission, the lease, hydration and the launch
-// (the rig launched exactly once), publishes `attaching`, is refused at
-// `publish` by that exact upstream error with NO HostLink class (a store
-// failure is not a placement outcome), and unwinds completely (the runtime
-// released, nothing left held). Over the link the same attach is answered as
-// this Host's failure (transport 100), never as a class a Factory would
-// re-place on. WHEN sessionstore lifts the pin this test FAILS at the first
-// assertion, and its successor is the round trip: bind with the returned
-// epoch, subscribe, deliver, receive, drain.
-func TestAComposedHostRunsTheAttachUpToTheStoresLegacyPinnedRegistration(t *testing.T) {
+// TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip is B1's composed
+// acceptance: a caller outside this module seeds a real SessionStore, reaches
+// a real HostLink, makes the session resident, and uses the returned
+// observation to bind and receive a committed publication.
+func TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip(t *testing.T) {
 	f := newComposeFixture(t)
-	seedDispositionSession(t, f.otherParty(t), composeSession)
+	other := f.otherParty(t)
+	seedDispositionSession(t, other, composeSession)
+	runtime := &composePublishingSession{
+		FullSession: f.session,
+		published:   make(chan sessionwire.EnduringPublication),
+	}
+	f.rig.Session = runtime
 
 	service, err := host.Compose(t.Context(), f.blueprint(t))
 	if err != nil {
@@ -328,52 +324,106 @@ func TestAComposedHostRunsTheAttachUpToTheStoresLegacyPinnedRegistration(t *test
 		t.Fatal("a started Service is not ready and live")
 	}
 
-	request := host.AttachRequest{
-		TenantID: composeTenant, SessionID: composeSession, AgentID: composeAgent,
-		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "test-service",
-	}
-	_, err = service.Attach(t.Context(), request)
-	var refused *host.AttachError
-	if !errors.As(err, &refused) {
-		t.Fatalf("Attach = %v, want *host.AttachError; if it SUCCEEDED, sessionstore has lifted the legacy pin on host registrations and this gap marker must become the round trip", err)
-	}
-	if refused.Step != "publish" {
-		t.Fatalf("Attach failed at %q: %v; the gap this test marks is at the publish step", refused.Step, err)
-	}
-	var catalog *sessionstore.CatalogError
-	if !errors.As(err, &catalog) || catalog.Field != "binding.protocol_mode" {
-		t.Fatalf("the publish failure is %v, want the store's catalog conflict on binding.protocol_mode", err)
-	}
-	if code, published := refused.HostLinkCode(); published {
-		t.Fatalf("a store failure was given HostLink class %q; it is not a placement outcome", code)
-	}
-	if len(refused.Unreleased) != 0 {
-		t.Fatalf("the unwind left %v held", refused.Unreleased)
-	}
-	// THE CONTROLS: the attach got as far as the launch, once, and gave the
-	// runtime back.
-	if launches := f.rig.Launches(); launches != 1 {
-		t.Fatalf("the rig launched %d times, want 1: the attach must reach the launch before the store refuses the route", launches)
-	}
-	if creates := f.rig.Creates(); len(creates) != 1 || creates[0].SessionID != composeSession {
-		t.Fatalf("the launch was %+v, want exactly one CREATE of %s: the request said create", creates, composeSession)
-	}
-	if released := f.session.Released(); released != 1 {
-		t.Fatalf("the launched runtime was released %d times, want 1 (the unwind)", released)
-	}
-
-	// OVER THE LINK the same attach is this Host's failure, not a class.
 	server := httptest.NewServer(service.Handler())
 	defer server.Close()
 	link := dialHostLink(t, server.URL, composeTenant)
 	defer link.Close()
-	reply := rpcOver(t, link, 2, sessionwire.HostLinkMethodAttach, sessionwire.HostLinkAttachRequest{
+
+	// THE ATTACH IS OVER THE REAL HOSTLINK. Its body is the observation the
+	// caller must use for the next step, rather than a value reconstructed from
+	// the request or from Host-local state.
+	attach := rpcOver(t, link, 2, sessionwire.HostLinkMethodAttach, sessionwire.HostLinkAttachRequest{
 		Version: sessionwire.CurrentWireVersion, TenantID: composeTenant, SessionID: composeSession,
 		HostID: "host-a", HostGeneration: 4, AgentID: composeAgent, RuntimeCompatibilityID: string(composeCompat),
 		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory", IdempotencyKey: "attach-1",
 	})
-	if reply.Error == nil || reply.Error.Code != 100 {
-		t.Fatalf("attach over the link answered %#v, want transport code 100 (this Host's failure, no class)", reply)
+	if attach.Error != nil {
+		t.Fatalf("attach over HostLink: %#v", *attach.Error)
+	}
+	if attach.RPC == nil || len(attach.RPC.Data) == 0 || string(attach.RPC.Data) == "null" {
+		t.Fatalf("attach returned no observation: %#v", attach)
+	}
+	var observation sessionwire.HostLinkRegistryObservation
+	if err := json.Unmarshal(attach.RPC.Data, &observation); err != nil {
+		t.Fatalf("decode attach observation %s: %v", attach.RPC.Data, err)
+	}
+	if observation.HostID != "host-a" || observation.HostGeneration != 4 {
+		t.Fatalf("observation names host %q generation %d, want host-a at 4", observation.HostID, observation.HostGeneration)
+	}
+	if observation.TenantID != composeTenant || observation.SessionID != composeSession {
+		t.Fatalf("observation names %s/%s, want %s/%s", observation.TenantID, observation.SessionID, composeTenant, composeSession)
+	}
+	if observation.Residency != sessionwire.SessionResidencyResident || !observation.Accepting {
+		t.Fatalf("observation reports %s/accepting=%v, want resident and accepting", observation.Residency, observation.Accepting)
+	}
+	if observation.LeaseEpoch == 0 {
+		t.Fatal("attach observation carries no residency lease epoch")
+	}
+
+	// THE OTHER PARTY READS THE SAME REGISTRATION FROM THE MEMSTORE. This
+	// checks both the durable resident state and the observation's fencing
+	// epoch, not merely the reply Host constructed in memory.
+	entry, err := other.GetHostRegistration(t.Context(), sessionstore.GetHostRegistrationRequest{
+		TenantID: composeTenant, SessionID: composeSession,
+	})
+	if err != nil {
+		t.Fatalf("read resident registration: %v", err)
+	}
+	if entry.Registration.Route == nil || entry.Registration.Route.Residency != sessionwire.SessionResidencyResident {
+		t.Fatalf("durable registration route = %+v, want resident", entry.Registration.Route)
+	}
+	durable, err := entry.Registration.Observation()
+	if err != nil {
+		t.Fatalf("project durable registration: %v", err)
+	}
+	if durable.LeaseEpoch != observation.LeaseEpoch {
+		t.Fatalf("durable observation epoch = %d, wire attach epoch = %d", durable.LeaseEpoch, observation.LeaseEpoch)
+	}
+
+	// BIND WITH THE EPOCH THE ATTACH RETURNED, THEN SUBSCRIBE TO THE SESSION'S
+	// CHANNEL. A command is a channel RPC, not a HostLink method constant.
+	bind := rpcOver(t, link, 3, sessionwire.HostLinkMethodBind, sessionwire.HostLinkBindRequest{
+		Version: sessionwire.CurrentWireVersion, TenantID: composeTenant, SessionID: composeSession,
+		HostID: "host-a", HostGeneration: 4, LeaseEpoch: observation.LeaseEpoch,
+		RuntimeCompatibilityID: string(composeCompat), IdempotencyKey: "bind-1",
+	})
+	if bind.Error != nil {
+		t.Fatalf("bind with returned epoch %d: %#v", observation.LeaseEpoch, *bind.Error)
+	}
+	channel := sessionwire.HostLinkChannel(composeTenant, composeSession)
+	subscribe := sendOver(t, link, map[string]any{
+		"id": 4, "subscribe": map[string]any{"channel": channel},
+	}, 4)
+	if subscribe.Error != nil {
+		t.Fatalf("subscribe to %q: %#v", channel, *subscribe.Error)
+	}
+	command := rpcOver(t, link, 5, channel, sessionwire.HostLinkCommandDelivery{CommandID: "command-1"})
+	if command.Error != nil {
+		t.Fatalf("channel command: %#v", *command.Error)
+	}
+
+	publication := sessionwire.EnduringPublication{
+		TenantID: composeTenant, SessionID: composeSession,
+		EventID: "event-1", JournalSeq: 1, CoveredThrough: 1,
+		Body: json.RawMessage(`{"kind":"published"}`),
+	}
+	select {
+	case runtime.published <- publication:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Host did not subscribe the resident runtime's committed publication tail")
+	}
+	got := awaitPublicationOver(t, link, channel)
+	if got.EventID != publication.EventID || got.JournalSeq != publication.JournalSeq || string(got.Body) != string(publication.Body) {
+		t.Fatalf("publication receipt = %+v, want %+v", got, publication)
+	}
+
+	// THE CONTROLS: the attach launched exactly one runtime, and the request
+	// was the CREATE shape carried all the way to the rig.
+	if launches := f.rig.Launches(); launches != 1 {
+		t.Fatalf("the rig launched %d times, want 1", launches)
+	}
+	if creates := f.rig.Creates(); len(creates) != 1 || creates[0].SessionID != composeSession {
+		t.Fatalf("the launch was %+v, want exactly one CREATE of %s", creates, composeSession)
 	}
 
 	// THE METRICS ARE THIS HOST'S: served, and not the default registry's.
@@ -389,6 +439,19 @@ func TestAComposedHostRunsTheAttachUpToTheStoresLegacyPinnedRegistration(t *test
 	}
 	if report.State != sessionwire.HostLinkDrainStateDrained || len(report.Failures) != 0 {
 		t.Fatalf("Stop reported %+v, want drained with no failures", report)
+	}
+	if released := f.session.Released(); released != 1 {
+		t.Fatalf("drain released the runtime %d times, want 1", released)
+	}
+	_, err = other.GetHostRegistration(t.Context(), sessionstore.GetHostRegistrationRequest{
+		TenantID: composeTenant, SessionID: composeSession,
+	})
+	if err == nil {
+		t.Fatal("registration remained routable after drain")
+	}
+	var released *sessionstore.RegistryError
+	if !errors.As(err, &released) || released.Code != sessionstore.RegistryErrorReleased {
+		t.Fatalf("registration after drain = %v, want a released tombstone", err)
 	}
 	if service.Live() || service.Ready() {
 		t.Fatal("a stopped Service still reports live or ready")
@@ -437,19 +500,28 @@ func TestAnAttachAgainstAnotherHoldersLeaseCarriesThatHoldersEpoch(t *testing.T)
 		t.Fatal("a refused lease still launched a runtime")
 	}
 	// THE CONTROL: release the other holder and the same attach gets PAST the
-	// lease -- it launches, and is then refused at the publish step by the
-	// upstream legacy pin the gap marker above records. The refusal above was
-	// therefore about the holder and not about this Host.
+	// lease and completes. The refusal above was therefore about the holder
+	// and not about this Host.
 	if err := holder.Release(t.Context()); err != nil {
 		t.Fatalf("release the other holder: %v", err)
 	}
-	_, err = service.Attach(t.Context(), host.AttachRequest{
+	// Keep the composed runtime's committed tail live for the successful
+	// post-contention attach. The first half of this test intentionally uses
+	// the real store holder; this control proves the later result is a genuine
+	// attach rather than another lease refusal.
+	f.rig.Session = &composePublishingSession{
+		FullSession: f.session,
+		published:   make(chan sessionwire.EnduringPublication),
+	}
+	residency, err := service.Attach(t.Context(), host.AttachRequest{
 		TenantID: composeTenant, SessionID: composeSession, AgentID: composeAgent,
 		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "test-service",
 	})
-	var later *host.AttachError
-	if !errors.As(err, &later) || later.Step == "lease" {
-		t.Fatalf("after the holder released, Attach = %v, want an attach that got past the lease", err)
+	if err != nil {
+		t.Fatalf("after the holder released, Attach = %v, want success", err)
+	}
+	if residency.LeaseEpoch == 0 || residency.SessionID != composeSession {
+		t.Fatalf("after the holder released, Attach returned %+v, want a resident session with an epoch", residency)
 	}
 	if f.rig.Launches() != 1 {
 		t.Fatalf("after the holder released the rig launched %d times, want 1", f.rig.Launches())
@@ -579,4 +651,41 @@ func rpcOver(t *testing.T, connection *websocket.Conn, id uint32, method string,
 		t.Fatalf("marshal body: %v", err)
 	}
 	return sendOver(t, connection, map[string]any{"id": id, "rpc": map[string]any{"method": method, "data": json.RawMessage(data)}}, id)
+}
+
+func awaitPublicationOver(t *testing.T, connection *websocket.Conn, channel string) sessionwire.EnduringPublication {
+	t.Helper()
+	linkMu.Lock()
+	defer linkMu.Unlock()
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("publication deadline: %v", err)
+	}
+	for {
+		_, frame, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("read publication: %v", err)
+		}
+		for _, line := range strings.Split(string(frame), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || line == "{}" {
+				continue
+			}
+			var envelope struct {
+				Push *struct {
+					Channel string `json:"channel"`
+					Pub     *struct {
+						Data json.RawMessage `json:"data"`
+					} `json:"pub"`
+				} `json:"push,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(line), &envelope); err != nil || envelope.Push == nil || envelope.Push.Pub == nil || envelope.Push.Channel != channel {
+				continue
+			}
+			var publication sessionwire.EnduringPublication
+			if err := json.Unmarshal(envelope.Push.Pub.Data, &publication); err != nil {
+				t.Fatalf("decode publication %s: %v", envelope.Push.Pub.Data, err)
+			}
+			return publication
+		}
+	}
 }
