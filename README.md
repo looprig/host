@@ -112,10 +112,12 @@ As of v0.3.0:
   **read fails** (a storage fault), the attach is refused with the **empty,
   unclassified code**, like every other durable-read failure. Neither ever
   starts the conversation over. **Warning:** factory v0.3.0 treats both as
-  "try the next candidate, retry next sweep" and **logs neither** — it only
-  counts them — so a fleet-wide refusal shows up as sessions that never
-  place, not as log lines. Host itself has no logger; the attach error Host
-  returns names the reason.
+  "try the next candidate, retry next sweep". It only **counts** a
+  `runtime_unavailable` refusal and never logs it, so a fleet-wide one shows
+  up as sessions that never place, not as log lines; the empty-code refusal
+  is logged at WARN ("a pooled candidate failed the attach"), carrying the
+  Host id but not Host's reason. Host itself has no logger; the attach error
+  Host returns names the reason.
 - **The journal store for each binding must therefore be the released harness
   session store** (`*harness/pkg/sessionstore.Store`, or a value embedding
   one): the same journal the runtime writes and settlement reads.
