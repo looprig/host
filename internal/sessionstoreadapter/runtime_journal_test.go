@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 
 	"github.com/looprig/host/internal/harnesstest"
 	"github.com/looprig/host/internal/residency"
@@ -256,4 +257,101 @@ func otherBindingRouter(t *testing.T) *sessionstoreadapter.TenantEvidenceRouter 
 		t.Fatalf("router: %v", err)
 	}
 	return router
+}
+
+// errLedgerDown is the injected storage fault: a pgstore connection reset, a
+// natsstore timeout.
+var errLedgerDown = errors.New("injected: the ledger is unreachable")
+
+// failingLedger is a storage.Ledger whose Read fails outright (readFails) or
+// whose cursor fails its first Next.
+type failingLedger struct {
+	storage.Ledger
+	readFails bool
+}
+
+// Read fails, or returns a cursor whose Next fails.
+func (l failingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	if l.readFails {
+		return nil, errLedgerDown
+	}
+	inner, err := l.Ledger.Read(ctx, name, from)
+	if err != nil {
+		return nil, err
+	}
+	return failingCursor{Cursor: inner}, nil
+}
+
+// failingCursor fails every Next.
+type failingCursor struct{ storage.Cursor }
+
+// Next fails with the injected fault.
+func (failingCursor) Next(context.Context) (storage.Record, error) {
+	return storage.Record{}, errLedgerDown
+}
+
+// TestAnUnreadableJournalIsAnErrorAndNeverAbsent holds the fail-closed rule on
+// the path it matters most: a journal READ that fails. Absent launches a create,
+// and a create over a journal that does exist is the silent restart — so a
+// transient storage fault must reach the caller as an error (the attach is then
+// refused with the unclassified code), never be read as "no conversation". The
+// catalog is empty here, so the probe must go to the ledger.
+func TestAnUnreadableJournalIsAnErrorAndNeverAbsent(t *testing.T) {
+	for name, readFails := range map[string]bool{"the ledger read fails": true, "the cursor's Next fails": false} {
+		t.Run(name, func(t *testing.T) {
+			base := harnesstest.Backend(t)
+			composite, err := storage.NewCompositeWithOrderedIndex(failingLedger{Ledger: base.Ledger, readFails: readFails}, base.Leaser, base.KV, base.Blobs, base.OrderedIndex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal := harnesstest.Store(t, composite, testTenant)
+			released, adapted := openStore(t, namespaceLayout(), sessionstoreadapter.WithRuntimeJournals(journalRouter(t, journal)))
+			createBoundSession(t, released, derivedRuntimeID.String())
+
+			state, err := adapted.LoadSessionState(t.Context(), testTenant, testSession)
+			if !errors.Is(err, errLedgerDown) {
+				t.Fatalf("LoadSessionState over an unreadable journal = (RuntimeJournal %v, %v), want the ledger fault as an error", state.RuntimeJournal, err)
+			}
+		})
+	}
+	// The control: the same wrapping with no fault reads Absent, so the rows
+	// above fail because of the fault and not because of the wrapper.
+	base := harnesstest.Backend(t)
+	composite, err := storage.NewCompositeWithOrderedIndex(countingLedger{Ledger: base.Ledger, opened: new(int), closed: new(int)}, base.Leaser, base.KV, base.Blobs, base.OrderedIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, adapted := openStore(t, namespaceLayout(), sessionstoreadapter.WithRuntimeJournals(journalRouter(t, harnesstest.Store(t, composite, testTenant))))
+	createBoundSession(t, released, derivedRuntimeID.String())
+	if state, err := adapted.LoadSessionState(t.Context(), testTenant, testSession); err != nil || state.RuntimeJournal != residency.RuntimeJournalAbsent {
+		t.Fatalf("control: LoadSessionState = (%v, %v), want Absent", state.RuntimeJournal, err)
+	}
+}
+
+// countingLedger counts the cursors it hands out and the ones closed.
+type countingLedger struct {
+	storage.Ledger
+	opened, closed *int
+}
+
+// Read counts an opened cursor.
+func (l countingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	inner, err := l.Ledger.Read(ctx, name, from)
+	if err != nil {
+		return nil, err
+	}
+	*l.opened++
+	return countingCursor{Cursor: inner, closed: l.closed}, nil
+}
+
+// countingCursor counts its Close.
+type countingCursor struct {
+	storage.Cursor
+	closed *int
+}
+
+// Close counts and closes.
+func (c countingCursor) Close() error {
+	*c.closed++
+	return c.Cursor.Close()
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/session"
 	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
@@ -317,4 +318,88 @@ func countOf[E event.Event](t *testing.T, store *harnessstore.Store, id uuid.UUI
 		}
 	}
 	return count
+}
+
+// errLedgerDown is the injected storage fault.
+var errLedgerDown = errors.New("injected: the ledger is unreachable")
+
+// unreadableLedger fails every read of the journal it wraps: outright
+// (readFails), or at the cursor's first Next.
+type unreadableLedger struct {
+	storage.Ledger
+	readFails bool
+}
+
+// Read fails, or returns a cursor whose Next fails.
+func (l unreadableLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	if l.readFails {
+		return nil, errLedgerDown
+	}
+	inner, err := l.Ledger.Read(ctx, name, from)
+	if err != nil {
+		return nil, err
+	}
+	return unreadableCursor{Cursor: inner}, nil
+}
+
+// unreadableCursor fails every Next.
+type unreadableCursor struct{ storage.Cursor }
+
+// Next fails with the injected fault.
+func (unreadableCursor) Next(context.Context) (storage.Record, error) {
+	return storage.Record{}, errLedgerDown
+}
+
+// TestAJournalReadFailureRefusesTheAttachAndStartsNothingOver is the fail-closed
+// rule end to end, under a storage fault: the session HAS a conversation, the
+// Host asked to attach it reads the same ledger through a store whose catalog
+// entry is missing (the best-effort cache lost it) and whose ledger read fails.
+// The attach is refused — with the EMPTY, unclassified code, the one every other
+// durable-read failure gets (runtime_unavailable is reserved for a binding with
+// no harness journal store) — nothing is launched, and the conversation still
+// has exactly one SessionStarted.
+func TestAJournalReadFailureRefusesTheAttachAndStartsNothingOver(t *testing.T) {
+	for name, readFails := range map[string]bool{"the ledger read fails": true, "the cursor's Next fails": false} {
+		t.Run(name, func(t *testing.T) {
+			world := newRealRuntimeWorld(t)
+			first, firstLauncher := world.host(t, 4, nil)
+			if _, err := attachAsFactoryDoes(t, first); err != nil {
+				t.Fatalf("Host A attach: %v", err)
+			}
+			world.turn(t, firstLauncher.controller(), rememberedWord)
+			stopWithin(t, first)
+
+			backend := world.fixture.journalBackend
+			unreadable, err := storage.NewCompositeWithOrderedIndex(unreadableLedger{Ledger: backend.Ledger, readFails: readFails},
+				backend.Leaser, harnesstest.Backend(t).KV, backend.Blobs, backend.OrderedIndex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := harnesstest.Store(t, unreadable, composeTenant)
+			second, secondLauncher := world.host(t, 5, reader)
+			t.Cleanup(func() { _, _ = second.Stop(context.Background()) })
+
+			_, err = attachAsFactoryDoes(t, second)
+			var refused *host.AttachError
+			if !errors.As(err, &refused) || refused.Code != "" || !errors.Is(err, errLedgerDown) {
+				t.Fatalf("attach(create) over an unreadable journal = %v, want an AttachError with the empty code carrying the ledger fault", err)
+			}
+			if creates, restores := secondLauncher.counts(); creates != 0 || len(restores) != 0 {
+				t.Fatalf("the Host launched over an unreadable journal: creates = %d, restores = %v", creates, restores)
+			}
+			if got := harnesstest.CountSessionStarted(t, world.journal, world.runtimeID); got != 1 {
+				t.Fatalf("%d SessionStarted after the refusal, want the original 1", got)
+			}
+		})
+	}
+}
+
+// stopWithin drains a Host, failing rather than hanging if the drain wedges.
+func stopWithin(t *testing.T, service *host.Service) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := service.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
 }

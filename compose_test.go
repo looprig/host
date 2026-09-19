@@ -105,6 +105,9 @@ type composeFixture struct {
 	// reads it to decide whether the session's conversation already exists.
 	// The fake rig never writes to it, so every session here is new to it.
 	journal *harnessstore.Store
+	// journalBackend is the storage under journal, so a test can open a
+	// second reader over the same ledger.
+	journalBackend *storage.Composite
 }
 
 func newComposeFixture(t testing.TB) *composeFixture {
@@ -114,11 +117,13 @@ func newComposeFixture(t testing.TB) *composeFixture {
 		t.Fatalf("uuid: %v", err)
 	}
 	session := testkit.NewFullSession(id)
+	journalBackend := harnesstest.Backend(t)
 	return &composeFixture{
-		backend: memstore.New(),
-		rig:     &testkit.FakeRig{Session: session},
-		session: session,
-		journal: harnesstest.Store(t, harnesstest.Backend(t), composeTenant),
+		backend:        memstore.New(),
+		rig:            &testkit.FakeRig{Session: session},
+		session:        session,
+		journal:        harnesstest.Store(t, journalBackend, composeTenant),
+		journalBackend: journalBackend,
 	}
 }
 
