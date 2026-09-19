@@ -78,7 +78,7 @@ func acceptedObservation(session sessionwire.SessionID) sessionwire.HostLinkRegi
 		AgentID:                "agent-alpha",
 		RuntimeCompatibilityID: testRuntime,
 		Placement:              sessionwire.HostPlacementPooled,
-		InternalEndpoint:       "ws://10.0.0.1:7100/hostlink",
+		InternalEndpoint:       "ws://10.0.0.1:7100",
 		Residency:              sessionwire.SessionResidencyResident,
 		Accepting:              true,
 		LeaseEpoch:             testEpoch,

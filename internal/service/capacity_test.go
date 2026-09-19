@@ -176,7 +176,7 @@ func pooledOptions(t *testing.T, clock hostconfig.Clock) hostconfig.Options {
 	t.Helper()
 	return hostconfig.Options{
 		HostID:            "host-7c1",
-		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
+		InternalEndpoint:  "wss://host-7c1.internal.example:8443",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        testDepartment(t),
 		SessionStore:      inertStore{},
@@ -401,7 +401,7 @@ func TestStableKeyAndRankingScopeSeparateWhatTheSpecSeparates(t *testing.T) {
 	first := base(t, func(*hostconfig.Options) {})
 	otherHost := base(t, func(o *hostconfig.Options) {
 		o.HostID = "host-b42"
-		o.InternalEndpoint = "wss://host-b42.internal.example:8443/hostlink"
+		o.InternalEndpoint = "wss://host-b42.internal.example:8443"
 	})
 	dedicated := base(t, func(o *hostconfig.Options) {
 		o.Placement = sessionwire.HostPlacementDedicated

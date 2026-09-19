@@ -55,7 +55,8 @@ func New(options Options) (*Host, error) {
 // ID returns the Host's identity.
 func (h *Host) ID() sessionwire.HostID { return h.resolved.ID() }
 
-// InternalEndpoint returns the address Factory dials for HostLink.
+// InternalEndpoint returns the HostLink base address this Host advertises.
+// Factory dials sessionwire.HostLinkEndpoint(base, tenant), never the base.
 func (h *Host) InternalEndpoint() sessionwire.InternalEndpoint { return h.resolved.InternalEndpoint() }
 
 // IsolationClass returns the advertised cross-tenant boundary, which is also

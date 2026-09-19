@@ -29,7 +29,7 @@ func observation(epoch uint64, at time.Time) sessionwire.HostLinkRegistryObserva
 		AgentID:                testAgent,
 		RuntimeCompatibilityID: testCompat,
 		Placement:              sessionwire.HostPlacementPooled,
-		InternalEndpoint:       sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
+		InternalEndpoint:       sessionwire.InternalEndpoint("ws://10.0.0.7:9443"),
 		Residency:              sessionwire.SessionResidencyResident,
 		Accepting:              true,
 		LeaseEpoch:             epoch,

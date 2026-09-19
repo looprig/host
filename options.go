@@ -88,7 +88,13 @@ type Options struct {
 	// HostID identifies this Host to Factory and in HostLink bindings.
 	HostID sessionwire.HostID
 
-	// InternalEndpoint is the credential-free WebSocket address Factory dials.
+	// InternalEndpoint is this Host's credential-free HostLink BASE address:
+	// a ws or wss scheme and an authority, with no path. Factory derives each
+	// tenant's address from it with sessionwire.HostLinkEndpoint(base,
+	// tenant), which is base + HostLinkPathPrefix + the escaped tenant. As of
+	// v0.3.0 a value HostLinkEndpoint would refuse (including the v0.2.1
+	// per-tenant spelling ".../hostlink/<tenant>") or one whose authority
+	// cannot be dialled is refused by New; see ErrUndiallableEndpoint.
 	InternalEndpoint sessionwire.InternalEndpoint
 
 	// IsolationClass is advertised with capacity so Factory can place
@@ -192,6 +198,14 @@ const (
 	OptionErrorCodeDedicatedCap    OptionErrorCode = OptionErrorCode(hostconfig.OptionErrorCodeDedicatedCap)
 	OptionErrorCodePooledFixed     OptionErrorCode = OptionErrorCode(hostconfig.OptionErrorCodePooledFixed)
 )
+
+// ErrUndiallableEndpoint is the cause of an InternalEndpoint refusal whose
+// authority no client could dial — an empty port, a port outside 1..65535, or
+// more than one port — although Core's InternalEndpoint.Validate and
+// sessionwire.HostLinkEndpoint accept it. Reach it with errors.Is. A base Core
+// itself refuses carries a *sessionwire.HostLinkEndpointError instead, whose
+// Code names the reason.
+var ErrUndiallableEndpoint = hostconfig.ErrUndiallableEndpoint
 
 // InvalidOptionsError reports an option Host may not run with.
 //

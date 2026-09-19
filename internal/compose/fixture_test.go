@@ -30,7 +30,7 @@ const (
 	testAgent    = sessionwire.AgentID("agent-a")
 	testCompat   = department.CompatibilityID("runtime-a")
 	testHostID   = sessionwire.HostID("host-a")
-	testEndpoint = sessionwire.InternalEndpoint("ws://10.0.0.1:7100/hostlink")
+	testEndpoint = sessionwire.InternalEndpoint("ws://10.0.0.1:7100")
 	testGen      = uint64(4)
 )
 

@@ -31,7 +31,7 @@ func testAdvertisement(accepting bool, capacity uint64) service.Advertisement {
 			AgentID:                testAgent,
 			RuntimeCompatibilityID: testCompat,
 			Placement:              sessionwire.HostPlacementPooled,
-			InternalEndpoint:       "ws://10.0.0.1:7100/hostlink",
+			InternalEndpoint:       "ws://10.0.0.1:7100",
 			IsolationClass:         sessionwire.HostIsolationClassCrossTenantIsolated,
 			Accepting:              accepting,
 			AvailableCapacity:      capacity,
@@ -80,7 +80,7 @@ func TestPublishedTargetsAreReadableAsPlacementCandidates(t *testing.T) {
 	if !got.Accepting || got.AvailableCapacity != 6 {
 		t.Errorf("published row = (accepting %v, capacity %d), want (true, 6)", got.Accepting, got.AvailableCapacity)
 	}
-	if got.InternalEndpoint != "ws://10.0.0.1:7100/hostlink" {
+	if got.InternalEndpoint != "ws://10.0.0.1:7100" {
 		t.Errorf("published endpoint = %q, want the advertised one", got.InternalEndpoint)
 	}
 	if got.IsolationClass != sessionwire.HostIsolationClassCrossTenantIsolated {

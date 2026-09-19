@@ -29,7 +29,7 @@ func completeEnvironment() environment {
 	return environment{
 		"HOST_ID":                    "host-a",
 		"HOST_GENERATION":            "4",
-		"HOST_INTERNAL_ENDPOINT":     "ws://10.0.0.1:7100/hostlink",
+		"HOST_INTERNAL_ENDPOINT":     "ws://10.0.0.1:7100",
 		"HOST_ISOLATION_CLASS":       "cross_tenant_isolated",
 		"HOST_PLACEMENT":             "pooled",
 		"HOST_CAPACITY":              "4",

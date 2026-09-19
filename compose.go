@@ -210,7 +210,8 @@ func (e *InvalidCompositionError) Unwrap() error { return e.Cause }
 
 // HostLinkPathPrefix is the path every HostLink connection arrives under on
 // the Handler; the segment after it is the tenant the connection claims and
-// the server then authenticates.
+// the server then authenticates. It is Core's sessionwire.HostLinkPathPrefix,
+// the prefix sessionwire.HostLinkEndpoint derives every tenant's address with.
 const HostLinkPathPrefix = compose.HostLinkPathPrefix
 
 // Service is one composed Host: built, then started, then stopped.

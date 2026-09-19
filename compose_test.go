@@ -99,7 +99,7 @@ type composeFixture struct {
 	session *testkit.FullSession
 }
 
-func newComposeFixture(t *testing.T) *composeFixture {
+func newComposeFixture(t testing.TB) *composeFixture {
 	t.Helper()
 	id, err := uuid.New()
 	if err != nil {
@@ -109,7 +109,7 @@ func newComposeFixture(t *testing.T) *composeFixture {
 	return &composeFixture{backend: memstore.New(), rig: &testkit.FakeRig{Session: session}, session: session}
 }
 
-func (f *composeFixture) registrar(t *testing.T) host.Registrar {
+func (f *composeFixture) registrar(t testing.TB) host.Registrar {
 	t.Helper()
 	return host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
 		target, err := department.NewRigTarget(f.rig, composeCompat, department.Capabilities{
@@ -125,12 +125,12 @@ func (f *composeFixture) registrar(t *testing.T) host.Registrar {
 	})
 }
 
-func (f *composeFixture) blueprint(t *testing.T) host.Composition {
+func (f *composeFixture) blueprint(t testing.TB) host.Composition {
 	t.Helper()
 	return host.Composition{
 		Options: host.Options{
 			HostID:            "host-a",
-			InternalEndpoint:  "ws://10.0.0.1:7100/hostlink",
+			InternalEndpoint:  "ws://10.0.0.1:7100",
 			IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
 			Placement:         sessionwire.HostPlacementPooled,
 			Capacity:          4,
@@ -167,7 +167,7 @@ func (f *composeFixture) blueprint(t *testing.T) host.Composition {
 
 // otherParty opens a SECOND store over the same backend: Factory seeding the
 // catalog, or another Host taking a lease.
-func (f *composeFixture) otherParty(t *testing.T) *sessionstore.Store {
+func (f *composeFixture) otherParty(t testing.TB) *sessionstore.Store {
 	t.Helper()
 	other, err := sessionstore.Open(t.Context(), f.backend)
 	if err != nil {
@@ -630,8 +630,12 @@ func TestRPCEmptyAcceptanceRejectsAValidHostLinkRefusalBody(t *testing.T) {
 
 func dialHostLink(t *testing.T, serverURL string, tenant sessionwire.TenantID) *websocket.Conn {
 	t.Helper()
-	endpoint := "ws" + strings.TrimPrefix(serverURL, "http") + host.HostLinkPathPrefix + string(tenant)
-	connection, response, err := websocket.DefaultDialer.Dial(endpoint, http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json"}})
+	// Derived exactly as a Factory derives it: Core's function over the base.
+	endpoint, err := sessionwire.HostLinkEndpoint(sessionwire.InternalEndpoint("ws"+strings.TrimPrefix(serverURL, "http")), tenant)
+	if err != nil {
+		t.Fatalf("derive the HostLink endpoint: %v", err)
+	}
+	connection, response, err := websocket.DefaultDialer.Dial(string(endpoint), http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json"}})
 	if err != nil {
 		t.Fatalf("dial %s (response %#v): %v", endpoint, response, err)
 	}
@@ -646,7 +650,7 @@ func dialHostLink(t *testing.T, serverURL string, tenant sessionwire.TenantID) *
 	return connection
 }
 
-func sendOver(t *testing.T, connection *websocket.Conn, command any, id uint32) linkReply {
+func sendOver(t testing.TB, connection *websocket.Conn, command any, id uint32) linkReply {
 	t.Helper()
 	linkMu.Lock()
 	defer linkMu.Unlock()

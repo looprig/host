@@ -106,7 +106,7 @@ func pooledOptions(t *testing.T) hostconfig.Options {
 	t.Helper()
 	return hostconfig.Options{
 		HostID:            "host-7c1",
-		InternalEndpoint:  "wss://host-7c1.internal.example:8443/hostlink",
+		InternalEndpoint:  "wss://host-7c1.internal.example:8443",
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        testDepartment(t),
 		SessionStore:      stubSessionStore{id: "store-a"},
@@ -712,9 +712,10 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		options.Department = testDepartment(t, crowd...)
 		options.HostID = long
 		// A second, structurally different endpoint: ws rather than wss, an
-		// address literal rather than a name, an explicit port, and a path that
-		// is not "/hostlink".
-		options.InternalEndpoint = "ws://10.0.4.7:9000/link"
+		// address literal rather than a name, and an explicit port. As of
+		// v0.3.0 it carries no path — the endpoint is a BASE, and every path is
+		// refused (TestInternalEndpointIsABase).
+		options.InternalEndpoint = "ws://10.0.4.7:9000"
 		options.IsolationClass = sessionwire.HostIsolationClassCrossTenantIsolated
 		options.Capacity = 1_000_000
 		options.WarmTTL = 30 * 24 * time.Hour
@@ -734,7 +735,7 @@ func TestGenerousButLegalConfigurationIsAccepted(t *testing.T) {
 		if built.Capacity() != 1_000_000 {
 			t.Errorf("Capacity() = %d, want 1000000", built.Capacity())
 		}
-		if built.InternalEndpoint() != "ws://10.0.4.7:9000/link" {
+		if built.InternalEndpoint() != "ws://10.0.4.7:9000" {
 			t.Errorf("InternalEndpoint() = %q", built.InternalEndpoint())
 		}
 		if got := built.Department().Len(); got != len(crowd) {
@@ -1108,7 +1109,7 @@ func TestInvalidEndpointCarriesCoresTypedCause(t *testing.T) {
 	t.Parallel()
 
 	options := pooledOptions(t)
-	options.InternalEndpoint = "wss://user:secret@host/hostlink"
+	options.InternalEndpoint = "wss://user:secret@host"
 	_, err := hostconfig.New(options)
 
 	var validation *sessionwire.RequestValidationError

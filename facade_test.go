@@ -182,7 +182,7 @@ func facadeOptions(t *testing.T) host.Options {
 	}
 	return host.Options{
 		HostID:            "host-facade",
-		InternalEndpoint:  "ws://10.0.0.1:7100/hostlink",
+		InternalEndpoint:  "ws://10.0.0.1:7100",
 		IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
 		Department:        dept,
 		SessionStore:      facadeStore{id: "store"},
@@ -246,6 +246,8 @@ func TestNewDelegatesEveryRefusal(t *testing.T) {
 		func(o *host.Options) { o.HostID = "" },
 		func(o *host.Options) { o.SessionStore = nil },
 		func(o *host.Options) { o.InternalEndpoint = "http://host/x" },
+		func(o *host.Options) { o.InternalEndpoint = "ws://10.0.0.1:7100/hostlink" },
+		func(o *host.Options) { o.InternalEndpoint = "ws://10.0.0.1:99999" },
 		func(o *host.Options) { o.HostID = sessionwire.HostID(strings.Repeat("h", sessionwire.MaxIDBytes+1)) },
 		func(o *host.Options) { o.IsolationClass = "shared" },
 		func(o *host.Options) { o.Placement = "elastic" },
@@ -321,5 +323,29 @@ func internalOptions(o host.Options) hostconfig.Options {
 		WarmTTL: o.WarmTTL, RegistryHeartbeat: o.RegistryHeartbeat, RegistryExpiry: o.RegistryExpiry,
 		ClaimTTL: o.ClaimTTL, ApplyDeadline: o.ApplyDeadline, CommandQueueSize: o.CommandQueueSize,
 		ReconcileInterval: o.ReconcileInterval, ReconcileBatch: o.ReconcileBatch,
+	}
+}
+
+// TestTheExportedConstructorRefusesANonBaseEndpointTypedly is v0.3.0's
+// endpoint rule seen from outside the module: a v0.2.1-style per-tenant
+// endpoint reaches Core's *HostLinkEndpointError with its Code, and an
+// undiallable authority reaches host.ErrUndiallableEndpoint, so a caller
+// branches on neither the Reason nor the internal package.
+func TestTheExportedConstructorRefusesANonBaseEndpointTypedly(t *testing.T) {
+	t.Parallel()
+
+	options := facadeOptions(t)
+	options.InternalEndpoint = "ws://10.0.0.1:7100/hostlink/tenant-a"
+	_, err := host.New(options)
+	var derive *sessionwire.HostLinkEndpointError
+	if !errors.As(err, &derive) || derive.Code != sessionwire.HostLinkEndpointCodeBaseNamesTenant {
+		t.Fatalf("New(per-tenant endpoint) = %v, want a *HostLinkEndpointError with code base_names_tenant", err)
+	}
+
+	options = facadeOptions(t)
+	options.InternalEndpoint = "ws://10.0.0.1:80:90"
+	_, err = host.New(options)
+	if !errors.Is(err, host.ErrUndiallableEndpoint) {
+		t.Fatalf("New(two ports) = %v, want host.ErrUndiallableEndpoint", err)
 	}
 }

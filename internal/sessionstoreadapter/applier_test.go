@@ -132,7 +132,7 @@ func newApplierHost(t *testing.T) *hostconfig.Host {
 	}
 	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            sessionwire.HostID("host-adapter"),
-		InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443/hostlink"),
+		InternalEndpoint:  sessionwire.InternalEndpoint("ws://10.0.0.7:9443"),
 		IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 		Department:        dept,
 		SessionStore:      stubSessionStore{},

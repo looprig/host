@@ -890,7 +890,7 @@ const (
 	testAgent         sessionwire.AgentID          = "coder"
 	testHost          sessionwire.HostID           = "host-7c1"
 	testCompat        department.CompatibilityID   = "rig-2026-09-a1"
-	testEndpoint      sessionwire.InternalEndpoint = "wss://host-7c1.internal.example:8443/hostlink"
+	testEndpoint      sessionwire.InternalEndpoint = "wss://host-7c1.internal.example:8443"
 	testWorkspaceRoot                              = "/var/lib/host/workspaces/session-4d2"
 	testNamespace                                  = "tenant-9f3/session-4d2/objects"
 	testGeneration    uint64                       = 41

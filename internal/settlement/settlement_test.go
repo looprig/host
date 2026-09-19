@@ -257,7 +257,7 @@ func (w *world) applier(runtime department.CommandApplier) *commands.Disposition
 
 	built, err := hostconfig.New(hostconfig.Options{
 		HostID:            "host-settlement",
-		InternalEndpoint:  "ws://10.0.0.1:7100/hostlink",
+		InternalEndpoint:  "ws://10.0.0.1:7100",
 		IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
 		Department:        testDepartment(w.t),
 		SessionStore:      w.adapted,

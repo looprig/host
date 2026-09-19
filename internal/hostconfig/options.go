@@ -2,7 +2,11 @@ package hostconfig
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -123,7 +127,8 @@ type Options struct {
 	// HostID identifies this Host to Factory and in HostLink bindings.
 	HostID sessionwire.HostID
 
-	// InternalEndpoint is the credential-free WebSocket address Factory dials.
+	// InternalEndpoint is the credential-free HostLink BASE address Factory
+	// derives each tenant's address from; see validateEndpointBase.
 	InternalEndpoint sessionwire.InternalEndpoint
 
 	// IsolationClass is advertised with capacity so Factory can place
@@ -283,17 +288,8 @@ func (o Options) validatePresence() error {
 }
 
 func (o Options) validateShape() error {
-	// Core owns this rule and reports a typed *RequestValidationError whose
-	// Code it documents as stable. The cause is carried rather than folded into
-	// a sentence, so a caller can tell a credential-bearing endpoint from a
-	// malformed one without matching text.
-	if err := o.InternalEndpoint.Validate(); err != nil {
-		return &InvalidOptionsError{
-			Code:   OptionErrorCodeInvalid,
-			Field:  "InternalEndpoint",
-			Reason: "is not a usable HostLink address: " + err.Error(),
-			Cause:  err,
-		}
+	if err := validateEndpointBase(o.InternalEndpoint); err != nil {
+		return err
 	}
 	// DELEGATED to Core, not restated. HostID.Validate and SessionID.Validate
 	// are exported and each calls Core's validateID, so this enforces Core's
@@ -553,4 +549,86 @@ func (f RegistrarFunc) Register(ctx context.Context) ([]department.Registration,
 // does not start.
 type Checkpointer interface {
 	Checkpoint(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+}
+
+// ---------------------------------------------------------------------------
+// The internal endpoint is a BASE
+// ---------------------------------------------------------------------------
+
+// ErrUndiallableEndpoint is the cause of an InternalEndpoint refusal whose
+// authority no client could dial — an empty port ("ws://h:"), a port outside
+// 1..65535 ("ws://h:99999", "ws://h:0"), or more than one port
+// ("ws://h:80:90") — although Core's InternalEndpoint.Validate and
+// HostLinkEndpoint both accept it. Reach it with errors.Is.
+var ErrUndiallableEndpoint = errors.New("host: the internal endpoint's authority cannot be dialled")
+
+// endpointProbeTenant is the tenant validateEndpointBase derives with. It is
+// the shortest legal, routable tenant, so the only refusals HostLinkEndpoint
+// can report for it are about the BASE — including too_long, which for a
+// one-byte tenant means no tenant at all fits on this base.
+const endpointProbeTenant sessionwire.TenantID = "t"
+
+// validateEndpointBase holds host v0.3.0's reading of InternalEndpoint.
+//
+// THE VALUE IS A BASE, NOT AN ADDRESS. Host serves each tenant's HostLink at
+// sessionwire.HostLinkPathPrefix plus that tenant, and Core owns the one
+// derivation a Factory uses to reach it, sessionwire.HostLinkEndpoint(base,
+// tenant). So the rule is Core's, applied BY CALLING IT rather than restated:
+// a base Core would refuse to derive from — invalid_base, base_names_tenant
+// (the v0.2.1 per-tenant spelling ".../hostlink" or ".../hostlink/<tenant>"),
+// base_not_bare (any other path, an ingress prefix, an empty fragment), or one
+// so long that no tenant fits (too_long) — is refused here, loudly at startup,
+// instead of being advertised and then refused by every Factory that reads it.
+// The *sessionwire.HostLinkEndpointError is carried as the cause so a caller
+// branches on its Code; for invalid_base it wraps Core's
+// *RequestValidationError in turn.
+//
+// THEN THE AUTHORITY MUST BE DIALLABLE, which Core does not check (core spec
+// F4): Validate accepts "ws://h:", "ws://h:99999" and "ws://h:80:90", and
+// HostLinkEndpoint appends to them faithfully. Each is an operator error that
+// would otherwise surface only as a Factory dial failure.
+func validateEndpointBase(endpoint sessionwire.InternalEndpoint) error {
+	if _, err := sessionwire.HostLinkEndpoint(endpoint, endpointProbeTenant); err != nil {
+		return &InvalidOptionsError{
+			Code:   OptionErrorCodeInvalid,
+			Field:  "InternalEndpoint",
+			Reason: "is not a usable HostLink base address (a ws or wss scheme and an authority, nothing else; each tenant's address is derived from it): " + err.Error(),
+			Cause:  err,
+		}
+	}
+	if err := dialableAuthority(endpoint); err != nil {
+		return &InvalidOptionsError{
+			Code:   OptionErrorCodeInvalid,
+			Field:  "InternalEndpoint",
+			Reason: err.Error(),
+			Cause:  err,
+		}
+	}
+	return nil
+}
+
+// dialableAuthority refuses an authority no client could dial. It runs after
+// HostLinkEndpoint accepted the base, so the base parses and has a host.
+func dialableAuthority(endpoint sessionwire.InternalEndpoint) error {
+	parsed, err := url.Parse(string(endpoint))
+	if err != nil {
+		return errors.Join(ErrUndiallableEndpoint, err)
+	}
+	authority := parsed.Host
+	if strings.HasSuffix(authority, ":") {
+		return errors.Join(ErrUndiallableEndpoint, errors.New("the authority names an empty port"))
+	}
+	if parsed.Port() == "" {
+		return nil
+	}
+	// SplitHostPort refuses a second port ("h:80:90") as too many colons, and
+	// accepts a bracketed IPv6 literal with one.
+	if _, _, err := net.SplitHostPort(authority); err != nil {
+		return errors.Join(ErrUndiallableEndpoint, err)
+	}
+	port, err := strconv.ParseUint(parsed.Port(), 10, 16)
+	if err != nil || port == 0 {
+		return errors.Join(ErrUndiallableEndpoint, errors.New("the port must be a decimal number from 1 to 65535"))
+	}
+	return nil
 }

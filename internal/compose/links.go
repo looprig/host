@@ -19,7 +19,15 @@ import (
 // HostLinkPathPrefix is the path every HostLink connection arrives under. The
 // segment after it is the tenant the connection claims, which the server then
 // AUTHENTICATES; a path segment is a claim and never a credential.
-const HostLinkPathPrefix = "/hostlink/"
+//
+// IT IS CORE'S CONSTANT, NOT A COPY. As of core v0.10.0 a Host advertises a
+// BASE and every Factory derives a tenant's address with
+// sessionwire.HostLinkEndpoint, which appends exactly
+// sessionwire.HostLinkPathPrefix. A private spelling here could drift from
+// that and make this Host unreachable from every Factory while every local
+// test stayed green; the root package's TestRoutesResolve… guards hold the
+// real router to the derivation.
+const HostLinkPathPrefix = sessionwire.HostLinkPathPrefix
 
 // tenantLink is everything one authenticated tenant's connections share: a
 // routing table, a transport, and the live event relay that publishes through
