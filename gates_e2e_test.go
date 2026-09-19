@@ -663,18 +663,16 @@ func TestAnAskUserGateClosedAtRestoreSettlesNoOp(t *testing.T) {
 	}
 }
 
-// TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor documents what a
-// GRACEFUL re-placement does with an open gate under harness v0.35.0, measured.
-// harness releases a session nonterminally only once it is whole-session idle,
-// and a session parked at a gate never is, so its ReleaseResidency waits. The
-// drain used to hand it a context nothing cancelled, and Stop never returned;
-// it is now bounded by the drain's grace. The refusal is recorded, Host's own
-// release still completes (tombstone, residency lease), and the gate stays open
-// and projected — but the runtime keeps its journal lease until its process
-// exits, so a successor in the same process is refused until that lease lapses.
-// A re-placement of a gated session is therefore a CRASH-EQUIVALENT one; what a
-// successor then does with the gate is TestAPermissionGateOpenAcrossAReplacement…
-// and TestAnAskUserGateClosedAtRestoreSettlesNoOp.
+// TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor: a graceful drain of
+// a session parked at a gate is CRASH-EQUIVALENT. harness releases a session
+// nonterminally only when it is whole-session idle, and a session at a gate
+// never is, so the release is refused within the drain's grace. The refused
+// runtime is then left PARKED — its context is not cancelled — so it writes
+// nothing: no TurnInterrupted, no GateResolved{abandoned}. The gate stays open
+// and projected, exactly as after a crash. The runtime keeps its journal lease
+// until its process exits, so a successor in the SAME process is refused.
+// (spec gate M1, quality gate F1: before, Stop cancelled the runtime and it
+// abandoned the gate after the publisher had stopped.)
 func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{})
 	first, firstLauncher, _ := world.host(t, 4)
@@ -694,8 +692,16 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 	if !refused {
 		t.Fatalf("drain failures = %+v, want the runtime's refused release recorded", report.Failures)
 	}
-	if got := world.resolutions(t, opened.GateID); len(got) != 0 {
-		t.Fatalf("the drain closed the gate: %+v", got)
+	// Abandonment used to land up to ~300ms after Stop returned; a parked
+	// runtime writes nothing at all, so a second of silence is the assertion.
+	time.Sleep(time.Second)
+	for _, ev := range harnesstest.Events(t, world.journal, world.runtimeID) {
+		switch ev := ev.(type) {
+		case event.GateResolved:
+			t.Fatalf("the drain resolved the gate (%q); a parked runtime writes nothing", ev.Reason)
+		case event.TurnInterrupted:
+			t.Fatal("the drain interrupted the parked turn; the runtime was cancelled")
+		}
 	}
 	if still := world.gates(t, 1)[0]; still.GateID != opened.GateID {
 		t.Fatalf("the projection after the drain holds %+v, want the open gate", still)
@@ -895,4 +901,36 @@ func TestACrashBetweenTheAnswerAndItsDispositionIsNeverATombstone(t *testing.T) 
 		t.Fatalf("resolutions = %+v, want exactly the answer, caused by the admitted command", resolved)
 	}
 	gateE2EEventually(t, "the agent to have received the answer before the crash", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
+}
+
+// TestAPermissionGateSurvivesADrainAndIsAnsweredOnTheSuccessor is the
+// crash-equivalence the drain now keeps: Host A drains with a permission gate
+// open, its parked runtime's journal lease lapses (as it does when the drained
+// process exits), and Host B restores the session with the gate still open and
+// applies the approval under its own residency.
+func TestAPermissionGateSurvivesADrainAndIsAnsweredOnTheSuccessor(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
+	first, firstLauncher, _ := world.host(t, 4)
+	world.submit(t, firstLauncher.controller(), "PLEASE-RUN-GATED")
+	opened := world.gates(t, 1)[0]
+	stopWithin(t, first)
+
+	second, _, secondEpoch := world.host(t, 5)
+	t.Cleanup(func() { stopBounded(second) })
+	gateE2EEventually(t, "Host B's fencing write", func() bool { return world.mark(t) == secondEpoch })
+	if still := world.gates(t, 1)[0]; still.GateID != opened.GateID {
+		t.Fatalf("after the drain and the restore the projection holds %+v, want the same gate", still)
+	}
+	entry := world.settled(t, world.answer(t, opened, string(gate.ApprovalApprove), map[string]json.RawMessage{}))
+	if entry.Record.State != sessionstore.InboxStateApplied || outcomeOf(t, entry) != "applied" {
+		t.Fatalf("the approval after a drain settled %q/%q, want applied/applied", entry.Record.State, outcomeOf(t, entry))
+	}
+	if entry.Record.Attempt == nil || uint64(entry.Record.Attempt.ResidencyEpoch) != secondEpoch {
+		t.Fatalf("the approval's attempt = %+v, want Host B's residency %d", entry.Record.Attempt, secondEpoch)
+	}
+	for _, resolved := range world.resolutions(t, opened.GateID) {
+		if resolved.Reason == gate.CloseAbandoned {
+			t.Fatal("the gate was abandoned across the drain")
+		}
+	}
 }

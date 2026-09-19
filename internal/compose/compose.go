@@ -676,7 +676,22 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 		<-done
 	}
 	s.warm.Stop()
-	s.manager.Close()
+	// A RUNTIME WHOSE RELEASE WAS REFUSED IS LEFT PARKED, and that is what
+	// makes the drain of a gated session crash-equivalent (spec gate M1,
+	// quality gate F1). harness refuses a nonterminal release of a session that
+	// is not whole-session idle — a session at a gate never is — and the
+	// manager's Close cancels every session context, which a refused runtime
+	// still runs on: cancelled, it interrupted its turn and journaled
+	// GateResolved{abandoned} after this Host's publisher had stopped, so the
+	// projection showed a gate that no longer existed and a permission request
+	// a crash would have preserved was destroyed. Parked, it writes nothing
+	// further; it keeps its journal lease until this process exits, and its
+	// successor restores the session as it restores a crashed Host's. Every
+	// session whose release succeeded has already torn itself down, so
+	// skipping the cancellation affects only the parked ones.
+	if !releaseRefused(report) {
+		s.manager.Close()
+	}
 
 	// STEP 6, AND IT IS LAST BECAUSE IT IS WRITTEN LAST. The previous version
 	// of this function did not close transports at all — the drain did, inside
@@ -692,6 +707,16 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 		report.Failures = append(report.Failures, lifecycle.Failure{Step: lifecycle.StepCloseLink, Err: err})
 	}
 	return report, nil
+}
+
+// releaseRefused reports whether any session's runtime refused its release.
+func releaseRefused(report lifecycle.Report) bool {
+	for _, failure := range report.Failures {
+		if failure.Step == lifecycle.StepReleaseResidency {
+			return true
+		}
+	}
+	return false
 }
 
 // ResidentSessions returns the sessions this Host holds, as the drain's seam.
