@@ -141,10 +141,33 @@ type Options struct {
 	// lifecycle.MemoryBudget.
 	Budget lifecycle.MemoryBudget
 
+	// Gates binds each resident session's gate publisher to its grant. It is
+	// OPTIONAL here and the production composition always supplies it: a
+	// composition without one publishes no gate, so a Factory can show no
+	// AskUser or permission question from this Host and every answer is
+	// refused as resolved. Internal fixtures that exercise nothing about gates
+	// leave it nil.
+	Gates GateSessions
+
+	// GateRetry is how long a gate publisher waits after a failed pass before
+	// retrying. Zero means DefaultGateRetry.
+	GateRetry time.Duration
+
 	// Logger receives this Host's operator diagnostics. It is OPTIONAL and nil
 	// discards: logging is never a precondition of running. What it says is
 	// stated where each record is written; see logAttach.
 	Logger *slog.Logger
+}
+
+// DefaultGateRetry is the gate publisher's retry wait when GateRetry is zero.
+const DefaultGateRetry = time.Second
+
+// gateRetry returns the configured retry wait or the default.
+func (o Options) gateRetry() time.Duration {
+	if o.GateRetry <= 0 {
+		return DefaultGateRetry
+	}
+	return o.GateRetry
 }
 
 // discardLogger is what a composition without a Logger writes to.

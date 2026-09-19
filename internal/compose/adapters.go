@@ -10,6 +10,7 @@ import (
 
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
+	"github.com/looprig/host/internal/gates"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
@@ -180,10 +181,39 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	if err != nil {
 		return nil, err
 	}
+	// THE GATE PUBLISHER IS BOUND TO THE SAME GRANT, and a Host that cannot
+	// bind one refuses the attach rather than holding a session whose gates no
+	// Factory could ever see. It starts BEFORE the consumer so its fencing
+	// write is under way when the first gate response is considered; the
+	// consumer re-checks a gate it could not yet own when the publisher
+	// converges (OnConverged hints it).
+	var publisher *gates.Publisher
+	if s.options.Gates != nil {
+		session, err := s.options.Gates.GateSessionFor(lease, request.Key.TenantID, request.Key.SessionID)
+		if err != nil {
+			tail.Stop()
+			return nil, err
+		}
+		publisher, err = gates.Start(ctx, gates.Options{
+			Session:     session,
+			Hints:       request.Runtime,
+			After:       s.options.Clock.After,
+			Retry:       s.options.gateRetry(),
+			OnConverged: func() { consumer.Hint("") },
+			Logger:      s.options.logger(),
+		})
+		if err != nil {
+			tail.Stop()
+			return nil, err
+		}
+	}
 	s.recordConsumer(request.Key, consumer)
 	go consumer.Run(ctx)
 	return &sessionWork{stop: func() {
 		tail.Stop()
+		if publisher != nil {
+			publisher.Stop()
+		}
 		consumer.Stop()
 		s.forgetConsumer(request.Key)
 		// AND EVERY ROUTE TO THIS SESSION GOES WITH IT.

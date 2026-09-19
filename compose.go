@@ -333,6 +333,8 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		// the store a create consults is the one settlement reads: the
 		// runtime's own journal for that (tenant, binding).
 		sessionstoreadapter.WithRuntimeJournals(router),
+		// And the journal a session's gates are folded from: the same one.
+		sessionstoreadapter.WithGateJournals(router),
 	}
 	if collaborators.RigSessionIDs != nil {
 		adapterOptions = append(adapterOptions, sessionstoreadapter.WithRigSessionIDs(sessionstoreadapter.RigSessionIDs(collaborators.RigSessionIDs)))
@@ -369,6 +371,7 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		Records:              adapted,
 		Writers:              adapted,
 		Targets:              adapted,
+		Gates:                adapted,
 		Checkpointer:         collaborators.Checkpointer,
 		Auth:                 collaborators.Auth,
 		PingInterval:         blueprint.Link.PingInterval,

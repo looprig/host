@@ -2,9 +2,11 @@ package compose
 
 import (
 	"context"
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"time"
 
 	"github.com/looprig/host/internal/commands"
+	"github.com/looprig/host/internal/gates"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/service"
@@ -74,4 +76,15 @@ type DispositionWriters interface {
 	// a writer with no grant, because such a writer would fail at the first
 	// command of a session this Host had already taken residency of.
 	DispositionWriterFor(residency.Lease) (commands.DispositionWrites, error)
+}
+
+// GateSessions binds one resident session's durable gate surface to the
+// residency grant this Host holds for it, for the gate publisher.
+//
+// IT IS A FACTORY FOR DispositionWriters' REASON: sessionstore v0.12.0's gate
+// writes take the store-issued *ResidencyGrant and refuse a bare epoch, so the
+// grant is bound once per session rather than passed per call. An
+// implementation that cannot recognise the lease must refuse.
+type GateSessions interface {
+	GateSessionFor(residency.Lease, sessionwire.TenantID, sessionwire.SessionID) (gates.Session, error)
 }
