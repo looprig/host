@@ -23,8 +23,8 @@ and compared segment by segment, so a sibling package under
 
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` v0.10.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.34.0.
+`github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
+`github.com/looprig/harness` v0.34.0. Core is v0.10.0.
 
 **A composed Host applies a command end to end: it attaches a disposition
 session, consumes its durable command stream, claims a command under its
@@ -32,6 +32,81 @@ residency grant, authorizes exactly one dispatch attempt, drives the runtime wit
 that attempt's identity and settles the command from the runtime's own durable
 disposition.** Read the next section before you plan around it; the mechanism is
 measured, not cautionary.
+
+## Upgrading to v0.3.0
+
+### `HOST_INTERNAL_ENDPOINT` is a BASE, and Factory must move with Host
+
+One pooled Host serves several tenants, each at its own HostLink address:
+`base + /hostlink/ + PathEscape(tenant)`. As of v0.3.0 the configured
+`InternalEndpoint` (`HOST_INTERNAL_ENDPOINT`) is that **base** — a `ws`/`wss`
+scheme and an authority, nothing else — and a Factory derives each tenant's
+address with Core's `sessionwire.HostLinkEndpoint(base, tenant)`. Host
+advertises the base unchanged in its capacity report and registry observation.
+
+`host.New` / `host.Compose` now **refuse at startup**:
+
+| value | refusal |
+|---|---|
+| not a valid internal endpoint (`http://…`, credentials, a query) | `*sessionwire.HostLinkEndpointError`, code `invalid_base` |
+| the v0.2.1 per-tenant spelling `…/hostlink` or `…/hostlink/<tenant>` | code `base_names_tenant` |
+| any other path (including an ingress prefix such as `https://gw/pods/h7/`), or a bare `#` | code `base_not_bare` |
+| so long that not even a one-byte tenant fits | code `too_long` |
+| an authority no client can dial although Core accepts it: `ws://h:`, `ws://h:99999`, `ws://h:0`, `ws://h:80:90` | `host.ErrUndiallableEndpoint` |
+
+Each is an `*InvalidOptionsError{Code: invalid, Field: "InternalEndpoint"}`
+whose cause is reachable with `errors.As` / `errors.Is`. A Host behind a
+path-prefixed ingress must use host-based routing, a port per Host, or
+in-cluster Service DNS.
+
+**Compatibility window.** A Factory at **v0.3.0 or older** dials the advertised
+endpoint **verbatim**; dialling a bare base gets **404**, so such a Factory
+cannot reach a v0.3.0 Host. **Upgrade Factory together with Host** (to the
+first Factory that derives addresses with `HostLinkEndpoint`). In the other
+direction, a **v0.2.1 Host reconfigured to a bare base already works** with a
+deriving Factory, because v0.2.1 already served every tenant at
+`/hostlink/<tenant>` — so a fleet can move Factory first and then Host. A
+controller that writes `…/hostlink/<tenant>` into `HOST_INTERNAL_ENDPOINT`
+must write the bare base instead, or a v0.3.0 Host refuses to start.
+
+Host's routing is unchanged, and the prefix is Core's own
+`sessionwire.HostLinkPathPrefix`. `routes_endpoint_test.go` holds the real
+`Service.Routes()` to `HostLinkEndpoint` over Core's golden tenant list and a
+fuzz target, observing which tenant each derived address authenticates as.
+
+### A re-placed session resumes its conversation instead of restarting it
+
+Factory sends **every** attach as `create` (both inputs its attach mode is
+chosen from are dead on a disposition record), and harness does not check
+that a session id it is asked to create under is fresh: creating over an
+existing conversation re-opens that stream, appends a second
+`SessionStarted` and restores nothing, with no error. Before v0.3.0 a Host
+launched every create fresh, so **a session released by one Host and placed
+on another silently lost its conversation**.
+
+As of v0.3.0:
+
+- The runtime is launched under the runtime session id the session's
+  **immutable binding** names (`SessionBinding.RuntimeSessionID` — the id
+  Factory derived, never the Core session id), via `rig.WithSessionID`.
+  `department.CreateRequest` / `RigCreateRequest` carry it as `RigSessionID`,
+  and a Rig that launches or restores under any other identity is refused
+  with `department.ErrRigSessionIdentity` (the mis-launched session is
+  released).
+- **A create is decided by the runtime's journal**, read under that id from
+  the journal store registered for the session's (tenant, storage binding) in
+  `Collaborators.JournalStores`: no conversation → create; a conversation →
+  **restore it**; cannot tell → **refuse with `runtime_unavailable`**. A
+  restore still refuses when the target requires a checkpoint the session has
+  not got. harness's catalog (`ReadMeta`) is consulted first and the ledger is
+  the authority, because the catalog is a best-effort cache.
+- **The journal store for each binding must therefore be the released harness
+  session store** (`*harness/pkg/sessionstore.Store`, or a value embedding
+  one): the same journal the runtime writes and settlement reads. A reader
+  that is not one leaves Host unable to tell a new session from a re-placed
+  one, and every create for that binding is refused.
+- `Collaborators.RigSessionIDs` is **deprecated and optional**; it is
+  consulted only for a record with no binding.
 
 ## Known limitations you must read before deploying
 
