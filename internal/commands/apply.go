@@ -250,8 +250,22 @@ type Gate struct {
 	// under. A gate response is resumable only while both still name this Host's
 	// current residency, because continuation is out of scope: a runtime that was
 	// released and relaunched no longer holds what the gate suspended.
+	//
+	// ON A DISPOSITION SESSION THE OWNER IS AN EPOCH ALONE. sessionstore
+	// v0.12.0 records no Host identity on a gate; it records the RESIDENCY
+	// epoch of the last Host to write any gate as the projection's mark, and
+	// raises it on every gate write. OwnerEpoch is that residency epoch — never
+	// a journal epoch — and OwnerHostID is empty. The owning Host is this one
+	// exactly when OwnerEpoch equals the grant it holds.
 	OwnerHostID sessionwire.HostID
 	OwnerEpoch  uint64
+
+	// OpenedEventID and OpenedJournalSeq identify the event that opened the
+	// gate, as projected. A gate response names one of them as the version it
+	// answers (Core's ExpectedOpen*), and a mismatch is a stale or malformed
+	// answer.
+	OpenedEventID    sessionwire.EventID
+	OpenedJournalSeq uint64
 }
 
 // ---------------------------------------------------------------------------

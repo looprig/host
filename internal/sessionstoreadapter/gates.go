@@ -19,7 +19,8 @@ import (
 )
 
 // ErrGateOwnerUnavailable is the refusal LoadGate returns for a gate that
-// exists.
+// exists on a LEGACY session. A disposition session's gate is answered by
+// residency epoch; see LoadGate.
 //
 // THE BACKSTOP IS DECIDED FROM MEMBERS THE PROJECTION DOES NOT CARRY — finding
 // F10. commands.Gate holds OwnerHostID and OwnerEpoch, and §9.4's release-race
@@ -43,24 +44,44 @@ var ErrGateOwnerUnavailable = errors.New(
 // A gate that is NOT open is answerable soundly: absence from the page is the
 // whole answer, and the owner members are documented as the state a gate was
 // opened under. A gate that IS open is refused; see ErrGateOwnerUnavailable.
+//
+// A DISPOSITION SESSION'S OPEN GATE IS ANSWERED, BY RESIDENCY EPOCH. Since
+// sessionstore v0.12.0 every gate write on such a session carries the Host's
+// store-issued residency grant and raises the record's LeaseEpoch — which on a
+// disposition record holds a RESIDENCY epoch, never a journal epoch — to it. So
+// the mark is the residency of the last Host to write a gate, a successor's
+// fencing write moves it, and it is exactly the owner the backstop needs:
+// OwnerEpoch is that mark and OwnerHostID is left empty, because the store
+// records no Host identity. A legacy session's gate still carries no owner and
+// is still refused.
 func (s *Store) LoadGate(
 	ctx context.Context,
 	tenant sessionwire.TenantID,
 	session sessionwire.SessionID,
 	gate sessionwire.GateID,
 ) (commands.Gate, bool, error) {
-	page, err := s.store.ReadGates(ctx, sessionstore.ReadGatesRequest{
+	entry, err := s.store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
 		TenantID:  tenant,
 		SessionID: session,
 	})
 	if err != nil {
 		return commands.Gate{}, false, err
 	}
-	for _, projection := range page.Gates {
+	record := entry.Record
+	for _, projection := range record.OpenGates {
 		if projection.GateID != gate {
 			continue
 		}
-		return commands.Gate{}, false, &GateOwnerUnavailableError{GateID: gate}
+		if record.Binding.ProtocolMode != sessionstore.ProtocolModeDisposition {
+			return commands.Gate{}, false, &GateOwnerUnavailableError{GateID: gate}
+		}
+		return commands.Gate{
+			GateID:           projection.GateID,
+			Open:             true,
+			OwnerEpoch:       record.LeaseEpoch,
+			OpenedEventID:    projection.OpenedEventID,
+			OpenedJournalSeq: projection.OpenedJournalSeq,
+		}, true, nil
 	}
 	return commands.Gate{}, false, nil
 }

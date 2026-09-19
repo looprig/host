@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 
+	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/gates"
 	"github.com/looprig/host/internal/harnesstest"
 	"github.com/looprig/host/internal/residency"
@@ -292,5 +293,51 @@ func TestReplayIsTheRuntimesJournalPositionedBySequence(t *testing.T) {
 	}
 	if len(tail) != 1 || tail[0] != last {
 		t.Fatalf("Replay from %d visited %v, want only that sequence", last, tail)
+	}
+}
+
+// TestLoadGateDecidesADispositionGatesOwnerByResidencyEpoch: on a disposition
+// session the projection's residency mark IS the owner the backstop needs — the
+// grant of the last Host to write a gate, which v0.12.0 raises on every gate
+// write — so an open gate is answered rather than refused. OwnerEpoch is that
+// RESIDENCY epoch, never a journal epoch, and OwnerHostID is left empty: the
+// store records no Host identity, and the caller compares epochs only.
+func TestLoadGateDecidesADispositionGatesOwnerByResidencyEpoch(t *testing.T) {
+	w := newGateWorld(t)
+	first, firstLease := w.session(t)
+	opened := projectedGate(t, 0x10, 3)
+	if err := first.Open(t.Context(), opened); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	got, held, err := w.adapted.LoadGate(t.Context(), testTenant, testSession, opened.GateID)
+	if err != nil || !held {
+		t.Fatalf("LoadGate for an open disposition gate = (%+v, %t, %v), want it answered", got, held, err)
+	}
+	want := commands.Gate{
+		GateID:           opened.GateID,
+		Open:             true,
+		OwnerEpoch:       uint64(firstLease.Epoch()),
+		OpenedEventID:    opened.OpenedEventID,
+		OpenedJournalSeq: opened.OpenedJournalSeq,
+	}
+	if got != want {
+		t.Fatalf("LoadGate = %+v, want %+v", got, want)
+	}
+
+	// A SUCCESSOR'S FENCING WRITE MOVES THE OWNER, and nothing else about the
+	// gate: the next read names the successor's residency.
+	successor, secondLease := w.session(t)
+	if err := successor.Resolve(t.Context(), gates.FenceGateID); err != nil {
+		t.Fatalf("fence: %v", err)
+	}
+	got, held, err = w.adapted.LoadGate(t.Context(), testTenant, testSession, opened.GateID)
+	if err != nil || !held || got.OwnerEpoch != uint64(secondLease.Epoch()) {
+		t.Fatalf("LoadGate after the successor's fence = (%+v, %t, %v), want owner epoch %d", got, held, err, secondLease.Epoch())
+	}
+
+	// And an absent gate is still absent.
+	if got, held, err := w.adapted.LoadGate(t.Context(), testTenant, testSession, "gate-never-opened"); err != nil || held || got != (commands.Gate{}) {
+		t.Fatalf("LoadGate for an unopened gate = (%+v, %t, %v), want (zero, false, nil)", got, held, err)
 	}
 }
