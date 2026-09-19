@@ -229,6 +229,29 @@ func (w *DispositionWriter) SettleDisposition(
 	return adaptState(entry.Record.State)
 }
 
+// RejectDisposition rejects a claimed command before any attempt was
+// authorized. The released edge refuses a record carrying an attempt and admits
+// only the live claim's holder, so the residency passed is this Host's own and
+// cannot move any mark.
+func (w *DispositionWriter) RejectDisposition(
+	ctx context.Context,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	command sessionwire.CommandID,
+	rejection commands.DispositionRejection,
+) error {
+	_, _, err := w.store.RejectDispositionCommand(ctx, sessionstore.RejectDispositionCommandRequest{
+		TenantID:         tenant,
+		SessionID:        session,
+		CommandID:        command,
+		ExpectedRevision: rejection.ExpectedRevision,
+		ResidencyEpoch:   sessionstore.ResidencyEpoch(rejection.ResidencyEpoch),
+	})
+	// THE SECOND RESULT IS DISCARDED for SettleDisposition's reason: false with
+	// a nil error is the idempotent arm, a record this edge already rejected.
+	return classifyInbox(err)
+}
+
 // ---------------------------------------------------------------------------
 // Translation
 // ---------------------------------------------------------------------------

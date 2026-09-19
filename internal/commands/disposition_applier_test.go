@@ -70,6 +70,7 @@ type fakeDispositionStore struct {
 	claims  []DispositionClaim
 	begins  []DispositionAttempt
 	settles []DispositionSettlement
+	rejects []DispositionRejection
 }
 
 func newFakeDispositionStore(clock *manualClock) *fakeDispositionStore {
@@ -245,6 +246,40 @@ func (s *fakeDispositionStore) SettleDisposition(
 	return stored.record.State, nil
 }
 
+// RejectDisposition is RejectDispositionCommand's refusal order: a record with
+// an attempt is never rejected here, a terminal record with none is this edge's
+// own earlier answer, and a live claim admits only its own holder.
+func (s *fakeDispositionStore) RejectDisposition(
+	_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, command sessionwire.CommandID, rejection DispositionRejection,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.note("RejectDisposition"); err != nil {
+		return err
+	}
+	s.rejects = append(s.rejects, rejection)
+	stored, ok := s.commands[command]
+	if !ok {
+		return errors.New("commands_test: no such command")
+	}
+	if stored.record.hasAttempt() {
+		return errDispAttempt
+	}
+	if stored.record.State.Terminal() {
+		return nil
+	}
+	if rejection.ExpectedRevision == 0 || stored.record.Revision != rejection.ExpectedRevision {
+		return errDispRevision
+	}
+	if stored.record.State == StateClaimed && rejection.ResidencyEpoch != stored.record.ClaimResidencyEpoch &&
+		s.clock.Now().Before(stored.record.ClaimExpiresAt) {
+		return errDispState
+	}
+	stored.record.State = StateRejected
+	stored.record.Revision++
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // The other doubles
 // ---------------------------------------------------------------------------
@@ -336,6 +371,7 @@ type dispositionFixture struct {
 	attempts *countingAttemptIDs
 	closer   *recordingCloser
 	fence    *fakeFence
+	gates    *fakeGates
 	epoch    uint64
 	applier  *DispositionApplier
 }
@@ -365,6 +401,14 @@ func newDispositionFixture(t *testing.T, configure ...func(*dispositionFixture))
 	for _, apply := range configure {
 		apply(f)
 	}
+	f.rebuild()
+	return f
+}
+
+// rebuild constructs the applier from the fixture's current collaborators.
+func (f *dispositionFixture) rebuild() {
+	t := f.t
+	t.Helper()
 	// A TYPED NIL IS NOT AN ABSENT COLLABORATOR, and the fixture must not
 	// manufacture one: assigning a nil *recordingCloser into an AttemptClosers
 	// field produces a NON-nil interface holding a nil pointer, which would
@@ -373,6 +417,10 @@ func newDispositionFixture(t *testing.T, configure ...func(*dispositionFixture))
 	var closer AttemptClosers
 	if f.closer != nil {
 		closer = f.closer
+	}
+	var gates Gates
+	if f.gates != nil {
+		gates = f.gates
 	}
 	applier, err := NewDispositionApplier(DispositionApplierOptions{
 		Host:           f.host,
@@ -384,13 +432,13 @@ func newDispositionFixture(t *testing.T, configure ...func(*dispositionFixture))
 		JournalEpochs:  f.journal,
 		Attempts:       f.attempts,
 		Closer:         closer,
+		Gates:          gates,
 		Fence:          f.fence,
 	})
 	if err != nil {
 		t.Fatalf("NewDispositionApplier: %v", err)
 	}
 	f.applier = applier
-	return f
 }
 
 func (f *dispositionFixture) put(kind Kind, state State) *storedDisposition {

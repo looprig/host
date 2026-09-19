@@ -1535,6 +1535,32 @@ func (w *fakeDispositionWriter) SettleDisposition(
 	return held.state, nil
 }
 
+// RejectDisposition rejects a record with no attempt.
+func (w *fakeDispositionWriter) RejectDisposition(
+	_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, rejection commands.DispositionRejection,
+) error {
+	d := w.store
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.rowFor(tenant, session, command)
+	if !ok {
+		return fmt.Errorf("fakeDispositions: no such command %q", command)
+	}
+	held := d.held(command, row)
+	if held.attempt != "" {
+		return fmt.Errorf("fakeDispositions: %q has an attempt and cannot be rejected", command)
+	}
+	if held.state.Terminal() {
+		return nil
+	}
+	if rejection.ExpectedRevision == 0 || held.revision != rejection.ExpectedRevision {
+		return fmt.Errorf("fakeDispositions: revision conflict on %q", command)
+	}
+	held.state = commands.StateRejected
+	held.revision++
+	return nil
+}
+
 // fakeDispositionWriters is the composition's DispositionWriters.
 //
 // IT REFUSES A LEASE IT DID NOT ISSUE, which is the released adapter's own rule:

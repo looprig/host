@@ -1,5 +1,5 @@
 // Package harnessadapter binds Host's department seams to the released
-// github.com/looprig/harness v0.33.0 rig and session API.
+// github.com/looprig/harness rig and session API (v0.35.0 as pinned).
 //
 // # Step-1 inventory
 //
@@ -112,11 +112,15 @@
 // capability's two results exist to separate "no epoch" from "epoch 0" and harness
 // gates the report on the lease still being Valid.
 //
-// H6. HARNESS APPLIES ONLY input AND interrupt. runtimecommand.Kind is a closed
-// two-member set. commands.Kind has five: create, restore, input, interrupt and
-// gate_response. The three with no counterpart are refused here rather than
+// H6. HARNESS APPLIES input, interrupt AND, SINCE v0.35.0, gate_response.
+// runtimecommand.Kind is a closed three-member set; commands.Kind has five. The
+// two with no counterpart, create and restore, are refused here rather than
 // forwarded as an unknown kind, which Admitted.Validate would reject after the
-// application prefix had already been written.
+// application prefix had already been written. A gate_response is admitted with
+// harness's decoded answer (Admitted.GateResponse), built from the stored Core
+// body by internal/gateresponse — the same decode the applier ran before the
+// attempt — with the user as its source and the attempt the record authorized,
+// which harness requires for this kind.
 //
 // H7. AN input COMMAND MUST CARRY DECODED content.Blocks, AND HOST'S PAYLOAD IS
 // OPAQUE BYTES. department.RuntimeCommand documents the body as travelling

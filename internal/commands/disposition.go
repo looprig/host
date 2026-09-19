@@ -210,22 +210,29 @@ type DispositionSettlement struct {
 	ResidencyEpoch uint64
 }
 
-// A HOST-AUTHORED REJECTION IS DELIBERATELY ABSENT FROM THIS FILE, and the
-// absence is a decision rather than an omission.
+// DispositionRejection refuses a command BEFORE any dispatch of it was durably
+// authorized, which is the only rejection this protocol lets a Host make.
 //
-// The released store DOES publish one — RejectDispositionCommand refuses a
-// command before any dispatch of it was durably authorized — and a seam for it
-// would compile. It is not declared because NO PATH IN THIS HOST WOULD CALL IT.
-// Once an attempt exists the store decides the terminal arm from evidence and
-// there is no caller-authored rejection to make; before one exists, the only
-// reason to reject is the apply deadline, and §10.4 gives that to FACTORY's
-// deadline reconciler rather than to a Host that merely observed a clock. A
-// Host that rejected on its own reading would durably destroy work a successor
-// would have done.
+// IT EXISTS FOR ONE KIND AND ONE REASON, and it used to be deliberately absent.
+// Once an attempt exists the store decides the terminal arm from evidence, and
+// the apply deadline is FACTORY's reconciler's to act on, not a Host's that
+// merely observed a clock — so until gate_response no path in this Host had a
+// rejection to make, and a Host that rejected on its own reading would durably
+// destroy work a successor would have done. A gate_response body no Host could
+// ever apply is different: it is immutable, every Host reads the same bytes,
+// and harness refuses it only AFTER the attempt, when nothing would then settle
+// the command. So it is rejected here, while the command is still claimed. A
+// gate this Host does not yet own is NOT a reason: that blocks and is retried.
 //
-// The structural fencing guard is what keeps that honest: an unused method on a
-// "…Writes" interface fails as VACUOUS rather than sitting there looking
-// implemented, which is how this declaration was removed rather than retained.
+// It carries no reason, because the store records none (sessionstore v0.8.0's
+// stated cost), and no epoch a caller could raise: the residency it names is
+// this Host's own, which the released edge requires to be the live claim's.
+type DispositionRejection struct {
+	ExpectedRevision uint64
+
+	// ResidencyEpoch is the Host grant holding the claim.
+	ResidencyEpoch uint64
+}
 
 // ---------------------------------------------------------------------------
 // Collaborators
@@ -265,6 +272,10 @@ type DispositionWrites interface {
 	// SettleDisposition settles an applying command from durable evidence and
 	// reports the terminal state the STORE chose. A caller does not choose it.
 	SettleDisposition(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, settlement DispositionSettlement) (State, error)
+
+	// RejectDisposition rejects a claimed command before any attempt. See
+	// DispositionRejection for the one case that uses it.
+	RejectDisposition(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, rejection DispositionRejection) error
 }
 
 // AttemptClosers drives a successor's recovery closure for a PREDECESSOR's

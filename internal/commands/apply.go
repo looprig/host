@@ -587,6 +587,18 @@ const (
 	// being misdirected.
 	RefusalReferencedGateResponse ApplyRefusal = "referenced_gate_response"
 
+	// RefusalGateNotOwned reports a gate response whose gate the durable
+	// projection holds under a residency mark that is not this Host's grant:
+	// below it, this Host's fencing write has not landed yet; above it, a
+	// successor has written. Neither is a statement about the answer, so the
+	// command is left claimed and the pass retried, never rejected.
+	RefusalGateNotOwned ApplyRefusal = "gate_not_owned"
+
+	// RefusalNoGateReader reports a gate response reaching a composition that
+	// supplied no durable gate reader, so the gate could not be checked before
+	// the attempt.
+	RefusalNoGateReader ApplyRefusal = "no_gate_reader"
+
 	// RefusalInvalidEffect reports a terminal application that names no durable
 	// event.
 	RefusalInvalidEffect ApplyRefusal = "invalid_effect"

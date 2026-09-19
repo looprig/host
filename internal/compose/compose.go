@@ -149,6 +149,12 @@ type Options struct {
 	// leave it nil.
 	Gates GateSessions
 
+	// GateReads is the durable gate projection a gate_response is checked
+	// against before its attempt. OPTIONAL here, supplied by the production
+	// composition: without it every gate_response blocks its session's pass
+	// (commands.RefusalNoGateReader).
+	GateReads commands.Gates
+
 	// GateRetry is how long a gate publisher waits after a failed pass before
 	// retrying. Zero means DefaultGateRetry.
 	GateRetry time.Duration

@@ -8,6 +8,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/gateresponse"
 	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
 )
@@ -49,6 +50,11 @@ type DispositionApplierOptions struct {
 	// than concluding anything about it.
 	Closer AttemptClosers
 
+	// Gates reads the durable gate projection a gate_response is checked
+	// against before its attempt. OPTIONAL: a composition without one blocks
+	// every gate_response (RefusalNoGateReader) and applies every other kind.
+	Gates Gates
+
 	// Fence is the lease-epoch guard every durable write goes through.
 	Fence Fence
 }
@@ -67,6 +73,7 @@ type DispositionApplier struct {
 	journal   department.LeaseEpochReporter
 	attempts  AttemptIDs
 	closer    AttemptClosers
+	gates     Gates
 	fence     Fence
 }
 
@@ -129,6 +136,7 @@ func NewDispositionApplier(options DispositionApplierOptions) (*DispositionAppli
 		journal:   options.JournalEpochs,
 		attempts:  options.Attempts,
 		closer:    options.Closer,
+		gates:     options.Gates,
 		fence:     options.Fence,
 	}, nil
 }
@@ -263,6 +271,18 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 			Cause:     err,
 		}
 	}
+	// A GATE RESPONSE IS CHECKED HERE, AFTER THE CLAIM AND BEFORE THE ATTEMPT,
+	// because this is the last point at which a rejection is still possible:
+	// once an attempt exists only the runtime's evidence settles the command.
+	if record.Kind == KindGateResponse {
+		rejected, problem := a.checkGateResponse(ctx, record, revision, payload)
+		if problem != nil {
+			return Outcome{State: StateClaimed}, problem
+		}
+		if rejected {
+			return Outcome{State: StateRejected}, nil
+		}
+	}
 	// THE RUNTIME'S OWN GRANT, AND `held` IS WHAT IS BRANCHED ON. No pinned
 	// provider zeroes a released lease's epoch, so reading the number alone
 	// would stamp a live-looking dead value into an immutable attempt.
@@ -311,6 +331,88 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 		return Outcome{State: StateApplying, PrefixOwned: true}, problem
 	}
 	return a.settle(ctx, record, applying)
+}
+
+// checkGateResponse answers, before the attempt, every question Host can answer
+// about a gate response, and reports whether it rejected the command.
+//
+// THREE ANSWERS, AND THEY ARE DIFFERENT KINDS OF ANSWER:
+//
+//   - A BODY NO HOST COULD EVER APPLY is rejected: malformed, naming another
+//     session or command, a gate identity harness never mints, or — for a gate
+//     the projection holds and this Host owns — an expected-open version that
+//     is not the projected one. The body is immutable and every Host reads the
+//     same bytes, and harness would refuse it only after the attempt.
+//   - A LIMIT OF THIS HOST blocks with nothing written: a body behind an object
+//     reference (this Host does not dereference), an unreadable projection, no
+//     gate reader, or a gate whose residency mark is not this Host's grant
+//     (below it the fencing write has not landed; above it a successor wrote).
+//   - EVERYTHING ELSE IS THE RUNTIME'S. A gate the projection no longer holds
+//     is dispatched: harness is the authority on whether it is open, and
+//     settles an answer to a closed gate as no_op. Rejecting on the projection
+//     would race the publisher and could destroy a valid answer.
+//
+// OWNERSHIP IS DECIDED BY RESIDENCY EPOCH ONLY. The projection's mark is the
+// residency of the last Host to write a gate; it is compared with this Host's
+// residency grant and never with a journal epoch.
+func (a *DispositionApplier) checkGateResponse(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bool, error) {
+	if len(payload.Body) == 0 && payload.Ref != (sessionwire.ObjectReference{}) {
+		return false, &ApplyError{
+			Refusal:   RefusalReferencedGateResponse,
+			CommandID: record.CommandID,
+			Reason:    "the gate response's private body is stored behind an object reference, which this Host does not dereference and harness cannot accept",
+		}
+	}
+	if a.gates == nil {
+		return false, &ApplyError{
+			Refusal:   RefusalNoGateReader,
+			CommandID: record.CommandID,
+			Reason:    "this composition supplied no durable gate reader, so the gate cannot be checked before the attempt",
+		}
+	}
+	response, err := gateresponse.Decode(payload.Body, a.key.SessionID, record.CommandID)
+	if err != nil {
+		return a.reject(ctx, record, revision)
+	}
+	gate, found, err := a.gates.LoadGate(ctx, a.key.TenantID, a.key.SessionID, response.Request.GateID)
+	if err != nil {
+		return false, &ApplyError{
+			Refusal:   RefusalStore,
+			CommandID: record.CommandID,
+			Reason:    "the durable gate could not be read, so the gate response could not be checked",
+			Cause:     err,
+		}
+	}
+	if !found || !gate.Open {
+		return false, nil
+	}
+	if gate.OwnerEpoch != a.residency {
+		return false, &ApplyError{
+			Refusal:   RefusalGateNotOwned,
+			CommandID: record.CommandID,
+			Reason:    "the durable gate's residency mark is not this Host's grant, so this Host cannot yet say it holds the gate",
+		}
+	}
+	request := response.Request
+	if (request.ExpectedOpenEventID != "" && request.ExpectedOpenEventID != gate.OpenedEventID) ||
+		(request.ExpectedOpenJournalSeq != 0 && request.ExpectedOpenJournalSeq != gate.OpenedJournalSeq) {
+		return a.reject(ctx, record, revision)
+	}
+	return false, nil
+}
+
+// reject durably rejects a claimed command before any attempt.
+func (a *DispositionApplier) reject(ctx context.Context, record DispositionRecord, revision uint64) (bool, error) {
+	err := a.fence.Write(func() error {
+		return a.writes.RejectDisposition(ctx, a.key.TenantID, a.key.SessionID, record.CommandID, DispositionRejection{
+			ExpectedRevision: revision,
+			ResidencyEpoch:   a.residency,
+		})
+	})
+	if err != nil {
+		return false, a.storeRefusal(record, "the gate response no Host could apply could not be rejected", err)
+	}
+	return true, nil
 }
 
 // dispatch drives the runtime with the authorized attempt's identity.

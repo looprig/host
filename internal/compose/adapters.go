@@ -156,6 +156,7 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		JournalEpochs: request.Runtime,
 		Attempts:      commands.UUIDAttemptIDs{},
 		Closer:        closerOrNil(closer),
+		Gates:         s.options.GateReads,
 		Fence:         guard,
 	})
 	if err != nil {

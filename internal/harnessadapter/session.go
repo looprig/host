@@ -7,10 +7,12 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/gateresponse"
 )
 
 // boundSession is one launched harness session, expressed as the capabilities
@@ -173,9 +175,9 @@ func (s *boundSession) pump(
 
 // ApplyCommand applies one admitted runtime command.
 //
-// FOUR OF THE FIVE HOST KINDS AND BOTH PAYLOAD FORMS ARE NARROWER HERE THAN AT
-// THE SEAM, and each refusal is a finding rather than a policy: H6 for the three
-// kinds runtimecommand.Kind does not name, H7 for the decode an input requires,
+// THE HOST KINDS AND BOTH PAYLOAD FORMS ARE NARROWER HERE THAN AT THE SEAM,
+// and each refusal is a finding rather than a policy: H6 for the two kinds
+// runtimecommand.Kind does not name, H7 for the decode an input requires,
 // H8 for the object reference that has nowhere to go, and H5 for the lease epoch
 // the seam does not carry.
 func (s *boundSession) ApplyCommand(ctx context.Context, command department.RuntimeCommand) error {
@@ -356,11 +358,29 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		// an identity the released type refuses is refused BEFORE the applier.
 		AttemptID: runtimecommand.AttemptID(command.AttemptID),
 	}
-	if !admitted.Kind.Valid() || admitted.Kind == runtimecommand.KindGateResponse {
+	if !admitted.Kind.Valid() {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{
 			CommandID: command.CommandID,
 			Kind:      command.Kind,
-			Reason:    "harness applies only input and interrupt commands",
+			Reason:    "harness applies only input, interrupt and gate_response commands",
+		}
+	}
+	if admitted.Kind == runtimecommand.KindGateResponse {
+		// THE SAME DECODE THE APPLIER RAN BEFORE THE ATTEMPT, so a body refused
+		// here was already rejected there and this refusal is unreachable from
+		// a conforming applier. It names the bound session's Core identity,
+		// which is what the stored body must name.
+		response, err := gateresponse.Decode(command.Payload, s.session, command.CommandID)
+		if err != nil {
+			return runtimecommand.Admitted{}, err
+		}
+		admitted.GateResponse = &gate.GateResponse{
+			GateID: gate.ID(response.GateID),
+			Action: response.Request.Action,
+			Values: response.Request.Values,
+			// ALWAYS THE USER. A classifier source is refused by the session
+			// on this path, and nothing Factory admits is a policy's answer.
+			Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 		}
 	}
 	if admitted.Kind == runtimecommand.KindInput {

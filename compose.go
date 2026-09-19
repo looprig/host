@@ -372,6 +372,7 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		Writers:              adapted,
 		Targets:              adapted,
 		Gates:                adapted,
+		GateReads:            adapted,
 		Checkpointer:         collaborators.Checkpointer,
 		Auth:                 collaborators.Auth,
 		PingInterval:         blueprint.Link.PingInterval,

@@ -158,7 +158,11 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 	// down the accept or refuse arm by runtimecommand.Kind.Valid rather than by a
 	// second list here, so a kind harness starts applying changes arm without an
 	// edit. Only the SPACE is hand-written; the expectation is not.
-	for _, kind := range []string{"create", "restore", "input", "interrupt", "gate_response"} {
+	// gate_response IS NOT A ROW: harness applies it since v0.35.0 and this
+	// adapter admits it with a decoded answer; see
+	// TestAdmitBuildsAGateResponseFromTheStoredBody and
+	// TestAdmitRefusesAGateResponseItCannotDecode.
+	for _, kind := range []string{"create", "restore", "input", "interrupt"} {
 		t.Run(kind, func(t *testing.T) {
 			bound := &boundSession{
 				leaseEpoch: heldEpoch(3),
@@ -170,11 +174,7 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 			command.Kind = kind
 			admitted, err := bound.admit(command)
 
-			// gate_response IS VALID TO HARNESS SINCE v0.35.0 AND STILL REFUSED
-			// HERE: this adapter does not yet build its decoded response, and an
-			// Admitted without one is refused by Validate only AFTER the caller
-			// has begun an attempt.
-			if runtimecommand.Kind(kind).Valid() && kind != string(runtimecommand.KindGateResponse) {
+			if runtimecommand.Kind(kind).Valid() {
 				if err != nil {
 					t.Fatalf("admit(%q) = %v, want it accepted", kind, err)
 				}
@@ -187,8 +187,8 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 			if !errors.As(err, &unsupported) {
 				t.Fatalf("admit(%q) = %v, want UnsupportedCommandError", kind, err)
 			}
-			if !strings.Contains(unsupported.Reason, "input and interrupt") {
-				t.Fatalf("reason = %q, want the two-kind refusal", unsupported.Reason)
+			if !strings.Contains(unsupported.Reason, "input, interrupt and gate_response") {
+				t.Fatalf("reason = %q, want the three-kind refusal", unsupported.Reason)
 			}
 		})
 	}
