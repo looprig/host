@@ -259,9 +259,10 @@ type CreateRequest struct {
 	// target must launch under exactly this id (harness: rig.WithSessionID),
 	// because the binding is the only record of where the session's journal
 	// lives; a session launched under a minted id writes a journal nothing
-	// can find again. Host sends a create only after establishing that no
-	// journal exists under it. Zero means the durable record named none — only
-	// a record with no binding — and the target mints one.
+	// can find again. Host sends a create only after reading no journal under
+	// it, under the residency lease; a lease lost mid-launch can still race a
+	// successor (closing that needs harness create-if-absent). Zero arises only
+	// for a session with no catalog record, and the target mints one.
 	RigSessionID uuid.UUID
 }
 

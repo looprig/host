@@ -59,10 +59,15 @@ whose cause is reachable with `errors.As` / `errors.Is`. A Host behind a
 path-prefixed ingress must use host-based routing, a port per Host, or
 in-cluster Service DNS.
 
-**Compatibility window.** A Factory at **v0.3.0 or older** dials the advertised
-endpoint **verbatim**; dialling a bare base gets **404**, so such a Factory
-cannot reach a v0.3.0 Host. **Upgrade Factory together with Host** (to the
-first Factory that derives addresses with `HostLinkEndpoint`). In the other
+**Compatibility window.** Every released Factory up to and including
+**v0.3.0** dials the advertised endpoint **verbatim** — measured against
+factory v0.3.0; no earlier one can derive, since `HostLinkEndpoint` first
+shipped in core v0.10.0 — and dialling a bare base gets **404**, so such a
+Factory cannot reach a v0.3.0 Host. **The failure is silent**: measured with
+released factory v0.3.0, a created session stays `pending`, is placed
+**nowhere**, and Factory **logs nothing** — a failed dial classifies as
+`ErrHostUnreachable`, which it only counts. **Upgrade Factory together with
+Host** (to the first Factory that derives addresses with `HostLinkEndpoint`). In the other
 direction, a **v0.2.1 Host reconfigured to a bare base already works** with a
 deriving Factory, because v0.2.1 already served every tenant at
 `/hostlink/<tenant>` — so a fleet can move Factory first and then Host. A
@@ -96,17 +101,43 @@ As of v0.3.0:
 - **A create is decided by the runtime's journal**, read under that id from
   the journal store registered for the session's (tenant, storage binding) in
   `Collaborators.JournalStores`: no conversation → create; a conversation →
-  **restore it**; cannot tell → **refuse with `runtime_unavailable`**. A
-  restore still refuses when the target requires a checkpoint the session has
-  not got. harness's catalog (`ReadMeta`) is consulted first and the ledger is
-  the authority, because the catalog is a best-effort cache.
+  **restore it**. A restore still refuses when the target requires a
+  checkpoint the session has not got. harness's catalog (`ReadMeta`) is
+  consulted first and the ledger is the authority, because the catalog is a
+  best-effort cache. Only a create consults the journal; an explicit
+  `restore` is launched as before.
+- **The two refusals carry different codes.** When **no journal store serves
+  the session's binding**, Host cannot tell a new session from a re-placed
+  one and refuses the create with **`runtime_unavailable`**. When the journal
+  **read fails** (a storage fault), the attach is refused with the **empty,
+  unclassified code**, like every other durable-read failure. Neither ever
+  starts the conversation over. **Warning:** factory v0.3.0 treats both as
+  "try the next candidate, retry next sweep" and **logs neither** — it only
+  counts them — so a fleet-wide refusal shows up as sessions that never
+  place, not as log lines. Host itself has no logger; the attach error Host
+  returns names the reason.
 - **The journal store for each binding must therefore be the released harness
   session store** (`*harness/pkg/sessionstore.Store`, or a value embedding
-  one): the same journal the runtime writes and settlement reads. A reader
-  that is not one leaves Host unable to tell a new session from a re-placed
-  one, and every create for that binding is refused.
+  one): the same journal the runtime writes and settlement reads.
+  **`host.Compose` refuses a reader that is not one** (`InvalidCompositionError`
+  on `Collaborators.JournalStores`), because every create routed to it would be
+  refused.
 - `Collaborators.RigSessionIDs` is **deprecated and optional**; it is
-  consulted only for a record with no binding.
+  consulted only for a record with no binding (legacy). Such a record's
+  journal is never probed, so **a create over a legacy record is now
+  refused** (v0.2.1 launched it); no shipped path creates one a Host can hold.
+- **What the journal check does not close.** The journal is read under the
+  residency lease, before the launch. A Host that reads "no conversation",
+  stalls inside the launch and **loses its lease** can still create over a
+  conversation a successor began meanwhile (measured: a second
+  `SessionStarted`; the conversation survived the next restore). Host cannot
+  close this alone; it needs harness to create-if-absent under its own
+  journal lease, which is booked for harness.
+- **Endpoints Host does not refuse although they are not usable from another
+  pod:** the unspecified address (`ws://0.0.0.0:1`), a link-local zone
+  (`ws://[fe80::1%25en0]:9000`), a raw non-ASCII IDNA host (advertised
+  verbatim, not converted to punycode), and invalid DNS names such as
+  `ws://h;x` and `ws://-h`. Core accepts all of them; they are booked.
 
 ## Known limitations you must read before deploying
 

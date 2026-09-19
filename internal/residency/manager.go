@@ -211,15 +211,19 @@ type SessionState struct {
 	// id the session's immutable durable binding names (Factory derives it
 	// at create; it is NOT the Core session id). A restore that does not carry
 	// it has nothing to restore from, and a create launches under it so the
-	// journal the runtime writes is the one the binding names. Zero means the
-	// store named none — only a record with no binding — and a create then
-	// lets the rig mint one.
+	// journal the runtime writes is the one the binding names. Zero arises
+	// only for a session with NO catalog record (Exists=false), and a create
+	// then lets the rig mint one. A record without a binding (legacy) gets the
+	// deprecated RigSessionIDs collaborator's answer, or an error.
 	RigSessionID uuid.UUID
 
 	// RuntimeJournal reports whether the runtime's own journal already holds
 	// a conversation under RigSessionID. It is what decides a create: see
 	// RuntimeJournal. The zero value is RuntimeJournalUnknown, which refuses a
-	// create, so a store that forgot to answer fails closed.
+	// create, so a store that forgot to answer fails closed. A legacy record
+	// (no binding) is never probed, so it stays Unknown and every create over
+	// one is refused; v0.2.1 launched it. No shipped path creates a legacy
+	// record a Host could hold (residency is disposition-only).
 	RuntimeJournal RuntimeJournal
 
 	// HasCheckpoint and CheckpointSequence report the active workspace
@@ -1182,16 +1186,30 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// create whose journal cannot be established is refused rather than
 	// launched, because launching is the silent restart.
 	//
-	// THE REFUSALS ARE runtime_unavailable, the code this Host already gives a
-	// restore it cannot perform (no durable state, a required checkpoint
-	// missing). It is the right one to reuse and the others are wrong in ways
-	// that matter to the caller: runtime_mismatch sends Factory looking for a
-	// Host on a different BUILD, which cannot help; epoch_mismatch invalidates
-	// a binding nobody holds; no_capacity and not_admitting describe this
-	// Host's occupancy, and would have Factory retry the same session on
-	// another Host that must reach the same answer from the same journal. The
-	// empty code — an unclassified failure — is kept for a store that failed
-	// to answer at all, as every other store failure here is.
+	// THE REFUSALS BELOW ARE runtime_unavailable, the code this Host already
+	// gives a restore it cannot perform (no durable state, a required
+	// checkpoint missing): the journal is Unknown (no journal store serves the
+	// binding — Compose refuses a reader that is not a harness store, so this
+	// is a binding the table does not serve), or a restore needs a checkpoint
+	// the session has not got. It is chosen for what it SAYS, not for what
+	// factory v0.3.0 does with it: v0.3.0 treats runtime_unavailable exactly as
+	// it treats no_capacity — try the next candidate, and retry on the next
+	// sweep — and only COUNTS it, never logs it. runtime_mismatch would claim a
+	// build problem, epoch_mismatch a stale binding, no_capacity and
+	// not_admitting this Host's occupancy; none of those is what happened.
+	//
+	// A JOURNAL READ THAT FAILS NEVER REACHES THIS SWITCH. LoadSessionState
+	// returns the error, and the attach is refused above with the EMPTY,
+	// unclassified code, as every other durable-read failure is (factory
+	// v0.3.0 reads that as ErrAttachFailed and also tries the next candidate).
+	//
+	// WHAT THIS DOES NOT CLOSE. The journal is read under the residency lease,
+	// before the launch. A Host that reads Absent, stalls inside the launch and
+	// LOSES its lease can still create over a conversation a successor began
+	// in the meantime (measured: a second SessionStarted; the conversation
+	// survived the next restore). No check Host can make closes it, because
+	// the stall is inside the launch; it needs harness to create-if-absent
+	// under its own journal lease. Booked as a harness follow-up.
 	launch := request.Mode
 	if request.Mode == ModeCreate && !state.RigSessionID.IsZero() {
 		switch state.RuntimeJournal {

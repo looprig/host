@@ -75,7 +75,8 @@ type NamespaceLayout func(sessionwire.TenantID, sessionwire.SessionID) string
 // answer from a composition could only agree with it or name a journal
 // nothing else reads. The collaborator is optional and is kept only so a
 // v0.2.x composition still compiles; no session this workspace ships can be
-// hosted without a binding.
+// hosted without a binding. A legacy record's journal is never probed, so a
+// create over one is now refused (v0.2.1 launched it).
 type RigSessionIDs func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uuid.UUID, error)
 
 // WarmTimer is one session's warm countdown, in time.Timer's own three methods.

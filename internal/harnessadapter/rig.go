@@ -114,10 +114,14 @@ func (a *Adapter) NewSession(ctx context.Context, request department.RigCreateRe
 	// the runtime session id the durable binding names, and a session launched
 	// without it gets an id the rig mints and nothing records — so its journal
 	// is unreachable to every later restore and every settlement read. Host
-	// sends a create only once it has found no journal under that id; harness
-	// verifies no freshness itself (rig.WithSessionID says so), and that check
-	// is the whole defence. A zero id names no binding, and harness refuses
-	// WithSessionID(zero), so the rig mints one then.
+	// sends a create only once it has read no journal under that id, under
+	// the residency lease; harness verifies no freshness itself
+	// (rig.WithSessionID says so). That read is Host's defence but not a
+	// complete one: a lease lost mid-launch can still race a successor, and
+	// closing it needs harness to create-if-absent under its own journal
+	// lease (a booked harness follow-up). A zero id names no session (no
+	// catalog record), and harness refuses WithSessionID(zero), so the rig
+	// mints one then.
 	var options []rig.SessionOption
 	if !request.RigSessionID.IsZero() {
 		options = append(options, rig.WithSessionID(request.RigSessionID))

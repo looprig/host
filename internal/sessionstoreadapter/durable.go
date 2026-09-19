@@ -121,10 +121,15 @@ func (e *RuntimeSessionIDError) Unwrap() error { return e.Cause }
 
 // LoadSessionState reports the durable state a hydration reads.
 //
-// A session with no catalog record is Exists=false and is the create path; a
-// session with one is the restore path, and the restore path CANNOT BE SERVED by
-// the released store — see F5. It refuses rather than answering with a zero
-// RigSessionID, because the caller's next act is to hand that UUID to Harness.
+// A session with no catalog record is Exists=false. A record with a BINDING
+// (every session Factory creates) reports the binding's runtime session id as
+// RigSessionID, refusing one that is not a non-zero UUID, and the runtime
+// journal's state under it (a journal read that fails is returned as an
+// error, never as Absent). A record without a binding (legacy) takes its
+// identity from the RigSessionIDs collaborator, and refuses without one
+// rather than answering with a zero RigSessionID, because the caller's next
+// act is to hand that UUID to Harness; its journal is never probed, so it
+// reports RuntimeJournalUnknown.
 func (s *Store) LoadSessionState(
 	ctx context.Context,
 	tenant sessionwire.TenantID,
