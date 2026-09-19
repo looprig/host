@@ -490,6 +490,12 @@ func TestAnAskUserGateReachesFactoryAndItsAnswerSettlesApplied(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{})
 	service, launcher, epoch := world.host(t, 4)
 	t.Cleanup(func() { stopBounded(service) })
+	// THE CAPABILITY SIGNAL, before any gate exists: a gate-publishing Host
+	// fences on attach, so the projection's residency mark equals the live
+	// owner's registered residency epoch. No Host before v0.4.0 writes the mark
+	// on a disposition session at all, so a Factory comparing the two admits a
+	// gate_response only to a Host that can apply it.
+	gateE2EEventually(t, "the attach-time fencing write", func() bool { return world.mark(t) == epoch })
 
 	world.submit(t, launcher.controller(), "PLEASE-ASK")
 	opened := world.gates(t, 1)[0]

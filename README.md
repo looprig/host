@@ -33,6 +33,102 @@ that attempt's identity and settles the command from the runtime's own durable
 disposition.** Read the next section before you plan around it; the mechanism is
 measured, not cautionary.
 
+**Since v0.4.0 every gate an agent raises reaches Factory, and the user's answer
+settles through the same path** — see "Upgrading to v0.4.0: gates".
+
+## Upgrading to v0.4.0: gates
+
+### Every AskUser and permission gate is published; the answer is a disposition command
+
+- **Publication.** Each resident session runs a gate publisher
+  (`internal/gates`). It subscribes to the runtime's committed stream (hints
+  only), makes one **fencing write** under the session's store-issued
+  `*ResidencyGrant` (never a bare epoch), folds the runtime journal
+  (`OpenEventReplayer`, positioned by ledger sequence) into the set of open gates,
+  and converges the sessionstore projection on it: `OpenGate` for a gate the
+  journal holds and the projection lacks, `ResolveGate` for one the journal has
+  closed. A lost subscription is resumed from the last sequence folded. A
+  superseded grant stops the publisher. A gate already projected (by a
+  predecessor) is never re-opened.
+- **The projection** is a function of the journaled `GateOpened` alone:
+  `harness sessionwire.ProjectGatePage` under a `ReadScope` whose Core
+  `SessionID` and `RuntimeSessionID` come from **one** read of the binding;
+  answerability `resident`; deadline = the event's durable `CreatedAt` + the
+  gate's `ResponsePolicy.Timeout`, or a per-kind TTL compiled into Host
+  (permission 5m — harness journals its own 5m default, so this is only a
+  fallback; ask_user and form 24h; open-url 1h).
+- **Ownership is a residency epoch.** On a disposition session the projection's
+  `CatalogRecord.LeaseEpoch` is the residency of the last Host to write a gate.
+  `LoadGate` returns it as `OwnerEpoch` (and no Host id); it is compared with the
+  Host's residency grant, never with a journal epoch.
+- **Applying an answer.** A `gate_response` is checked after the claim and
+  before the attempt — the last point a rejection is possible:
+  - **rejected** (`RejectDispositionCommand`, no durable reason) when no Host
+    could ever apply it: not Core's strict `GateResponseRequest`, naming another
+    session or command, a gate id that is not a non-zero UUID, or — for a gate
+    the projection holds under this Host's mark — an `ExpectedOpen*` that is not
+    the projected version;
+  - **blocked, nothing written** for a limit of this Host: a body behind an
+    object reference, an unreadable projection, or a gate whose mark is not this
+    Host's grant (fence not yet landed, or superseded);
+  - **dispatched** otherwise, including for a gate the projection no longer
+    holds — harness is the authority and settles an answer to a closed gate
+    `no_op`.
+  The adapter builds `Admitted.GateResponse` (source: user) under the
+  authorized `AttemptID`, and the command settles from the runtime's evidence
+  only.
+- **What the outcomes mean.** `applied/applied`: the answer resolved the gate.
+  `applied/no_op`: the gate was already closed (a second answer, a timeout that
+  won, a gate closed at restore). `rejected`: the body could never apply.
+
+### ONE-WAY UPGRADE
+
+Once a session's journal holds any `gate_response` application — applied,
+no_op or refused — harness ≤ v0.34.0 cannot replay or reopen it. **Never roll a
+Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
+
+### Limits you must plan around (harness v0.35.0)
+
+- **A gated session cannot be released gracefully.** harness releases a session
+  only when it is whole-session idle, and a session parked at a gate is not. The
+  drain bounds that release by its grace (it used to hang forever); the gate
+  stays open and projected, the runtime keeps its journal lease until the
+  process exits, and the successor restores the session as it restores a
+  crashed Host's.
+- **After a restore**, a permission gate is restored open and answerable, but
+  the turn that was parked at it is `TurnInterrupted`: the approval is applied
+  and nothing runs the tool. An **ask_user** gate is closed at restore
+  (`restore_unavailable`) and an answer to it settles `no_op`. Both are booked
+  for harness v0.36.0.
+- A crash between the runtime's `GateResolved` and its disposition frame leaves
+  the command `applying` forever (never a false `not_applied`): the same
+  liveness gap input has.
+
+### Capability: how a Factory knows a Host can apply a gate response
+
+v0.4.0 advertises **nothing new** in `hostlink_methods`. The signal it does
+guarantee: **after its attach-time fencing write, the projection's residency
+mark equals the owning Host's registered `LeaseEpoch`**, and no Host before
+v0.4.0 ever writes that mark on a disposition session. A Factory that admits a
+`gate_response` only when `owner.LeaseEpoch == CatalogRecord.LeaseEpoch` never
+admits one for an older Host.
+
+### Other v0.4.0 changes
+
+- **A superseded generation still releases its sessions.** A newer incarnation
+  of the same HostID started before the old one stops makes the old drain's
+  target withdrawal fail permanently (`host target generation`); the drain used
+  to abort there, before releasing any session lease, and every later Host got
+  `epoch_mismatch`. The row now belongs to the newer generation, the drain skips
+  it (`service.ErrTargetGenerationSuperseded`) and releases every session. A
+  platform should still not overlap two generations of one HostID.
+- **A successor takes a crashed predecessor's command claim** before its attempt
+  (it used to resume at the attempt, which the store refuses, forever).
+- **`Collaborators.Logger`** (optional `*slog.Logger`, nil discards): attach
+  refusals at hydration are WARN with tenant, session, step, code and reason;
+  placement-race refusals are DEBUG; a failed gate pass and a failed
+  advertisement heartbeat are WARN. `cmd/host` logs JSON to stderr.
+
 ## Upgrading to v0.3.0
 
 ### `HOST_INTERNAL_ENDPOINT` is a BASE, and Factory must move with Host
@@ -357,10 +453,10 @@ effect that may already have committed. Host's honest exactly-once claim is
 **"at most one authorized attempt, settled only from the runtime's durable
 disposition"**.
 
-**There is no Host-authored rejection once an attempt exists**, and none before
-one either: the only pre-attempt reason to reject is the apply deadline, and
-§10.4 gives that to Factory's deadline reconciler. `RejectDispositionCommand` is
-deliberately not bound.
+**There is no Host-authored rejection once an attempt exists.** Before one,
+exactly one kind is ever rejected by Host (v0.4.0): a `gate_response` whose body
+no Host could apply; see "Gates" below. The apply deadline is still Factory's
+deadline reconciler's (§10.4), never a Host's.
 
 ### What a deployment must wire, and what Host cannot check
 
