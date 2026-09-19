@@ -465,13 +465,21 @@ type partialStates struct {
 }
 
 func (p *partialStates) sample() {
-	// Read the ledger FIRST and the publication SECOND. Reading them the other
-	// way round would make "published while still admitting" reachable by the
-	// sampler's own interleaving rather than by the drain's.
-	draining := p.ledger.Draining()
-	published := p.ads.count()
-	begun := p.begun()
+	// READ IN THE REVERSE OF THE ORDER THE DRAIN WRITES. The drain flips the
+	// ledger, then publishes, then becomes observable, then touches sessions.
+	// Every violation below pairs a LATER state with the absence of an EARLIER
+	// one, so the later state must be read first: a sampler preempted between
+	// two reads then pairs a stale later state with a fresh earlier one, which
+	// can only hide a violation, never invent one. An earlier version read in
+	// the drain's own order and claimed that prevented tearing; it caused it —
+	// read published=0, the drain proceeds, read touched>0, and a correct drain
+	// was reported half-done (54-72 in 500 runs at -race -cpu 1, at v0.2.1 as
+	// well as v0.3.0). The positive control still catches a genuinely
+	// misordered transition.
 	touched := p.journal.entryCount()
+	begun := p.begun()
+	published := p.ads.count()
+	draining := p.ledger.Draining()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
