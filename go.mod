@@ -5,7 +5,7 @@ go 1.26.8
 require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/looprig/core v0.10.0
+	github.com/looprig/core v0.11.0
 	github.com/looprig/harness v0.35.0
 	github.com/looprig/inference v0.12.0
 	github.com/looprig/sessionstore v0.12.0

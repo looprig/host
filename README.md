@@ -24,7 +24,7 @@ and compared segment by segment, so a sibling package under
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.35.0. Core is v0.10.0.
+`github.com/looprig/harness` v0.35.0. Core is v0.11.0.
 
 **A composed Host applies a command end to end: it attaches a disposition
 session, consumes its durable command stream, claims a command under its
@@ -106,12 +106,26 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
 
 ### Capability: how a Factory knows a Host can apply a gate response
 
-v0.4.0 advertises **nothing new** in `hostlink_methods`. The signal it does
-guarantee: **after its attach-time fencing write, the projection's residency
-mark equals the owning Host's registered `LeaseEpoch`**, and no Host before
-v0.4.0 ever writes that mark on a disposition session. A Factory that admits a
-`gate_response` only when `owner.LeaseEpoch == CatalogRecord.LeaseEpoch` never
-admits one for an older Host.
+A Host that applies `gate_response` advertises Core's capability token
+**`hostlink.command.gate_response`** (`sessionwire.HostLinkCapabilityGateResponse`,
+core v0.11.0) in its connect reply's `hostlink_methods`, after the five reserved
+methods. **A Factory admits — and wakes — a gate response only for a Host whose
+reply `Supports` it**; no earlier Host advertises it. A token is not a method:
+nothing dispatches on it, and sent as an RPC it is answered from the channel arm
+like any unknown name. Host advertises it only when its composition wires both
+gate seams (publication and the pre-attempt check); `host.Compose` always does.
+
+The projection's residency mark equalling this Host's grant is **not** a
+capability signal. It is the applier's **ownership** check (an answer to a gate
+whose mark is not this Host's grant blocks until it is), and a Factory must not
+read `CatalogRecord.LeaseEpoch` to decide anything.
+
+**Mixed fleets.** An answer admitted while a v0.4.0 Host owns the session can
+still be re-placed onto a v0.3.0 Host, which claims it, begins its attempt and
+cannot apply it: it sits `applying` until a v0.4.0 successor settles it
+`not_applied`. **Do not run v0.3.0 and v0.4.0 Hosts serving gating agents
+together.** factory v0.5.0 refuses admission, and filters pooled placement, on
+the token.
 
 ### Other v0.4.0 changes
 

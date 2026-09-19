@@ -82,6 +82,9 @@ type factoryLink struct {
 
 	waiting chan struct{}
 	closed  bool
+
+	// connected is the connect reply's raw result.
+	connected json.RawMessage
 }
 
 // pushFrame is one asynchronous publication.
@@ -148,6 +151,7 @@ func dialFactoryLink(t *testing.T, serverURL string, tenant sessionwire.TenantID
 	if reply.Connect == nil || reply.Error != nil {
 		t.Fatalf("connect as %s was refused: %s", tenant, mustJSON(t, reply))
 	}
+	link.connected = *reply.Connect
 	return link
 }
 
@@ -1719,6 +1723,87 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 			t.Errorf("%s is declared as %q in source and imported as %q", name, got, value)
 		}
 	}
+
+	// -- the capability arm (core v0.11.0) ----------------------------------
+	// A capability token shares hostlink_methods with the methods but is not
+	// one, so it is parsed separately and does not count toward the five.
+	tokens, err := hostLinkConstants("../realtime/hostlink", "Capability", coreCapabilityNames)
+	if err != nil {
+		t.Fatalf("parse the hostlink capability constants: %v", err)
+	}
+	wantTokens := map[string]string{"CapabilityGateResponse": hostlink.CapabilityGateResponse}
+	if len(tokens) != len(wantTokens) {
+		t.Fatalf("hostlink declares capability tokens %v, want exactly %v; a new token is a new promise to Factory and must be reviewed as one", tokens, wantTokens)
+	}
+	for name, value := range wantTokens {
+		if tokens[name] != value {
+			t.Errorf("%s is declared as %q in source and imported as %q", name, tokens[name], value)
+		}
+		if _, method := declared[name]; method {
+			t.Errorf("%s was also read as a reserved method", name)
+		}
+	}
+}
+
+// coreCapabilityNames resolves the Core capability selector a hostlink
+// capability constant may be declared from; it is coreFramingNames' role for
+// tokens, and a selector absent from it is reported, not skipped.
+var coreCapabilityNames = map[string]string{
+	"HostLinkCapabilityGateResponse": sessionwire.HostLinkCapabilityGateResponse,
+}
+
+// hostLinkConstants is reservedHostLinkMethods' parse over another name
+// prefix and another table of Core names: every production constant whose name
+// begins with prefix, as name to wire value.
+func hostLinkConstants(directory, prefix string, core map[string]string) (map[string]string, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	fileSet := token.NewFileSet()
+	found := map[string]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(directory, name)
+		file, err := parser.ParseFile(fileSet, path, nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, declaration := range file.Decls {
+			general, ok := declaration.(*ast.GenDecl)
+			if !ok || general.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range general.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for index, constant := range value.Names {
+					if !strings.HasPrefix(constant.Name, prefix) {
+						continue
+					}
+					if index >= len(value.Values) {
+						return nil, errors.New(path + ": " + constant.Name + " declares no value of its own")
+					}
+					selector, ok := value.Values[index].(*ast.SelectorExpr)
+					if !ok {
+						return nil, errors.New(path + ": " + constant.Name + " is not declared from a Core constant")
+					}
+					pkg, ok := selector.X.(*ast.Ident)
+					wire, known := core[selector.Sel.Name]
+					if !ok || pkg.Name != "sessionwire" || !known {
+						return nil, errors.New(path + ": " + constant.Name + " is declared from a selector this guard does not resolve")
+					}
+					found[constant.Name] = wire
+				}
+			}
+		}
+	}
+	return found, nil
 }
 
 // reservedHostLinkMethods returns every reserved RPC method constant declared

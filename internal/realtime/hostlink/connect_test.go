@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,39 +93,30 @@ func TestConnectWithoutMultiplexerAdvertisesNoMethods(t *testing.T) {
 func TestTheAdvertisedMethodsAreExactlyTheOnesDispatchRoutes(t *testing.T) {
 	f := newFixture(t, withAttacher(&recordingAttacher{answer: acceptedObservation(testSession)}))
 	auth := &recordingAuthenticator{wantToken: testCredential}
-	server, httpServer := startServer(t, auth, hostlink.Config{Multiplexer: f.mux})
+	server, httpServer := startServer(t, auth, hostlink.Config{Multiplexer: f.mux, Capabilities: []string{hostlink.CapabilityGateResponse}})
 	defer closeServers(t, server, httpServer)
 
 	connection := dial(t, httpServer.URL, "")
 	defer connection.Close()
-	reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}})
-	if reply.Connect == nil || reply.Error != nil {
-		t.Fatalf("connect reply = %#v", reply)
-	}
-	negotiated, err := sessionwire.DecodeHostLinkConnectReply(reply.Connect.Data)
-	if err != nil {
-		t.Fatalf("Core's own decoder refuses this Host's connect reply %s: %v", reply.Connect.Data, err)
-	}
-	advertised := negotiated.HostLinkMethods()
-	if len(advertised) == 0 {
-		t.Fatal("the connect reply advertises no methods")
-	}
+	negotiated := negotiatedReply(t, connection)
 	for _, method := range []string{sessionwire.HostLinkMethodAttach, sessionwire.HostLinkMethodBind} {
 		if !negotiated.Supports(method) {
 			t.Fatalf("Supports(%q) = false; a Factory would refuse to place on this Host", method)
 		}
 	}
+	methods, capabilities := splitAdvertised(negotiated.HostLinkMethods())
 
 	routed := dispatchCases(t)
-	sort.Strings(advertised)
 	sort.Strings(routed)
-	if !slices.Equal(advertised, routed) {
-		t.Fatalf("advertised %v but dispatch routes %v; the two must be the same set", advertised, routed)
+	sortedMethods := append([]string(nil), methods...)
+	sort.Strings(sortedMethods)
+	if !slices.Equal(sortedMethods, routed) {
+		t.Fatalf("advertised methods %v but dispatch routes %v; the two must be the same set", sortedMethods, routed)
 	}
 
 	// BEHAVIOURAL: each advertised method is a reserved handler.
 	id := uint32(10)
-	for _, method := range advertised {
+	for _, method := range methods {
 		id++
 		answer := rpc(t, connection, id, method, map[string]any{"version": 1})
 		if answer.Error == nil || answer.Error.Code != 107 {
@@ -139,6 +131,104 @@ func TestTheAdvertisedMethodsAreExactlyTheOnesDispatchRoutes(t *testing.T) {
 	if !published || refusal.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
 		t.Fatalf("an unknown method answered %#v, want runtime_unavailable from the channel arm", phantom)
 	}
+	if len(capabilities) == 0 {
+		t.Fatal("the reply advertised no capability tokens, so the capability half of this test is vacuous")
+	}
+}
+
+// TestTheAdvertisedCapabilitiesAreCoreTokensThatNothingDispatches is the other
+// half of hostlink_methods (core v0.11.0): the capability tokens. Each follows
+// the methods in the wire order, is one of Core's HostLinkCapability*
+// constants, is NOT a dispatch case, does not begin with ChannelPrefix, and —
+// sent as an RPC — takes the phantom channel arm (a HostLinkError), exactly
+// as any other unrecognised name does.
+func TestTheAdvertisedCapabilitiesAreCoreTokensThatNothingDispatches(t *testing.T) {
+	f := newFixture(t, withAttacher(&recordingAttacher{answer: acceptedObservation(testSession)}))
+	auth := &recordingAuthenticator{wantToken: testCredential}
+	server, httpServer := startServer(t, auth, hostlink.Config{Multiplexer: f.mux, Capabilities: []string{hostlink.CapabilityGateResponse}})
+	defer closeServers(t, server, httpServer)
+	connection := dial(t, httpServer.URL, "")
+	defer connection.Close()
+
+	advertised := negotiatedReply(t, connection).HostLinkMethods()
+	methods, capabilities := splitAdvertised(advertised)
+	if !slices.Equal(advertised, append(append([]string(nil), methods...), capabilities...)) {
+		t.Fatalf("advertised %v; every method must precede every capability", advertised)
+	}
+	if !slices.Equal(capabilities, []string{sessionwire.HostLinkCapabilityGateResponse}) {
+		t.Fatalf("capabilities = %v, want exactly Core's gate-response token", capabilities)
+	}
+	coreTokens := []string{sessionwire.HostLinkCapabilityGateResponse}
+	routed := dispatchCases(t)
+	id := uint32(40)
+	for _, capability := range capabilities {
+		switch {
+		case !slices.Contains(coreTokens, capability):
+			t.Errorf("%q is not a Core HostLinkCapability* constant", capability)
+		case slices.Contains(routed, capability):
+			t.Errorf("%q is a dispatch case; a capability is never dispatched", capability)
+		case strings.HasPrefix(capability, hostlink.ChannelPrefix):
+			t.Errorf("%q begins with the channel prefix", capability)
+		}
+		id++
+		reply := rpc(t, connection, id, capability, map[string]any{"version": 1})
+		refusal, published := refusalOfReply(reply)
+		if !published || refusal.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
+			t.Errorf("%s sent as an RPC answered %#v, want the phantom channel arm's HostLinkError", capability, reply)
+		}
+	}
+}
+
+// TestAServerAdvertisesOnlyTheCapabilitiesItIsGiven: without Capabilities the
+// reply carries the five methods and no token, and a token this package cannot
+// advertise, or one named twice, is refused at construction.
+func TestAServerAdvertisesOnlyTheCapabilitiesItIsGiven(t *testing.T) {
+	f := newFixture(t, withAttacher(&recordingAttacher{answer: acceptedObservation(testSession)}))
+	auth := &recordingAuthenticator{wantToken: testCredential}
+	server, httpServer := startServer(t, auth, hostlink.Config{Multiplexer: f.mux})
+	defer closeServers(t, server, httpServer)
+	connection := dial(t, httpServer.URL, "")
+	defer connection.Close()
+	negotiated := negotiatedReply(t, connection)
+	if negotiated.Supports(sessionwire.HostLinkCapabilityGateResponse) {
+		t.Fatal("a server given no capabilities advertised the gate-response token")
+	}
+	for _, capabilities := range [][]string{{"hostlink.command.unknown"}, {hostlink.CapabilityGateResponse, hostlink.CapabilityGateResponse}} {
+		if _, err := hostlink.NewCentrifugeServer(hostlink.Config{TenantID: testTenant, Authenticator: auth, Multiplexer: f.mux, Capabilities: capabilities}); err == nil {
+			t.Errorf("NewCentrifugeServer accepted capabilities %v", capabilities)
+		}
+	}
+}
+
+// negotiatedReply connects and decodes the reply with Core's own decoder.
+func negotiatedReply(t *testing.T, connection *websocket.Conn) sessionwire.VersionNegotiationResponse {
+	t.Helper()
+	reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}})
+	if reply.Connect == nil || reply.Error != nil {
+		t.Fatalf("connect reply = %#v", reply)
+	}
+	negotiated, err := sessionwire.DecodeHostLinkConnectReply(reply.Connect.Data)
+	if err != nil {
+		t.Fatalf("Core's own decoder refuses this Host's connect reply %s: %v", reply.Connect.Data, err)
+	}
+	if len(negotiated.HostLinkMethods()) == 0 {
+		t.Fatal("the connect reply advertises no methods")
+	}
+	return negotiated
+}
+
+// splitAdvertised separates hostlink_methods into the dispatch-routed method
+// names and the rest, preserving the wire order.
+func splitAdvertised(advertised []string) (methods, capabilities []string) {
+	reserved := []string{hostlink.MethodBind, hostlink.MethodUnbind, hostlink.MethodAttach, hostlink.MethodDrain, hostlink.MethodDrainStatus}
+	for _, name := range advertised {
+		if slices.Contains(reserved, name) {
+			methods = append(methods, name)
+		} else {
+			capabilities = append(capabilities, name)
+		}
+	}
+	return methods, capabilities
 }
 
 // dispatchCases reads the `case` identifiers of Multiplexer.dispatch from

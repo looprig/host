@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +62,11 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		return nil, errors.New("hostlink: pong timeout must be shorter than ping interval")
 	}
 
+	for index, capability := range config.Capabilities {
+		if !slices.Contains(advertisedCapabilities, capability) || slices.Contains(config.Capabilities[:index], capability) {
+			return nil, errors.New("hostlink: " + strconv.Quote(capability) + " is not a capability this package can advertise, or is named twice")
+		}
+	}
 	metrics := prometheus.NewRegistry()
 	nodeConfig := centrifuge.Config{
 		Name:    "looprig-hostlink",
@@ -120,7 +127,7 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		// the two equal in both directions. A server without a Multiplexer has
 		// no dispatch table and therefore advertises no methods.
 		if config.Multiplexer != nil {
-			response = response.WithHostLinkMethods(advertisedMethods...)
+			response = response.WithHostLinkMethods(append(append([]string(nil), advertisedMethods...), config.Capabilities...)...)
 		}
 		data, err := sessionwire.EncodeHostLinkConnectReply(response)
 		if err != nil {

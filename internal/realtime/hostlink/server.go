@@ -41,6 +41,11 @@ type Config struct {
 	// heartbeats, and answers every RPC and subscribe with Centrifuge's own
 	// unhandled-command refusal.
 	Multiplexer *Multiplexer
+
+	// Capabilities are the capability tokens this server advertises after
+	// its methods. Each must be one of advertisedCapabilities; a server
+	// without a Multiplexer advertises nothing, tokens included.
+	Capabilities []string
 }
 
 // Server is an embedded HostLink transport, mounted at the Host's private

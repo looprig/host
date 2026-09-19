@@ -963,6 +963,20 @@ const (
 // reply bytes.
 var advertisedMethods = []string{MethodBind, MethodUnbind, MethodAttach, MethodDrain, MethodDrainStatus}
 
+// CapabilityGateResponse is the capability token a Host advertises when it
+// applies the gate_response runtime command through the disposition path.
+// It is Core's name. A Factory admits, and wakes, a gate response only for a
+// Host whose connect reply Supports it.
+const CapabilityGateResponse = sessionwire.HostLinkCapabilityGateResponse
+
+// advertisedCapabilities is every capability token this package can
+// advertise. A token is NOT a method: dispatch has no case for it, and an RPC
+// naming one falls to the channel arm like any unknown name. It shares
+// hostlink_methods with the methods only because that is where Core puts it,
+// and it follows them in the wire order. Which tokens a server advertises is
+// its composition's choice (Config.Capabilities), and every one must be here.
+var advertisedCapabilities = []string{CapabilityGateResponse}
+
 // errUnroutableRPC is returned to Centrifuge when a refusal has no Core class,
 // which is the malformed-body case and nothing else.
 var errUnroutableRPC = errors.New("hostlink: the RPC body is not a valid Core record")

@@ -165,6 +165,20 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// capabilities are the capability tokens this composition's links advertise.
+//
+// THE GATE-RESPONSE TOKEN IS ADVERTISED ONLY WHEN BOTH GATE SEAMS ARE WIRED.
+// Gates alone would publish gates this Host then blocks every answer to
+// (commands.RefusalNoGateReader); GateReads alone would check answers against
+// a projection nothing publishes. Either half alone is a Host that cannot
+// apply a gate_response, and a Factory must not be told it can.
+func (s *Service) capabilities() []string {
+	if s.options.Gates != nil && s.options.GateReads != nil {
+		return []string{hostlink.CapabilityGateResponse}
+	}
+	return nil
+}
+
 // DefaultGateRetry is the gate publisher's retry wait when GateRetry is zero.
 const DefaultGateRetry = time.Second
 
@@ -722,6 +736,7 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 		PingInterval:  s.options.PingInterval,
 		PongTimeout:   s.options.PongTimeout,
 		Multiplexer:   mux,
+		Capabilities:  s.capabilities(),
 	})
 	if err != nil {
 		return nil, err
