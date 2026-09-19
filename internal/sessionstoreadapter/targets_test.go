@@ -173,3 +173,38 @@ func TestAnExpiryBeyondTheStoresBoundIsRefused(t *testing.T) {
 		t.Fatal("PublishTarget with an expiry beyond the store's bound succeeded")
 	}
 }
+
+// TestASupersededGenerationIsClassifiedAndNothingElseIs: once a newer
+// incarnation of this HostID has written the row, the older one's publication
+// AND withdrawal carry service.ErrTargetGenerationSuperseded, with the store's
+// own error — code and mark — still reachable. An ordinary refusal (here the
+// store's own validation of an empty HostID) is not given the sentinel.
+func TestASupersededGenerationIsClassifiedAndNothingElseIs(t *testing.T) {
+	_, adapted := openStore(t)
+
+	newer := testAdvertisement(true, 6)
+	newer.Report.HostGeneration = 5
+	if err := adapted.PublishTarget(t.Context(), newer); err != nil {
+		t.Fatalf("the newer incarnation's PublishTarget: %v", err)
+	}
+	for name, write := range map[string]func() error{
+		"publish":  func() error { return adapted.PublishTarget(t.Context(), testAdvertisement(true, 6)) },
+		"withdraw": func() error { return adapted.WithdrawTarget(t.Context(), testAdvertisement(false, 0)) },
+	} {
+		err := write()
+		if !errors.Is(err, service.ErrTargetGenerationSuperseded) {
+			t.Fatalf("%s at generation 4 below a row at 5 = %v, want ErrTargetGenerationSuperseded", name, err)
+		}
+		var target *sessionstore.HostTargetError
+		if !errors.As(err, &target) || target.Code != sessionstore.HostTargetErrorGeneration || target.Generation != 5 {
+			t.Fatalf("%s: the store's own refusal did not survive the classification: %#v", name, target)
+		}
+	}
+
+	invalid := testAdvertisement(true, 6)
+	invalid.Report.HostID = ""
+	err := adapted.PublishTarget(t.Context(), invalid)
+	if err == nil || errors.Is(err, service.ErrTargetGenerationSuperseded) {
+		t.Fatalf("an invalid publication = %v, want a refusal that is NOT the superseded sentinel", err)
+	}
+}

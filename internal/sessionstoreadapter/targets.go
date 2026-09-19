@@ -2,6 +2,7 @@ package sessionstoreadapter
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -55,7 +56,7 @@ func (s *Store) PublishTarget(ctx context.Context, advertisement service.Adverti
 			ExpiresAt:         report.ExpiresAt,
 		},
 	})
-	return err
+	return classifyTarget(err)
 }
 
 // WithdrawTarget removes this Host's offer for one target, gracefully and
@@ -81,6 +82,22 @@ func (s *Store) WithdrawTarget(ctx context.Context, advertisement service.Advert
 		HostID:         report.HostID,
 		HostGeneration: report.HostGeneration,
 	})
+	return classifyTarget(err)
+}
+
+// classifyTarget maps the one PERMANENT directory refusal onto the Host's
+// sentinel and leaves every other failure alone.
+//
+// HostTargetErrorGeneration is the store telling a superseded incarnation of
+// this HostID that a newer one owns the row ("so a superseded incarnation learns
+// it has been superseded rather than retrying forever"). The store's error is
+// JOINED rather than replaced, so its code and the generation mark it carries
+// still reach a caller through errors.As.
+func classifyTarget(err error) error {
+	var target *sessionstore.HostTargetError
+	if errors.As(err, &target) && target.Code == sessionstore.HostTargetErrorGeneration {
+		return errors.Join(service.ErrTargetGenerationSuperseded, err)
+	}
 	return err
 }
 

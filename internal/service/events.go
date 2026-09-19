@@ -185,6 +185,19 @@ func (t *Tail) Published() uint64 {
 	return t.published
 }
 
+// ErrTargetGenerationSuperseded reports a target-directory write refused
+// because a NEWER incarnation of this same HostID — a higher host generation —
+// has already written the row.
+//
+// IT IS PERMANENT FOR THIS PROCESS, which is what separates it from every other
+// directory failure. The row's generation mark only rises, so no retry by this
+// incarnation can ever succeed, and the row this Host would withdraw is no
+// longer this Host's: it says whatever the newer incarnation last published. A
+// drain that treated it as an ordinary failure aborted before releasing a
+// single session, and the residency leases it held were then never handed back
+// (the v0.3.0 same-HostID overlap).
+var ErrTargetGenerationSuperseded = errors.New("service: a newer generation of this HostID owns the target row, so this incarnation can no longer write it")
+
 // ErrForeignPublication is the refusal for a publication naming a session other
 // than the one the tail was started for.
 //

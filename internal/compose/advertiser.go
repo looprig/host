@@ -42,6 +42,13 @@ var _ lifecycle.Advertiser = (*advertiser)(nil)
 // operation a row takes, and it is the derivation's own answer rather than a
 // second reading of the drain flag here.
 func (a *advertiser) publish(ctx context.Context) error {
+	return a.publishRows(ctx, false)
+}
+
+// publishRows writes every derived row. With skipSuperseded, a row a newer
+// incarnation of this HostID owns is not reported as a failure; see
+// PublishNonaccepting for the one caller that asks for that.
+func (a *advertiser) publishRows(ctx context.Context, skipSuperseded bool) error {
 	rows, err := a.capacity.Publish()
 	if err != nil {
 		return err
@@ -54,6 +61,9 @@ func (a *advertiser) publish(ctx context.Context) error {
 			err = a.directory.PublishTarget(ctx, row)
 		}
 		if err != nil {
+			if skipSuperseded && errors.Is(err, service.ErrTargetGenerationSuperseded) {
+				continue
+			}
 			failures = append(failures, err)
 		}
 	}
@@ -88,9 +98,19 @@ func (a *advertiser) publish(ctx context.Context) error {
 // for it at all, so there is no row of ours left saying Accepting true. Treating
 // that as a drain failure would make a Host that lost one session unable to
 // report a drain it had genuinely performed.
+//
+// THE SAME HOLDS FOR A TARGET ROW A NEWER GENERATION OF THIS HostID OWNS, and
+// not holding it was a live defect (the v0.3.0 same-HostID overlap). A platform
+// that starts the next incarnation before the old one stops makes the old one's
+// withdrawal fail with the store's generation refusal — permanently, since the
+// mark only rises. The drain treated that as a refused publication and aborted
+// BEFORE releasing any session, so the residency leases it held were never
+// handed back and every later Host was refused epoch_mismatch. The row says what
+// the newer incarnation published, not what this one did; there is no row of
+// ours left saying Accepting true, so the drain proceeds.
 func (a *advertiser) PublishNonaccepting(ctx context.Context) error {
 	var failures []error
-	if err := a.publish(ctx); err != nil {
+	if err := a.publishRows(ctx, true); err != nil {
 		failures = append(failures, err)
 	}
 	for _, entry := range a.registry.Snapshot() {

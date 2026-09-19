@@ -615,6 +615,8 @@ type fakeDirectory struct {
 	published  []service.Advertisement
 	withdrawn  []service.Advertisement
 	publishErr error
+	// withdrawErr fails every withdrawal, as a store would that refuses it.
+	withdrawErr error
 }
 
 func (d *fakeDirectory) MaxAdvertisementTTL() time.Duration { return d.ttl }
@@ -633,6 +635,9 @@ func (d *fakeDirectory) PublishTarget(_ context.Context, advertisement service.A
 func (d *fakeDirectory) WithdrawTarget(_ context.Context, advertisement service.Advertisement) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.withdrawErr != nil {
+		return d.withdrawErr
+	}
 	d.withdrawn = append(d.withdrawn, advertisement)
 	d.trace.record("directory.withdraw")
 	return nil

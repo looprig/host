@@ -1408,6 +1408,11 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"InvalidCapacityOptionsError.Error":  true,
 		"InvalidCapacityOptionsError.Unwrap": true,
 
+		// v0.4.0. A SENTINEL, NOT A SURFACE: it classifies a directory write a
+		// newer incarnation of this HostID has superseded, so the drain can tell
+		// "not my row any more" from "the directory is down". It yields no record.
+		"ErrTargetGenerationSuperseded": true,
+
 		// events.go, O5.3. THE LIVE TAIL IS NOT A SECOND CATALOGUE and this
 		// enumeration is where that is decided rather than assumed: a Tail
 		// carries one session's committed journal events onto one HostLink
