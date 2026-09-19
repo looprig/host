@@ -312,7 +312,60 @@ func newGateE2EWorld(t *testing.T, options gateE2EOptions) *gateE2EWorld {
 // with the launcher recording its runtime and the residency epoch it holds.
 func (w *gateE2EWorld) host(t *testing.T, generation uint64) (*host.Service, *capturingLauncher, uint64) {
 	t.Helper()
-	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs)}
+	service, launcher := w.compose(t, generation, nil)
+	resident, err := attachAsFactoryDoes(t, service)
+	if err != nil {
+		t.Fatalf("attach at generation %d: %v", generation, err)
+	}
+	return service, launcher, resident.LeaseEpoch
+}
+
+// heldAttach is an attach running in the background while its restore is held.
+type heldAttach struct {
+	service  *host.Service
+	launcher *capturingLauncher
+	release  chan struct{}
+	done     chan error
+}
+
+// hostHeld composes and starts a Host whose attach runs in the background and
+// parks at its runtime restore until release is closed.
+func (w *gateE2EWorld) hostHeld(t *testing.T, generation uint64) *heldAttach {
+	t.Helper()
+	release := make(chan struct{})
+	service, launcher := w.compose(t, generation, release)
+	held := &heldAttach{service: service, launcher: launcher, release: release, done: make(chan error, 1)}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 60*time.Second)
+		defer cancel()
+		_, err := service.Attach(ctx, host.AttachRequest{
+			TenantID: composeTenant, SessionID: composeSession, AgentID: composeAgent,
+			Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory",
+		})
+		held.done <- err
+	}()
+	return held
+}
+
+// finish releases the held restore and waits for the attach.
+func (h *heldAttach) finish(t *testing.T) {
+	t.Helper()
+	close(h.release)
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("the held attach: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the held attach did not finish")
+	}
+}
+
+// compose composes and starts one Host; hold, when non-nil, parks its
+// runtime restores until closed.
+func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct{}) (*host.Service, *capturingLauncher) {
+	t.Helper()
+	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs), holdRestore: hold}
 	adapter, err := harnessadapter.New(launcher)
 	if err != nil {
 		t.Fatalf("harnessadapter.New: %v", err)
@@ -345,11 +398,7 @@ func (w *gateE2EWorld) host(t *testing.T, generation uint64) (*host.Service, *ca
 	if err := service.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	resident, err := attachAsFactoryDoes(t, service)
-	if err != nil {
-		t.Fatalf("attach at generation %d: %v", generation, err)
-	}
-	return service, launcher, resident.LeaseEpoch
+	return service, launcher
 }
 
 // submit runs a user turn on the runtime.
@@ -640,17 +689,27 @@ func TestAPermissionGateOpenAcrossAReplacementIsAnsweredOnTheSuccessor(t *testin
 // never an answer to a gate that no longer exists.
 func TestAnAskUserGateClosedAtRestoreSettlesNoOp(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
-	first, firstLauncher, _ := world.host(t, 4)
+	first, firstLauncher, firstEpoch := world.host(t, 4)
 	t.Cleanup(func() { stopBounded(first) })
 	world.submit(t, firstLauncher.controller(), "PLEASE-ASK")
 	opened := world.gates(t, 1)[0]
-	// Host A crashes with the gate open; see the permission test.
+	// Host A crashes with the gate open, but its consumer is still running —
+	// the zombie a successor must fence out.
 
-	// Factory admits against the projection it last read, before the
-	// successor exists: the race the no_op answers.
+	// THE SUCCESSOR FENCES BEFORE ITS RESTORE. Host B is held between its
+	// residency grant and its runtime restore; its fencing write has already
+	// raised the mark, so the answer admitted now cannot be taken by A, whose
+	// ownership check fails. Deterministic: before the fence moved to attach,
+	// A applied it in the window (spec gate C2, quality gate F2).
+	second := world.hostHeld(t, 5)
+	t.Cleanup(func() { stopBounded(second.service) })
+	gateE2EEventually(t, "Host B's attach-time fencing write", func() bool { return world.mark(t) > firstEpoch })
 	id := world.answer(t, opened, "answer", answerValue())
-	second, _, _ := world.host(t, 5)
-	t.Cleanup(func() { stopBounded(second) })
+	time.Sleep(300 * time.Millisecond)
+	if entry := world.command(t, id); entry.Record.Attempt != nil {
+		t.Fatalf("a fenced-out predecessor began an attempt on the answer: %+v", entry.Record.Attempt)
+	}
+	second.finish(t)
 
 	entry := world.settled(t, id)
 	if entry.Record.State != sessionstore.InboxStateApplied || outcomeOf(t, entry) != "no_op" {
@@ -932,5 +991,44 @@ func TestAPermissionGateSurvivesADrainAndIsAnsweredOnTheSuccessor(t *testing.T) 
 		if resolved.Reason == gate.CloseAbandoned {
 			t.Fatal("the gate was abandoned across the drain")
 		}
+	}
+}
+
+// TestAnAnswerInTheFenceWindowIsNeverTakenByAFencedPredecessor is the quality
+// gate's F2 construction, held open deterministically: Host A holds a
+// permission gate and is not dead; Host B has taken residency and is held
+// before its runtime restore. The answer is admitted in that window. Before
+// v0.4.0's fix round the projection fence came after the restore, so A's
+// ownership check still passed, A began the attempt, lost the journal to B,
+// and the user's answer settled rejected/not_applied. B now fences at attach,
+// before the restore: A's check fails, A never begins an attempt, and B applies
+// the answer.
+func TestAnAnswerInTheFenceWindowIsNeverTakenByAFencedPredecessor(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
+	first, firstLauncher, firstEpoch := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(first) })
+	world.submit(t, firstLauncher.controller(), "PLEASE-RUN-GATED")
+	opened := world.gates(t, 1)[0]
+
+	second := world.hostHeld(t, 5)
+	t.Cleanup(func() { stopBounded(second.service) })
+	gateE2EEventually(t, "Host B's attach-time fencing write", func() bool { return world.mark(t) > firstEpoch })
+	secondEpoch := world.mark(t)
+	id := world.answer(t, opened, string(gate.ApprovalApprove), map[string]json.RawMessage{})
+	time.Sleep(500 * time.Millisecond)
+	if entry := world.command(t, id); entry.Record.Attempt != nil || entry.Record.State == sessionstore.InboxStateRejected {
+		t.Fatalf("in the fence window the predecessor took the answer: state %q, attempt %+v", entry.Record.State, entry.Record.Attempt)
+	}
+	second.finish(t)
+
+	entry := world.settled(t, id)
+	if entry.Record.State != sessionstore.InboxStateApplied || outcomeOf(t, entry) != "applied" {
+		t.Fatalf("the answer settled %q/%q, want applied/applied on the successor", entry.Record.State, outcomeOf(t, entry))
+	}
+	if entry.Record.Attempt == nil || uint64(entry.Record.Attempt.ResidencyEpoch) != secondEpoch {
+		t.Fatalf("the attempt = %+v, want Host B's residency %d", entry.Record.Attempt, secondEpoch)
+	}
+	if resolved := world.resolutions(t, opened.GateID); len(resolved) != 1 {
+		t.Fatalf("the gate was resolved %d times, want once", len(resolved))
 	}
 }

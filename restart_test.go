@@ -47,6 +47,11 @@ type capturingLauncher struct {
 	creates  int
 	restores []uuid.UUID
 	last     session.SessionController
+
+	// holdRestore, when set, parks every restore until it is closed, which is
+	// how a test holds a successor between its residency grant and its
+	// runtime's restore.
+	holdRestore chan struct{}
 }
 
 // NewSession launches through the real rig.
@@ -63,6 +68,13 @@ func (l *capturingLauncher) NewSession(ctx context.Context, options ...rig.Sessi
 
 // RestoreSession restores through the real rig.
 func (l *capturingLauncher) RestoreSession(ctx context.Context, id uuid.UUID) (session.SessionController, error) {
+	if l.holdRestore != nil {
+		select {
+		case <-l.holdRestore:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	controller, err := l.rig.RestoreSession(ctx, id)
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -487,6 +487,19 @@ func (s *Service) leaseFor(key registry.Key) residency.Lease {
 	return s.leases[key]
 }
 
+// fenceGates makes the projection-fencing gate write under a fresh grant, when
+// this composition publishes gates.
+func (s *Service) fenceGates(ctx context.Context, lease residency.Lease, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	if s.options.Gates == nil {
+		return nil
+	}
+	fence, err := s.options.Gates.GateSessionFor(lease, tenant, session)
+	if err != nil {
+		return err
+	}
+	return fence.Resolve(ctx, gates.FenceGateID)
+}
+
 // leaseRecorder wraps the durable lease seam and remembers what it granted.
 //
 // THE COMPOSITION HAS NO OTHER WAY TO REACH THE GRANT, and that is a shape of
@@ -508,9 +521,25 @@ var _ residency.SessionLeases = (*leaseRecorder)(nil)
 // A REFUSAL RECORDS NOTHING, including the one refusal that still owes a
 // release: LeaseCleanupError carries its own Release and the caller that owns
 // the retry is residency's unwinder, not this.
+//
+// AND IT FENCES THE GATE PROJECTION, BEFORE THE RUNTIME IS RESTORED (quality
+// gate F2). The residency grant exists from here, so one gate write under it
+// raises the projection's mark past any predecessor now, while the runtime is
+// still unlaunched. Before, the mark moved only when the publisher started,
+// after the restore: in between, a predecessor that was not dead still passed
+// its ownership check on an answer, began its attempt, lost the journal to this
+// Host's restore, and the user's answer settled rejected/not_applied. Now that
+// predecessor's check fails first and it never begins one. A failed fence
+// releases the grant and refuses the attach.
 func (r *leaseRecorder) AcquireSessionLease(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (residency.Lease, error) {
 	lease, err := r.inner.AcquireSessionLease(ctx, tenant, session)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.service.fenceGates(ctx, lease, tenant, session); err != nil {
+		if releaseErr := lease.Release(context.WithoutCancel(ctx)); releaseErr != nil {
+			return nil, &residency.LeaseCleanupError{Cause: errors.Join(err, releaseErr), Cleanup: lease.Release}
+		}
 		return nil, err
 	}
 	r.service.mu.Lock()

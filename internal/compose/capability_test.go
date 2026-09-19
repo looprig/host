@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"testing"
 
@@ -76,5 +77,45 @@ func TestTheGateResponseTokenIsAdvertisedOnlyWhenBothGateSeamsAreWired(t *testin
 				t.Fatalf("Supports(gate_response) = %v, want %v", got, row.advertised)
 			}
 		})
+	}
+}
+
+// fencingGateSessions records the fence writes and can refuse them.
+type fencingGateSessions struct {
+	resolves []sessionwire.GateID
+	err      error
+}
+
+func (g *fencingGateSessions) GateSessionFor(residency.Lease, sessionwire.TenantID, sessionwire.SessionID) (gates.Session, error) {
+	return fencingSession{sessions: g}, nil
+}
+
+type fencingSession struct {
+	gates.Session
+	sessions *fencingGateSessions
+}
+
+func (s fencingSession) Resolve(_ context.Context, id sessionwire.GateID) error {
+	s.sessions.resolves = append(s.sessions.resolves, id)
+	return s.sessions.err
+}
+
+// TestTheGateFenceIsWrittenAtAttachBeforeTheRuntimeLaunches (quality gate F2):
+// the fencing write is made under the fresh grant before hydration launches the
+// runtime; a fence that fails refuses the attach, launches nothing and hands
+// the grant back.
+func TestTheGateFenceIsWrittenAtAttachBeforeTheRuntimeLaunches(t *testing.T) {
+	refused := &fencingGateSessions{err: errors.New("injected: the fence write failed")}
+	f := newFixture(t, func(options *Options, _ *hostconfig.Options) { options.Gates = refused })
+	f.start()
+	f.attachRefused(tenantA, sessionA)
+	if len(refused.resolves) != 1 || refused.resolves[0] != gates.FenceGateID {
+		t.Fatalf("fence writes = %v, want the one fence", refused.resolves)
+	}
+	if f.rig.Launches() != 0 {
+		t.Fatal("a refused fence still launched the runtime")
+	}
+	if released := f.trace.count("lease.release"); released != 1 {
+		t.Fatalf("the grant was released %d times after a refused fence, want 1", released)
 	}
 }
