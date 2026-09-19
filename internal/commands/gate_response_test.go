@@ -212,9 +212,9 @@ func TestAGateResponseToAGateNotProjectedIsTheRuntimesToDecide(t *testing.T) {
 	}
 }
 
-// TestAGateResponseHostCannotReadYetBlocks: a body behind an object reference,
-// a projection that cannot be read, and a composition with no gate reader are
-// all this Host's limits and not the answer's, so each blocks with no write
+// TestAGateResponseHostCannotReadYetBlocks: a projection that cannot be read
+// and a composition with no gate reader are this Host's limits and not the
+// answer's, so each blocks with no write
 // past the claim and no rejection.
 func TestAGateResponseHostCannotReadYetBlocks(t *testing.T) {
 	for _, row := range []struct {
@@ -222,9 +222,6 @@ func TestAGateResponseHostCannotReadYetBlocks(t *testing.T) {
 		configure func(*dispositionFixture)
 		refusal   ApplyRefusal
 	}{
-		{"a referenced body", func(f *dispositionFixture) {
-			f.store.payloads[commandID(1)] = Payload{Ref: sessionwire.ObjectReference{ObjectID: "object-1"}}
-		}, RefusalReferencedGateResponse},
 		{"an unreadable projection", func(f *dispositionFixture) {
 			f.gates.err = errors.New("injected: the catalog read failed")
 		}, RefusalStore},
@@ -312,5 +309,27 @@ func TestAHostRetakesItsOwnLapsedClaim(t *testing.T) {
 	}
 	if claims != 2 {
 		t.Fatalf("the store saw %d claims, want the original and the re-take", claims)
+	}
+}
+
+// TestAReferencedGateResponseIsRejectedNotBlocked (spec gate C1, quality gate
+// F5): no released Host can apply a body stored by reference, and blocking on
+// it held the session's whole stream — interrupts included — until Factory's
+// deadline sweep rejected it anyway. It is rejected before any attempt, even by
+// a composition with no gate reader.
+func TestAReferencedGateResponseIsRejectedNotBlocked(t *testing.T) {
+	for name, gates := range map[string]*fakeGates{"with a gate reader": ownedGate(testEpoch), "with none": nil} {
+		t.Run(name, func(t *testing.T) {
+			f := gateFixture(t, gates, nil)
+			f.store.payloads[commandID(1)] = Payload{Ref: sessionwire.ObjectReference{ObjectID: "object-1"}}
+			outcome, err := f.process()
+			if err != nil || outcome.State != StateRejected {
+				t.Fatalf("Process = (%+v, %v), want rejected", outcome, err)
+			}
+			want := []string{"LoadDispositionCommand", "ClaimDisposition", "LoadDispositionPayload", "RejectDisposition"}
+			if got := f.store.operations(); !equalStrings(got, want) {
+				t.Fatalf("the store saw %v, want %v", got, want)
+			}
+		})
 	}
 }

@@ -356,14 +356,15 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 //
 // THREE ANSWERS, AND THEY ARE DIFFERENT KINDS OF ANSWER:
 //
-//   - A BODY NO HOST COULD EVER APPLY is rejected: malformed, naming another
-//     session or command, a gate identity harness never mints, or — for a gate
+//   - A BODY NO HOST COULD EVER APPLY is rejected: stored by reference,
+//     malformed, naming another session or command, a gate identity harness
+//     never mints, or — for a gate
 //     the projection holds and this Host owns — an expected-open version that
 //     is not the projected one. The body is immutable and every Host reads the
 //     same bytes, and harness would refuse it only after the attempt.
-//   - A LIMIT OF THIS HOST blocks with nothing written: a body behind an object
-//     reference (this Host does not dereference), an unreadable projection, no
-//     gate reader, or a gate whose residency mark is not this Host's grant
+//   - A LIMIT OF THIS HOST blocks with nothing written: an unreadable
+//     projection, no gate reader, or a gate whose residency mark is not this
+//     Host's grant
 //     (below it the fencing write has not landed; above it a successor wrote).
 //   - EVERYTHING ELSE IS THE RUNTIME'S. A gate the projection no longer holds
 //     is dispatched: harness is the authority on whether it is open, and
@@ -374,12 +375,15 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 // residency of the last Host to write a gate; it is compared with this Host's
 // residency grant and never with a journal epoch.
 func (a *DispositionApplier) checkGateResponse(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bool, error) {
+	// A BODY STORED BY REFERENCE IS REJECTED, NOT BLOCKED (spec gate C1,
+	// quality gate F5). This Host does not dereference a private object and
+	// harness's admitted command has no reference member, so no released Host
+	// can apply it — and a block holds the session's WHOLE command stream,
+	// interrupts included, until Factory's deadline sweep rejects the answer
+	// anyway. factory v0.5.0 refuses such a body at admission; this is for
+	// every other path.
 	if len(payload.Body) == 0 && payload.Ref != (sessionwire.ObjectReference{}) {
-		return false, &ApplyError{
-			Refusal:   RefusalReferencedGateResponse,
-			CommandID: record.CommandID,
-			Reason:    "the gate response's private body is stored behind an object reference, which this Host does not dereference and harness cannot accept",
-		}
+		return a.reject(ctx, record, revision)
 	}
 	if a.gates == nil {
 		return false, &ApplyError{

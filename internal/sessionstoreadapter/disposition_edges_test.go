@@ -603,3 +603,35 @@ func TestALiveGrantIsNeverBelowTheRecordsHighWaterMark(t *testing.T) {
 		t.Fatalf("a successor holding a strictly higher grant could not claim: %v", err)
 	}
 }
+
+// TestTheRejectEdgeRejectsUnderTheLiveClaimsResidency drives RejectDisposition
+// through the released store while this Host's claim is LIVE (spec gate S7).
+// The released edge admits only the live claim's holder, so the residency the
+// adapter passes must be the claim's own: one that passed zero, or any other
+// number, would be refused as claim_held and the command would wait out the
+// claim's TTL.
+func TestTheRejectEdgeRejectsUnderTheLiveClaimsResidency(t *testing.T) {
+	w := newEdgeWorld(t)
+	entry, err := w.store.GetDispositionCommand(t.Context(), sessionstore.GetDispositionCommandRequest{TenantID: edgeTenant, SessionID: edgeSession, CommandID: "command-4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := w.writer.ClaimDisposition(t.Context(), edgeTenant, edgeSession, "command-4", commands.DispositionClaim{
+		ExpectedRevision: entry.Revision, ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("ClaimDisposition: %v", err)
+	}
+	if err := w.writer.RejectDisposition(t.Context(), edgeTenant, edgeSession, "command-4", commands.DispositionRejection{
+		ExpectedRevision: revision, ResidencyEpoch: w.residencyEpoch,
+	}); err != nil {
+		t.Fatalf("RejectDisposition under the live claim's residency: %v", err)
+	}
+	after, err := w.store.GetDispositionCommand(t.Context(), sessionstore.GetDispositionCommandRequest{TenantID: edgeTenant, SessionID: edgeSession, CommandID: "command-4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Record.State != sessionstore.InboxStateRejected || after.Record.Attempt != nil {
+		t.Fatalf("after the reject the record is %q with attempt %+v, want rejected with none", after.Record.State, after.Record.Attempt)
+	}
+}
