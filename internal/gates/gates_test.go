@@ -260,7 +260,7 @@ func TestThePublisherFencesBeforeItWritesAnyGate(t *testing.T) {
 
 	calls, _, _ := session.snapshot()
 	want := []string{"scope", "resolve:" + string(FenceGateID), "replay", "projected", "open:" + string(gateIDOf(ask))}
-	if !slices.Equal(calls[:len(want)], want) {
+	if len(calls) < len(want) || !slices.Equal(calls[:len(want)], want) {
 		t.Fatalf("calls = %v, want them to begin %v", calls, want)
 	}
 	if h.hints.count() != 1 {
