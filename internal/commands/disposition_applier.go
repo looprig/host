@@ -180,7 +180,15 @@ func (a *DispositionApplier) Process(ctx context.Context, command Command) (Outc
 		// straight at the attempt was refused on every pass, forever. The
 		// claim edge lets a later residency take a claim over and refuses an
 		// earlier one, so this is safe in both directions.
-		if record.ClaimResidencyEpoch != a.residency {
+		//
+		// AND A CLAIM IS THIS HOST'S ONLY WHILE IT IS LIVE (spec gate M2). One
+		// at this Host's residency that has lapsed — the pass blocked, on a
+		// gate this Host did not yet own or an unreadable projection, for
+		// longer than the claim TTL — is refused by BeginAttempt as lost, on
+		// every pass, until Factory's deadline sweep rejects the command. The
+		// store admits a new claim at the same residency over a lapsed one, so
+		// it is re-taken first.
+		if record.ClaimResidencyEpoch != a.residency || !record.ClaimExpiresAt.After(a.now()) {
 			return a.claimThenDispatch(ctx, record)
 		}
 		return a.authorizeAndDispatch(ctx, record, record.Revision)

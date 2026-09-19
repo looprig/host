@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -271,5 +272,45 @@ func TestAFailedRejectionIsAStoreRefusal(t *testing.T) {
 	}
 	if got := f.stored().record.State; got != StateClaimed {
 		t.Fatalf("the durable record is %q, want still claimed", got)
+	}
+}
+
+// TestAHostRetakesItsOwnLapsedClaim is the spec gate's M2 construction: this
+// Host claims a gate response and blocks (its fencing write has not landed)
+// for longer than the claim TTL. The claim is still THIS Host's residency but
+// has lapsed, and BeginAttempt refuses a lapsed claim, so resuming straight
+// at the attempt was refused on every pass and the user's answer sat claimed
+// until Factory's deadline sweep rejected it. The claim is re-taken first.
+func TestAHostRetakesItsOwnLapsedClaim(t *testing.T) {
+	gates := ownedGate(testEpoch - 1)
+	f := gateFixture(t, gates, nil)
+	if _, err := f.process(); err == nil {
+		t.Fatal("the first pass did not block")
+	}
+	if got := f.stored().record.State; got != StateClaimed {
+		t.Fatalf("after the block the record is %q, want claimed", got)
+	}
+	// The block outlives the claim: the TTL is 11s in this fixture, the
+	// spec gate's was 5s against a 6s block.
+	f.clock.advance(12 * time.Second)
+	id := sessionwire.GateID(testGateUUID.String())
+	gates.mu.Lock()
+	held := gates.gates[id]
+	held.OwnerEpoch = testEpoch
+	gates.gates[id] = held
+	gates.mu.Unlock()
+
+	outcome, err := f.process()
+	if err != nil || outcome.State != StateApplied {
+		t.Fatalf("after the fence landed, Process = (%+v, %v), want the lapsed claim re-taken and the answer applied", outcome, err)
+	}
+	claims := 0
+	for _, op := range f.store.operations() {
+		if op == "ClaimDisposition" {
+			claims++
+		}
+	}
+	if claims != 2 {
+		t.Fatalf("the store saw %d claims, want the original and the re-take", claims)
 	}
 }
