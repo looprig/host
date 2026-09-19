@@ -124,10 +124,11 @@ type Collaborators struct {
 	// under the runtime session id the session's binding names. The reader
 	// registered for the binding must therefore be the released harness
 	// session store (*harness sessionstore.Store, or a value embedding one) —
-	// the same journal the runtime writes. For a binding whose reader is not
-	// one, Host cannot tell a new session from a re-placed one, and it REFUSES
-	// the create with runtime_unavailable rather than risk starting a
-	// conversation over.
+	// the same journal the runtime writes. Compose REFUSES a reader that is
+	// not one. A session whose binding has no reader at all is refused a
+	// create with runtime_unavailable; a journal READ that fails refuses the
+	// attach with the empty, unclassified code, like every other durable-read
+	// failure. Neither ever starts a conversation over.
 	JournalStores map[EvidenceKey]sessionstore.DispositionEvidenceReader
 
 	// Registrar produces the Department this Host serves. REQUIRED.
@@ -268,6 +269,20 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 	router, err := sessionstoreadapter.NewTenantEvidenceRouter(readers)
 	if err != nil {
 		return nil, &InvalidCompositionError{Field: "Collaborators.JournalStores", Reason: "the settlement evidence table is unusable", Cause: err}
+	}
+	// EVERY READER MUST BE A HARNESS JOURNAL, refused here rather than at the
+	// first placement. An attach reads the binding's journal to decide a
+	// create, and a reader that cannot answer turns every create routed to it
+	// into a runtime_unavailable refusal — and Factory sends every attach as a
+	// create, so such a Host could never place a session while passing every
+	// probe. Refusing it is this module's rule: fail at composition.
+	for key, reader := range collaborators.JournalStores {
+		if !sessionstoreadapter.IsRuntimeJournal(reader) {
+			return nil, &InvalidCompositionError{
+				Field:  "Collaborators.JournalStores",
+				Reason: "the reader for tenant " + strconv.Quote(string(key.TenantID)) + " and binding " + strconv.Quote(key.StorageBindingID) + " is not a harness session store (*harness sessionstore.Store, or a value embedding one), so Host could not tell a new session from one it would restart and would refuse every create",
+			}
+		}
 	}
 
 	storeOptions := append(append([]sessionstore.Option(nil), collaborators.StoreOptions...), sessionstore.WithDispositionEvidence(router))

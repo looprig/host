@@ -22,6 +22,15 @@ type harnessJournal interface {
 	OpenInternalEventReplayer(uuid.UUID, harnesssessionstore.ReplayRequest) (journal.EventReplayer, error)
 }
 
+// IsRuntimeJournal reports whether a journal store registered for a binding
+// can answer RuntimeJournal: the released harness session store, or a value
+// embedding one. A composition refuses a reader that cannot, because every
+// create routed to it would be refused.
+func IsRuntimeJournal(reader sessionstore.DispositionEvidenceReader) bool {
+	_, ok := reader.(harnessJournal)
+	return ok
+}
+
 // The released store is the journal. A drift is a build failure here rather
 // than every create in production silently reporting Unknown.
 var _ harnessJournal = (*harnesssessionstore.Store)(nil)

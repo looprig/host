@@ -140,9 +140,9 @@ func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
 }
 
 // host composes and starts one Host over the world, at a generation of its
-// own, launching through a real rig over the shared journal. journalReader, if
-// non-nil, replaces the journal store as the binding's reader.
-func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalReader sessionstore.DispositionEvidenceReader) (*host.Service, *capturingLauncher) {
+// own, launching through a real rig over the shared journal. journalStores, if
+// non-nil, replaces the composition's journal table.
+func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalStores map[host.EvidenceKey]sessionstore.DispositionEvidenceReader) (*host.Service, *capturingLauncher) {
 	t.Helper()
 	launcher := &capturingLauncher{rig: harnesstest.Rig(t, w.journal, w.llm)}
 	adapter, err := harnessadapter.New(launcher)
@@ -160,8 +160,8 @@ func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalReader s
 		}
 		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
 	})
-	if journalReader != nil {
-		blueprint.Collaborators.JournalStores = map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: journalReader}
+	if journalStores != nil {
+		blueprint.Collaborators.JournalStores = journalStores
 	}
 	service, err := host.Compose(t.Context(), blueprint)
 	if err != nil {
@@ -272,10 +272,11 @@ func TestAReleasedSessionReattachedAsCreateResumesTheSameConversation(t *testing
 }
 
 // TestACreateThatCannotBeRestoredIsRefusedAndStartsNothingOver: the session has
-// a conversation, and the Host asked to attach it has no way to read the
-// binding's journal (its reader is not a harness store). It refuses with
-// runtime_unavailable rather than launching — and the journal still holds
-// exactly the one conversation it held.
+// a conversation, and the Host asked to attach it holds no journal store for
+// the session's binding (its table serves another binding), so it cannot tell
+// a new session from a re-placed one. It refuses with runtime_unavailable
+// rather than launching — and the journal still holds exactly the one
+// conversation it held.
 func TestACreateThatCannotBeRestoredIsRefusedAndStartsNothingOver(t *testing.T) {
 	world := newRealRuntimeWorld(t)
 	first, firstLauncher := world.host(t, 4, nil)
@@ -283,16 +284,15 @@ func TestACreateThatCannotBeRestoredIsRefusedAndStartsNothingOver(t *testing.T) 
 		t.Fatalf("Host A attach: %v", err)
 	}
 	world.turn(t, firstLauncher.controller(), rememberedWord)
-	if _, err := first.Stop(t.Context()); err != nil {
-		t.Fatalf("Host A Stop: %v", err)
-	}
+	stopWithin(t, first)
 
-	blind, blindLauncher := world.host(t, 5, stubEvidence{})
+	elsewhere := map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: "binding-elsewhere"}: world.journal}
+	blind, blindLauncher := world.host(t, 5, elsewhere)
 	t.Cleanup(func() { _, _ = blind.Stop(context.Background()) })
 	_, err := attachAsFactoryDoes(t, blind)
 	var refused *host.AttachError
 	if !errors.As(err, &refused) || refused.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
-		t.Fatalf("attach(create) with an unreadable journal = %v, want an AttachError with runtime_unavailable", err)
+		t.Fatalf("attach(create) with no journal store for the binding = %v, want an AttachError with runtime_unavailable", err)
 	}
 	if creates, restores := blindLauncher.counts(); creates != 0 || len(restores) != 0 {
 		t.Fatalf("the refusing Host launched anyway: creates = %d, restores = %v", creates, restores)
@@ -300,6 +300,34 @@ func TestACreateThatCannotBeRestoredIsRefusedAndStartsNothingOver(t *testing.T) 
 	if got := harnesstest.CountSessionStarted(t, world.journal, world.runtimeID); got != 1 {
 		t.Fatalf("%d SessionStarted after the refusal, want the original 1", got)
 	}
+}
+
+// TestComposeRefusesAJournalReaderThatIsNotAHarnessStore: a reader that cannot
+// answer the create decision would make every create refuse at the first
+// placement; Compose refuses it at startup instead. The control is the
+// fixture's harness store, accepted.
+func TestComposeRefusesAJournalReaderThatIsNotAHarnessStore(t *testing.T) {
+	f := newComposeFixture(t)
+	blueprint := f.blueprint(t)
+	blueprint.Collaborators.JournalStores = map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: stubEvidence{}}
+	service, err := host.Compose(t.Context(), blueprint)
+	var invalid *host.InvalidCompositionError
+	if !errors.As(err, &invalid) || invalid.Field != "Collaborators.JournalStores" {
+		if service != nil {
+			_, _ = service.Stop(context.Background())
+		}
+		t.Fatalf("Compose with a non-harness journal reader = %v, want an InvalidCompositionError on Collaborators.JournalStores", err)
+	}
+	service, err = host.Compose(t.Context(), f.blueprint(t))
+	if err != nil {
+		t.Fatalf("control: Compose with a harness journal store = %v", err)
+	}
+	_, _ = service.Stop(context.Background())
+}
+
+// servesTheBinding is a journal table serving the fixture's binding with reader.
+func servesTheBinding(reader sessionstore.DispositionEvidenceReader) map[host.EvidenceKey]sessionstore.DispositionEvidenceReader {
+	return map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: reader}
 }
 
 // journalHas reports whether an event of type E is filed under id.
@@ -376,7 +404,7 @@ func TestAJournalReadFailureRefusesTheAttachAndStartsNothingOver(t *testing.T) {
 				t.Fatal(err)
 			}
 			reader := harnesstest.Store(t, unreadable, composeTenant)
-			second, secondLauncher := world.host(t, 5, reader)
+			second, secondLauncher := world.host(t, 5, servesTheBinding(reader))
 			t.Cleanup(func() { _, _ = second.Stop(context.Background()) })
 
 			_, err = attachAsFactoryDoes(t, second)
