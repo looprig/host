@@ -336,9 +336,10 @@ func TestLoadGateDecidesADispositionGatesOwnerByResidencyEpoch(t *testing.T) {
 		t.Fatalf("LoadGate after the successor's fence = (%+v, %t, %v), want owner epoch %d", got, held, err, secondLease.Epoch())
 	}
 
-	// And an absent gate is still absent.
-	if got, held, err := w.adapted.LoadGate(t.Context(), testTenant, testSession, "gate-never-opened"); err != nil || held || got != (commands.Gate{}) {
-		t.Fatalf("LoadGate for an unopened gate = (%+v, %t, %v), want (zero, false, nil)", got, held, err)
+	// And an absent gate is absent — carrying the projection's mark, because
+	// the owner is the projection's and not one gate's.
+	if got, held, err := w.adapted.LoadGate(t.Context(), testTenant, testSession, "gate-never-opened"); err != nil || held || got != (commands.Gate{OwnerEpoch: uint64(secondLease.Epoch())}) {
+		t.Fatalf("LoadGate for an unopened gate = (%+v, %t, %v), want (owner %d only, false, nil)", got, held, err, secondLease.Epoch())
 	}
 }
 

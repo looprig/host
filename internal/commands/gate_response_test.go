@@ -33,6 +33,10 @@ type fakeGates struct {
 	gates map[sessionwire.GateID]Gate
 	err   error
 	loads int
+
+	// mark is the projection's residency mark, reported for a gate it does
+	// not hold.
+	mark uint64
 }
 
 func (g *fakeGates) LoadGate(_ context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID, gate sessionwire.GateID) (Gate, bool, error) {
@@ -43,6 +47,9 @@ func (g *fakeGates) LoadGate(_ context.Context, _ sessionwire.TenantID, _ sessio
 		return Gate{}, false, g.err
 	}
 	held, ok := g.gates[gate]
+	if !ok {
+		return Gate{OwnerEpoch: g.mark}, false, nil
+	}
 	return held, ok, nil
 }
 
@@ -201,7 +208,7 @@ func TestAGateResponseIsNotRejectedForAGateThisHostDoesNotOwn(t *testing.T) {
 // harness settles an answer to a closed gate as no_op; rejecting on Host's own
 // reading would race the projection and could destroy a valid answer.
 func TestAGateResponseToAGateNotProjectedIsTheRuntimesToDecide(t *testing.T) {
-	f := gateFixture(t, &fakeGates{}, nil)
+	f := gateFixture(t, &fakeGates{mark: testEpoch}, nil)
 	f.runtime.onApply = func(command sessionwire.CommandID) { f.setEvidence(command, "no_op") }
 	outcome, err := f.process()
 	if err != nil || outcome.State != StateApplied {
@@ -345,5 +352,29 @@ func TestAnAnswerNamingOnlyTheOpenEventIsApplied(t *testing.T) {
 	outcome, err := f.process()
 	if err != nil || outcome.State != StateApplied {
 		t.Fatalf("Process = (%+v, %v), want an answer naming the projected open event applied", outcome, err)
+	}
+}
+
+// TestAFencedOutHostDoesNotDispatchAnAnswerToAnUnprojectedGate: the ownership
+// check is the PROJECTION's mark, and it applies whether or not the answered
+// gate is still projected. A predecessor fenced out by its successor saw the
+// successor's publisher resolve a gate closed at restore, took the "not
+// projected, the runtime decides" arm, began an attempt on its own claim, and
+// the successor's recovery settled the user's answer rejected/not_applied
+// (9/50 at -race -cpu 1, found by the fix round's verification). It now blocks.
+func TestAFencedOutHostDoesNotDispatchAnAnswerToAnUnprojectedGate(t *testing.T) {
+	f := gateFixture(t, &fakeGates{mark: testEpoch + 1}, nil)
+	_, err := f.process()
+	var refused *ApplyError
+	if !errors.As(err, &refused) || refused.Refusal != RefusalGateNotOwned {
+		t.Fatalf("Process = %v, want RefusalGateNotOwned", err)
+	}
+	for _, op := range f.store.operations() {
+		if op == "BeginAttempt" || op == "RejectDisposition" {
+			t.Fatalf("a fenced-out Host made %s", op)
+		}
+	}
+	if len(f.runtime.commands()) != 0 {
+		t.Fatal("a fenced-out Host dispatched the answer")
 	}
 }

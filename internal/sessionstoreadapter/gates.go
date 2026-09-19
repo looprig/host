@@ -83,6 +83,12 @@ func (s *Store) LoadGate(
 			OpenedJournalSeq: projection.OpenedJournalSeq,
 		}, true, nil
 	}
+	// AN ABSENT GATE STILL HAS AN OWNER on a disposition session: the mark is
+	// the projection's, and the applier checks it before dispatching an answer
+	// to a gate that is no longer projected.
+	if record.Binding.ProtocolMode == sessionstore.ProtocolModeDisposition {
+		return commands.Gate{OwnerEpoch: record.LeaseEpoch}, false, nil
+	}
 	return commands.Gate{}, false, nil
 }
 

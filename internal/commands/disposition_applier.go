@@ -367,7 +367,8 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 //     Host's grant
 //     (below it the fencing write has not landed; above it a successor wrote).
 //   - EVERYTHING ELSE IS THE RUNTIME'S. A gate the projection no longer holds
-//     is dispatched: harness is the authority on whether it is open, and
+//     is dispatched — by the Host that owns the projection's mark, and only by
+//     it: harness is the authority on whether it is open, and
 //     settles an answer to a closed gate as no_op. Rejecting on the projection
 //     would race the publisher and could destroy a valid answer.
 //
@@ -405,15 +406,19 @@ func (a *DispositionApplier) checkGateResponse(ctx context.Context, record Dispo
 			Cause:     err,
 		}
 	}
-	if !found || !gate.Open {
-		return false, nil
-	}
+	// OWNERSHIP IS THE PROJECTION'S MARK, WHETHER OR NOT THE GATE IS STILL
+	// PROJECTED. A gate this Host's successor has already resolved is not
+	// projected, and a predecessor that skipped the check on that arm began an
+	// attempt its successor then closed as not_applied, losing the answer.
 	if gate.OwnerEpoch != a.residency {
 		return false, &ApplyError{
 			Refusal:   RefusalGateNotOwned,
 			CommandID: record.CommandID,
 			Reason:    "the durable gate's residency mark is not this Host's grant, so this Host cannot yet say it holds the gate",
 		}
+	}
+	if !found || !gate.Open {
+		return false, nil
 	}
 	request := response.Request
 	if (request.ExpectedOpenEventID != "" && request.ExpectedOpenEventID != gate.OpenedEventID) ||

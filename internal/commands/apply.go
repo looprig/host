@@ -256,7 +256,9 @@ type Gate struct {
 	// epoch of the last Host to write any gate as the projection's mark, and
 	// raises it on every gate write. OwnerEpoch is that residency epoch — never
 	// a journal epoch — and OwnerHostID is empty. The owning Host is this one
-	// exactly when OwnerEpoch equals the grant it holds.
+	// exactly when OwnerEpoch equals the grant it holds. It is reported for a
+	// gate the projection does NOT hold too (Open false, found false), because
+	// the mark belongs to the projection, not to one gate.
 	OwnerHostID sessionwire.HostID
 	OwnerEpoch  uint64
 
