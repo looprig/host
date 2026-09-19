@@ -170,7 +170,11 @@ func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
 			command.Kind = kind
 			admitted, err := bound.admit(command)
 
-			if runtimecommand.Kind(kind).Valid() {
+			// gate_response IS VALID TO HARNESS SINCE v0.35.0 AND STILL REFUSED
+			// HERE: this adapter does not yet build its decoded response, and an
+			// Admitted without one is refused by Validate only AFTER the caller
+			// has begun an attempt.
+			if runtimecommand.Kind(kind).Valid() && kind != string(runtimecommand.KindGateResponse) {
 				if err != nil {
 					t.Fatalf("admit(%q) = %v, want it accepted", kind, err)
 				}
@@ -686,7 +690,9 @@ func TestCloseAttemptRefusesAMalformedClosure(t *testing.T) {
 		epoch   uint64
 	}{
 		{"no attempt identity", "", "input", 40},
-		{"an unknown kind", "attempt-9", "gate_response", 40},
+		// restore, not gate_response: harness v0.35.0 applies gate_response,
+		// so it is no longer an example of a kind the released closer refuses.
+		{"an unknown kind", "attempt-9", "restore", 40},
 		{"no attempt grant", "attempt-9", "input", 0},
 	} {
 		t.Run(row.name, func(t *testing.T) {

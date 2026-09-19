@@ -356,7 +356,7 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		// an identity the released type refuses is refused BEFORE the applier.
 		AttemptID: runtimecommand.AttemptID(command.AttemptID),
 	}
-	if !admitted.Kind.Valid() {
+	if !admitted.Kind.Valid() || admitted.Kind == runtimecommand.KindGateResponse {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{
 			CommandID: command.CommandID,
 			Kind:      command.Kind,
