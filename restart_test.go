@@ -176,7 +176,9 @@ func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalStores m
 // attachAsFactoryDoes attaches in the only mode Factory ever sends.
 func attachAsFactoryDoes(t *testing.T, service *host.Service) (host.Residency, error) {
 	t.Helper()
-	return service.Attach(t.Context(), host.AttachRequest{
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	return service.Attach(ctx, host.AttachRequest{
 		TenantID: composeTenant, SessionID: composeSession, AgentID: composeAgent,
 		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory",
 	})
@@ -203,7 +205,9 @@ func (w *realRuntimeWorld) turn(t *testing.T, controller session.SessionControll
 	if !ok {
 		t.Fatal("the harness session is not a session.IdleWaiter")
 	}
-	if err := idle.WaitIdle(t.Context()); err != nil {
+	idleCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := idle.WaitIdle(idleCtx); err != nil {
 		t.Fatalf("WaitIdle after %q: %v", text, err)
 	}
 }
@@ -230,15 +234,13 @@ func TestAReleasedSessionReattachedAsCreateResumesTheSameConversation(t *testing
 		t.Fatalf("Host A launched runtime session %v, want the binding's %v (R5)", got, world.runtimeID)
 	}
 	world.turn(t, firstLauncher.controller(), rememberedWord)
-	if _, err := first.Stop(t.Context()); err != nil {
-		t.Fatalf("Host A Stop (the drain that releases the session): %v", err)
-	}
+	stopWithin(t, first)
 	if got := harnesstest.CountSessionStarted(t, world.journal, world.runtimeID); got != 1 {
 		t.Fatalf("after Host A: %d SessionStarted under the runtime id, want 1", got)
 	}
 
 	second, secondLauncher := world.host(t, 5, nil)
-	t.Cleanup(func() { _, _ = second.Stop(context.Background()) })
+	t.Cleanup(func() { stopBounded(second) })
 	if _, err := attachAsFactoryDoes(t, second); err != nil {
 		t.Fatalf("Host B attach(create) of the released session: %v", err)
 	}
@@ -252,8 +254,8 @@ func TestAReleasedSessionReattachedAsCreateResumesTheSameConversation(t *testing
 	if got := harnesstest.CountSessionStarted(t, world.journal, world.runtimeID); got != 1 {
 		t.Fatalf("after Host B: %d SessionStarted under the runtime id, want 1 — a second one is a restarted conversation", got)
 	}
-	if !journalHas[event.RestoreDone](t, world.journal, world.runtimeID) {
-		t.Fatal("the journal records no RestoreDone: Host B did not restore the conversation")
+	if got := countOf[event.RestoreDone](t, world.journal, world.runtimeID); got != 1 {
+		t.Fatalf("the journal records %d RestoreDone, want exactly 1: Host B restored the conversation once", got)
 	}
 
 	before := len(world.llm.Requests())
@@ -288,7 +290,7 @@ func TestACreateThatCannotBeRestoredIsRefusedAndStartsNothingOver(t *testing.T) 
 
 	elsewhere := map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: "binding-elsewhere"}: world.journal}
 	blind, blindLauncher := world.host(t, 5, elsewhere)
-	t.Cleanup(func() { _, _ = blind.Stop(context.Background()) })
+	t.Cleanup(func() { stopBounded(blind) })
 	_, err := attachAsFactoryDoes(t, blind)
 	var refused *host.AttachError
 	if !errors.As(err, &refused) || refused.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
@@ -314,7 +316,7 @@ func TestComposeRefusesAJournalReaderThatIsNotAHarnessStore(t *testing.T) {
 	var invalid *host.InvalidCompositionError
 	if !errors.As(err, &invalid) || invalid.Field != "Collaborators.JournalStores" {
 		if service != nil {
-			_, _ = service.Stop(context.Background())
+			stopBounded(service)
 		}
 		t.Fatalf("Compose with a non-harness journal reader = %v, want an InvalidCompositionError on Collaborators.JournalStores", err)
 	}
@@ -322,18 +324,12 @@ func TestComposeRefusesAJournalReaderThatIsNotAHarnessStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("control: Compose with a harness journal store = %v", err)
 	}
-	_, _ = service.Stop(context.Background())
+	stopBounded(service)
 }
 
 // servesTheBinding is a journal table serving the fixture's binding with reader.
 func servesTheBinding(reader sessionstore.DispositionEvidenceReader) map[host.EvidenceKey]sessionstore.DispositionEvidenceReader {
 	return map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: reader}
-}
-
-// journalHas reports whether an event of type E is filed under id.
-func journalHas[E event.Event](t *testing.T, store *harnessstore.Store, id uuid.UUID) bool {
-	t.Helper()
-	return countOf[E](t, store, id) > 0
 }
 
 // countOf counts the events of type E filed under id.
@@ -405,7 +401,7 @@ func TestAJournalReadFailureRefusesTheAttachAndStartsNothingOver(t *testing.T) {
 			}
 			reader := harnesstest.Store(t, unreadable, composeTenant)
 			second, secondLauncher := world.host(t, 5, servesTheBinding(reader))
-			t.Cleanup(func() { _, _ = second.Stop(context.Background()) })
+			t.Cleanup(func() { stopBounded(second) })
 
 			_, err = attachAsFactoryDoes(t, second)
 			var refused *host.AttachError
@@ -430,4 +426,12 @@ func stopWithin(t *testing.T, service *host.Service) {
 	if _, err := service.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
+}
+
+// stopBounded drains a Host at cleanup, bounded so a wedged drain cannot hang
+// the package.
+func stopBounded(service *host.Service) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = service.Stop(ctx)
 }
