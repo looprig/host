@@ -64,15 +64,18 @@ type Workspaces interface {
 // both modes, so a Host composed without one could never attach a session.
 type NamespaceLayout func(sessionwire.TenantID, sessionwire.SessionID) string
 
-// RigSessionIDs answers Harness's own identity for a session, which no released
-// record holds. It is REQUIRED, and the reason is narrower than "restores need
-// it": the store adapter refuses a hydration of ANY session that has a catalog
-// record and no answer here, in both modes — and in production every session a
-// Host is asked to attach has one, because Factory creates the record before it
-// places. A Host composed without this could attach only a session nobody had
-// created. The product that recorded the identity is the only thing that can
-// answer; a deployment with no such record answers with an error, which refuses
-// the attach rather than handing Harness a zero identity.
+// RigSessionIDs answers Harness's own identity for a session whose durable
+// record carries NO BINDING (a legacy record), and is consulted for nothing
+// else.
+//
+// Deprecated: As of v0.3.0 the Harness identity of every bound session is read
+// from its immutable durable binding (SessionBinding.RuntimeSessionID), which
+// is where Factory records the identity it derived at create. That value is
+// the authority — settlement reads the runtime's journal by it — and a second
+// answer from a composition could only agree with it or name a journal
+// nothing else reads. The collaborator is optional and is kept only so a
+// v0.2.x composition still compiles; no session this workspace ships can be
+// hosted without a binding.
 type RigSessionIDs func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uuid.UUID, error)
 
 // WarmTimer is one session's warm countdown, in time.Timer's own three methods.
@@ -107,10 +110,24 @@ type Collaborators struct {
 	// rather than silently replace the router Compose built.
 	StoreOptions []sessionstore.Option
 
-	// JournalStores are this deployment's settlement evidence readers, one per
-	// (tenant, storage binding). REQUIRED and non-empty: a Host with no reader
-	// cannot settle anything and is refused at composition rather than at the
-	// first command.
+	// JournalStores are this deployment's runtime journal stores, one per
+	// (tenant, storage binding): the settlement evidence readers, and — as of
+	// v0.3.0 — what an attach reads to decide whether a session's conversation
+	// already exists. REQUIRED and non-empty: a Host with no reader cannot
+	// settle anything and is refused at composition rather than at the first
+	// command.
+	//
+	// A CREATE IS DECIDED BY THE JOURNAL, NOT BY THE ATTACH MODE. Factory sends
+	// every attach as create, and harness does not verify that the id it is
+	// asked to create under is fresh: a create over an existing conversation
+	// silently re-opens that stream and restores nothing. So Host looks first,
+	// under the runtime session id the session's binding names. The reader
+	// registered for the binding must therefore be the released harness
+	// session store (*harness sessionstore.Store, or a value embedding one) —
+	// the same journal the runtime writes. For a binding whose reader is not
+	// one, Host cannot tell a new session from a re-placed one, and it REFUSES
+	// the create with runtime_unavailable rather than risk starting a
+	// conversation over.
 	JournalStores map[EvidenceKey]sessionstore.DispositionEvidenceReader
 
 	// Registrar produces the Department this Host serves. REQUIRED.
@@ -130,7 +147,10 @@ type Collaborators struct {
 	// NamespaceLayout is REQUIRED; see NamespaceLayout.
 	NamespaceLayout NamespaceLayout
 
-	// RigSessionIDs is REQUIRED; see RigSessionIDs.
+	// RigSessionIDs is OPTIONAL and consulted only for a record with no
+	// binding.
+	//
+	// Deprecated: see RigSessionIDs.
 	RigSessionIDs RigSessionIDs
 }
 
@@ -279,10 +299,17 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		return nil, &InvalidCompositionError{Field: "Collaborators.Registrar", Reason: "the registrations do not form a Department", Cause: err}
 	}
 
-	adapted, err := sessionstoreadapter.New(store,
+	adapterOptions := []sessionstoreadapter.Option{
 		sessionstoreadapter.WithNamespaceLayout(sessionstoreadapter.NamespaceLayout(collaborators.NamespaceLayout)),
-		sessionstoreadapter.WithRigSessionIDs(sessionstoreadapter.RigSessionIDs(collaborators.RigSessionIDs)),
-	)
+		// The router is the journal reader as well as the evidence reader, so
+		// the store a create consults is the one settlement reads: the
+		// runtime's own journal for that (tenant, binding).
+		sessionstoreadapter.WithRuntimeJournals(router),
+	}
+	if collaborators.RigSessionIDs != nil {
+		adapterOptions = append(adapterOptions, sessionstoreadapter.WithRigSessionIDs(sessionstoreadapter.RigSessionIDs(collaborators.RigSessionIDs)))
+	}
+	adapted, err := sessionstoreadapter.New(store, adapterOptions...)
 	if err != nil {
 		closeStore()
 		return nil, &InvalidCompositionError{Field: "Collaborators.Backend", Reason: "the session store could not be adapted", Cause: err}
@@ -377,7 +404,6 @@ func (c Composition) validate() error {
 		{"Collaborators.Auth", c.Collaborators.Auth != nil},
 		{"Collaborators.Workspaces", c.Collaborators.Workspaces != nil},
 		{"Collaborators.NamespaceLayout", c.Collaborators.NamespaceLayout != nil},
-		{"Collaborators.RigSessionIDs", c.Collaborators.RigSessionIDs != nil},
 	} {
 		if !required.present {
 			return &InvalidCompositionError{Field: required.field, Reason: "must be set"}

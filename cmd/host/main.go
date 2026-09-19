@@ -23,7 +23,6 @@ import (
 	"syscall"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 
@@ -81,13 +80,6 @@ type Bootstrap interface {
 	// one can never attach a session — which is what v0.1.0's binary shipped
 	// as, and why host.Compose requires it.
 	NamespaceLayout() host.NamespaceLayout
-
-	// RigSessionIDs answers Harness's own identity for a session, which no
-	// released record holds and which the adapter requires for every session
-	// that has a catalog record — in production, every session a Host is asked
-	// to attach. The product that recorded it is the only thing that can
-	// answer; see host.RigSessionIDs.
-	RigSessionIDs() host.RigSessionIDs
 }
 
 func main() {
@@ -156,7 +148,6 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 			Auth:            bootstrap.Auth(),
 			Workspaces:      bootstrap.Workspaces(),
 			NamespaceLayout: bootstrap.NamespaceLayout(),
-			RigSessionIDs:   bootstrap.RigSessionIDs(),
 		},
 	}, host.ListenOptions{Address: config.ListenAddress})
 }
@@ -214,13 +205,6 @@ func (unconfiguredBootstrap) Workspaces() host.Workspaces { return unconfiguredB
 // refuses; the binary never gets that far.
 func (unconfiguredBootstrap) NamespaceLayout() host.NamespaceLayout {
 	return func(sessionwire.TenantID, sessionwire.SessionID) string { return "" }
-}
-
-// RigSessionIDs refuses.
-func (unconfiguredBootstrap) RigSessionIDs() host.RigSessionIDs {
-	return func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uuid.UUID, error) {
-		return uuid.UUID{}, errNoBootstrap
-	}
 }
 
 // VerifyTenant refuses.

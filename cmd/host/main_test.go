@@ -392,10 +392,10 @@ func TestBootstrapAsksAProductForNothingTheReleasedStoreCanAnswer(t *testing.T) 
 		// requires it; the product is the only thing that can answer it.
 		"NamespaceLayout": true,
 
-		// RigSessionIDs is the eighth, for the same gap one step further: the
-		// adapter refuses a hydration of any session WITH a catalog record and
-		// no Harness identity, and every session Factory places has one.
-		"RigSessionIDs": true,
+		// RigSessionIDs WAS the eighth and is gone at v0.3.0. The Harness
+		// identity of every bound session is read from its immutable durable
+		// binding, which is where Factory records it; a product answering it
+		// separately could only agree or name a journal nothing reads.
 	}
 	for name := range want {
 		if !got[name] {

@@ -17,12 +17,14 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/harnesstest"
 	"github.com/looprig/host/internal/testkit"
 )
 
@@ -97,6 +99,12 @@ type composeFixture struct {
 	backend *storage.Composite
 	rig     *testkit.FakeRig
 	session *testkit.FullSession
+
+	// journal is the runtime's journal store for (composeTenant,
+	// composeBinding): a REAL harness session store, because an attach now
+	// reads it to decide whether the session's conversation already exists.
+	// The fake rig never writes to it, so every session here is new to it.
+	journal *harnessstore.Store
 }
 
 func newComposeFixture(t testing.TB) *composeFixture {
@@ -106,7 +114,12 @@ func newComposeFixture(t testing.TB) *composeFixture {
 		t.Fatalf("uuid: %v", err)
 	}
 	session := testkit.NewFullSession(id)
-	return &composeFixture{backend: memstore.New(), rig: &testkit.FakeRig{Session: session}, session: session}
+	return &composeFixture{
+		backend: memstore.New(),
+		rig:     &testkit.FakeRig{Session: session},
+		session: session,
+		journal: harnesstest.Store(t, harnesstest.Backend(t), composeTenant),
+	}
 }
 
 func (f *composeFixture) registrar(t testing.TB) host.Registrar {
@@ -150,16 +163,13 @@ func (f *composeFixture) blueprint(t testing.TB) host.Composition {
 		WorkPoll:             time.Second,
 		Collaborators: host.Collaborators{
 			Backend:       f.backend,
-			JournalStores: map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: stubEvidence{}},
+			JournalStores: map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: composeTenant, StorageBindingID: composeBinding}: f.journal},
 			Registrar:     f.registrar(t),
 			Checkpointer:  inertCheckpointer{},
 			Auth:          acceptingAuth{},
 			Workspaces:    inertWorkspaces{},
 			NamespaceLayout: func(tenant sessionwire.TenantID, session sessionwire.SessionID) string {
 				return string(tenant) + "/" + string(session)
-			},
-			RigSessionIDs: func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uuid.UUID, error) {
-				return f.session.ID(), nil
 			},
 		},
 	}
@@ -178,8 +188,9 @@ func (f *composeFixture) otherParty(t testing.TB) *sessionstore.Store {
 }
 
 // seedDispositionSession is Factory's create: the catalog record a Host's
-// AcquireResidency will grant residency over.
-func seedDispositionSession(t *testing.T, store *sessionstore.Store, session sessionwire.SessionID) {
+// AcquireResidency will grant residency over. Its binding names the fixture's
+// runtime session, as Factory's derived runtime id names the runtime's.
+func (f *composeFixture) seedDispositionSession(t *testing.T, store *sessionstore.Store, session sessionwire.SessionID) {
 	t.Helper()
 	now := time.Now().UTC()
 	if _, _, err := store.CreateCatalogEntry(t.Context(), sessionstore.CreateCatalogEntryRequest{
@@ -196,7 +207,7 @@ func seedDispositionSession(t *testing.T, store *sessionstore.Store, session ses
 		Binding: sessionstore.SessionBinding{
 			StorageBindingID: composeBinding,
 			BindingVersion:   "v1",
-			RuntimeSessionID: "runtime-session-1",
+			RuntimeSessionID: f.session.ID().String(),
 			ProtocolMode:     sessionstore.ProtocolModeDisposition,
 		},
 	}); err != nil {
@@ -241,7 +252,6 @@ func TestComposeRefusesWhatItCannotRun(t *testing.T) {
 		{"Collaborators.Auth", func(c *host.Composition) { c.Collaborators.Auth = nil }},
 		{"Collaborators.Workspaces", func(c *host.Composition) { c.Collaborators.Workspaces = nil }},
 		{"Collaborators.NamespaceLayout", func(c *host.Composition) { c.Collaborators.NamespaceLayout = nil }},
-		{"Collaborators.RigSessionIDs", func(c *host.Composition) { c.Collaborators.RigSessionIDs = nil }},
 		{"Collaborators.JournalStores", func(c *host.Composition) {
 			c.Collaborators.JournalStores = map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{{TenantID: "", StorageBindingID: "b"}: stubEvidence{}}
 		}},
@@ -300,7 +310,7 @@ func TestComposeRefusesWhatItCannotRun(t *testing.T) {
 func TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip(t *testing.T) {
 	f := newComposeFixture(t)
 	other := f.otherParty(t)
-	seedDispositionSession(t, other, composeSession)
+	f.seedDispositionSession(t, other, composeSession)
 	runtime := &composePublishingSession{
 		FullSession: f.session,
 		published:   make(chan sessionwire.EnduringPublication),
@@ -462,7 +472,7 @@ func TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip(t *testing.T) {
 func TestAnAttachAgainstAnotherHoldersLeaseCarriesThatHoldersEpoch(t *testing.T) {
 	f := newComposeFixture(t)
 	other := f.otherParty(t)
-	seedDispositionSession(t, other, composeSession)
+	f.seedDispositionSession(t, other, composeSession)
 	holder, err := other.AcquireResidency(t.Context(), sessionstore.AcquireResidencyRequest{TenantID: composeTenant, SessionID: composeSession})
 	if err != nil {
 		t.Fatalf("the other Host could not take the lease: %v", err)

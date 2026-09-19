@@ -400,7 +400,7 @@ func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.Te
 }
 
 func (s *fakeStore) LoadSessionState(context.Context, sessionwire.TenantID, sessionwire.SessionID) (residency.SessionState, error) {
-	return residency.SessionState{Namespace: "tenant/session", CompatibilityID: testCompat, RigSessionID: testRigSessionID}, nil
+	return residency.SessionState{Namespace: "tenant/session", CompatibilityID: testCompat, RigSessionID: testRigSessionID, RuntimeJournal: residency.RuntimeJournalAbsent}, nil
 }
 
 func (s *fakeStore) PublishResidency(_ context.Context, observation sessionwire.HostLinkRegistryObservation) error {

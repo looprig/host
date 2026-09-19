@@ -62,6 +62,12 @@ type RigCreateRequest struct {
 	Placement     sessionwire.HostPlacement
 	WorkspaceRoot string
 	Storage       StorageContext
+
+	// RigSessionID is the Harness identity to launch under; see
+	// CreateRequest.RigSessionID. A Rig over harness passes it as
+	// rig.WithSessionID when it is non-zero, and the launched session's ID()
+	// must equal it or the launch is refused.
+	RigSessionID uuid.UUID
 }
 
 // RigRestoreRequest is RigCreateRequest for a relaunch over durable state.
@@ -134,6 +140,9 @@ func (t *rigTarget) Create(ctx context.Context, request CreateRequest) (Runtime,
 	if err != nil {
 		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "create", Cause: err}
 	}
+	if err := requireRigIdentity(ctx, request.RigSessionID, session); err != nil {
+		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "create", Cause: err}
+	}
 	return adaptRigSession(request.SessionID, request.AgentID, session)
 }
 
@@ -177,7 +186,47 @@ func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtim
 	if err != nil {
 		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "restore", Cause: err}
 	}
+	if err := requireRigIdentity(ctx, request.RigSessionID, session); err != nil {
+		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "restore", Cause: err}
+	}
 	return adaptRigSession(request.SessionID, request.AgentID, session)
+}
+
+// ErrRigSessionIdentity is the cause of a RigLaunchError raised when a Rig
+// launched or restored a session under a different Harness identity from the
+// one the request named. Reach it with errors.Is.
+var ErrRigSessionIdentity = errors.New("the rig launched the session under a different Harness identity from the one requested")
+
+// requireRigIdentity refuses a launched session whose Harness identity is not
+// the one requested, releasing it first.
+//
+// IT IS THE ONLY THING HOLDING A PRODUCT'S RIG TO THE BINDING. Rig is
+// implemented outside this module, and a Rig that ignored RigSessionID —
+// launching under an id it minted — would write the session's conversation to
+// a journal the durable binding does not name: nothing could find it again,
+// and the next placement would start the conversation over, silently. That is
+// the defect host v0.3.0 exists to close, reachable one seam further out.
+//
+// THE MIS-LAUNCHED SESSION IS RELEASED, NOT ABANDONED. It holds the runtime's
+// single-writer lease, and a refusal that left it running would leak it for
+// the life of the process. Release is NONTERMINAL (it is not Shutdown), so it
+// appends nothing that ends the conversation it did start. A session that
+// cannot be released is refused all the same; the release is best-effort.
+//
+// A zero request identity checks nothing: it is a create with no durable
+// binding, where the rig mints the id. A nil session is left to
+// adaptRigSession, which reports it.
+func requireRigIdentity(ctx context.Context, want uuid.UUID, session RigSession) error {
+	if want.IsZero() || isNilSession(session) {
+		return nil
+	}
+	if session.ID() == want {
+		return nil
+	}
+	if releaser, ok := session.(Releaser); ok {
+		_ = releaser.ReleaseResidency(ctx)
+	}
+	return ErrRigSessionIdentity
 }
 
 // adaptRigSession discovers the capabilities Host requires and refuses a

@@ -47,7 +47,14 @@ func (e *UnavailableMemberError) Error() string {
 // not gets UnavailableMemberError rather than an empty string.
 type NamespaceLayout func(sessionwire.TenantID, sessionwire.SessionID) string
 
-// RigSessionIDs answers Harness's own identity for a session Host created.
+// RigSessionIDs answers Harness's own identity for a session whose durable
+// record carries NO BINDING — a legacy record — and for nothing else.
+//
+// A BOUND RECORD NEVER REACHES IT. Since sessionstore v0.6.0 the immutable
+// SessionBinding names the runtime session (RuntimeSessionID), and that durable
+// member is the authority: it is what Factory derived and recorded at create,
+// and a second answer from a composition could only agree with it or be wrong.
+// Everything below is the pre-binding history of this seam.
 //
 // IT IS A PARAMETER FOR F5'S REASON, which is F4's reason with a different
 // owner. residency.SessionState.RigSessionID is documented as something Host
@@ -68,10 +75,49 @@ func WithNamespaceLayout(layout NamespaceLayout) Option {
 }
 
 // WithRigSessionIDs supplies the Harness identity LoadSessionState reports for
-// an existing session.
+// an existing session whose record carries no binding.
 func WithRigSessionIDs(ids RigSessionIDs) Option {
 	return func(s *Store) { s.rigSessionIDs = ids }
 }
+
+// RuntimeJournals answers whether the runtime's own journal already holds a
+// conversation under a session's runtime identity. See residency.RuntimeJournal
+// for why a create depends on it. An implementation answers
+// residency.RuntimeJournalUnknown, with no error, when it has no way to look;
+// an error is a lookup that failed.
+type RuntimeJournals interface {
+	RuntimeJournal(context.Context, sessionwire.TenantID, sessionstore.SessionBinding, uuid.UUID) (residency.RuntimeJournal, error)
+}
+
+// WithRuntimeJournals supplies the journal reader LoadSessionState consults
+// for a bound session. Without one every bound session reports
+// RuntimeJournalUnknown, and a create over it is refused.
+func WithRuntimeJournals(journals RuntimeJournals) Option {
+	return func(s *Store) { s.journals = journals }
+}
+
+// RuntimeSessionIDError reports a durable binding whose runtime session id is
+// not a Harness identity: not a UUID, or the zero UUID. The store accepts any
+// bounded opaque string there; Harness identifies a session by UUID, so Host
+// cannot launch or restore under it and refuses before the launch rather than
+// hand Harness the zero id.
+type RuntimeSessionIDError struct {
+	TenantID  sessionwire.TenantID
+	SessionID sessionwire.SessionID
+	Cause     error
+}
+
+func (e *RuntimeSessionIDError) Error() string {
+	message := "sessionstoreadapter: the binding of session " + strconv.Quote(string(e.SessionID)) +
+		" in tenant " + strconv.Quote(string(e.TenantID)) + " names a runtime session that is not a Harness identity (a non-zero UUID)"
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+// Unwrap returns the parse failure, if any.
+func (e *RuntimeSessionIDError) Unwrap() error { return e.Cause }
 
 // LoadSessionState reports the durable state a hydration reads.
 //
@@ -110,6 +156,30 @@ func (s *Store) LoadSessionState(
 	state.CompatibilityID = department.CompatibilityID(entry.Record.RuntimeCompatibilityID)
 	state.HasCheckpoint = entry.Record.Checkpoint.JournalSeq != 0
 	state.CheckpointSequence = entry.Record.Checkpoint.JournalSeq
+
+	// THE BINDING NAMES THE RUNTIME SESSION, and it is the only authority for
+	// it. Factory DERIVES that id at create (it is not the Core session id and
+	// cannot be recomputed from it here), records it in the immutable binding,
+	// and every journal read keys on it — settlement evidence included. A
+	// launch under any other id writes a conversation nothing can find again.
+	if binding := entry.Record.Binding; binding != (sessionstore.SessionBinding{}) {
+		runtimeID, err := uuid.Parse(binding.RuntimeSessionID)
+		if err == nil && runtimeID.IsZero() {
+			err = errors.New("the zero UUID names no session")
+		}
+		if err != nil {
+			return residency.SessionState{}, &RuntimeSessionIDError{TenantID: tenant, SessionID: session, Cause: err}
+		}
+		state.RigSessionID = runtimeID
+		if s.journals != nil {
+			journal, err := s.journals.RuntimeJournal(ctx, tenant, binding, runtimeID)
+			if err != nil {
+				return residency.SessionState{}, err
+			}
+			state.RuntimeJournal = journal
+		}
+		return state, nil
+	}
 
 	if s.rigSessionIDs == nil {
 		return residency.SessionState{}, &UnavailableMemberError{

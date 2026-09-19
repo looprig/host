@@ -980,7 +980,7 @@ func newFixture(t *testing.T, configure ...func(*fixture)) *fixture {
 		},
 		registry:   &spyRegistry{inner: registry.New(fixedClock{at: testClockAt}), trace: steps},
 		leases:     &fakeLeases{trace: steps, nextEpoch: testFirstEpoch - 1, held: map[sessionwire.SessionID]bool{}},
-		durable:    &fakeDurable{trace: steps, state: SessionState{Exists: true, Namespace: testNamespace, CompatibilityID: testCompat, RigSessionID: testRigSessionID, HasCheckpoint: true, CheckpointSequence: 91}},
+		durable:    &fakeDurable{trace: steps, state: SessionState{Exists: true, Namespace: testNamespace, CompatibilityID: testCompat, RigSessionID: testRigSessionID, RuntimeJournal: RuntimeJournalAbsent, HasCheckpoint: true, CheckpointSequence: 91}},
 		workspaces: &fakeWorkspaces{trace: steps, root: testWorkspaceRoot},
 		locations:  &fakeLocations{trace: steps},
 		ownership:  &fakeOwnership{trace: steps},
@@ -1280,6 +1280,7 @@ func TestAttachCreatesUnderTheLeaseInTheSpecifiedOrder(t *testing.T) {
 		Placement:     sessionwire.HostPlacementPooled,
 		WorkspaceRoot: testWorkspaceRoot,
 		Storage:       department.StorageContext{Namespace: testNamespace},
+		RigSessionID:  testRigSessionID,
 	}
 	if creates[0] != want {
 		t.Errorf("the target received\n  %+v\nwant\n  %+v", creates[0], want)
@@ -1671,6 +1672,36 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			wantStep:  StepHydrate,
 			wantCode:  sessionwire.HostLinkErrorRuntimeUnavailable,
 			forbidden: []string{"workspace.ensure", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
+			name: "4 create over a runtime journal whose restore needs a checkpoint it has not got",
+			mode: ModeCreate,
+			configure: func(f *fixture) {
+				f.durable.state.RuntimeJournal = RuntimeJournalPresent
+				f.target.capabilities.RequiresCheckpoint = true
+				f.durable.state.HasCheckpoint = false
+			},
+			wantStep:  StepHydrate,
+			wantCode:  sessionwire.HostLinkErrorRuntimeUnavailable,
+			forbidden: []string{"workspace.ensure", "target.create", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
+			name:      "4 create whose runtime journal cannot be determined",
+			mode:      ModeCreate,
+			configure: func(f *fixture) { f.durable.state.RuntimeJournal = RuntimeJournalUnknown },
+			wantStep:  StepHydrate,
+			wantCode:  sessionwire.HostLinkErrorRuntimeUnavailable,
+			forbidden: []string{"workspace.ensure", "target.create", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
+			name: "4 create over a runtime journal whose restore the target refuses",
+			mode: ModeCreate,
+			configure: func(f *fixture) {
+				f.durable.state.RuntimeJournal = RuntimeJournalPresent
+				f.target.restoreErr = sentinel
+			},
+			wantStep:  StepHydrate,
+			forbidden: []string{"target.create", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
 			name:      "4 the durable store returns no object namespace",
@@ -4248,4 +4279,90 @@ func journalOpenings(file *ast.File) []string {
 		return true
 	})
 	return found
+}
+
+// ---------------------------------------------------------------------------
+// A create over an existing conversation (the restart bug)
+// ---------------------------------------------------------------------------
+//
+// Factory sends EVERY attach as create: both inputs its attach mode is chosen
+// from are dead on a disposition record. harness's rig.WithSessionID does not
+// verify freshness — naming a session whose journal already exists re-opens
+// THAT stream and appends a second SessionStarted, and the conversation is not
+// restored — so a Host that obeyed the mode silently restarted every re-placed
+// session. The mode is therefore Factory's REQUEST and the runtime journal is
+// the decision: these rows hold the three outcomes.
+
+// TestACreateOverAnExistingRuntimeJournalRestoresIt is the fix: the journal
+// exists, so the session is RESTORED under the binding's runtime identity, and
+// nothing is created.
+func TestACreateOverAnExistingRuntimeJournalRestoresIt(t *testing.T) {
+	f := newFixture(t)
+	f.durable.state.RuntimeJournal = RuntimeJournalPresent
+
+	residency, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+	if err != nil {
+		t.Fatalf("Attach(create) over an existing runtime journal = %v, want it restored", err)
+	}
+	requireSteps(t, f.trace.recorded(), restoreSequence)
+	if creates := f.target.createRequests(); len(creates) != 0 {
+		t.Fatalf("the target was asked to CREATE %d times over an existing journal; that is the silent restart", len(creates))
+	}
+	restores := f.target.restoreRequests()
+	if len(restores) != 1 {
+		t.Fatalf("the target was asked to restore %d times, want 1", len(restores))
+	}
+	want := department.RestoreRequest{
+		TenantID:        testTenant,
+		SessionID:       testSession,
+		AgentID:         testAgent,
+		Placement:       sessionwire.HostPlacementPooled,
+		WorkspaceRoot:   testWorkspaceRoot,
+		Storage:         department.StorageContext{Namespace: testNamespace},
+		CompatibilityID: testCompat,
+		RigSessionID:    testRigSessionID,
+	}
+	if restores[0] != want {
+		t.Errorf("the target received\n  %+v\nwant\n  %+v", restores[0], want)
+	}
+	if !residency.Attached {
+		t.Error("the restoring attach reports Attached false")
+	}
+}
+
+// TestACreateWithNoRuntimeJournalCreatesUnderTheBindingsIdentity is the
+// control: a genuinely new session still creates, and it creates under the
+// runtime identity the durable binding names rather than one the rig mints.
+func TestACreateWithNoRuntimeJournalCreatesUnderTheBindingsIdentity(t *testing.T) {
+	f := newFixture(t)
+	f.durable.state.RuntimeJournal = RuntimeJournalAbsent
+
+	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err != nil {
+		t.Fatalf("Attach(create) with no runtime journal = %v", err)
+	}
+	requireSteps(t, f.trace.recorded(), createSequence)
+	creates := f.target.createRequests()
+	if len(creates) != 1 || len(f.target.restoreRequests()) != 0 {
+		t.Fatalf("creates = %d, restores = %d; want one create", len(creates), len(f.target.restoreRequests()))
+	}
+	if creates[0].RigSessionID != testRigSessionID {
+		t.Errorf("the create carried rig session %v, want the binding's %v", creates[0].RigSessionID, testRigSessionID)
+	}
+}
+
+// TestACreateOverAJournalWithACheckpointRestores holds that the checkpoint rule
+// a create inherits by restoring is the restore rule, not a stricter one: a
+// target requiring a checkpoint restores when the session has one.
+func TestACreateOverAJournalWithACheckpointRestores(t *testing.T) {
+	f := newFixture(t)
+	f.durable.state.RuntimeJournal = RuntimeJournalPresent
+	f.target.capabilities.RequiresCheckpoint = true
+	f.durable.state.HasCheckpoint = true
+
+	if _, err := f.manager.Attach(context.Background(), f.request(ModeCreate)); err != nil {
+		t.Fatalf("Attach(create) over a checkpointed journal = %v", err)
+	}
+	if len(f.target.restoreRequests()) != 1 || len(f.target.createRequests()) != 0 {
+		t.Fatalf("restores = %d, creates = %d; want one restore", len(f.target.restoreRequests()), len(f.target.createRequests()))
+	}
 }

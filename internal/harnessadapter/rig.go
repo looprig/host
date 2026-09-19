@@ -110,7 +110,19 @@ func (a *Adapter) NewSession(ctx context.Context, request department.RigCreateRe
 	if isNil(assembled) {
 		return nil, ErrNoRig
 	}
-	controller, err := assembled.NewSession(ctx)
+	// THE SESSION IS LAUNCHED UNDER THE BINDING'S IDENTITY. The request carries
+	// the runtime session id the durable binding names, and a session launched
+	// without it gets an id the rig mints and nothing records — so its journal
+	// is unreachable to every later restore and every settlement read. Host
+	// sends a create only once it has found no journal under that id; harness
+	// verifies no freshness itself (rig.WithSessionID says so), and that check
+	// is the whole defence. A zero id names no binding, and harness refuses
+	// WithSessionID(zero), so the rig mints one then.
+	var options []rig.SessionOption
+	if !request.RigSessionID.IsZero() {
+		options = append(options, rig.WithSessionID(request.RigSessionID))
+	}
+	controller, err := assembled.NewSession(ctx, options...)
 	if err != nil {
 		return nil, err
 	}

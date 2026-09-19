@@ -207,10 +207,20 @@ type SessionState struct {
 	// restore onto a different build is refused.
 	CompatibilityID department.CompatibilityID
 
-	// RigSessionID is Harness's identity for the session, which Host recorded
-	// at create and cannot derive. A restore that does not carry it has
-	// nothing to restore from.
+	// RigSessionID is Harness's identity for the session: the runtime session
+	// id the session's immutable durable binding names (Factory derives it
+	// at create; it is NOT the Core session id). A restore that does not carry
+	// it has nothing to restore from, and a create launches under it so the
+	// journal the runtime writes is the one the binding names. Zero means the
+	// store named none — only a record with no binding — and a create then
+	// lets the rig mint one.
 	RigSessionID uuid.UUID
+
+	// RuntimeJournal reports whether the runtime's own journal already holds
+	// a conversation under RigSessionID. It is what decides a create: see
+	// RuntimeJournal. The zero value is RuntimeJournalUnknown, which refuses a
+	// create, so a store that forgot to answer fails closed.
+	RuntimeJournal RuntimeJournal
 
 	// HasCheckpoint and CheckpointSequence report the active workspace
 	// checkpoint. A target declaring RequiresCheckpoint may not be restored
@@ -218,6 +228,33 @@ type SessionState struct {
 	HasCheckpoint      bool
 	CheckpointSequence uint64
 }
+
+// RuntimeJournal is what the runtime's own journal holds for a session's
+// runtime identity.
+//
+// IT EXISTS BECAUSE A CREATE CANNOT BE TRUSTED TO MEAN "NEW". Factory sends
+// every attach as create (both inputs its attach mode is chosen from are dead
+// on a disposition record), and harness does not verify that a session id it
+// is asked to create under is fresh: naming a session whose journal exists
+// re-opens THAT stream, appends a second SessionStarted and restores nothing,
+// with no error. So a Host that launched every create fresh silently restarted
+// every re-placed session's conversation. The journal is the authority; the
+// attach mode is only a request.
+type RuntimeJournal int
+
+const (
+	// RuntimeJournalUnknown means nothing established whether a journal
+	// exists. A create is REFUSED on it rather than launched, because
+	// launching is exactly the silent restart when the answer would have been
+	// "present". It is the zero value on purpose.
+	RuntimeJournalUnknown RuntimeJournal = iota
+	// RuntimeJournalAbsent means the runtime has no conversation under the
+	// session's runtime identity, so a create launches a new one under it.
+	RuntimeJournalAbsent
+	// RuntimeJournalPresent means a conversation exists, so a create restores
+	// it instead of starting over.
+	RuntimeJournalPresent
+)
 
 // DurableStore reads the durable session state a hydration needs.
 type DurableStore interface {
@@ -1139,6 +1176,36 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		}
 	}
 
+	// A CREATE IS A REQUEST AND THE RUNTIME JOURNAL DECIDES IT. See
+	// RuntimeJournal for why the mode alone cannot be obeyed: a create over a
+	// conversation that already exists is launched as a RESTORE of it, and a
+	// create whose journal cannot be established is refused rather than
+	// launched, because launching is the silent restart.
+	//
+	// THE REFUSALS ARE runtime_unavailable, the code this Host already gives a
+	// restore it cannot perform (no durable state, a required checkpoint
+	// missing). It is the right one to reuse and the others are wrong in ways
+	// that matter to the caller: runtime_mismatch sends Factory looking for a
+	// Host on a different BUILD, which cannot help; epoch_mismatch invalidates
+	// a binding nobody holds; no_capacity and not_admitting describe this
+	// Host's occupancy, and would have Factory retry the same session on
+	// another Host that must reach the same answer from the same journal. The
+	// empty code — an unclassified failure — is kept for a store that failed
+	// to answer at all, as every other store failure here is.
+	launch := request.Mode
+	if request.Mode == ModeCreate && !state.RigSessionID.IsZero() {
+		switch state.RuntimeJournal {
+		case RuntimeJournalAbsent:
+		case RuntimeJournalPresent:
+			if capabilities.RequiresCheckpoint && !state.HasCheckpoint {
+				return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeUnavailable, "a create names a session whose runtime journal already holds a conversation, and restoring it requires a checkpoint the session has not got; it is refused rather than started over", nil)
+			}
+			launch = ModeRestore
+		default:
+			return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeUnavailable, "a create names a runtime session whose journal this Host cannot inspect, so it cannot tell a new session from one it would silently restart; it is refused rather than launched", nil)
+		}
+	}
+
 	var workspaceRoot string
 	if capabilities.RequiresWorkspace {
 		workspaceRoot, err = m.workspaces.EnsureWorkspace(sessionCtx, key.TenantID, key.SessionID)
@@ -1152,7 +1219,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	storage := department.StorageContext{Namespace: state.Namespace}
 	var runtime department.Runtime
-	if request.Mode == ModeCreate {
+	if launch == ModeCreate {
 		runtime, err = target.target.Create(sessionCtx, department.CreateRequest{
 			TenantID:      key.TenantID,
 			SessionID:     key.SessionID,
@@ -1160,6 +1227,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 			Placement:     m.host.Placement(),
 			WorkspaceRoot: workspaceRoot,
 			Storage:       storage,
+			RigSessionID:  state.RigSessionID,
 		})
 	} else {
 		runtime, err = target.target.Restore(sessionCtx, department.RestoreRequest{

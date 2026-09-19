@@ -18,6 +18,7 @@ type Store struct {
 
 	namespace     NamespaceLayout
 	rigSessionIDs RigSessionIDs
+	journals      RuntimeJournals
 }
 
 // New adapts an open store.

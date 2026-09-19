@@ -252,6 +252,17 @@ type CreateRequest struct {
 	Placement     sessionwire.HostPlacement
 	WorkspaceRoot string
 	Storage       StorageContext
+
+	// RigSessionID is HARNESS'S identity to launch the new session under: the
+	// runtime session id the session's immutable durable binding names, which
+	// Factory derived at create and which is NOT the sessionwire SessionID. A
+	// target must launch under exactly this id (harness: rig.WithSessionID),
+	// because the binding is the only record of where the session's journal
+	// lives; a session launched under a minted id writes a journal nothing
+	// can find again. Host sends a create only after establishing that no
+	// journal exists under it. Zero means the durable record named none — only
+	// a record with no binding — and the target mints one.
+	RigSessionID uuid.UUID
 }
 
 // RestoreRequest is a Host-side relaunch request over existing durable state.

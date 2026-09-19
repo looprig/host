@@ -427,12 +427,11 @@ type publishingSession struct {
 }
 
 func newPublishingSession() *publishingSession {
-	id, err := uuid.New()
-	if err != nil {
-		panic(err)
-	}
+	// testRigSessionID, not a fresh id: the fixture's durable state names that
+	// runtime session for every session, as a binding does, and the
+	// department refuses a launch under any identity but the requested one.
 	return &publishingSession{
-		id:        id,
+		id:        testRigSessionID,
 		published: make(chan sessionwire.EnduringPublication),
 		stopped:   make(chan struct{}),
 		drove:     make(chan struct{}, 1),

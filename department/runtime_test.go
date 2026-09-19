@@ -34,6 +34,7 @@ func launchRequest() department.CreateRequest {
 		Placement:     sessionwire.HostPlacementDedicated,
 		WorkspaceRoot: "/srv/workspaces/71c",
 		Storage:       department.StorageContext{Namespace: "tenants/9f3/sessions/71c"},
+		RigSessionID:  rigSessionUUID,
 	}
 }
 
@@ -102,6 +103,7 @@ func TestCreatePropagatesTheLaunchContextToTheRig(t *testing.T) {
 		Placement:     sessionwire.HostPlacementDedicated,
 		WorkspaceRoot: "/srv/workspaces/71c",
 		Storage:       department.StorageContext{Namespace: "tenants/9f3/sessions/71c"},
+		RigSessionID:  uuid.MustParse("6f1c9e2a-3b47-4d58-9a10-2c7e5f8b4d63"),
 	}
 	if got != want {
 		t.Errorf("the rig received %+v, want %+v", got, want)
@@ -1504,4 +1506,59 @@ func TestAdaptedRuntimeForwardsToTheSession(t *testing.T) {
 	if err := runtime.WaitIdle(cancelled); !errors.Is(err, context.Canceled) {
 		t.Errorf("WaitIdle with a cancelled context = %v, want context.Canceled", err)
 	}
+}
+
+// otherRigSessionUUID is a Harness identity no request in this file names.
+var otherRigSessionUUID = uuid.MustParse("0b8d4e21-7c3a-4f96-a5e2-91d3c7f60a18")
+
+// TestALaunchUnderAnotherHarnessIdentityIsRefused holds R5 at the product
+// seam. department.Rig is implemented OUTSIDE this module, so nothing but this
+// check stops a Rig that ignores RigSessionID — launching under a minted id —
+// from writing a journal the durable binding does not name: the conversation
+// then exists nowhere Host can find it again, and the next placement starts
+// over. The refusal releases what the rig launched rather than leaking it.
+func TestALaunchUnderAnotherHarnessIdentityIsRefused(t *testing.T) {
+	t.Parallel()
+
+	t.Run("create", func(t *testing.T) {
+		t.Parallel()
+		session := testkit.NewFullSession(otherRigSessionUUID)
+		rig := &testkit.FakeRig{Session: session}
+		_, err := rigTarget(t, rig).Create(t.Context(), launchRequest())
+		var launch *department.RigLaunchError
+		if !errors.As(err, &launch) || !errors.Is(err, department.ErrRigSessionIdentity) {
+			t.Fatalf("Create under another identity = %v, want a RigLaunchError wrapping ErrRigSessionIdentity", err)
+		}
+		if session.Released() != 1 {
+			t.Errorf("the mis-launched session was released %d times, want 1", session.Released())
+		}
+	})
+	t.Run("restore", func(t *testing.T) {
+		t.Parallel()
+		session := testkit.NewFullSession(otherRigSessionUUID)
+		rig := &testkit.FakeRig{Session: session}
+		_, err := rigTarget(t, rig).Restore(t.Context(), restoreRequest("rig-2026-09"))
+		if !errors.Is(err, department.ErrRigSessionIdentity) {
+			t.Fatalf("Restore answered by another identity = %v, want ErrRigSessionIdentity", err)
+		}
+		if session.Released() != 1 {
+			t.Errorf("the mis-restored session was released %d times, want 1", session.Released())
+		}
+	})
+	t.Run("create with no identity lets the rig mint one", func(t *testing.T) {
+		t.Parallel()
+		rig := &testkit.FakeRig{Session: testkit.NewFullSession(otherRigSessionUUID)}
+		request := launchRequest()
+		request.RigSessionID = uuid.UUID{}
+		if _, err := rigTarget(t, rig).Create(t.Context(), request); err != nil {
+			t.Fatalf("Create with no named identity = %v, want the rig's own id accepted", err)
+		}
+	})
+	t.Run("control: the named identity is accepted", func(t *testing.T) {
+		t.Parallel()
+		rig := &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}
+		if _, err := rigTarget(t, rig).Create(t.Context(), launchRequest()); err != nil {
+			t.Fatalf("Create under the named identity = %v", err)
+		}
+	})
 }
