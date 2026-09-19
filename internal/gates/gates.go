@@ -412,7 +412,29 @@ func (p *Publisher) converge(ctx context.Context) error {
 			return 0
 		}
 	})
+	// THE RESOLVES RUN FIRST, AND THE ORDER IS LOAD-BEARING. The pass that
+	// folds a gate's close is also the pass that must publish a gate the
+	// projection had no room for, and the projection holds at most
+	// sessionstore's cap. Opening first meant that pass tried the overflow
+	// gate while the slot was still taken, freed the slot afterwards, and then
+	// cleared `dirty` — leaving the gate invisible with a free slot beside it,
+	// silently (the full-projection WARN is once per gate), until some
+	// unrelated gate opened or closed. Resolving first makes the slot
+	// available to the very pass that freed it.
 	var failures []error
+	for _, projection := range projected {
+		if want[projection.GateID] {
+			continue
+		}
+		if err := p.options.Session.Resolve(ctx, projection.GateID); err != nil {
+			if errors.Is(err, residency.ErrEpochSuperseded) {
+				return err
+			}
+			failures = append(failures, err)
+		}
+	}
+	// AND THE OPENS FOLLOW, oldest first, into whatever room the resolves
+	// above have made.
 	for _, held := range pending {
 		projection, err := Project(p.scope, held.opened, held.seq)
 		if err == nil {
@@ -426,27 +448,17 @@ func (p *Publisher) converge(ctx context.Context) error {
 			p.unpublishable[coresessionwire.GateID(held.opened.Gate.ID.String())] = true
 			p.warn(ctx, "host: a gate can never be projected and will not be retried", err)
 		case errors.Is(err, ErrProjectionFull):
-			// NOT A FAILED PASS. Retrying on the timer would change nothing
-			// until a gate closes, and closing one changes the fold, which
-			// marks the next pass dirty and tries this gate again. Until then
-			// Factory cannot see it, which is logged once.
+			// NOT A FAILED PASS. Retrying on the timer would change
+			// nothing: only a gate closing makes room, and a close is a
+			// fold change, so the next pass converges and — because the
+			// resolves ran first — has the slot to publish this gate into.
+			// Until then Factory cannot see it, which is logged once.
 			id := coresessionwire.GateID(held.opened.Gate.ID.String())
 			if !p.full[id] {
 				p.full[id] = true
 				p.warn(ctx, "host: a gate is not visible to Factory because the session's gate projection is full; it is published when another gate closes", err)
 			}
 		default:
-			failures = append(failures, err)
-		}
-	}
-	for _, projection := range projected {
-		if want[projection.GateID] {
-			continue
-		}
-		if err := p.options.Session.Resolve(ctx, projection.GateID); err != nil {
-			if errors.Is(err, residency.ErrEpochSuperseded) {
-				return err
-			}
 			failures = append(failures, err)
 		}
 	}

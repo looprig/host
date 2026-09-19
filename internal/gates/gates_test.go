@@ -529,68 +529,56 @@ func TestASupersededResolveInConvergeStopsThePublisher(t *testing.T) {
 	eventually(t, "the publisher to report it was superseded", h.publisher.Superseded)
 }
 
-// TestAFullProjectionIsNotARetryStorm (quality gate F7): sessionstore holds at
-// most 16 open gates. A gate that does not fit is logged ONCE and is not
-// retried on the timer — nothing changes until a gate closes — and the pass
-// still converges. When a gate closes, the next pass publishes it.
+// TestAFullProjectionIsNotARetryStorm (quality gate F7): a gate the projection
+// has no room for is logged ONCE and is never retried on the timer — nothing
+// changes until a gate closes — and the pass still converges. The reader is a
+// real cap, so a pass that DOES free a slot publishes it
+// (TestAGateBeyondTheCapIsPublishedByThePassThatFreesASlot).
 func TestAFullProjectionIsNotARetryStorm(t *testing.T) {
-	session := &fakeSession{}
+	session := &capSession{cap: 1}
 	first := opened(0x10, gate.KindAskUser, 0)
 	overflow := opened(0x20, gate.KindAskUser, 0)
 	session.append(first, 3)
 	session.append(overflow, 5)
-	session.openErr = map[coresessionwire.GateID]error{gateIDOf(overflow): errors.Join(ErrProjectionFull, errors.New("store: too_large open_gates"))}
-	records := &recordingHandler{}
-	h := &harness{session: session, hints: &fakeHints{}, converged: make(chan struct{}, 64)}
-	publisher, err := Start(t.Context(), Options{
-		Session: session, Hints: h.hints, After: time.After, Retry: 5 * time.Millisecond,
-		OnConverged: func() { h.converged <- struct{}{} }, Logger: slog.New(records),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.publisher = publisher
-	t.Cleanup(func() { publisher.Stop() })
+	h, records := startCapped(t, session)
 	h.awaitConverged(t)
 	time.Sleep(100 * time.Millisecond) // twenty Retry intervals
 
-	// ANOTHER DIRTY PASS, which retries the gate that does not fit: the WARN
-	// is once per GATE, not once per attempt.
+	if attempts := countCalls(t, session, "open-full:"+string(gateIDOf(overflow))); attempts != 1 {
+		t.Fatalf("the gate that does not fit was tried %d times with nothing changed, want 1: the timer must not retry it", attempts)
+	}
+
+	// ANOTHER DIRTY PASS THAT FREES NOTHING: an unrelated gate opens and
+	// closes within one fold, so the overflow is tried again — and the WARN is
+	// once per GATE, not once per attempt.
 	extra := opened(0x50, gate.KindAskUser, 0)
 	session.append(extra, 20)
 	session.append(resolved(0x51, extra.Gate.ID), 21)
 	h.hints.hint()
 	h.awaitConverged(t)
 
-	calls, _, _ := session.snapshot()
-	attempts := 0
-	for _, call := range calls {
-		if call == "open:"+string(gateIDOf(overflow)) {
-			attempts++
-		}
-	}
-	if attempts < 2 {
-		t.Fatalf("the gate that does not fit was opened %d times over two dirty passes, so this test cannot see a per-attempt log", attempts)
-	}
-	if retries := len(calls); retries == 0 {
-		t.Fatal("no calls were recorded")
+	if attempts := countCalls(t, session, "open-full:"+string(gateIDOf(overflow))); attempts < 2 {
+		t.Fatalf("the gate that does not fit was tried %d times over two dirty passes, so this test cannot see a per-attempt log", attempts)
 	}
 	if records.count() != 1 {
 		t.Fatalf("%d WARN records over two dirty passes, want exactly one for the gate that does not fit", records.count())
 	}
-
-	// A gate closes: the fold changes and the overflow is published.
-	// (The first 100ms held twenty Retry intervals with no dirty pass and no
-	// attempt: the timer never retries it.)
-	session.mu.Lock()
-	delete(session.openErr, gateIDOf(overflow))
-	session.mu.Unlock()
-	session.append(resolved(0x30, first.Gate.ID), 30)
-	h.hints.hint()
-	h.awaitConverged(t)
-	if _, projected, _ := session.snapshot(); len(projected) != 1 || projected[0].GateID != gateIDOf(overflow) {
-		t.Fatalf("projection = %+v after a gate closed, want the gate that did not fit", projected)
+	if _, projected, _ := session.snapshot(); len(projected) != 1 || projected[0].GateID != gateIDOf(first) {
+		t.Fatalf("projection = %+v, want the one gate that fits", projected)
 	}
+}
+
+// countCalls counts one recorded call on a session.
+func countCalls(t *testing.T, session *capSession, call string) int {
+	t.Helper()
+	calls, _, _ := session.snapshot()
+	count := 0
+	for _, recorded := range calls {
+		if recorded == call {
+			count++
+		}
+	}
+	return count
 }
 
 // recordingHandler counts WARN records.
@@ -656,5 +644,91 @@ func TestStopIsBoundedAgainstAStoreCallThatIgnoresCancellation(t *testing.T) {
 	}
 	if !healthy.Stop() {
 		t.Fatal("a publisher whose calls honour cancellation did not stop within its bound")
+	}
+}
+
+// capSession models sessionstore's REAL open-gate rule: at most cap gates are
+// projected per session, a further OpenGate is refused (the adapter classifies
+// CatalogErrorTooLarge/open_gates as ErrProjectionFull), and a Resolve frees a
+// slot. It is the reader the full-projection tests need: a fake that refuses
+// the overflow gate FOREVER cannot exercise the recovery those tests claim.
+type capSession struct {
+	fakeSession
+	cap int
+}
+
+func (s *capSession) Open(ctx context.Context, projection coresessionwire.GateProjection) error {
+	s.mu.Lock()
+	full := len(s.projected) >= s.cap
+	if full {
+		s.record("open-full:" + string(projection.GateID))
+	}
+	s.mu.Unlock()
+	if full {
+		return errors.Join(ErrProjectionFull, errors.New("sessionstore: too_large (open_gates)"))
+	}
+	return s.fakeSession.Open(ctx, projection)
+}
+
+// startCapped runs a publisher over a capped projection, recording its WARNs.
+func startCapped(t *testing.T, session *capSession) (*harness, *recordingHandler) {
+	t.Helper()
+	records := &recordingHandler{}
+	h := &harness{session: &session.fakeSession, hints: &fakeHints{}, converged: make(chan struct{}, 64)}
+	publisher, err := Start(t.Context(), Options{
+		Session: session, Hints: h.hints, After: time.After, Retry: 5 * time.Millisecond,
+		OnConverged: func() { h.converged <- struct{}{} }, Logger: slog.New(records),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.publisher = publisher
+	t.Cleanup(func() { publisher.Stop() })
+	return h, records
+}
+
+// TestAGateBeyondTheCapIsPublishedByThePassThatFreesASlot is the regate's F7
+// probe, committed.
+//
+// THE CLOSING GATE AND THE OVERFLOW GATE ARE HANDLED IN ONE PASS, which is why
+// converge RESOLVES BEFORE IT OPENS. With the open loop first, that pass tried
+// the overflow gate while the projection was still full, then freed the slot,
+// then cleared `dirty` — so the gate stayed invisible with a free slot beside
+// it until some unrelated gate opened or closed, silently (the WARN is once per
+// gate). An ask_user gate with no timeout could wait forever.
+func TestAGateBeyondTheCapIsPublishedByThePassThatFreesASlot(t *testing.T) {
+	session := &capSession{cap: 2}
+	first := opened(0x10, gate.KindAskUser, 0)
+	second := opened(0x20, gate.KindAskUser, 0)
+	overflow := opened(0x30, gate.KindAskUser, 0)
+	session.append(first, 3)
+	session.append(second, 4)
+	session.append(overflow, 5)
+	h, records := startCapped(t, session)
+	h.awaitConverged(t)
+
+	_, projected, _ := session.snapshot()
+	if len(projected) != 2 || records.count() != 1 {
+		t.Fatalf("%d gates projected with %d WARNs, want the cap and one WARN for the gate that did not fit", len(projected), records.count())
+	}
+
+	// ONE OF THE TWO CLOSES, in the same pass that must publish the overflow.
+	session.append(resolved(0x40, first.Gate.ID), 6)
+	h.hints.hint()
+	h.awaitConverged(t)
+
+	_, projected, _ = session.snapshot()
+	held := map[coresessionwire.GateID]bool{}
+	for _, projection := range projected {
+		held[projection.GateID] = true
+	}
+	if !held[gateIDOf(overflow)] {
+		t.Fatalf("the gate beyond the cap is still invisible after another closed; projected = %d", len(projected))
+	}
+	if held[gateIDOf(first)] || !held[gateIDOf(second)] || len(projected) != 2 {
+		t.Fatalf("projection = %+v, want the second gate and the overflow", projected)
+	}
+	if records.count() != 1 {
+		t.Fatalf("%d WARN records, want the one for the gate that did not fit", records.count())
 	}
 }
