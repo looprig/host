@@ -355,3 +355,24 @@ func (c countingCursor) Close() error {
 	*c.closed++
 	return c.Cursor.Close()
 }
+
+// TestTheJournalProbeClosesEveryCursorItOpens: the ledger path runs on every
+// create whose catalog entry is absent, and on pgstore or natsstore an unclosed
+// cursor holds a connection or a subscription per attach. memstore would never
+// notice, so the ledger is counted.
+func TestTheJournalProbeClosesEveryCursorItOpens(t *testing.T) {
+	opened, closed := 0, 0
+	base := harnesstest.Backend(t)
+	composite, err := storage.NewCompositeWithOrderedIndex(countingLedger{Ledger: base.Ledger, opened: &opened, closed: &closed}, base.Leaser, base.KV, base.Blobs, base.OrderedIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, adapted := openStore(t, namespaceLayout(), sessionstoreadapter.WithRuntimeJournals(journalRouter(t, harnesstest.Store(t, composite, testTenant))))
+	createBoundSession(t, released, derivedRuntimeID.String())
+	if _, err := adapted.LoadSessionState(t.Context(), testTenant, testSession); err != nil {
+		t.Fatalf("LoadSessionState: %v", err)
+	}
+	if opened == 0 || opened != closed {
+		t.Fatalf("the probe opened %d ledger cursors and closed %d", opened, closed)
+	}
+}
