@@ -566,6 +566,14 @@ var ErrUndiallableEndpoint = errors.New("host: the internal endpoint's authority
 // the shortest legal, routable tenant, so the only refusals HostLinkEndpoint
 // can report for it are about the BASE — including too_long, which for a
 // one-byte tenant means no tenant at all fits on this base.
+//
+// A BASE WHERE ONLY SHORT TENANTS FIT IS ACCEPTED, deliberately. The derived
+// address is bounded by Core's MaxIDBytes over base plus ESCAPED tenant, so a
+// long base narrows which tenants it can serve (a 245-byte base serves only
+// one-byte tenants), and a tenant that does not fit is refused by the
+// deriving Factory with too_long, per tenant. Refusing here at any length
+// above "no tenant fits" would invent a ceiling Core does not have; an
+// operator with long tenant names should keep the base short.
 const endpointProbeTenant sessionwire.TenantID = "t"
 
 // validateEndpointBase holds host v0.3.0's reading of InternalEndpoint.

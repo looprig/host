@@ -29,6 +29,15 @@ func TestInternalEndpointIsABase(t *testing.T) {
 	if err := tooLongForAnyTenant.Validate(); err != nil {
 		t.Fatalf("control: the too-long base must itself validate, got %v", err)
 	}
+	// THE BOUNDARY: one byte shorter, exactly one one-byte tenant fits, and
+	// the base is ACCEPTED. The rule is "some tenant fits", which is Core's
+	// own limit applied to the shortest tenant; a stricter floor would be an
+	// invented ceiling. This row is what pins the probe tenant's length: a
+	// longer probe tenant refuses it.
+	oneByteTenantFits := tooLongForAnyTenant[:len(tooLongForAnyTenant)-1]
+	if derived, err := sessionwire.HostLinkEndpoint(oneByteTenantFits, "a"); err != nil || len(derived) != sessionwire.MaxIDBytes {
+		t.Fatalf("control: the boundary base must derive a %d-byte endpoint for a one-byte tenant, got %q (%d), %v", sessionwire.MaxIDBytes, derived, len(derived), err)
+	}
 
 	type refusal struct {
 		code        sessionwire.HostLinkEndpointCode // set for Core's base refusals
@@ -49,6 +58,7 @@ func TestInternalEndpointIsABase(t *testing.T) {
 		{name: "lowest port", endpoint: "ws://host:1"},
 		{name: "highest port", endpoint: "ws://host:65535"},
 		{name: "leading-zero port", endpoint: "ws://host:080"},
+		{name: "boundary: exactly one one-byte tenant fits", endpoint: oneByteTenantFits},
 
 		// Core's three base refusals.
 		{name: "invalid_base: wrong scheme", endpoint: "http://host", refused: &refusal{code: sessionwire.HostLinkEndpointCodeInvalidBase}},
