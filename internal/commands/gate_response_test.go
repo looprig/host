@@ -333,3 +333,17 @@ func TestAReferencedGateResponseIsRejectedNotBlocked(t *testing.T) {
 		})
 	}
 }
+
+// TestAnAnswerNamingOnlyTheOpenEventIsApplied (quality gate Q14): Core lets an
+// answer name its gate's version by ExpectedOpenEventID alone. A check that
+// compared the unset sequence would reject every such answer.
+func TestAnAnswerNamingOnlyTheOpenEventIsApplied(t *testing.T) {
+	f := gateFixture(t, ownedGate(testEpoch), func(r *sessionwire.GateResponseRequest) {
+		r.ExpectedOpenJournalSeq = 0
+		r.ExpectedOpenEventID = "event-opened"
+	})
+	outcome, err := f.process()
+	if err != nil || outcome.State != StateApplied {
+		t.Fatalf("Process = (%+v, %v), want an answer naming the projected open event applied", outcome, err)
+	}
+}
