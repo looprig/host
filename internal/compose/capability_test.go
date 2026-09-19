@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/harness/pkg/event"
 
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/gates"
@@ -90,14 +91,31 @@ func (g *fencingGateSessions) GateSessionFor(residency.Lease, sessionwire.Tenant
 	return fencingSession{sessions: g}, nil
 }
 
+// fencingSession answers every seam, so a publisher started over it fails its
+// pass rather than dereferencing nothing.
 type fencingSession struct {
-	gates.Session
 	sessions *fencingGateSessions
 }
 
 func (s fencingSession) Resolve(_ context.Context, id sessionwire.GateID) error {
 	s.sessions.resolves = append(s.sessions.resolves, id)
 	return s.sessions.err
+}
+
+func (fencingSession) Scope(context.Context) (gates.Scope, error) {
+	return gates.Scope{}, errors.New("compose_test: this fixture publishes nothing")
+}
+
+func (fencingSession) Projected(context.Context) ([]sessionwire.GateProjection, error) {
+	return nil, errors.New("compose_test: this fixture publishes nothing")
+}
+
+func (fencingSession) Open(context.Context, sessionwire.GateProjection) error {
+	return errors.New("compose_test: this fixture publishes nothing")
+}
+
+func (fencingSession) Replay(context.Context, uint64, func(event.Event, uint64) error) error {
+	return errors.New("compose_test: this fixture publishes nothing")
 }
 
 // TestTheGateFenceIsWrittenAtAttachBeforeTheRuntimeLaunches (quality gate F2):
