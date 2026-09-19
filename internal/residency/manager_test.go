@@ -4366,3 +4366,21 @@ func TestACreateOverAJournalWithACheckpointRestores(t *testing.T) {
 		t.Fatalf("restores = %d, creates = %d; want one restore", len(f.target.restoreRequests()), len(f.target.createRequests()))
 	}
 }
+
+// TestAnExplicitRestoreIsNotGatedOnTheRuntimeJournal pins the scope of the
+// create decision: only a CREATE consults the runtime journal. An explicit
+// restore launches as it always did, whatever the journal reader answered —
+// including Unknown and Absent — because the caller has asserted durable state
+// and harness's restore is the authority on whether it exists.
+func TestAnExplicitRestoreIsNotGatedOnTheRuntimeJournal(t *testing.T) {
+	for _, journal := range []RuntimeJournal{RuntimeJournalUnknown, RuntimeJournalAbsent, RuntimeJournalPresent} {
+		f := newFixture(t)
+		f.durable.state.RuntimeJournal = journal
+		if _, err := f.manager.Attach(context.Background(), f.request(ModeRestore)); err != nil {
+			t.Fatalf("Attach(restore) with RuntimeJournal %v = %v, want the restore performed", journal, err)
+		}
+		if len(f.target.restoreRequests()) != 1 || len(f.target.createRequests()) != 0 {
+			t.Fatalf("RuntimeJournal %v: restores = %d, creates = %d; want one restore", journal, len(f.target.restoreRequests()), len(f.target.createRequests()))
+		}
+	}
+}
