@@ -937,6 +937,11 @@ func TestACrashBetweenTheAnswerAndItsDispositionIsNeverATombstone(t *testing.T) 
 	id := world.answer(t, opened, "answer", answerValue())
 	gateE2EEventually(t, "the disposition append to be lost", func() bool { return hits.Load() > 0 })
 	gateE2EEventually(t, "the answer to be durable", func() bool { return len(world.resolutions(t, opened.GateID)) == 1 })
+	// The answer reached A's agent in memory before the crash: waited for
+	// HERE, on the event itself, because once B restores it holds the journal
+	// and A's loop can no longer reach the model (quality gate F4: asserted
+	// after B's attach, this raced B's fence 9/20 at -race -cpu 1).
+	gateE2EEventually(t, "the agent to receive the answer before the crash", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
 	// Host A crashes here: it is abandoned, not drained, and its leases lapse.
 
 	second, _, secondEpoch := world.host(t, 5)
@@ -959,7 +964,6 @@ func TestACrashBetweenTheAnswerAndItsDispositionIsNeverATombstone(t *testing.T) 
 	if len(resolved) != 1 || resolved[0].Cause.CommandID != runtimeCommand {
 		t.Fatalf("resolutions = %+v, want exactly the answer, caused by the admitted command", resolved)
 	}
-	gateE2EEventually(t, "the agent to have received the answer before the crash", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
 }
 
 // TestAPermissionGateSurvivesADrainAndIsAnsweredOnTheSuccessor is the
