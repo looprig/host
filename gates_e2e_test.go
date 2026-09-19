@@ -1036,3 +1036,37 @@ func TestAnAnswerInTheFenceWindowIsNeverTakenByAFencedPredecessor(t *testing.T) 
 		t.Fatalf("the gate was resolved %d times, want once", len(resolved))
 	}
 }
+
+// TestAnAnswerToAGateTheSuccessorAlreadyResolvedIsNotTakenByThePredecessor is
+// the UNPROJECTED arm of the ownership check, end to end (the regate's X11e):
+// Host A is fenced out and still live; Host B has taken the session and its
+// publisher has already resolved the gate, so the projection no longer holds
+// it. A must not take the not-projected arm and dispatch to its zombie runtime
+// — the successor's recovery would settle the user's answer
+// rejected/not_applied — and B must settle it no_op.
+func TestAnAnswerToAGateTheSuccessorAlreadyResolvedIsNotTakenByThePredecessor(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
+	first, firstLauncher, firstEpoch := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(first) })
+	world.submit(t, firstLauncher.controller(), "PLEASE-ASK")
+	opened := world.gates(t, 1)[0]
+
+	// Host A crashes; Host B takes the session, restores it (which closes the
+	// ask_user gate) and its publisher clears the projection. A is still live.
+	second, _, secondEpoch := world.host(t, 5)
+	t.Cleanup(func() { stopBounded(second) })
+	gateE2EEventually(t, "Host B's fence and its publisher clearing the gate", func() bool {
+		page, err := world.factory.ReadGates(t.Context(), sessionstore.ReadGatesRequest{TenantID: composeTenant, SessionID: composeSession})
+		return err == nil && len(page.Gates) == 0 && world.mark(t) == secondEpoch && secondEpoch > firstEpoch
+	})
+
+	// The answer Factory admitted against the projection it last saw.
+	entry := world.settled(t, world.answer(t, opened, "answer", answerValue()))
+	if entry.Record.State != sessionstore.InboxStateApplied || outcomeOf(t, entry) != "no_op" {
+		t.Fatalf("the answer settled %q/%q, want applied/no_op from the successor", entry.Record.State, outcomeOf(t, entry))
+	}
+	if entry.Record.Attempt == nil || uint64(entry.Record.Attempt.ResidencyEpoch) != secondEpoch {
+		t.Fatalf("the attempt = %+v, want the successor's residency %d and never the fenced-out predecessor's %d",
+			entry.Record.Attempt, secondEpoch, firstEpoch)
+	}
+}
