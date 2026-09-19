@@ -546,6 +546,20 @@ const (
 // means: the registry Factory routed from was stale.
 var ErrLeaseHeld = errors.New("residency: the session lease is held by another owner")
 
+// ErrInvalidRuntimeIdentity is the cause a DurableStore joins into a
+// LoadSessionState failure when the session's durable binding names no runtime
+// identity a Host could launch or restore under — a non-UUID, or the zero UUID.
+//
+// IT IS A STATEMENT ABOUT THE SESSION AND NOT ABOUT THE STORE, which is the
+// whole of F12. Every other LoadSessionState failure is a read that failed and
+// may succeed on retry, so it carries no placement code. This one is permanent:
+// the binding is immutable and every Host reads the same one. It is refused
+// with runtime_unavailable — "this Host cannot run this session" — which is the
+// code a restore with no durable state gets, rather than the empty code that
+// reads as a transient store failure. Core has no class that says "and no Host
+// ever will"; when it gains one this is the refusal that should move to it.
+var ErrInvalidRuntimeIdentity = errors.New("residency: the session's durable binding names no runtime identity a Host could launch under")
+
 // AttachError reports a refused or failed attach.
 //
 // Step names WHERE it failed, which is what a Host operator needs and what no
@@ -1145,6 +1159,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// See the sequence at the top of this file for why the fence that used to
 	// sit here is gone and must not come back.
 	state, err := m.durable.LoadSessionState(sessionCtx, key.TenantID, key.SessionID)
+	if errors.Is(err, ErrInvalidRuntimeIdentity) {
+		return fail(StepHydrate, sessionwire.HostLinkErrorRuntimeUnavailable, "the session's durable binding names no runtime identity this Host could launch or restore under", err)
+	}
 	if err != nil {
 		return fail(StepHydrate, "", "the durable session state could not be read", err)
 	}

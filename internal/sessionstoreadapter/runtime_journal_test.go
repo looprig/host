@@ -132,6 +132,11 @@ func TestABindingThatNamesNoUUIDIsRefused(t *testing.T) {
 			if !errors.As(err, &refused) {
 				t.Fatalf("LoadSessionState over runtime session %q = %v, want *RuntimeSessionIDError", runtimeID, err)
 			}
+			// F12: the residency manager classifies it by this sentinel, as a
+			// permanent statement about the session rather than a failed read.
+			if !errors.Is(err, residency.ErrInvalidRuntimeIdentity) {
+				t.Fatalf("LoadSessionState over runtime session %q = %v, want it to be residency.ErrInvalidRuntimeIdentity", runtimeID, err)
+			}
 		})
 	}
 }
@@ -311,6 +316,15 @@ func TestAnUnreadableJournalIsAnErrorAndNeverAbsent(t *testing.T) {
 			state, err := adapted.LoadSessionState(t.Context(), testTenant, testSession)
 			if !errors.Is(err, errLedgerDown) {
 				t.Fatalf("LoadSessionState over an unreadable journal = (RuntimeJournal %v, %v), want the ledger fault as an error", state.RuntimeJournal, err)
+			}
+			// F12: the probe's failure names its component and the session,
+			// and is NOT the permanent binding refusal.
+			var probe *sessionstoreadapter.RuntimeJournalProbeError
+			if !errors.As(err, &probe) || probe.RuntimeSessionID != derivedRuntimeID || probe.TenantID != testTenant {
+				t.Fatalf("LoadSessionState over an unreadable journal = %v, want a *RuntimeJournalProbeError naming the tenant and runtime session", err)
+			}
+			if errors.Is(err, residency.ErrInvalidRuntimeIdentity) {
+				t.Fatal("a failed journal read was classified as a permanently unrunnable binding")
 			}
 		})
 	}

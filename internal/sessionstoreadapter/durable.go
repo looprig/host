@@ -119,6 +119,40 @@ func (e *RuntimeSessionIDError) Error() string {
 // Unwrap returns the parse failure, if any.
 func (e *RuntimeSessionIDError) Unwrap() error { return e.Cause }
 
+// Is reports residency.ErrInvalidRuntimeIdentity, the sentinel the residency
+// manager classifies a PERMANENTLY unrunnable binding by (F12): the binding is
+// immutable and every Host reads the same one, so it is not a failed read.
+func (e *RuntimeSessionIDError) Is(target error) bool {
+	return target == residency.ErrInvalidRuntimeIdentity
+}
+
+// RuntimeJournalProbeError reports a runtime-journal read that FAILED while
+// deciding a create. It names the component and the session, which the harness
+// store's own errors do not, so an operator can tell it from every other
+// durable-read failure (F12). It is transient by nature and carries no
+// placement code: the attach is refused with the empty code and may succeed on
+// retry, unlike a RuntimeSessionIDError.
+type RuntimeJournalProbeError struct {
+	TenantID         sessionwire.TenantID
+	SessionID        sessionwire.SessionID
+	StorageBindingID string
+	RuntimeSessionID uuid.UUID
+	Cause            error
+}
+
+func (e *RuntimeJournalProbeError) Error() string {
+	message := "sessionstoreadapter: the runtime journal of session " + strconv.Quote(string(e.SessionID)) +
+		" in tenant " + strconv.Quote(string(e.TenantID)) + " (binding " + strconv.Quote(e.StorageBindingID) +
+		", runtime session " + e.RuntimeSessionID.String() + ") could not be read"
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+// Unwrap returns the harness store's failure.
+func (e *RuntimeJournalProbeError) Unwrap() error { return e.Cause }
+
 // LoadSessionState reports the durable state a hydration reads.
 //
 // A session with no catalog record is Exists=false. A record with a BINDING
@@ -179,7 +213,10 @@ func (s *Store) LoadSessionState(
 		if s.journals != nil {
 			journal, err := s.journals.RuntimeJournal(ctx, tenant, binding, runtimeID)
 			if err != nil {
-				return residency.SessionState{}, err
+				return residency.SessionState{}, &RuntimeJournalProbeError{
+					TenantID: tenant, SessionID: session, StorageBindingID: binding.StorageBindingID,
+					RuntimeSessionID: runtimeID, Cause: err,
+				}
 			}
 			state.RuntimeJournal = journal
 		}

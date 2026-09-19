@@ -1647,6 +1647,17 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			forbidden: []string{"workspace.ensure", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
 		},
 		{
+			// F12. A binding that names no runnable runtime identity is a
+			// statement about the SESSION, not a store that failed: every Host
+			// would read the same binding and refuse the same way.
+			name:      "4 durable binding names no runnable runtime identity",
+			mode:      ModeCreate,
+			configure: func(f *fixture) { f.durable.err = fmt.Errorf("adapter: %w", ErrInvalidRuntimeIdentity) },
+			wantStep:  StepHydrate,
+			wantCode:  sessionwire.HostLinkErrorRuntimeUnavailable,
+			forbidden: []string{"workspace.ensure", "target.create", "target.restore", "registry.insert", "location.publish:attaching", "ownership.begin"},
+		},
+		{
 			name:      "4 restore of a session with no durable state",
 			mode:      ModeRestore,
 			configure: func(f *fixture) { f.durable.state.Exists = false },

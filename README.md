@@ -116,8 +116,16 @@ As of v0.3.0:
   `runtime_unavailable` refusal and never logs it, so a fleet-wide one shows
   up as sessions that never place, not as log lines; the empty-code refusal
   is logged at WARN ("a pooled candidate failed the attach"), carrying the
-  Host id but not Host's reason. Host itself has no logger; the attach error
-  Host returns names the reason.
+  Host id but not Host's reason. The attach error Host returns names the
+  reason; a failed journal read is a `*RuntimeJournalProbeError` naming the
+  tenant, binding and runtime session (v0.4.0).
+- **A binding whose `RuntimeSessionID` is not a non-zero UUID is refused with
+  `runtime_unavailable`** (v0.4.0; v0.3.0 gave it the empty code). It is a
+  permanent statement about the session — the binding is immutable and every
+  Host reads the same one — so the empty code, which reads as a transient
+  store failure, was wrong. Core has no class meaning "and no Host ever will";
+  `runtime_unavailable` ("this Host cannot run this session") is the nearest,
+  and is what a restore with no durable state already gets.
 - **The journal store for each binding must therefore be the released harness
   session store** (`*harness/pkg/sessionstore.Store`, or a value embedding
   one): the same journal the runtime writes and settlement reads.
