@@ -104,6 +104,13 @@ type Session interface {
 // booked F2 residue). The publisher records it and stops trying that gate.
 var ErrUnpublishable = errors.New("gates: this gate can never be projected")
 
+// ErrProjectionFull is what a Session returns for a gate the projection has no
+// room for: sessionstore holds at most sessionstore.MaxCatalogOpenGates (16)
+// open gates per session. The gate is NOT visible to Factory until another
+// closes. The publisher logs it once per gate and tries it again only when the
+// fold changes, never on a retry timer.
+var ErrProjectionFull = errors.New("gates: the session's gate projection is full")
+
 // Options configures a Publisher.
 type Options struct {
 	// Session is the session's durable gate surface. Required.
@@ -161,6 +168,7 @@ type Publisher struct {
 	next          uint64
 	dirty         bool
 	unpublishable map[coresessionwire.GateID]bool
+	full          map[coresessionwire.GateID]bool
 
 	mu         sync.Mutex
 	superseded bool
@@ -194,6 +202,7 @@ func Start(ctx context.Context, options Options) (*Publisher, error) {
 		next:          1,
 		dirty:         true,
 		unpublishable: map[coresessionwire.GateID]bool{},
+		full:          map[coresessionwire.GateID]bool{},
 	}
 	go p.run(runCtx)
 	return p, nil
@@ -385,6 +394,16 @@ func (p *Publisher) converge(ctx context.Context) error {
 		case errors.Is(err, ErrUnpublishable):
 			p.unpublishable[coresessionwire.GateID(held.opened.Gate.ID.String())] = true
 			p.warn(ctx, "host: a gate can never be projected and will not be retried", err)
+		case errors.Is(err, ErrProjectionFull):
+			// NOT A FAILED PASS. Retrying on the timer would change nothing
+			// until a gate closes, and closing one changes the fold, which
+			// marks the next pass dirty and tries this gate again. Until then
+			// Factory cannot see it, which is logged once.
+			id := coresessionwire.GateID(held.opened.Gate.ID.String())
+			if !p.full[id] {
+				p.full[id] = true
+				p.warn(ctx, "host: a gate is not visible to Factory because the session's gate projection is full; it is published when another gate closes", err)
+			}
 		default:
 			failures = append(failures, err)
 		}

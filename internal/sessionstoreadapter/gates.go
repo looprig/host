@@ -287,6 +287,8 @@ func classifyGateWrite(err error) error {
 		return errors.Join(residency.ErrEpochSuperseded, err)
 	case catalog.Code == sessionstore.CatalogErrorDeleted && catalog.Field == "gate_intent":
 		return errors.Join(gates.ErrUnpublishable, err)
+	case catalog.Code == sessionstore.CatalogErrorTooLarge && catalog.Field == "open_gates":
+		return errors.Join(gates.ErrProjectionFull, err)
 	default:
 		return err
 	}

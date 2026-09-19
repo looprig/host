@@ -3,6 +3,7 @@ package gates
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"sync"
 	"testing"
@@ -85,6 +86,7 @@ type fakeSession struct {
 	froms     []uint64
 
 	openErr      map[coresessionwire.GateID]error
+	resolveErrs  map[coresessionwire.GateID]error
 	projectedErr error
 	resolveErr   error
 }
@@ -129,6 +131,9 @@ func (s *fakeSession) Resolve(_ context.Context, id coresessionwire.GateID) erro
 	s.record("resolve:" + string(id))
 	if s.resolveErr != nil {
 		return s.resolveErr
+	}
+	if err := s.resolveErrs[id]; err != nil {
+		return err
 	}
 	s.projected = slices.DeleteFunc(s.projected, func(p coresessionwire.GateProjection) bool { return p.GateID == id })
 	return nil
@@ -282,6 +287,8 @@ func TestAnOpenGateIsProjectedFromItsJournaledEvent(t *testing.T) {
 		{"a timeout on the gate", gate.KindAskUser, 90 * time.Second, openedAt.Add(90 * time.Second)},
 		{"ask_user with none: a day", gate.KindAskUser, 0, openedAt.Add(24 * time.Hour)},
 		{"permission with none: five minutes", gate.KindPermission, 0, openedAt.Add(5 * time.Minute)},
+		{"open_url with none: an hour", gate.KindOpenURL, 0, openedAt.Add(time.Hour)},
+		{"form with none: a day", gate.KindForm, 0, openedAt.Add(24 * time.Hour)},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			session := &fakeSession{}
@@ -480,4 +487,107 @@ func TestStartRefusesWhatItCannotRun(t *testing.T) {
 			t.Errorf("Start without %s = %v, want InvalidOptionsError naming it", field, err)
 		}
 	}
+}
+
+// TestAResolveOnlyFoldConvergesTheProjection (quality gate Q2): a pass whose
+// fold only CLOSES a gate — no new GateOpened — still converges, so the
+// projection does not keep a gate the runtime resolved.
+func TestAResolveOnlyFoldConvergesTheProjection(t *testing.T) {
+	session := &fakeSession{}
+	ask := opened(0x10, gate.KindAskUser, 0)
+	session.append(ask, 4)
+	h := start(t, session)
+	h.awaitConverged(t)
+
+	session.append(resolved(0x20, ask.Gate.ID), 6)
+	h.hints.hint()
+	h.awaitConverged(t)
+	if _, projected, _ := session.snapshot(); len(projected) != 0 {
+		t.Fatalf("projection = %+v after a resolve-only fold, want none", projected)
+	}
+}
+
+// TestASupersededResolveInConvergeStopsThePublisher (spec gate S14): the stale
+// gate's resolve is a gate write like an open, and a successor's mark refusing
+// it stops the publisher for good rather than retrying every second.
+func TestASupersededResolveInConvergeStopsThePublisher(t *testing.T) {
+	session := &fakeSession{}
+	stale := coresessionwire.GateID(seedUUID(0x42).String())
+	session.projected = []coresessionwire.GateProjection{{GateID: stale, OpenedJournalSeq: 3}}
+	session.resolveErrs = map[coresessionwire.GateID]error{stale: errors.Join(residency.ErrEpochSuperseded, errors.New("store: epoch"))}
+	h := start(t, session)
+	eventually(t, "the publisher to report it was superseded", h.publisher.Superseded)
+}
+
+// TestAFullProjectionIsNotARetryStorm (quality gate F7): sessionstore holds at
+// most 16 open gates. A gate that does not fit is logged ONCE and is not
+// retried on the timer — nothing changes until a gate closes — and the pass
+// still converges. When a gate closes, the next pass publishes it.
+func TestAFullProjectionIsNotARetryStorm(t *testing.T) {
+	session := &fakeSession{}
+	first := opened(0x10, gate.KindAskUser, 0)
+	overflow := opened(0x20, gate.KindAskUser, 0)
+	session.append(first, 3)
+	session.append(overflow, 5)
+	session.openErr = map[coresessionwire.GateID]error{gateIDOf(overflow): errors.Join(ErrProjectionFull, errors.New("store: too_large open_gates"))}
+	records := &recordingHandler{}
+	h := &harness{session: session, hints: &fakeHints{}, converged: make(chan struct{}, 64)}
+	publisher, err := Start(t.Context(), Options{
+		Session: session, Hints: h.hints, After: time.After, Retry: 5 * time.Millisecond,
+		OnConverged: func() { h.converged <- struct{}{} }, Logger: slog.New(records),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(publisher.Stop)
+	h.awaitConverged(t)
+	time.Sleep(100 * time.Millisecond) // twenty Retry intervals
+
+	calls, _, _ := session.snapshot()
+	attempts := 0
+	for _, call := range calls {
+		if call == "open:"+string(gateIDOf(overflow)) {
+			attempts++
+		}
+	}
+	if attempts != 1 {
+		t.Fatalf("the gate that does not fit was opened %d times with nothing changed, want 1", attempts)
+	}
+	if records.count() != 1 {
+		t.Fatalf("%d WARN records, want exactly one for the gate that does not fit", records.count())
+	}
+
+	// A gate closes: the fold changes and the overflow is published.
+	session.mu.Lock()
+	delete(session.openErr, gateIDOf(overflow))
+	session.mu.Unlock()
+	session.append(resolved(0x30, first.Gate.ID), 7)
+	h.hints.hint()
+	h.awaitConverged(t)
+	if _, projected, _ := session.snapshot(); len(projected) != 1 || projected[0].GateID != gateIDOf(overflow) {
+		t.Fatalf("projection = %+v after a gate closed, want the gate that did not fit", projected)
+	}
+}
+
+// recordingHandler counts WARN records.
+type recordingHandler struct {
+	mu    sync.Mutex
+	warns int
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) Handle(_ context.Context, record slog.Record) error {
+	if record.Level == slog.LevelWarn {
+		h.mu.Lock()
+		h.warns++
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+func (h *recordingHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.warns
 }

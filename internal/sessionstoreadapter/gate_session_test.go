@@ -341,3 +341,24 @@ func TestLoadGateDecidesADispositionGatesOwnerByResidencyEpoch(t *testing.T) {
 		t.Fatalf("LoadGate for an unopened gate = (%+v, %t, %v), want (zero, false, nil)", got, held, err)
 	}
 }
+
+// TestASeventeenthOpenGateIsProjectionFull: sessionstore holds at most
+// MaxCatalogOpenGates open gates per session, and the one that does not fit is
+// reported as gates.ErrProjectionFull, which the publisher does not retry on a
+// timer (quality gate F7).
+func TestASeventeenthOpenGateIsProjectionFull(t *testing.T) {
+	w := newGateWorld(t)
+	session, _ := w.session(t)
+	for index := 0; index < sessionstore.MaxCatalogOpenGates; index++ {
+		if err := session.Open(t.Context(), projectedGate(t, byte(0x10+index*4), uint64(3+index))); err != nil {
+			t.Fatalf("open gate %d: %v", index, err)
+		}
+	}
+	err := session.Open(t.Context(), projectedGate(t, 0xC0, 99))
+	if !errors.Is(err, gates.ErrProjectionFull) {
+		t.Fatalf("the %dth open gate = %v, want ErrProjectionFull", sessionstore.MaxCatalogOpenGates+1, err)
+	}
+	if errors.Is(err, gates.ErrUnpublishable) {
+		t.Fatal("a full projection was classified as a permanently unpublishable gate")
+	}
+}
