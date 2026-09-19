@@ -5,9 +5,9 @@ go 1.26.8
 require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/looprig/core v0.9.1
+	github.com/looprig/core v0.10.0
 	github.com/looprig/harness v0.34.0
-	github.com/looprig/sessionstore v0.10.0
+	github.com/looprig/sessionstore v0.12.0
 	github.com/looprig/storage v0.6.0
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/mod v0.40.0
