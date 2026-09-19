@@ -670,7 +670,18 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	run(StepBeginRelease, session.BeginRelease)
 	d.waitIdle(graceCtx, session, key)
 	run(StepCheckpoint, session.Checkpoint)
-	run(StepReleaseResidency, session.ReleaseResidency)
+	// THE RUNTIME'S RELEASE IS BOUNDED BY THE PLATFORM GRACE, and it is the one
+	// step that is. harness refuses a nonterminal release of a session that is
+	// not whole-session idle and WAITS for idle first — so a session parked at
+	// an open gate, which is never idle, held this call, the drain and Stop
+	// forever (measured on a composed Host with a permission gate open). A
+	// refusal here is already a path this sequence takes: it is recorded and
+	// FinishRelease still runs. The runtime keeps its own journal lease until
+	// the process exits, so the session's successor restores it the way it
+	// restores a crashed Host's.
+	if err := session.ReleaseResidency(graceCtx); err != nil {
+		d.record(Failure{Key: key, Step: StepReleaseResidency, Err: err})
+	}
 	run(StepFinishRelease, session.FinishRelease)
 }
 

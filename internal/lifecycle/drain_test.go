@@ -285,6 +285,11 @@ type fakeSession struct {
 	deaf    bool
 	release chan struct{}
 
+	// gated makes ReleaseResidency wait for its context, as harness's does for
+	// a session parked at an open gate: a nonterminal release requires
+	// whole-session idle, and a gate is not idle.
+	gated bool
+
 	errs map[step]error
 
 	mu    sync.Mutex
@@ -330,9 +335,15 @@ func (s *fakeSession) WaitIdle(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (s *fakeSession) Checkpoint(context.Context) error       { return s.run(stepCheckpoint) }
-func (s *fakeSession) ReleaseResidency(context.Context) error { return s.run(stepReleaseResidency) }
-func (s *fakeSession) FinishRelease(context.Context) error    { return s.run(stepFinishRelease) }
+func (s *fakeSession) Checkpoint(context.Context) error { return s.run(stepCheckpoint) }
+func (s *fakeSession) ReleaseResidency(ctx context.Context) error {
+	if err := s.run(stepReleaseResidency); err != nil || !s.gated {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (s *fakeSession) FinishRelease(context.Context) error { return s.run(stepFinishRelease) }
 
 func (s *fakeSession) stepsTaken() []step {
 	s.mu.Lock()
@@ -2047,4 +2058,46 @@ func TestTheProcessLifecycleDrainIsAttributableToNobody(t *testing.T) {
 			t.Errorf("the drain reports it was begun for %+v, want %+v", scope, want)
 		}
 	})
+}
+
+// TestTheGraceBoundsAReleaseThatWaitsForAGate: harness refuses a nonterminal
+// release of a session that is not whole-session idle, and a session parked at
+// an open gate never is — its ReleaseResidency waits for its context. Handed a
+// context nothing cancels, the drain waited forever and Stop never returned
+// (measured on a real composed Host with a permission gate open). The platform
+// grace now bounds that step: the refusal is recorded and the session still
+// reaches FinishRelease, the path a refused ReleaseResidency already takes.
+func TestTheGraceBoundsAReleaseThatWaitsForAGate(t *testing.T) {
+	t.Parallel()
+	gated := newSession("session-gated", nil)
+	gated.hang = true
+	gated.gated = true
+	f := newFixture(t, gated)
+
+	mustStart(t, f.drainer)
+	waitFor(t, "the idle bound and the grace to be armed", func() bool {
+		return f.clock.pendingFor(testIdleGrace) == 1 && f.clock.pendingFor(testGrace) > 0
+	})
+	finished := make(chan lifecycle.Report, 1)
+	go func() { finished <- f.drainer.Wait() }()
+	f.clock.fireAll()
+
+	var report lifecycle.Report
+	select {
+	case report = <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a session whose release waits for its gate held the drain past the platform grace")
+	}
+	refused := false
+	for _, failure := range report.Failures {
+		if failure.Key == gated.Key() && failure.Step == lifecycle.StepReleaseResidency {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatalf("failures = %v, want the gated session's release recorded", report.Failures)
+	}
+	if !slices.Contains(gated.stepsTaken(), stepFinishRelease) {
+		t.Fatal("the gated session did not reach FinishRelease")
+	}
 }
