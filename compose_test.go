@@ -84,13 +84,42 @@ func (stubEvidence) ReadDispositionEvidence(context.Context, sessionstore.Dispos
 // FullSession intentionally returns a closed channel because most composition
 // tests exercise lifecycle unwinds; the HostLink round trip needs a live tail
 // so a publication can cross the composed relay and reach a real subscriber.
+//
+// EVERY SUBSCRIBER GETS ITS OWN CHANNEL, as every subscriber of the released
+// adapter gets its own harness subscription. Since v0.4.0 the gate publisher
+// subscribes beside the live tail; with one shared channel it stole the
+// publication meant for the tail (quality gate F3, a fixture defect).
 type composePublishingSession struct {
 	*testkit.FullSession
 	published chan sessionwire.EnduringPublication
+
+	mu          sync.Mutex
+	subscribers []chan sessionwire.EnduringPublication
+	fanning     bool
 }
 
 func (s *composePublishingSession) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
-	return s.published, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subscriber := make(chan sessionwire.EnduringPublication, 16)
+	s.subscribers = append(s.subscribers, subscriber)
+	if !s.fanning {
+		s.fanning = true
+		go s.fanOut()
+	}
+	return subscriber, nil
+}
+
+// fanOut copies every publication the test sends to every subscriber.
+func (s *composePublishingSession) fanOut() {
+	for publication := range s.published {
+		s.mu.Lock()
+		subscribers := append([]chan sessionwire.EnduringPublication(nil), s.subscribers...)
+		s.mu.Unlock()
+		for _, subscriber := range subscribers {
+			subscriber <- publication
+		}
+	}
 }
 
 // composeFixture is one blueprint's inputs, with the backend shared so a
