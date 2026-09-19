@@ -237,6 +237,14 @@ func (p *Publisher) Stop() bool {
 	}
 }
 
+// Converged reports how many passes have converged the projection. It is a
+// monotonic count a caller can wait on.
+func (p *Publisher) Converged() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.passes
+}
+
 // Superseded reports whether the publisher stopped because a successor's
 // grant fenced it.
 func (p *Publisher) Superseded() bool {

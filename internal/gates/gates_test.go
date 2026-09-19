@@ -205,6 +205,9 @@ type harness struct {
 	hints     *fakeHints
 	publisher *Publisher
 	converged chan struct{}
+
+	// seen is how many converged passes this harness has already waited for.
+	seen int
 }
 
 func start(t *testing.T, session *fakeSession) *harness {
@@ -225,14 +228,21 @@ func start(t *testing.T, session *fakeSession) *harness {
 	return h
 }
 
-// awaitConverged waits for the next converged pass.
+// awaitConverged waits for one more converged pass than have been seen.
+//
+// IT COUNTS RATHER THAN RECEIVES. A signal per converge is lost when two
+// converges land before a receiver, and hints are coalesced, so a channel made
+// the number of passes a test could wait for depend on scheduling.
 func (h *harness) awaitConverged(t *testing.T) {
 	t.Helper()
-	select {
-	case <-h.converged:
-	case <-time.After(5 * time.Second):
-		calls, _, _ := h.session.snapshot()
-		t.Fatalf("the publisher did not converge within 5s; calls = %v", calls)
+	h.seen++
+	deadline := time.Now().Add(5 * time.Second)
+	for h.publisher.Converged() < h.seen {
+		if time.Now().After(deadline) {
+			calls, _, _ := h.session.snapshot()
+			t.Fatalf("the publisher converged %d times, want %d; calls = %v", h.publisher.Converged(), h.seen, calls)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -539,9 +549,18 @@ func TestAFullProjectionIsNotARetryStorm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.publisher = publisher
 	t.Cleanup(func() { publisher.Stop() })
 	h.awaitConverged(t)
 	time.Sleep(100 * time.Millisecond) // twenty Retry intervals
+
+	// ANOTHER DIRTY PASS, which retries the gate that does not fit: the WARN
+	// is once per GATE, not once per attempt.
+	extra := opened(0x50, gate.KindAskUser, 0)
+	session.append(extra, 20)
+	session.append(resolved(0x51, extra.Gate.ID), 21)
+	h.hints.hint()
+	h.awaitConverged(t)
 
 	calls, _, _ := session.snapshot()
 	attempts := 0
@@ -550,18 +569,23 @@ func TestAFullProjectionIsNotARetryStorm(t *testing.T) {
 			attempts++
 		}
 	}
-	if attempts != 1 {
-		t.Fatalf("the gate that does not fit was opened %d times with nothing changed, want 1", attempts)
+	if attempts < 2 {
+		t.Fatalf("the gate that does not fit was opened %d times over two dirty passes, so this test cannot see a per-attempt log", attempts)
+	}
+	if retries := len(calls); retries == 0 {
+		t.Fatal("no calls were recorded")
 	}
 	if records.count() != 1 {
-		t.Fatalf("%d WARN records, want exactly one for the gate that does not fit", records.count())
+		t.Fatalf("%d WARN records over two dirty passes, want exactly one for the gate that does not fit", records.count())
 	}
 
 	// A gate closes: the fold changes and the overflow is published.
+	// (The first 100ms held twenty Retry intervals with no dirty pass and no
+	// attempt: the timer never retries it.)
 	session.mu.Lock()
 	delete(session.openErr, gateIDOf(overflow))
 	session.mu.Unlock()
-	session.append(resolved(0x30, first.Gate.ID), 7)
+	session.append(resolved(0x30, first.Gate.ID), 30)
 	h.hints.hint()
 	h.awaitConverged(t)
 	if _, projected, _ := session.snapshot(); len(projected) != 1 || projected[0].GateID != gateIDOf(overflow) {
