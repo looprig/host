@@ -41,15 +41,20 @@ settles through the same path** — see "Upgrading to v0.4.0: gates".
 ### Every AskUser and permission gate is published; the answer is a disposition command
 
 - **Publication.** Each resident session runs a gate publisher
-  (`internal/gates`). It subscribes to the runtime's committed stream (hints
-  only), makes one **fencing write** under the session's store-issued
-  `*ResidencyGrant` (never a bare epoch), folds the runtime journal
+  (`internal/gates`). **At attach, under the fresh residency grant and before
+  the runtime is restored**, the Host makes one **fencing write** to the
+  projection (never a bare epoch; the store-issued `*ResidencyGrant`), so a
+  predecessor that is not dead fails its ownership check before it can begin an
+  attempt on an answer. The publisher then subscribes to the runtime's
+  committed stream (hints only), fences again (a no-op), folds the runtime journal
   (`OpenEventReplayer`, positioned by ledger sequence) into the set of open gates,
   and converges the sessionstore projection on it: `OpenGate` for a gate the
   journal holds and the projection lacks, `ResolveGate` for one the journal has
   closed. A lost subscription is resumed from the last sequence folded. A
   superseded grant stops the publisher. A gate already projected (by a
-  predecessor) is never re-opened.
+  predecessor) is never re-opened. The projection holds at most 16 open gates
+  per session (sessionstore); a gate beyond that is **not visible to Factory**
+  until another closes, is logged once, and is published when one does.
 - **The projection** is a function of the journaled `GateOpened` alone:
   `harness sessionwire.ProjectGatePage` under a `ReadScope` whose Core
   `SessionID` and `RuntimeSessionID` come from **one** read of the binding;
@@ -64,13 +69,16 @@ settles through the same path** — see "Upgrading to v0.4.0: gates".
 - **Applying an answer.** A `gate_response` is checked after the claim and
   before the attempt — the last point a rejection is possible:
   - **rejected** (`RejectDispositionCommand`, no durable reason) when no Host
-    could ever apply it: not Core's strict `GateResponseRequest`, naming another
+    could ever apply it: stored by object reference (no released Host
+    dereferences one), not Core's strict `GateResponseRequest`, naming another
     session or command, a gate id that is not a non-zero UUID, or — for a gate
     the projection holds under this Host's mark — an `ExpectedOpen*` that is not
     the projected version;
-  - **blocked, nothing written** for a limit of this Host: a body behind an
-    object reference, an unreadable projection, or a gate whose mark is not this
-    Host's grant (fence not yet landed, or superseded);
+  - **blocked, nothing written** for a limit of this Host: an unreadable
+    projection, or a gate whose mark is not this Host's grant (fence not yet
+    landed, or superseded). **A block holds the session's whole command stream**,
+    interrupts included, until it clears; a claim that lapses while blocked is
+    re-taken on the next pass;
   - **dispatched** otherwise, including for a gate the projection no longer
     holds — harness is the authority and settles an answer to a closed gate
     `no_op`.
@@ -79,7 +87,10 @@ settles through the same path** — see "Upgrading to v0.4.0: gates".
   only.
 - **What the outcomes mean.** `applied/applied`: the answer resolved the gate.
   `applied/no_op`: the gate was already closed (a second answer, a timeout that
-  won, a gate closed at restore). `rejected`: the body could never apply.
+  won, a gate closed at restore). `rejected/refused`: harness refused the answer
+  (an action the gate does not offer, values its schema rejects), settled from
+  its evidence one pass after the attempt. `rejected` with no attempt: the body
+  could never apply.
 
 ### ONE-WAY UPGRADE
 
@@ -89,12 +100,17 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
 
 ### Limits you must plan around (harness v0.35.0)
 
-- **A gated session cannot be released gracefully.** harness releases a session
-  only when it is whole-session idle, and a session parked at a gate is not. The
-  drain bounds that release by its grace (it used to hang forever); the gate
-  stays open and projected, the runtime keeps its journal lease until the
-  process exits, and the successor restores the session as it restores a
-  crashed Host's.
+- **A gated session cannot be released gracefully, so its drain is
+  crash-equivalent.** harness releases a session only when it is whole-session
+  idle, and a session parked at a gate is not. The drain bounds that release by
+  its grace (it used to hang forever) and then leaves the refused runtime
+  **parked**: its context is not cancelled, so it writes nothing — no
+  `TurnInterrupted`, no `GateResolved{abandoned}` — and the gate stays open and
+  projected, as after a crash. The parked runtime keeps its journal lease until
+  **its process exits**, so **another Host in the same process cannot attach
+  that session until then** (it is refused `lease held`); `cmd/host` exits after
+  its drain. The successor then restores the session as it restores a crashed
+  Host's, and a permission gate is restored open.
 - **After a restore**, a permission gate is restored open and answerable, but
   the turn that was parked at it is `TurnInterrupted`: the approval is applied
   and nothing runs the tool. An **ask_user** gate is closed at restore
@@ -136,8 +152,9 @@ the token.
   `epoch_mismatch`. The row now belongs to the newer generation, the drain skips
   it (`service.ErrTargetGenerationSuperseded`) and releases every session. A
   platform should still not overlap two generations of one HostID.
-- **A successor takes a crashed predecessor's command claim** before its attempt
-  (it used to resume at the attempt, which the store refuses, forever).
+- **A successor takes a crashed predecessor's command claim**, and **a Host
+  re-takes its own lapsed claim**, before the attempt (both used to resume at
+  the attempt, which the store refuses, forever).
 - **`Collaborators.Logger`** (optional `*slog.Logger`, nil discards): attach
   refusals at hydration are WARN with tenant, session, step, code and reason;
   placement-race refusals are DEBUG; a failed gate pass and a failed
