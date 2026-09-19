@@ -318,6 +318,9 @@ type fakeStore struct {
 	// tombstoneErr makes the epoch-fenced tombstone refuse; see refuseTombstones.
 	tombstoneErr error
 
+	// stateErr makes LoadSessionState fail, as a durable read would.
+	stateErr error
+
 	// heldElsewhere makes AcquireSessionLease refuse a key as another owner's,
 	// with the error the released adapter would produce; see holdElsewhere.
 	heldElsewhere map[registry.Key]error
@@ -400,6 +403,12 @@ func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.Te
 }
 
 func (s *fakeStore) LoadSessionState(context.Context, sessionwire.TenantID, sessionwire.SessionID) (residency.SessionState, error) {
+	s.mu.Lock()
+	stateErr := s.stateErr
+	s.mu.Unlock()
+	if stateErr != nil {
+		return residency.SessionState{}, stateErr
+	}
 	return residency.SessionState{Namespace: "tenant/session", CompatibilityID: testCompat, RigSessionID: testRigSessionID, RuntimeJournal: residency.RuntimeJournalAbsent}, nil
 }
 

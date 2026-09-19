@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -148,6 +149,8 @@ func Run(ctx context.Context, lookup Environment, bootstrap Bootstrap) error {
 			Auth:            bootstrap.Auth(),
 			Workspaces:      bootstrap.Workspaces(),
 			NamespaceLayout: bootstrap.NamespaceLayout(),
+			// The binary's operator diagnostics go to stderr as JSON.
+			Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 		},
 	}, host.ListenOptions{Address: config.ListenAddress})
 }

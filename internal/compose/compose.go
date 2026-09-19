@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -139,6 +140,22 @@ type Options struct {
 	// is UNKNOWN, which is deliberately not a default; see
 	// lifecycle.MemoryBudget.
 	Budget lifecycle.MemoryBudget
+
+	// Logger receives this Host's operator diagnostics. It is OPTIONAL and nil
+	// discards: logging is never a precondition of running. What it says is
+	// stated where each record is written; see logAttach.
+	Logger *slog.Logger
+}
+
+// discardLogger is what a composition without a Logger writes to.
+var discardLogger = slog.New(slog.DiscardHandler)
+
+// logger returns the configured Logger or the discard logger.
+func (o Options) logger() *slog.Logger {
+	if o.Logger == nil {
+		return discardLogger
+	}
+	return o.Logger
 }
 
 // InvalidOptionsError reports a composition that may not run.
@@ -453,7 +470,13 @@ func (s *Service) heartbeat(ctx context.Context, done chan struct{}) {
 		case <-ctx.Done():
 			return
 		case <-s.options.Clock.After(interval):
-			_ = s.advertise.publish(ctx)
+			if err := s.advertise.publish(ctx); err != nil {
+				// A superseded generation is said so, because it is permanent
+				// for this process and has one remedy: stop it.
+				s.options.logger().LogAttrs(ctx, slog.LevelWarn, "host: the target advertisement heartbeat failed",
+					slog.Bool("generation_superseded", errors.Is(err, service.ErrTargetGenerationSuperseded)),
+					slog.String("error", err.Error()))
+			}
 		}
 	}
 }
@@ -511,7 +534,47 @@ func (s *Service) Metrics() *lifecycle.Metrics { return s.metrics }
 // one: a bind validates current ownership and never grants it, and the routing
 // table is handed a read-only view of the registry precisely so that it cannot.
 func (s *Service) Attach(ctx context.Context, request residency.Request) (residency.Residency, error) {
-	return s.manager.Attach(ctx, request)
+	held, err := s.manager.Attach(ctx, request)
+	if err != nil {
+		s.logAttach(ctx, request, err)
+	}
+	return held, err
+}
+
+// logAttach records a refused attach for an operator.
+//
+// A HYDRATION REFUSAL IS A WARNING, and it is the one this Host was booked to
+// log (v0.3.0's N3 and F12). Those refusals — no journal store serves the
+// binding, a restore needs a checkpoint the session has not got, the binding
+// names no runnable identity, the journal read failed — are about the SESSION
+// or this Host's wiring, the same on every retry and on every Host with the
+// same configuration, and factory v0.3.0 counts them without logging them. So
+// the only place an operator can learn why a session never places is here.
+//
+// EVERY OTHER REFUSAL IS DEBUG. epoch_mismatch, no_capacity and not_admitting
+// are the ordinary traffic of a placement race and of a draining Host; at WARN
+// they would bury the records above.
+func (s *Service) logAttach(ctx context.Context, request residency.Request, err error) {
+	level := slog.LevelDebug
+	attributes := []slog.Attr{
+		slog.String("tenant_id", string(request.TenantID)),
+		slog.String("session_id", string(request.SessionID)),
+		slog.String("agent_id", string(request.AgentID)),
+		slog.String("mode", string(request.Mode)),
+	}
+	var refused *residency.AttachError
+	if errors.As(err, &refused) {
+		code, _ := refused.HostLinkCode()
+		attributes = append(attributes,
+			slog.String("step", string(refused.Step)),
+			slog.String("code", string(code)),
+			slog.String("reason", refused.Reason))
+		if refused.Step == residency.StepHydrate {
+			level = slog.LevelWarn
+		}
+	}
+	attributes = append(attributes, slog.String("error", err.Error()))
+	s.options.logger().LogAttrs(ctx, level, "host: attach refused", attributes...)
 }
 
 // Stop drains this Host and waits for the drain to finish.

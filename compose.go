@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -154,6 +155,17 @@ type Collaborators struct {
 	//
 	// Deprecated: see RigSessionIDs.
 	RigSessionIDs RigSessionIDs
+
+	// Logger receives this Host's operator diagnostics. It is OPTIONAL: nil
+	// discards, and nothing about running depends on it. An attach refused
+	// while hydrating a session — no journal store serves its binding, a
+	// restore needs a checkpoint it has not got, its binding names no runnable
+	// runtime identity, its journal could not be read — is logged at WARN,
+	// because a Factory counts those refusals without logging them. A failed
+	// gate publication and a failed advertisement heartbeat are WARN too;
+	// ordinary placement refusals (epoch_mismatch, no_capacity,
+	// not_admitting) are DEBUG.
+	Logger *slog.Logger
 }
 
 // LinkOptions bound the HostLink transport.
@@ -369,6 +381,7 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		PublishBound:         blueprint.Drain.PublishBound,
 		CompatibilityTimeout: blueprint.CompatibilityTimeout,
 		WorkPoll:             blueprint.WorkPoll,
+		Logger:               collaborators.Logger,
 		// WorkStates IS NOT WIRED, and neither cmd/host nor this surface has
 		// ever wired it: the seam needs a reader of the runtime's gate state
 		// that department.Runtime does not expose. A Host composed here never
