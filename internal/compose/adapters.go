@@ -212,8 +212,9 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	go consumer.Run(ctx)
 	return &sessionWork{stop: func() {
 		tail.Stop()
-		if publisher != nil {
-			publisher.Stop()
+		if publisher != nil && !publisher.Stop() {
+			s.options.logger().Warn("host: the gate publisher did not stop within its bound; a store call is ignoring cancellation",
+				"tenant_id", string(request.Key.TenantID), "session_id", string(request.Key.SessionID))
 		}
 		consumer.Stop()
 		s.forgetConsumer(request.Key)

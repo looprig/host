@@ -221,7 +221,7 @@ func start(t *testing.T, session *fakeSession) *harness {
 		t.Fatalf("Start: %v", err)
 	}
 	h.publisher = publisher
-	t.Cleanup(publisher.Stop)
+	t.Cleanup(func() { publisher.Stop() })
 	return h
 }
 
@@ -539,7 +539,7 @@ func TestAFullProjectionIsNotARetryStorm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(publisher.Stop)
+	t.Cleanup(func() { publisher.Stop() })
 	h.awaitConverged(t)
 	time.Sleep(100 * time.Millisecond) // twenty Retry intervals
 
@@ -590,4 +590,47 @@ func (h *recordingHandler) count() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.warns
+}
+
+// deafSession is a store whose Scope call ignores cancellation until released.
+type deafSession struct {
+	fakeSession
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *deafSession) Scope(context.Context) (Scope, error) {
+	close(s.entered)
+	<-s.release
+	return Scope{}, errors.New("released")
+}
+
+// TestStopIsBoundedAgainstAStoreCallThatIgnoresCancellation (quality gate F8):
+// a store call that never honours its context cannot hold Stop, and through it
+// the session's release, forever.
+func TestStopIsBoundedAgainstAStoreCallThatIgnoresCancellation(t *testing.T) {
+	session := &deafSession{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(session.release)
+	publisher, err := Start(t.Context(), Options{
+		Session: session, Hints: &fakeHints{}, After: time.After, Retry: time.Second, StopBound: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-session.entered
+	started := time.Now()
+	if publisher.Stop() {
+		t.Fatal("Stop reported the publisher returned while its store call was still blocked")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Stop took %v, want it bounded by StopBound", elapsed)
+	}
+	// And the control: a publisher whose calls honour cancellation stops in time.
+	healthy, err := Start(t.Context(), Options{Session: &fakeSession{}, Hints: &fakeHints{}, After: time.After, Retry: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !healthy.Stop() {
+		t.Fatal("a publisher whose calls honour cancellation did not stop within its bound")
+	}
 }

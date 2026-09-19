@@ -134,7 +134,14 @@ type Options struct {
 
 	// Logger receives WARN records for failed passes. Optional.
 	Logger *slog.Logger
+
+	// StopBound is how long Stop waits for the publisher to return after
+	// cancelling it. Zero means DefaultStopBound.
+	StopBound time.Duration
 }
+
+// DefaultStopBound is Stop's wait when Options.StopBound is zero.
+const DefaultStopBound = 5 * time.Second
 
 // InvalidOptionsError reports a Publisher that may not run.
 type InvalidOptionsError struct {
@@ -208,10 +215,26 @@ func Start(ctx context.Context, options Options) (*Publisher, error) {
 	return p, nil
 }
 
-// Stop ends publication and waits for the publisher to return.
-func (p *Publisher) Stop() {
+// Stop ends publication and waits, BOUNDED, for the publisher to return.
+//
+// THE WAIT IS BOUNDED (quality gate F8). A store call that ignores its
+// context would otherwise hold Stop — and with it the session's release, which
+// runs Stop before the grace-bounded runtime release — forever. Past the bound
+// Stop returns and the goroutine is abandoned to finish its call; the released
+// stores honour cancellation, so this is a guard against a provider that does
+// not. It reports whether the publisher returned in time.
+func (p *Publisher) Stop() bool {
 	p.cancel()
-	<-p.done
+	bound := p.options.StopBound
+	if bound <= 0 {
+		bound = DefaultStopBound
+	}
+	select {
+	case <-p.done:
+		return true
+	case <-p.options.After(bound):
+		return false
+	}
 }
 
 // Superseded reports whether the publisher stopped because a successor's
