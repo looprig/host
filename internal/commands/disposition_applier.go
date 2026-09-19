@@ -149,8 +149,9 @@ func NewDispositionApplier(options DispositionApplierOptions) (*DispositionAppli
 //
 // THE FOUR ARMS ARE THE FOUR DURABLE STATES AND NOTHING ELSE. A terminal record
 // is reported; an applying record has a durably authorized attempt and is
-// settled or recovered; a claimed record already holds this Host's claim and
-// resumes at the attempt; a pending record starts at the claim.
+// settled or recovered; a claimed record resumes at the attempt when the claim
+// is this Host's, and is claimed first when it is another residency's; a
+// pending record starts at the claim.
 func (a *DispositionApplier) Process(ctx context.Context, command Command) (Outcome, error) {
 	record, err := a.records.LoadDispositionCommand(ctx, a.key.TenantID, a.key.SessionID, command.CommandID)
 	if err != nil {
@@ -173,6 +174,15 @@ func (a *DispositionApplier) Process(ctx context.Context, command Command) (Outc
 	case StateApplying:
 		return a.settleOrRecover(ctx, record)
 	case StateClaimed:
+		// A CLAIM IS THIS HOST'S ONLY AT THIS HOST'S RESIDENCY. One held under
+		// another — a predecessor that crashed mid-command — is taken first:
+		// BeginAttempt fences its residency to EQUAL the claim's, so resuming
+		// straight at the attempt was refused on every pass, forever. The
+		// claim edge lets a later residency take a claim over and refuses an
+		// earlier one, so this is safe in both directions.
+		if record.ClaimResidencyEpoch != a.residency {
+			return a.claimThenDispatch(ctx, record)
+		}
 		return a.authorizeAndDispatch(ctx, record, record.Revision)
 	default:
 		return a.claimThenDispatch(ctx, record)

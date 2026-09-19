@@ -1196,3 +1196,45 @@ func TestTheAttemptsExistenceIsItsIdentityAndNotItsGrant(t *testing.T) {
 		})
 	}
 }
+
+// TestASuccessorTakesAPredecessorsClaimBeforeItsAttempt: a command claimed by a
+// predecessor that crashed is `claimed` under ANOTHER residency. Treating it as
+// this Host's own claim sent it straight to BeginAttempt, which the store
+// fences to EQUAL the claim's residency and refuses — every pass, forever
+// (measured on two composed Hosts with a gate answer claimed by the crashed
+// one). A successor claims it first, which the released claim edge allows.
+func TestASuccessorTakesAPredecessorsClaimBeforeItsAttempt(t *testing.T) {
+	f := newDispositionFixture(t, func(f *dispositionFixture) {
+		stored := f.put(KindInput, StateClaimed)
+		stored.record.ClaimResidencyEpoch = testEpoch - 1
+		stored.record.ClaimExpiresAt = testClockAt.Add(time.Minute)
+	})
+	outcome, err := f.process()
+	if err != nil || outcome.State != StateApplied {
+		t.Fatalf("Process = (%+v, %v), want the successor to claim and apply", outcome, err)
+	}
+	want := []string{"LoadDispositionCommand", "ClaimDisposition", "LoadDispositionPayload", "BeginAttempt", "SettleDisposition"}
+	if got := f.store.operations(); !equalStrings(got, want) {
+		t.Fatalf("the store saw %v, want %v", got, want)
+	}
+	if got := f.stored().record.ClaimResidencyEpoch; got != testEpoch {
+		t.Fatalf("the claim is held at residency %d, want this Host's %d", got, testEpoch)
+	}
+}
+
+// TestAClaimThisHostHoldsResumesAtTheAttempt is the control: a claim at this
+// Host's own residency is resumed without a second claim.
+func TestAClaimThisHostHoldsResumesAtTheAttempt(t *testing.T) {
+	f := newDispositionFixture(t, func(f *dispositionFixture) {
+		stored := f.put(KindInput, StateClaimed)
+		stored.record.ClaimResidencyEpoch = testEpoch
+		stored.record.ClaimExpiresAt = testClockAt.Add(time.Minute)
+	})
+	if outcome, err := f.process(); err != nil || outcome.State != StateApplied {
+		t.Fatalf("Process = (%+v, %v)", outcome, err)
+	}
+	want := []string{"LoadDispositionCommand", "LoadDispositionPayload", "BeginAttempt", "SettleDisposition"}
+	if got := f.store.operations(); !equalStrings(got, want) {
+		t.Fatalf("the store saw %v, want %v", got, want)
+	}
+}
