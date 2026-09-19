@@ -3260,7 +3260,15 @@ func TestAParkedAttachLaunchesOnTheTargetAsItIsWhenItRuns(t *testing.T) {
 	if _, err := f.manager.Attach(context.Background(), f.requestWithoutBuild(ModeCreate)); err == nil {
 		t.Fatal("the winner's injected step 8 failure was not reported")
 	}
-	second := <-returned
+	// BOUNDED: if the winner fails before step 8, inWindow never runs, no
+	// parked attach is started, and an unbounded receive would hang until the
+	// package timeout instead of failing here.
+	var second outcome
+	select {
+	case second = <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked attach never returned: the winner did not reach the ownership window, so no second attach was started")
+	}
 	if second.err != nil {
 		t.Fatalf("the parked attach failed: %v", second.err)
 	}
