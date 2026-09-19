@@ -326,9 +326,7 @@ func (p *Publisher) fold(ctx context.Context) error {
 			p.open[ev.Gate.ID] = openGate{opened: ev, seq: seq}
 			p.dirty = true
 		case event.GateResolved:
-			if _, held := p.open[ev.GateID]; held {
-				delete(p.open, ev.GateID)
-			}
+			delete(p.open, ev.GateID)
 			p.dirty = true
 		}
 		if seq >= p.next {
