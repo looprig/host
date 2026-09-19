@@ -111,6 +111,13 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
   that session until then** (it is refused `lease held`); `cmd/host` exits after
   its drain. The successor then restores the session as it restores a crashed
   Host's, and a permission gate is restored open.
+  **A parked runtime is uncancelled, not stopped.** It keeps its goroutines,
+  accepts a `Submit`, and keeps its own gate timers — so a permission gate's
+  five-minute default can fire on a drained Host whose publisher has stopped,
+  resolving the gate and continuing the turn against a stale projection.
+  **A Host that drains with a gate open MUST exit**; `cmd/host` does. Note also
+  that `Stop` skips the manager's context cancellation **for the whole
+  process** when any one session's release was refused.
 - **After a restore**, a permission gate is restored open and answerable, but
   the turn that was parked at it is `TurnInterrupted`: the approval is applied
   and nothing runs the tool. An **ask_user** gate is closed at restore
