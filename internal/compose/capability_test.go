@@ -2,8 +2,8 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
