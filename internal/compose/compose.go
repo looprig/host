@@ -207,6 +207,17 @@ type InvalidOptionsError struct {
 	Reason string
 }
 
+// ServiceLifecycleError reports an operation refused by the service lifecycle.
+type ServiceLifecycleError struct{ Reason string }
+
+func (e *ServiceLifecycleError) Error() string { return "compose: " + e.Reason }
+
+var (
+	ErrServiceDisposed   = &ServiceLifecycleError{Reason: "service has been disposed"}
+	ErrServiceActive     = &ServiceLifecycleError{Reason: "service has started, is starting, or holds an attachment"}
+	ErrServiceNotStarted = &ServiceLifecycleError{Reason: "service has not started"}
+)
+
 func (e *InvalidOptionsError) Error() string {
 	return "compose: invalid option " + strconv.Quote(e.Field) + ": " + e.Reason
 }
@@ -224,12 +235,18 @@ type Service struct {
 	drainer   *lifecycle.Drainer
 	links     *links
 
-	mu        sync.Mutex
-	started   bool
-	stopped   bool
-	sessions  map[registry.Key]*resident
-	consumers map[registry.Key]*commands.Consumer
-	leases    map[registry.Key]residency.Lease
+	mu          sync.Mutex
+	started     bool
+	starting    bool
+	draining    bool
+	stopped     bool
+	disposed    bool
+	disposeDone chan struct{}
+	disposeErr  error
+	attaching   int
+	sessions    map[registry.Key]*resident
+	consumers   map[registry.Key]*commands.Consumer
+	leases      map[registry.Key]residency.Lease
 
 	// stopping closes when this Host is stopped, so a compatibility wait ends
 	// with the process rather than outliving it.
@@ -449,19 +466,28 @@ func (o Options) validate() error {
 // socket, so a binary can mount HostLink beside its own probes on one server.
 func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
-	if s.started || s.stopped {
+	if s.disposed {
+		s.mu.Unlock()
+		return ErrServiceDisposed
+	}
+	if s.started || s.stopped || s.starting || s.draining {
 		s.mu.Unlock()
 		return errors.New("compose: a Service starts once")
 	}
+	s.starting = true
 	s.mu.Unlock()
 
 	if err := s.advertise.publish(ctx); err != nil {
+		s.mu.Lock()
+		s.starting = false
+		s.mu.Unlock()
 		return err
 	}
 
 	beatCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 	s.mu.Lock()
+	s.starting = false
 	s.started = true
 	s.stopHeartbeat = cancel
 	s.heartbeatDone = done
@@ -577,6 +603,18 @@ func (s *Service) Metrics() *lifecycle.Metrics { return s.metrics }
 // one: a bind validates current ownership and never grants it, and the routing
 // table is handed a read-only view of the registry precisely so that it cannot.
 func (s *Service) Attach(ctx context.Context, request residency.Request) (residency.Residency, error) {
+	s.mu.Lock()
+	if s.disposed {
+		s.mu.Unlock()
+		return residency.Residency{}, ErrServiceDisposed
+	}
+	if !s.started {
+		s.mu.Unlock()
+		return residency.Residency{}, ErrServiceNotStarted
+	}
+	s.attaching++
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.attaching--; s.mu.Unlock() }()
 	held, err := s.manager.Attach(ctx, request)
 	if err != nil {
 		s.logAttach(ctx, request, err)
@@ -659,7 +697,7 @@ func (s *Service) logAttach(ctx context.Context, request residency.Request, err 
 // is an operator's problem and not a reason to fail a Stop whose releases all
 // succeeded.
 func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
-	if _, err := s.drainer.StartDrain(hostlink.DrainScope{}); err != nil {
+	if _, err := s.StartDrain(hostlink.DrainScope{}); err != nil {
 		return lifecycle.Report{}, err
 	}
 	report := s.drainer.Wait()
@@ -709,6 +747,66 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 	return report, nil
 }
 
+// CloseUnstarted disposes a composed Host which never started or held a
+// residency. Its cleanup is independent of the waiter's context and is shared
+// by subsequent callers. A refused call leaves the Host available.
+func (s *Service) CloseUnstarted(ctx context.Context, closeOwnedStore func() error) error {
+	s.mu.Lock()
+	if !s.disposed {
+		if s.starting || s.draining || s.started || s.stopped || s.attaching != 0 || len(s.sessions) != 0 || len(s.registry.Snapshot()) != 0 {
+			s.mu.Unlock()
+			return ErrServiceActive
+		}
+		s.disposed = true
+		s.disposeDone = make(chan struct{})
+		// Cleanup belongs to the Service lifetime. The caller's context only
+		// bounds its wait, so passing it to this worker would strand resources.
+		// #nosec G118 -- cancellation must not stop Service-owned cleanup.
+		go func() {
+			s.warm.Stop()
+			s.manager.Close()
+			err := errors.Join(s.links.Close(context.Background()), closeOwnedStore())
+			s.mu.Lock()
+			s.disposeErr = err
+			close(s.disposeDone)
+			s.mu.Unlock()
+		}()
+	}
+	done := s.disposeDone
+	s.mu.Unlock()
+	select {
+	case <-done:
+		s.mu.Lock()
+		err := s.disposeErr
+		s.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// StartDrain is the shared admission point for process and HostLink drains.
+// A drain attempt may already have changed the durable admission ledger when
+// its publication reports an error, so it permanently excludes disposal.
+func (s *Service) StartDrain(scope hostlink.DrainScope) (hostlink.DrainStatus, error) {
+	s.mu.Lock()
+	if s.disposed {
+		s.mu.Unlock()
+		return hostlink.DrainStatus{}, ErrServiceDisposed
+	}
+	if s.starting {
+		s.mu.Unlock()
+		return hostlink.DrainStatus{}, ErrServiceActive
+	}
+	if !s.started {
+		s.mu.Unlock()
+		return hostlink.DrainStatus{}, ErrServiceNotStarted
+	}
+	s.draining = true
+	s.mu.Unlock()
+	return s.drainer.StartDrain(scope)
+}
+
 // releaseRefused reports whether any session's runtime refused its release.
 func releaseRefused(report lifecycle.Report) bool {
 	for _, failure := range report.Failures {
@@ -745,7 +843,7 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 		Residencies:        s.registry,
 		Admission:          s.capacity,
 		Consumers:          s,
-		DrainStarter:       s.drainer,
+		DrainStarter:       s,
 		DrainObserver:      s.drainer,
 		Attacher:           linkAttacher{service: s},
 		FixedSessionID:     s.options.Host.FixedSessionID(),

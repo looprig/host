@@ -323,7 +323,9 @@ type fakeStore struct {
 
 	// heldElsewhere makes AcquireSessionLease refuse a key as another owner's,
 	// with the error the released adapter would produce; see holdElsewhere.
-	heldElsewhere map[registry.Key]error
+	heldElsewhere  map[registry.Key]error
+	acquireEntered chan struct{}
+	acquireRelease chan struct{}
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -384,6 +386,10 @@ func (s *fakeStore) mode(key registry.Key) protocolMode {
 // store stops, and every assertion after it would be about a Host that cannot
 // exist.
 func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (residency.Lease, error) {
+	if s.acquireEntered != nil {
+		close(s.acquireEntered)
+		<-s.acquireRelease
+	}
 	s.trace.record("lease.acquire")
 	key := registry.Key{TenantID: tenant, SessionID: session}
 	s.mu.Lock()

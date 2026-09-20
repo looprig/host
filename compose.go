@@ -256,6 +256,18 @@ type Service struct {
 	metrics http.Handler
 }
 
+// ServiceLifecycleError reports an operation refused by the Host lifecycle.
+type ServiceLifecycleError = compose.ServiceLifecycleError
+
+// ErrServiceDisposed means disposal has begun and the Service cannot restart.
+var ErrServiceDisposed = compose.ErrServiceDisposed
+
+// ErrServiceActive means the Service is running or has admitted work.
+var ErrServiceActive = compose.ErrServiceActive
+
+// ErrServiceNotStarted means Start has not completed successfully.
+var ErrServiceNotStarted = compose.ErrServiceNotStarted
+
 // Compose validates the composition, opens the session store, builds the
 // Department and every collaborator, and returns a Service with nothing
 // running.
@@ -512,8 +524,19 @@ func (s *Service) Department() *department.Department { return s.host.Department
 
 // Start publishes this Host's advertisements and begins its heartbeat. The
 // first publication is synchronous, so a Host whose directory refuses it
-// fails here rather than running invisibly. A Service starts once.
+// fails here rather than running invisibly. A Service starts once and returns
+// ErrServiceDisposed after CloseUnstarted begins.
 func (s *Service) Start(ctx context.Context) error { return s.inner.Start(ctx) }
+
+// CloseUnstarted disposes a Service that never started and holds no residency.
+// It closes the SessionStore opened by Compose, but leaves the caller's Storage
+// backend open. If initial publication committed before Start returned an
+// error, its advertisement remains until expiry; this is not a graceful drain.
+// Caller cancellation only ends that call's wait. Later calls wait for the same
+// cleanup and return its final result. Start and Stop refuse after disposal.
+func (s *Service) CloseUnstarted(ctx context.Context) error {
+	return s.inner.CloseUnstarted(ctx, func() error { return s.store.Close(context.Background()) })
+}
 
 // Ready reports whether this Host is ACCEPTING: the readiness probe's answer.
 // A draining Host is not ready from the instant its ledger flips.
@@ -649,7 +672,9 @@ func (e *AttachError) HostLinkCode() (sessionwire.HostLinkErrorCode, bool) {
 // It is the SAME entry point the hostlink.attach RPC reaches, so its
 // semantics are the RPC's: serialized per session, idempotent on a resident
 // session (Attached false, the existing epoch), refused with a HostLink class
-// where placement should be re-run and with none where it should not.
+// where placement should be re-run and with none where it should not. Attach
+// requires a successful Start; it returns ErrServiceNotStarted before that and
+// ErrServiceDisposed after disposal begins.
 func (s *Service) Attach(ctx context.Context, request AttachRequest) (Residency, error) {
 	var mode residency.Mode
 	switch request.Mode {
@@ -738,7 +763,8 @@ const StepCloseStore = "close_store"
 
 // Stop drains this Host, waits for the drain to finish, closes every tenant
 // transport, and then closes the session store Compose opened. The store is
-// last because everything before it may still write.
+// last because everything before it may still write. Before a successful Start
+// it returns ErrServiceNotStarted; after disposal it returns ErrServiceDisposed.
 func (s *Service) Stop(ctx context.Context) (DrainReport, error) {
 	report, err := s.inner.Stop(ctx)
 	if err != nil {
