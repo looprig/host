@@ -198,6 +198,13 @@ func TestAServerAdvertisesOnlyTheCapabilitiesItIsGiven(t *testing.T) {
 			t.Errorf("NewCentrifugeServer accepted capabilities %v", capabilities)
 		}
 	}
+	// A local WebSocket Close does not wait for the server to remove the client.
+	// If node shutdown wins that race, Centrifuge waits for its close handshake
+	// longer than closeServers' context and makes this test fail in cleanup.
+	if err := connection.Close(); err != nil {
+		t.Fatalf("close connection: %v", err)
+	}
+	auth.waitForDisconnects(t, 1)
 }
 
 // negotiatedReply connects and decodes the reply with Core's own decoder.
