@@ -286,7 +286,8 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	// closure is a capability only a successor ever uses, and requiring it would
 	// refuse every runtime that cannot write one for a session that may never
 	// need one. What such a composition loses is the ability to close a
-	// PREDECESSOR's stranded attempt, which costs liveness on one command.
+	// PREDECESSOR's stranded attempt, which blocks this session's entire command
+	// stream permanently: the consumer stops its pass at that command.
 	//
 	// IT MUST STILL BE FORWARDED, and this wrapper not forwarding it was a REAL
 	// DEFECT found by a surviving mutant rather than by reading. A composed Host
@@ -365,6 +366,11 @@ func (r *rigRuntime) CloseAttempt(
 	}
 	return r.closer.CloseAttempt(ctx, command, runtimeCommand, kind, attempt, attemptJournalEpoch)
 }
+
+// AttemptCloserAvailable reports the wrapper's actual forwarded capability.
+// The wrapper itself has CloseAttempt for every runtime, so an interface
+// assertion on it cannot distinguish a working closer from the refusal path.
+func (r *rigRuntime) AttemptCloserAvailable() bool { return r.closer != nil }
 
 func (r *rigRuntime) SessionID() sessionwire.SessionID { return r.sessionID }
 func (r *rigRuntime) AgentID() sessionwire.AgentID     { return r.agentID }

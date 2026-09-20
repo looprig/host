@@ -468,6 +468,23 @@ var ErrNoAttemptCloser = errors.New("department: this runtime offers no recovery
 // every implementer of that path — the composed adapter, every test double —
 // carry a method only a successor ever calls. A composition whose runtime does
 // not satisfy it blocks on a stranded attempt rather than concluding anything.
+//
+// A product session backed by harness can forward to the real journal closer.
+// Here s.closer is a runtimecommand.AttemptCloser from that session's live
+// journal lease; it supplies the author grant itself. The example uses
+// context, github.com/looprig/core/sessionwire/v1 (as sessionwire),
+// github.com/looprig/core/uuid, and
+// github.com/looprig/harness/pkg/runtimecommand:
+//
+//	func (s *Session) CloseAttempt(ctx context.Context, command sessionwire.CommandID, runtimeID uuid.UUID, kind, attempt string, epoch uint64) error {
+//	    closure := runtimecommand.Closure{CommandID: runtimecommand.CommandID(command), RuntimeCommandID: runtimeID, Kind: runtimecommand.Kind(kind), AttemptID: runtimecommand.AttemptID(attempt), AttemptJournalEpoch: epoch}
+//	    if err := closure.Validate(); err != nil { return err }
+//	    _, err := s.closer.CloseAttempt(ctx, closure)
+//	    return err
+//	}
+//
+// Forward the closer's error; a refusal to close must leave the command
+// applying. The attempt epoch comes from Host's durable command record.
 type AttemptCloser interface {
 	// CloseAttempt durably records that the named attempt was not applied.
 	//

@@ -89,6 +89,25 @@ recovery path refused exactly what the adapter did.
 command is settled as not applied; a client that wants those words sent must
 send them again as an input.
 
+### Every product runtime needs a recovery closer
+
+A product runtime must implement `department.AttemptCloser` to recover a
+predecessor's stranded attempt. This is not limited to migration from v0.4.0:
+an ordinary pod eviction can leave an attempt in flight in an all-v0.5.0 fleet.
+Without the closer, Host refuses recovery as `no_attempt_closer`, leaves that command
+`applying`, and the consumer cannot advance past it. **The entire session's
+command stream remains blocked**, including later input and interrupt commands;
+the apply deadline cannot settle an attempt-bearing record. The bound journal
+session must write the closure under its own strictly later journal grant. The
+`department.AttemptCloser` documentation includes a copyable harness-backed
+method.
+
+Host logs `attempt_closer_unavailable` at WARN when it composes a launched
+runtime without the capability, before starting its command consumer. This
+check occurs at session attach because `host.Compose` has no launched runtime
+to inspect. The warning does not refuse the attach; a session with no stranded
+attempt can still run.
+
 ### ONE-WAY UPGRADE
 
 Once a session's journal holds any `create` or `restore` application prefix or

@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -135,12 +136,19 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	if err != nil {
 		return nil, err
 	}
-	// THE RUNTIME IS ASKED FOR ITS CLOSER RATHER THAN REQUIRED TO HAVE ONE, on
-	// the released capability's own terms: a recovery closure is segregated from
-	// the control path, and a composition whose runtime cannot offer one blocks
-	// on a predecessor's stranded attempt instead of concluding anything about
-	// it. department.Runtime does not name it, so this is the assertion.
-	closer, _ := request.Runtime.(department.AttemptCloser)
+	// THE RUNTIME IS ASKED FOR ITS CLOSER RATHER THAN REQUIRED TO HAVE ONE.
+	// A missing closer blocks recovery of a predecessor's attempt without
+	// refusing ordinary attach. A department wrapper always has the method, so
+	// its explicit availability report overrides the interface assertion.
+	closer, available := attemptCloserFor(request.Runtime)
+	// This is the session's composition point: only now has the launch target
+	// returned a runtime, and the warning can name the affected session.
+	if !available {
+		s.options.logger().LogAttrs(ctx, slog.LevelWarn, "host: runtime cannot close a predecessor's stranded attempt",
+			slog.String("condition", "attempt_closer_unavailable"),
+			slog.String("tenant_id", string(request.Key.TenantID)),
+			slog.String("session_id", string(request.Key.SessionID)))
+	}
 	applier, err := commands.NewDispositionApplier(commands.DispositionApplierOptions{
 		Host:           s.options.Host,
 		Key:            request.Key,
@@ -240,6 +248,19 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		// TestReleasingOneSessionLeavesEveryOtherSessionSRoutesAlone.
 		link.mux.InvalidateSession(request.Key)
 	}}, nil
+}
+
+// attemptCloserFor asks both the method set and, when present, the wrapper's
+// actual forwarded capability. A reporter cannot invent a missing method.
+func attemptCloserFor(runtime any) (department.AttemptCloser, bool) {
+	closer, ok := runtime.(department.AttemptCloser)
+	if !ok {
+		return nil, false
+	}
+	if reporter, ok := runtime.(interface{ AttemptCloserAvailable() bool }); ok && !reporter.AttemptCloserAvailable() {
+		return nil, false
+	}
+	return closer, true
 }
 
 // errNoRecordedLease is the refusal beginWork makes when the composition has no
