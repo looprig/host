@@ -80,6 +80,9 @@ func checkExample(docs []exampleObject) string {
 		return "missing deployment resource"
 	}
 	pod := exampleAt(deploy, "spec", "template", "spec")
+	if pod["hostNetwork"] == true {
+		return "public HostLink through host network"
+	}
 	containers := exampleList(pod, "containers")
 	if len(containers) != 1 {
 		return "expected one Host container"
@@ -87,6 +90,12 @@ func checkExample(docs []exampleObject) string {
 	c, _ := containers[0].(exampleObject)
 	if c == nil {
 		return "invalid Host container"
+	}
+	for _, item := range exampleList(c, "ports") {
+		port, _ := item.(exampleObject)
+		if exposed, present := port["hostPort"]; present && exposed != 0 {
+			return "public HostLink through host port"
+		}
 	}
 	if serviceSpec := exampleAt(service, "spec"); serviceSpec["clusterIP"] != "None" || serviceSpec["type"] == "LoadBalancer" || serviceSpec["type"] == "NodePort" || serviceSpec["externalIPs"] != nil {
 		return "public or load-balanced HostLink"
@@ -133,7 +142,10 @@ func checkExample(docs []exampleObject) string {
 	if !ok || time.Duration(seconds)*time.Second < grace+15*time.Second {
 		return "unsafe termination timing"
 	}
-	if exampleAt(hpa, "spec")["maxReplicas"] == nil {
+	hpaSpec := exampleAt(hpa, "spec")
+	minimum, minOK := hpaSpec["minReplicas"].(int)
+	maximum, maxOK := hpaSpec["maxReplicas"].(int)
+	if !minOK || !maxOK || minimum < 1 || maximum <= minimum || maximum > 64 {
 		return "unbounded autoscaling"
 	}
 	return ""
@@ -154,6 +166,16 @@ func TestPooledCloudExampleRejectsUnsafeChanges(t *testing.T) {
 			exampleNamed(exampleList(hostContainer(d), "env"), "PRODUCT_HOSTLINK_CREDENTIAL")["value"] = "real-credential"
 		}},
 		{"public HostLink", func(d []exampleObject) { exampleAt(document(d, "Service"), "spec")["type"] = "LoadBalancer" }},
+		{"external Service IP", func(d []exampleObject) {
+			exampleAt(document(d, "Service"), "spec")["externalIPs"] = []interface{}{"203.0.113.10"}
+		}},
+		{"host network", func(d []exampleObject) {
+			exampleAt(document(d, "Deployment"), "spec", "template", "spec")["hostNetwork"] = true
+		}},
+		{"host port", func(d []exampleObject) {
+			port, _ := exampleList(hostContainer(d), "ports")[0].(exampleObject)
+			port["hostPort"] = 7100
+		}},
 		{"shared HostLink base", func(d []exampleObject) {
 			exampleNamed(exampleList(hostContainer(d), "env"), "HOST_INTERNAL_ENDPOINT")["value"] = "ws://pooled-host:7100"
 		}},
@@ -163,6 +185,11 @@ func TestPooledCloudExampleRejectsUnsafeChanges(t *testing.T) {
 		{"missing limits", func(d []exampleObject) { delete(exampleAt(hostContainer(d), "resources", "limits"), "memory") }},
 		{"unsafe timing", func(d []exampleObject) {
 			exampleAt(document(d, "Deployment"), "spec", "template", "spec")["terminationGracePeriodSeconds"] = 60
+		}},
+		{"zero HPA maximum", func(d []exampleObject) { exampleAt(document(d, "HorizontalPodAutoscaler"), "spec")["maxReplicas"] = 0 }},
+		{"HPA maximum at minimum", func(d []exampleObject) { exampleAt(document(d, "HorizontalPodAutoscaler"), "spec")["maxReplicas"] = 2 }},
+		{"unbounded HPA maximum", func(d []exampleObject) {
+			exampleAt(document(d, "HorizontalPodAutoscaler"), "spec")["maxReplicas"] = 1000000
 		}},
 	}
 	for _, test := range tests {
