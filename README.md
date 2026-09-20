@@ -1,6 +1,6 @@
 # looprig/host
 
-`host` is Looprig's Department runtime host. A Host is a tenant-scoped process
+`host` is Looprig's Department runtime host. A Host is a process
 that keeps runtime targets resident, consumes commands addressed to it, serves
 the HostLink realtime surface, and drains on release.
 
@@ -37,6 +37,62 @@ measured, not cautionary.
 create and restore". **Since v0.4.0 every gate an agent raises reaches Factory,
 and the user's answer settles through the same path** — see "Upgrading to
 v0.4.0: gates".
+
+## Deployment and operations
+
+A product supplies the Department's launch targets and runtime adapter. The
+advertised isolation class, placement and capacity describe what Factory may
+select; they do not make a runtime compatible with a target. Compose the
+product's registered target and verify the runtime adapter before publishing
+it. A target declares an opaque runtime compatibility ID; restore refuses a
+journal created under a different ID, so preserve that ID only for builds that
+can actually read the same state. The generic `cmd/host` has an unconfigured
+bootstrap and refuses to start without product collaborators.
+
+`host.Run` serves HostLink, `/readyz`, `/healthz` and `/metrics` on one HTTP
+listener (`HOST_LISTEN_ADDRESS` in `cmd/host`). HostLink is internal: keep the
+whole listener on an internal network, including its probe and metrics paths.
+HostLink verifies the tenant credential through the product's authenticator.
+It is service-to-service and does not use browser Origin or CSRF checks.
+`host.Run` uses plain HTTP; terminate TLS in front of the listener or supply a
+secured listener in the product composition. The Host advertises a **bare**
+internal endpoint; Factory v0.5.0 or later derives each tenant's HostLink path.
+Older Factory versions dial the base verbatim and get 404. Roll Factory and
+Host as a paired change when switching to the bare base.
+
+Pooled means several sessions can reside on a Host; dedicated means one fixed
+session (`HOST_FIXED_SESSION_ID`). Neither word describes durability. Recovery
+requires a shared SessionStore backend, its leases and the Harness journal;
+object bytes need a separately selected object store. Legacy SessionStore
+`PutObject` and object-first retention are not a Host disposition
+`SessionObjectStore`. A pooled Host's whole-process drain runs on shutdown;
+HostLink drain is available only for a dedicated resident fixed session.
+The dedicated workload controller must observe the terminal drain status
+before it deletes that workload.
+
+`Run` drains before shutting down the listener, so the drain-status observation
+remains readable. Set `HOST_DRAIN_GRACE` inside the platform's termination grace
+with margin; `HOST_DRAIN_IDLE_BOUNDARY` and `HOST_DRAIN_PUBLISH_BOUND` bound
+parts of that work. `/readyz` reports admission readiness and `/healthz`
+reports process liveness. A Host with an open gate must exit after drain;
+releasing a gated runtime gracefully is unsupported.
+
+The isolated `/metrics` registry exports `host_sessions` (by state),
+`host_sessions_gate_waiting`, `host_sessions_command_blocked`,
+`host_admission_weight_consumed`, `host_admission_weight_capacity`,
+`host_command_lag`, `host_command_queue_depth`,
+`host_release_failures_total` and, only when known,
+`host_memory_budget_bytes`. Capacity and queue gauges are local Host state;
+Factory backlog, resident wait, reconciliation and controller drain metrics
+are not exported here. Watch `host_sessions_command_blocked`: a nonzero value
+means a durable command cannot progress.
+
+A Host advertises `hostlink.command.gate_response` only when its gate seams
+are composed. Factory must check that capability before admitting an answer.
+Keep every Factory gate reader on sessionstore v0.12.0 or later before a Host
+publishes a gate. Once a Host has applied a gate response, do not roll it back
+below v0.4.0; after a create or restore disposition, do not roll it back below
+v0.5.0. A cold AskUser answer/resume remains unsupported.
 
 ## Upgrading to v0.5.0: create and restore
 
