@@ -2,7 +2,9 @@ package harnessadapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -145,50 +147,89 @@ func (r *movingReporter) moveTo(epoch uint64, held bool) {
 	r.epoch, r.held = epoch, held
 }
 
-// H6. commands.Kind has five members and runtimecommand.Kind has two. The three
-// with no counterpart are refused HERE, before the durable prefix is written,
-// rather than by Admitted.Validate after it.
+// H6. commands.Kind has five members and, since harness v0.36.0,
+// runtimecommand.Kind has the same five. Every kind Factory admits is now
+// applied, and a kind NEITHER vocabulary holds is refused HERE, before the
+// durable prefix is written, rather than by Admitted.Validate after it.
+//
+// THE TEST ASSERTS WHAT CROSSED, NOT WHICH ARM THE KIND WENT DOWN, and that is
+// the whole reason it is shaped this way. Its previous form branched on
+// runtimecommand.Kind(kind).Valid() and checked only that an accepted kind
+// crossed with its own name on it. When harness widened Kind.Valid() to five it
+// therefore went green for create and restore BY ITSELF, while the payload
+// decode was still reached only by KindInput -- so a create crossed with no
+// Blocks, the applier sent nothing, and the command settled `applied` with the
+// user's first message dropped in silence. A test that passes vacuously through
+// the defect it is nearest to is worse than no test, so each row now names the
+// content its kind must carry, and a missing decode arm fails the create row by
+// assertion.
 func TestAdmitRefusesEveryKindHarnessDoesNotApply(t *testing.T) {
-	// THE LIST IS A COPY OF commands.Kind's five constants AND THE DUPLICATION IS
-	// FORCED, which is worth saying rather than dressing up as derivation. This
-	// package cannot import internal/commands — that is Host's inbox vocabulary
-	// and this is the harness edge — so there is nothing to enumerate from, and
-	// these are string literals that must be re-checked by hand when either
-	// vocabulary moves. What IS derived is the classification: each kind is sent
-	// down the accept or refuse arm by runtimecommand.Kind.Valid rather than by a
-	// second list here, so a kind harness starts applying changes arm without an
-	// edit. Only the SPACE is hand-written; the expectation is not.
-	// gate_response IS NOT A ROW: harness applies it since v0.35.0 and this
-	// adapter admits it with a decoded answer; see
-	// TestAdmitBuildsAGateResponseFromTheStoredBody and
+	// THE LIST IS A COPY OF commands.Kind's five constants AND THE DUPLICATION
+	// IS FORCED, which is worth saying rather than dressing up as derivation.
+	// This package cannot import internal/commands — that is Host's inbox
+	// vocabulary and this is the harness edge — so there is nothing to
+	// enumerate from, and these are string literals that must be re-checked by
+	// hand when either vocabulary moves. The last row is in neither vocabulary
+	// and is what keeps the refusal arm reachable at all now that all five of
+	// Factory's kinds are applied.
+	//
+	// gate_response IS NOT A ROW: its body must name a gate harness could have
+	// minted and the session it is stored under, which is a fixture of its own;
+	// see TestAdmitBuildsAGateResponseFromTheStoredBody and
 	// TestAdmitRefusesAGateResponseItCannotDecode.
-	for _, kind := range []string{"create", "restore", "input", "interrupt"} {
-		t.Run(kind, func(t *testing.T) {
-			bound := &boundSession{
-				leaseEpoch: heldEpoch(3),
-				decode: func([]byte) ([]content.Block, error) {
-					return []content.Block{&content.TextBlock{Text: "hello"}}, nil
-				},
-			}
+	for _, row := range []struct {
+		kind string
+		body []byte
+		// carries is the text the admitted command's single block must hold,
+		// or "" when the kind must cross carrying nothing.
+		carries string
+	}{
+		{kind: "create", body: createBody(t, "the first thing the user said"), carries: "the first thing the user said"},
+		{kind: "create", body: createBody(t, ""), carries: ""},
+		{kind: "input", body: inputBody(t, "a later message"), carries: "a later message"},
+		{kind: "interrupt", body: []byte(`{"version":1,"command_id":"command-a","session_id":"session-a"}`), carries: ""},
+		{kind: "restore", body: []byte(`{"version":1,"command_id":"command-a","session_id":"session-a"}`), carries: ""},
+		{kind: "no_such_kind", body: nil, carries: ""},
+	} {
+		name := row.kind
+		if row.kind == "create" && row.carries == "" {
+			name = "create with no first message"
+		}
+		t.Run(name, func(t *testing.T) {
+			bound := &boundSession{leaseEpoch: heldEpoch(3), decode: inputShapedDecoder(t)}
 			command := inputCommand()
-			command.Kind = kind
+			command.Kind = row.kind
+			command.Payload = row.body
 			admitted, err := bound.admit(command)
 
-			if runtimecommand.Kind(kind).Valid() {
+			if runtimecommand.Kind(row.kind).Valid() {
 				if err != nil {
-					t.Fatalf("admit(%q) = %v, want it accepted", kind, err)
+					t.Fatalf("admit(%q) = %v, want it accepted", row.kind, err)
 				}
-				if string(admitted.Kind) != kind {
-					t.Fatalf("kind = %q, want %q", admitted.Kind, kind)
+				if string(admitted.Kind) != row.kind {
+					t.Fatalf("kind = %q, want %q", admitted.Kind, row.kind)
+				}
+				if row.carries == "" {
+					if len(admitted.Blocks) != 0 {
+						t.Fatalf("a %q crossed with %d blocks, want none", row.kind, len(admitted.Blocks))
+					}
+					return
+				}
+				if len(admitted.Blocks) != 1 {
+					t.Fatalf("a %q crossed with %d blocks, want the one its body carries", row.kind, len(admitted.Blocks))
+				}
+				text, ok := admitted.Blocks[0].(*content.TextBlock)
+				if !ok || text.Text != row.carries {
+					t.Fatalf("a %q crossed carrying %#v, want %q", row.kind, admitted.Blocks[0], row.carries)
 				}
 				return
 			}
 			var unsupported *UnsupportedCommandError
 			if !errors.As(err, &unsupported) {
-				t.Fatalf("admit(%q) = %v, want UnsupportedCommandError", kind, err)
+				t.Fatalf("admit(%q) = %v, want UnsupportedCommandError", row.kind, err)
 			}
-			if !strings.Contains(unsupported.Reason, "input, interrupt and gate_response") {
-				t.Fatalf("reason = %q, want the three-kind refusal", unsupported.Reason)
+			if !strings.Contains(unsupported.Reason, "create, input, interrupt, restore and gate_response") {
+				t.Fatalf("reason = %q, want the five-kind refusal", unsupported.Reason)
 			}
 		})
 	}
@@ -728,4 +769,208 @@ func (c *recordingAttemptCloser) CloseAttempt(_ context.Context, closure runtime
 	}
 	c.seen = append(c.seen, closure)
 	return runtimecommand.ClosureResult{Sequence: 1, Appended: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// H6's create and restore arms
+// ---------------------------------------------------------------------------
+//
+// THE SILENT DROP THESE COVER IS WHAT MAKES THE VOCABULARY TEST ABOVE
+// INSUFFICIENT ON ITS OWN. The kind gate is Kind.Valid(), so harness v0.36.0
+// opened it for create and restore by itself; the payload decode was reached
+// only by KindInput. A create therefore crossed with no Blocks, the applier
+// sent nothing, and the command settled `applied` -- the user's first message
+// dropped in silence with the record looking perfectly settled. Every row below
+// asserts on what CROSSED, never on the arm the kind was sent down.
+
+// createBody is the Core CreateRequest Factory stores as a create's private
+// body, carrying blocks when text is non-empty.
+func createBody(t *testing.T, text string) []byte {
+	t.Helper()
+	request := sessionwire.CreateRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: "command-a"},
+		SessionID:       testSession,
+		AgentID:         "agent-a",
+	}
+	if text != "" {
+		request.Blocks = json.RawMessage(`[{"type":"text","text":` + strconv.Quote(text) + `}]`)
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("the fixture's create request is not one Core admits: %v", err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+// createCommand is one create as the applier dispatches it.
+func createCommand(t *testing.T, text string) department.RuntimeCommand {
+	t.Helper()
+	command := inputCommand()
+	command.Kind = "create"
+	command.Payload = createBody(t, text)
+	return command
+}
+
+// inputShapedDecoder is the decoder a composition binds: it reads the
+// INPUT-SHAPED body H7 names, and refuses anything else, which is what makes a
+// create's own CreateRequest body unreadable to it.
+func inputShapedDecoder(t *testing.T) BlockDecoder {
+	t.Helper()
+	return func(body []byte) ([]content.Block, error) {
+		var request sessionwire.InputRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			return nil, err
+		}
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(request.Blocks, &blocks); err != nil {
+			return nil, err
+		}
+		decoded := make([]content.Block, 0, len(blocks))
+		for _, block := range blocks {
+			decoded = append(decoded, &content.TextBlock{Text: block.Text})
+		}
+		return decoded, nil
+	}
+}
+
+// A CREATE'S FIRST MESSAGE CROSSES, and it crosses through the SAME decoder an
+// input's body goes through: the create's blocks are re-presented in the
+// input-shaped body that decoder reads, so a composition binds one encoding
+// rather than two.
+func TestAdmitDecodesACreatesFirstMessage(t *testing.T) {
+	bound := &boundSession{leaseEpoch: heldEpoch(3), decode: inputShapedDecoder(t)}
+
+	admitted, err := bound.admit(createCommand(t, "the first thing the user said"))
+	if err != nil {
+		t.Fatalf("admit of a create carrying a first message: %v", err)
+	}
+	if len(admitted.Blocks) != 1 {
+		t.Fatalf("the create crossed with %d blocks, want its first message", len(admitted.Blocks))
+	}
+	text, ok := admitted.Blocks[0].(*content.TextBlock)
+	if !ok || text.Text != "the first thing the user said" {
+		t.Fatalf("the block is %#v, want the create's first message", admitted.Blocks[0])
+	}
+}
+
+// A BARE CREATE CARRIES NOTHING AND IS STILL ADMITTED. Core's
+// CreateRequest.Blocks is omitempty and an idle create is legitimate; refusing
+// one would make every idle session's first command unsettleable, which is the
+// wedge harness v0.36.0 exists to end.
+func TestAdmitCarriesABareCreateWithNoBlocks(t *testing.T) {
+	consulted := false
+	bound := &boundSession{
+		leaseEpoch: heldEpoch(3),
+		decode: func([]byte) ([]content.Block, error) {
+			consulted = true
+			return []content.Block{&content.TextBlock{Text: "invented"}}, nil
+		},
+	}
+
+	admitted, err := bound.admit(createCommand(t, ""))
+	if err != nil {
+		t.Fatalf("admit of a bare create: %v", err)
+	}
+	if len(admitted.Blocks) != 0 {
+		t.Fatalf("a bare create crossed with %d blocks, want none", len(admitted.Blocks))
+	}
+	if consulted {
+		t.Fatal("the decoder was consulted for a create that carries no blocks")
+	}
+}
+
+// H7 EXTENDS TO A CREATE THAT CARRIES ONE. A composition with no decoder
+// refuses rather than applying an empty first turn, which is exactly the
+// silent drop this release exists to prevent.
+func TestAdmitRefusesACreateWithAFirstMessageAndNoDecoder(t *testing.T) {
+	bound := &boundSession{leaseEpoch: heldEpoch(3)}
+
+	_, err := bound.admit(createCommand(t, "the first thing the user said"))
+	var unsupported *UnsupportedCommandError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("admit of a create with no decoder = %v, want UnsupportedCommandError", err)
+	}
+	if !strings.Contains(unsupported.Reason, "block decoder") {
+		t.Fatalf("reason = %q, want the missing decoder", unsupported.Reason)
+	}
+}
+
+// A BODY THAT IS NOT A CORE CreateRequest IS REFUSED. The adapter reads the
+// stored record itself rather than handing opaque bytes to the input decoder,
+// so a body no Host could read is refused here rather than silently producing
+// an empty turn.
+func TestAdmitRefusesACreateBodyCoreDoesNotAdmit(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		body []byte
+	}{
+		{"no body at all", nil},
+		{"not JSON", []byte("hello")},
+		{"an input request, not a create", []byte(`{"version":1,"command_id":"command-a","session_id":"session-a","blocks":[{"type":"text","text":"hi"}]}`)},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			bound := &boundSession{leaseEpoch: heldEpoch(3), decode: inputShapedDecoder(t)}
+			command := createCommand(t, "")
+			command.Payload = row.body
+
+			if _, err := bound.admit(command); err == nil {
+				t.Fatal("admit accepted a create body Core does not admit")
+			}
+		})
+	}
+}
+
+// A RESTORE CARRIES NOTHING AND CONSULTS NOTHING. Core's RestoreRequest has no
+// blocks member and Admitted.Validate refuses a restore that carries any, so
+// the only correct arm is a pass-through.
+func TestAdmitPassesARestoreThroughCarryingNothing(t *testing.T) {
+	consulted := false
+	bound := &boundSession{
+		leaseEpoch: heldEpoch(3),
+		decode: func([]byte) ([]content.Block, error) {
+			consulted = true
+			return []content.Block{&content.TextBlock{Text: "invented"}}, nil
+		},
+	}
+	command := inputCommand()
+	command.Kind = "restore"
+	command.Payload = []byte(`{"version":1,"command_id":"command-a","session_id":"session-a"}`)
+
+	admitted, err := bound.admit(command)
+	if err != nil {
+		t.Fatalf("admit of a restore: %v", err)
+	}
+	if len(admitted.Blocks) != 0 {
+		t.Fatalf("a restore crossed with %d blocks, want none", len(admitted.Blocks))
+	}
+	if admitted.GateResponse != nil {
+		t.Fatal("a restore crossed carrying a gate response")
+	}
+	if consulted {
+		t.Fatal("the decoder was consulted for a restore")
+	}
+}
+
+// inputBody is the Core InputRequest Factory stores as an input's private body.
+func inputBody(t *testing.T, text string) []byte {
+	t.Helper()
+	request := sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: "command-a"},
+		SessionID:       testSession,
+		Blocks:          json.RawMessage(`[{"type":"text","text":` + strconv.Quote(text) + `}]`),
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("the fixture's input request is not one Core admits: %v", err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }

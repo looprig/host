@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/session"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/createbody"
 	"github.com/looprig/host/internal/gateresponse"
 )
 
@@ -362,7 +363,7 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{
 			CommandID: command.CommandID,
 			Kind:      command.Kind,
-			Reason:    "harness applies only input, interrupt and gate_response commands",
+			Reason:    "harness applies only create, input, interrupt, restore and gate_response commands",
 		}
 	}
 	if admitted.Kind == runtimecommand.KindGateResponse {
@@ -383,6 +384,40 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 			Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 		}
 	}
+	// A CREATE CARRIES THE SESSION'S FIRST MESSAGE, AND IT IS THE ONE KIND THE
+	// GATE ABOVE ADMITS WHOSE BODY IS NOT THE SHAPE THE DECODER READS. Core
+	// stores a create as a CreateRequest, whose Blocks member is omitempty, so
+	// handing the payload straight to the input decoder would fail on every
+	// create and reading no payload at all would drop the first message in
+	// silence -- harness's own KindCreate doc names that second failure, because
+	// an undecoded payload and an absent one are the same value on its side of
+	// this seam and it cannot tell them apart.
+	if admitted.Kind == runtimecommand.KindCreate {
+		body, err := createbody.FirstMessage(command.Payload)
+		if err != nil {
+			return runtimecommand.Admitted{}, err
+		}
+		if len(body) != 0 {
+			if s.decode == nil {
+				return runtimecommand.Admitted{}, &UnsupportedCommandError{
+					CommandID: command.CommandID,
+					Kind:      command.Kind,
+					Reason:    "no block decoder was bound, and a create carrying a first message must carry decoded content",
+				}
+			}
+			blocks, err := s.decode(body)
+			if err != nil {
+				return runtimecommand.Admitted{}, err
+			}
+			admitted.Blocks = blocks
+		}
+	}
+	// A RESTORE CARRIES NOTHING AND IS NOT LISTED HERE FOR THAT REASON.
+	// Core's RestoreRequest has no blocks member, and Admitted.Validate refuses
+	// a restore that carries any, so there is no arm to write: the kind crosses
+	// with the identities and the epoch and nothing else. harness gates the
+	// input preparation on the PAYLOAD rather than on the kind, so a restore
+	// never borrows the input path's loop refusals.
 	if admitted.Kind == runtimecommand.KindInput {
 		if s.decode == nil {
 			return runtimecommand.Admitted{}, &UnsupportedCommandError{

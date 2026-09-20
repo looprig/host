@@ -112,15 +112,46 @@
 // capability's two results exist to separate "no epoch" from "epoch 0" and harness
 // gates the report on the lease still being Valid.
 //
-// H6. HARNESS APPLIES input, interrupt AND, SINCE v0.35.0, gate_response.
-// runtimecommand.Kind is a closed three-member set; commands.Kind has five. The
-// two with no counterpart, create and restore, are refused here rather than
-// forwarded as an unknown kind, which Admitted.Validate would reject after the
-// application prefix had already been written. A gate_response is admitted with
-// harness's decoded answer (Admitted.GateResponse), built from the stored Core
-// body by internal/gateresponse — the same decode the applier ran before the
-// attempt — with the user as its source and the attempt the record authorized,
-// which harness requires for this kind.
+// H6. HARNESS APPLIES ALL FIVE KINDS SINCE v0.36.0, AND H6 IS LIFTED.
+// runtimecommand.Kind named input and interrupt, then gate_response at v0.35.0,
+// then create and restore at v0.36.0; commands.Kind has the same five. Until
+// then create and restore were refused here — and that refusal was the wedge
+// v0.36.0 exists to end: Host had already begun a durable dispatch attempt by
+// the time the adapter said no, no disposition frame was ever written, the
+// store could never settle the record, and the consumer blocked at the
+// session's FIRST command forever. The gate is Kind.Valid() and always was, so
+// nothing in this package had to change for the kinds to start crossing.
+//
+// WHAT DID HAVE TO CHANGE IS THE PAYLOAD, AND MISSING IT IS SILENT DATA LOSS.
+// The decode below used to be reached only by KindInput. A create crossing with
+// no Blocks is a command harness accepts — Core's CreateRequest.Blocks is
+// optional, so an empty one is a legitimate idle create — which the applier
+// then settles `applied` having sent nothing. The user's first message would be
+// dropped with the record looking perfectly settled, which is worse than the
+// wedge it replaced because the wedge was visible. harness cannot detect it:
+// an undecoded payload and an absent one are the same value on its side of the
+// seam. So a create's body is read here, as Core's CreateRequest, and its
+// blocks are re-presented in the input-shaped body a BlockDecoder reads; see
+// internal/createbody for why there is one encoding rather than two. A create
+// carrying a first message with no decoder bound is refused, exactly as an
+// input is by H7.
+//
+// A RESTORE CROSSES CARRYING NOTHING. Core's RestoreRequest has no blocks
+// member and Admitted.Validate refuses a restore that carries any. harness
+// gates its input preparation on the PAYLOAD rather than the kind, so a restore
+// never borrows the input path's loop refusals and a resident session's resume
+// is not refused because some loop had exited.
+//
+// A gate_response is admitted with harness's decoded answer
+// (Admitted.GateResponse), built from the stored Core body by
+// internal/gateresponse — the same decode the applier ran before the attempt —
+// with the user as its source and the attempt the record authorized, which
+// harness requires for this kind.
+//
+// ONE-WAY UPGRADE, and it is Host's to state as well as harness's. Once a
+// session journal holds a create or restore application prefix or disposition
+// frame, harness v0.35.0 and older can neither replay nor reopen it. Do not
+// roll a Host back below harness v0.36.0 once it has applied either kind.
 //
 // H7. AN input COMMAND MUST CARRY DECODED content.Blocks, AND HOST'S PAYLOAD IS
 // OPAQUE BYTES. department.RuntimeCommand documents the body as travelling
