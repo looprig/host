@@ -121,6 +121,22 @@ refused by a v0.4.0 successor after its own attempt, which re-strands the
 record until a v0.5.0 Host takes it. **Do not run v0.4.0 and v0.5.0 Hosts over
 one session pool.**
 
+### v0.6.0: create bodies are checked before an attempt
+
+After claiming a `create`, Host checks its stored Core request before minting
+or recording an attempt. A malformed body or one naming another session or
+command is rejected while the command has no attempt, freeing the session's
+command stream. A body this Host may be too old to understand (`unknown_field`
+or `unsupported_version`) stays claimed and unattempted; a newer Host can
+take the claim, and Factory's apply deadline still bounds it. A body stored
+only by object reference also blocks conservatively because this Host cannot
+read it. Once an attempt exists, only runtime evidence settles the command.
+
+The precheck validates the generic create envelope and block-array shape. A
+product's block decoder can still refuse a block after the attempt; that
+runtime-specific failure remains visible as an applying command until a
+successor closes the attempt or an operator repairs the decoder.
+
 ## Upgrading to v0.4.0: gates
 
 ### Every AskUser and permission gate is published; the answer is a disposition command
@@ -577,8 +593,8 @@ effect that may already have committed. Host's honest exactly-once claim is
 disposition"**.
 
 **There is no Host-authored rejection once an attempt exists.** Before one,
-exactly one kind is ever rejected by Host (v0.4.0): a `gate_response` whose body
-no Host could apply; see "Gates" below. The apply deadline is still Factory's
+Host rejects a `gate_response` or `create` whose immutable body no Host could
+apply. The apply deadline is still Factory's
 deadline reconciler's (§10.4), never a Host's.
 
 ### What a deployment must wire, and what Host cannot check

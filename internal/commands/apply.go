@@ -584,6 +584,10 @@ const (
 	// absent, or a payload the store's own one-of-two invariant refuses.
 	RefusalMissingPayload ApplyRefusal = "missing_payload"
 
+	// RefusalUnreadableCreate leaves a claimed create unattempted because this
+	// Host cannot read its body, while a newer Host may be able to.
+	RefusalUnreadableCreate ApplyRefusal = "unreadable_create"
+
 	// RefusalUnreadableGateResponse reports a gate response whose private body
 	// this Host cannot read the gate identity out of, so §9.4's recheck cannot
 	// be run.

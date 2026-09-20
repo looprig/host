@@ -8,6 +8,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/createbody"
 	"github.com/looprig/host/internal/gateresponse"
 	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
@@ -316,6 +317,15 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 			return Outcome{State: StateRejected}, nil
 		}
 	}
+	if record.Kind == KindCreate {
+		rejected, problem := a.checkCreate(ctx, record, revision, payload)
+		if problem != nil {
+			return Outcome{State: StateClaimed}, problem
+		}
+		if rejected {
+			return Outcome{State: StateRejected}, nil
+		}
+	}
 	// THE RUNTIME'S OWN GRANT, AND `held` IS WHAT IS BRANCHED ON. No pinned
 	// provider zeroes a released lease's epoch, so reading the number alone
 	// would stamp a live-looking dead value into an immutable attempt.
@@ -364,6 +374,25 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 		return Outcome{State: StateApplying, PrefixOwned: true}, problem
 	}
 	return a.settle(ctx, record, applying)
+}
+
+// checkCreate distinguishes immutable malformed bytes from a version this Host
+// cannot read. Both answers are made after the claim and before any attempt.
+func (a *DispositionApplier) checkCreate(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bool, error) {
+	if payload.Ref != (sessionwire.ObjectReference{}) {
+		return false, &ApplyError{Refusal: RefusalUnreadableCreate, CommandID: record.CommandID,
+			Reason: "this Host cannot dereference the create body, so a capable successor may need to read it"}
+	}
+	err := createbody.Check(payload.Body, a.key.SessionID, record.CommandID)
+	if err == nil {
+		return false, nil
+	}
+	var malformed *createbody.MalformedError
+	if errors.As(err, &malformed) {
+		return a.reject(ctx, record, revision)
+	}
+	return false, &ApplyError{Refusal: RefusalUnreadableCreate, CommandID: record.CommandID,
+		Reason: "this Host cannot read the create body, so the claimed command stays available to a newer Host", Cause: err}
 }
 
 // checkGateResponse answers, before the attempt, every question Host can answer
@@ -452,7 +481,7 @@ func (a *DispositionApplier) reject(ctx context.Context, record DispositionRecor
 		})
 	})
 	if err != nil {
-		return false, a.storeRefusal(record, "the gate response no Host could apply could not be rejected", err)
+		return false, a.storeRefusal(record, "the command no Host could apply could not be rejected", err)
 	}
 	return true, nil
 }

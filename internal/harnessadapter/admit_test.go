@@ -482,6 +482,23 @@ func TestApplyCommandReportsADecodeFailure(t *testing.T) {
 	}
 }
 
+// A CREATE WITH BLOCKS MUST PROPAGATE THE SHARED DECODER'S ERROR. Swallowing
+// it would send an empty create to harness, settle applied, and lose the first
+// message while every durable status looks healthy.
+func TestApplyCommandReportsACreateDecodeFailure(t *testing.T) {
+	sentinel := errors.New("the create's blocks cannot be decoded")
+	var seen []runtimecommand.Admitted
+	controller := newApplyingController(applierPart{available: true, admitted: &seen})
+	runtime := boundFor(t, controller,
+		WithBlockDecoder(func([]byte) ([]content.Block, error) { return nil, sentinel }))
+	if err := runtime.ApplyCommand(t.Context(), createCommand(t, "first words")); !errors.Is(err, sentinel) {
+		t.Fatalf("create ApplyCommand = %v, want decoder error", err)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the applier saw %d creates after the decoder refused", len(seen))
+	}
+}
+
 // Both refusals this package raises name their subject. IncapableSessionError is
 // what an operator sees when a Host will not bind a launched session, and
 // UnsupportedCommandError is what it sees when a command cannot be applied;
@@ -856,6 +873,55 @@ func TestAdmitDecodesACreatesFirstMessage(t *testing.T) {
 	text, ok := admitted.Blocks[0].(*content.TextBlock)
 	if !ok || text.Text != "the first thing the user said" {
 		t.Fatalf("the block is %#v, want the create's first message", admitted.Blocks[0])
+	}
+}
+
+// The create arm preserves every block, its type and its order. A one-block
+// text fixture cannot catch a truncated or entirely dropped first message.
+func TestAdmitCarriesMultiblockImageCreateInOrder(t *testing.T) {
+	blocks, err := content.MarshalBlocks([]content.Block{
+		&content.TextBlock{Text: "first"},
+		&content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{URL: "https://example.test/first.png"}},
+		&content.TextBlock{Text: "last"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := sessionwire.CreateRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: "command-a"},
+		SessionID:       testSession, AgentID: "agent-a", Blocks: blocks,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := createCommand(t, "")
+	command.Payload = body
+	bound := &boundSession{leaseEpoch: heldEpoch(3), decode: func(body []byte) ([]content.Block, error) {
+		var input sessionwire.InputRequest
+		if err := json.Unmarshal(body, &input); err != nil {
+			return nil, err
+		}
+		return content.UnmarshalBlocks(input.Blocks)
+	}}
+	admitted, err := bound.admit(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admitted.Blocks) != 3 {
+		t.Fatalf("create crossed with %d blocks, want 3", len(admitted.Blocks))
+	}
+	first, ok := admitted.Blocks[0].(*content.TextBlock)
+	if !ok || first.Text != "first" {
+		t.Fatalf("first block = %#v", admitted.Blocks[0])
+	}
+	image, ok := admitted.Blocks[1].(*content.ImageBlock)
+	if !ok || image.MediaType != "image/png" || image.Source.URL != "https://example.test/first.png" {
+		t.Fatalf("image block = %#v", admitted.Blocks[1])
+	}
+	last, ok := admitted.Blocks[2].(*content.TextBlock)
+	if !ok || last.Text != "last" {
+		t.Fatalf("last block = %#v", admitted.Blocks[2])
 	}
 }
 

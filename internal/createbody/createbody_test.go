@@ -96,7 +96,6 @@ func TestABodyCoreDoesNotAdmitIsRefused(t *testing.T) {
 		{"a JSON value that is not an object", []byte(`"hello"`)},
 		{"an input request, not a create", []byte(`{"version":1,"command_id":"command-a","session_id":"session-a","blocks":[{"type":"text","text":"hi"}]}`)},
 		{"a create with no agent", []byte(`{"version":1,"command_id":"command-a","session_id":"session-a"}`)},
-		{"a create at an unsupported wire version", []byte(`{"version":99,"command_id":"command-a","session_id":"session-a","agent_id":"agent-a"}`)},
 		{"a create whose blocks are not a block array", []byte(`{"version":1,"command_id":"command-a","session_id":"session-a","agent_id":"agent-a","blocks":{"text":"hi"}}`)},
 	} {
 		t.Run(row.name, func(t *testing.T) {
@@ -109,6 +108,34 @@ func TestABodyCoreDoesNotAdmitIsRefused(t *testing.T) {
 				t.Fatalf("a refused body still produced %s", presented)
 			}
 		})
+	}
+}
+
+func TestANewerCreateBodyIsUnsupportedHere(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"version":99,"command_id":"command-a","session_id":"session-a","agent_id":"agent-a"}`),
+		[]byte(`{"version":1,"command_id":"command-a","session_id":"session-a","agent_id":"agent-a","future_member":true}`),
+	} {
+		_, err := createbody.FirstMessage(body)
+		var unsupported *createbody.UnsupportedError
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("FirstMessage(%s) = %v, want UnsupportedError", body, err)
+		}
+	}
+}
+
+func TestCreateBodyIdentityMismatchIsPermanent(t *testing.T) {
+	for _, row := range []struct {
+		session sessionwire.SessionID
+		command sessionwire.CommandID
+	}{
+		{"session-other", testCommand}, {testSession, "command-other"},
+	} {
+		err := createbody.Check(stored(t, ""), row.session, row.command)
+		var malformed *createbody.MalformedError
+		if !errors.As(err, &malformed) {
+			t.Fatalf("Check identity = %v, want MalformedError", err)
+		}
 	}
 }
 

@@ -8,8 +8,8 @@
 // body — Harness is" — so every place that DOES read one is a deliberate
 // exception with a rule of its own, and each such rule lives in a package that
 // can be read and tested without the runtime edge around it. The gate response
-// has two readers; this one has one today, and the applier will be the second
-// if a create's body ever needs a pre-attempt check.
+// has two readers; this one has two: the applier checks the Core envelope before
+// an attempt, and the harness adapter presents its blocks to the decoder.
 //
 // IT DECODES NOTHING ONTO A WIRE. The records here are Core's, read from a
 // durable body the store already holds; no frame crosses HostLink from this
@@ -39,6 +39,16 @@ func (e *MalformedError) Error() string {
 // Unwrap returns the decode failure.
 func (e *MalformedError) Unwrap() error { return e.Cause }
 
+// UnsupportedError reports bytes this Host cannot interpret but a newer Host
+// may. The caller must leave the command claimed without an attempt, so a
+// capable successor or Factory's deadline sweep can decide it later.
+type UnsupportedError struct{ Cause error }
+
+func (e *UnsupportedError) Error() string {
+	return "createbody: this Host cannot read the create request: " + e.Cause.Error()
+}
+func (e *UnsupportedError) Unwrap() error { return e.Cause }
+
 // ErrEmptyBody is the cause of a MalformedError for a create with no inline
 // body. A body stored behind an object reference is not this error: its bytes
 // exist, this Host does not dereference them, and that is the caller's to say.
@@ -65,12 +75,9 @@ var ErrEmptyBody = errors.New("createbody: the command carries no inline body")
 // make every idle session's first command unsettleable, which is the wedge
 // harness v0.36.0 exists to end, reinstated for a subset of sessions.
 func FirstMessage(body []byte) ([]byte, error) {
-	if len(body) == 0 {
-		return nil, &MalformedError{Cause: ErrEmptyBody}
-	}
-	var request sessionwire.CreateRequest
-	if err := json.Unmarshal(body, &request); err != nil {
-		return nil, &MalformedError{Cause: err}
+	request, err := decodeCreate(body)
+	if err != nil {
+		return nil, err
 	}
 	if len(request.Blocks) == 0 {
 		return nil, nil
@@ -88,4 +95,49 @@ func FirstMessage(body []byte) ([]byte, error) {
 		return nil, &MalformedError{Cause: err}
 	}
 	return presented, nil
+}
+
+// Check validates the immutable create body against the durable command's
+// identities before an attempt can be written.
+func Check(body []byte, session sessionwire.SessionID, command sessionwire.CommandID) error {
+	request, err := decodeCreate(body)
+	if err != nil {
+		return err
+	}
+	if request.SessionID != session || request.CommandID != command {
+		return &MalformedError{Cause: errors.New("the create body names another session or command")}
+	}
+	return nil
+}
+
+func decodeCreate(body []byte) (sessionwire.CreateRequest, error) {
+	if len(body) == 0 {
+		return sessionwire.CreateRequest{}, &MalformedError{Cause: ErrEmptyBody}
+	}
+	var request sessionwire.CreateRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return sessionwire.CreateRequest{}, classify(err)
+	}
+	return request, nil
+}
+
+func classify(err error) error {
+	var validation *sessionwire.RequestValidationError
+	if errors.As(err, &validation) {
+		switch validation.Code {
+		case sessionwire.RequestValidationCodeUnknownField, sessionwire.RequestValidationCodeUnsupportedVersion:
+			return &UnsupportedError{Cause: err}
+		case sessionwire.RequestValidationCodeInvalidJSON, sessionwire.RequestValidationCodeDuplicateField,
+			sessionwire.RequestValidationCodeMissingField, sessionwire.RequestValidationCodeInvalidField:
+			return &MalformedError{Cause: err}
+		default:
+			return &UnsupportedError{Cause: err}
+		}
+	}
+	var syntax *json.SyntaxError
+	var typeError *json.UnmarshalTypeError
+	if errors.As(err, &syntax) || errors.As(err, &typeError) {
+		return &MalformedError{Cause: err}
+	}
+	return &UnsupportedError{Cause: err}
 }

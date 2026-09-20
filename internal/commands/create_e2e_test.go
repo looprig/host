@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,6 +122,23 @@ func (l *recordingLLM) modelRequests() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.requests)
+}
+
+func (l *recordingLLM) sawUserBlocks(want []content.Block) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, request := range l.requests {
+		for _, message := range request.Messages {
+			user, ok := message.(*content.UserMessage)
+			if !ok {
+				continue
+			}
+			if reflect.DeepEqual(user.Blocks, want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // openFence is the ownership guard, and it is the one seam that is a double
@@ -304,18 +322,7 @@ func liveDecoder() harnessadapter.BlockDecoder {
 		if err := json.Unmarshal(body, &request); err != nil {
 			return nil, err
 		}
-		var blocks []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(request.Blocks, &blocks); err != nil {
-			return nil, err
-		}
-		decoded := make([]content.Block, 0, len(blocks))
-		for _, block := range blocks {
-			decoded = append(decoded, &content.TextBlock{Text: block.Text})
-		}
-		return decoded, nil
+		return content.UnmarshalBlocks(request.Blocks)
 	}
 }
 
@@ -490,10 +497,56 @@ func (w *liveWorld) admitCreate(text string) sessionwire.CommandID {
 	if text != "" {
 		request.Blocks = blockArray(text)
 	}
+	return w.admitCreateRequest(id, request)
+}
+
+func (w *liveWorld) admitCreateBlocks(blocks json.RawMessage) sessionwire.CommandID {
+	w.t.Helper()
+	id := w.nextID()
+	return w.admitCreateRequest(id, sessionwire.CreateRequest{
+		CommandEnvelope: envelope(id), SessionID: liveSession, AgentID: liveAgent, Blocks: blocks,
+	})
+}
+
+func (w *liveWorld) admitCreateRequest(id sessionwire.CommandID, request sessionwire.CreateRequest) sessionwire.CommandID {
+	w.t.Helper()
 	if err := request.Validate(); err != nil {
 		w.t.Fatalf("the fixture's create is not one Core admits: %v", err)
 	}
 	return w.admit(id, "create", request)
+}
+
+func TestCreateBlocksReachTheModelInOrder(t *testing.T) {
+	image := func() content.Block {
+		return &content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{Data: []byte{0, 1, 2, 254}}}
+	}
+	for _, test := range []struct {
+		name   string
+		blocks []content.Block
+	}{
+		{"multiple text", []content.Block{&content.TextBlock{Text: "FIRST"}, &content.TextBlock{Text: "LAST"}}},
+		{"standalone image", []content.Block{image()}},
+		{"mixed text and image", []content.Block{&content.TextBlock{Text: "FIRST"}, image(), &content.TextBlock{Text: "LAST"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			world := newLiveWorld(t)
+			runtime := world.launch(false)
+			lease := world.hold()
+			consumer := world.consumer(lease, runtime, nil)
+			blocks, err := content.MarshalBlocks(test.blocks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := world.admitCreateBlocks(blocks)
+			drain(t, consumer)
+			if state := world.record(id).Record.State; state != sessionstore.InboxStateApplied {
+				t.Fatalf("create settled %q, want applied", state)
+			}
+			eventually(t, "all first-message blocks in one model request", func() bool {
+				return world.llm.sawUserBlocks(test.blocks)
+			})
+		})
+	}
 }
 
 // admitInput admits an input carrying text.
