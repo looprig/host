@@ -141,6 +141,16 @@ func (r *TenantEvidenceRouter) GateJournal(tenant sessionwire.TenantID, storageB
 
 // WithGateJournals supplies the journals gates are folded from. Without it,
 // GateSessionFor refuses.
+//
+// N7, RECORDED: THE REFUSAL COSTS THE WHOLE ATTACH, NOT JUST THE GATES. A
+// composition that wires Gates and omits this option fails GateSessionFor, and
+// internal/compose takes that failure in beginWork -- before the consumer
+// starts -- so the session is not held at all. Every attach on such a Host is
+// refused, not merely gate publication. It is FAIL-CLOSED and it is the right
+// answer: a Host holding a session whose gates no Factory could ever see would
+// strand every approval the agent raises. It is also unreachable through
+// host.Compose, which installs the router itself; only a composition assembling
+// this package directly can produce it.
 func WithGateJournals(journals GateJournals) Option {
 	return func(s *Store) { s.gateJournals = journals }
 }

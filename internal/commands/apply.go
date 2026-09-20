@@ -108,9 +108,23 @@ const (
 // deliberate. A newer Factory may admit a kind a newer Host applies and this one
 // does not; rejecting it here would make an older Host in a rolling deployment
 // durably destroy work a newer one would have done. Refusing leaves the record
-// for a Host that understands it, and §10.4 already bounds how long that can
-// last: the apply deadline turns an unapplied command into
-// rejected/runtime_unavailable through Factory's deadline reconciler.
+// for a Host that understands it, and §10.4 bounds how long that can last: the
+// apply deadline turns the command into rejected/runtime_unavailable through
+// Factory's deadline reconciler.
+//
+// THE DEADLINE BOUNDS AN UNATTEMPTED COMMAND AND NOTHING ELSE, and the sentence
+// above used to say "an unapplied command", which is wider than the sweep and
+// was wrong in the one case that mattered. A deadline sweep SKIPS a record that
+// carries a durably authorized attempt, because such a record may have a
+// committed effect and only the runtime's own evidence -- or a successor's
+// recovery closure -- may settle it. So a kind refused HERE, before any write,
+// really is bounded by the deadline; a kind refused at the RUNTIME, after the
+// attempt is durable, is not bounded by anything. That is precisely what
+// harness v0.36.0 was released to end: host v0.4.0's adapter refused create and
+// restore after this applier's disposition sibling had already begun the
+// attempt, so every session Factory created sat `applying` for good and the
+// consumer never advanced past its FIRST command. Nothing about the tolerance
+// here saved it, and nothing here would save the next such kind either.
 func (k Kind) known() bool {
 	switch k {
 	case KindCreate, KindRestore, KindInput, KindInterrupt, KindGateResponse:

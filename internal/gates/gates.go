@@ -137,6 +137,16 @@ type Options struct {
 
 	// StopBound is how long Stop waits for the publisher to return after
 	// cancelling it. Zero means DefaultStopBound.
+	//
+	// N5, RECORDED AND NOT FIXED: NO COMPOSED HOST CAN SET IT. host.Composition
+	// declares no field for it and internal/compose passes none, so every Host
+	// built through host.Compose runs at DefaultStopBound and this field is
+	// reachable only from a test. That is acceptable rather than merely
+	// tolerated -- the released stores honour cancellation, so the bound is a
+	// backstop against a provider that does not, and a deployment has no
+	// information with which to choose a better number than five seconds. It is
+	// written down because a configurable-looking option nobody can configure
+	// is the kind of thing a reader assumes is wired.
 	StopBound time.Duration
 }
 

@@ -188,6 +188,21 @@ func (a *DispositionApplier) Process(ctx context.Context, command Command) (Outc
 		// every pass, until Factory's deadline sweep rejects the command. The
 		// store admits a new claim at the same residency over a lapsed one, so
 		// it is re-taken first.
+		//
+		// N6, RECORDED AND NOT FIXED. The liveness test compares the STORE's
+		// recorded expiry with THIS HOST's clock, and the two are different
+		// clocks: ClaimExpiresAt was computed here as now+ClaimTTL and then
+		// durably stored, so any skew between a Host and its peers reappears
+		// here as an error in the comparison. The two directions cost different
+		// things and neither is a correctness defect. A Host running FAST
+		// declares its own live claim lapsed and re-takes it, which the store
+		// admits at the same residency: one extra write. A Host running SLOW
+		// treats a lapsed claim as live and goes straight to BeginAttempt,
+		// which refuses it as lost -- the `claim_lost` loop -- until the skew
+		// closes or the TTL is exceeded by more than the skew. Fixing it needs
+		// a store-issued deadline this applier could compare against a
+		// store-issued now, which is a released-module change; the honest thing
+		// at this seam is to say which clock is being read.
 		if record.ClaimResidencyEpoch != a.residency || !record.ClaimExpiresAt.After(a.now()) {
 			return a.claimThenDispatch(ctx, record)
 		}
