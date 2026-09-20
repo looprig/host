@@ -6,7 +6,7 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/looprig/core v0.11.0
-	github.com/looprig/harness v0.35.0
+	github.com/looprig/harness v0.36.0
 	github.com/looprig/inference v0.12.0
 	github.com/looprig/sessionstore v0.12.0
 	github.com/looprig/storage v0.6.0

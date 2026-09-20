@@ -690,9 +690,13 @@ func TestCloseAttemptRefusesAMalformedClosure(t *testing.T) {
 		epoch   uint64
 	}{
 		{"no attempt identity", "", "input", 40},
-		// restore, not gate_response: harness v0.35.0 applies gate_response,
-		// so it is no longer an example of a kind the released closer refuses.
-		{"an unknown kind", "attempt-9", "restore", 40},
+		// A KIND NO VOCABULARY HOLDS, and it has to be invented rather than
+		// borrowed. runtimecommand.Kind named three kinds at v0.34.0 and five
+		// at v0.36.0, so gate_response, then create and restore in turn stopped
+		// being examples of a kind the released closer refuses. commands.Kind
+		// has the same five, so there is no Host kind left to borrow either:
+		// the row names a string neither vocabulary has ever held.
+		{"an unknown kind", "attempt-9", "no_such_kind", 40},
 		{"no attempt grant", "attempt-9", "input", 0},
 	} {
 		t.Run(row.name, func(t *testing.T) {

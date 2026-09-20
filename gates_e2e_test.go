@@ -40,7 +40,7 @@ import (
 //
 // Everything below is real and released: the composed Host (host.Compose), the
 // orchestration store (sessionstore v0.12.0) over one backend, the runtime's
-// journal store (harness v0.35.0) over another, and a real rig whose loop raises
+// journal store (harness v0.36.0) over another, and a real rig whose loop raises
 // real gates — an ask_user gate from a tool that asks, and a permission gate
 // from a tool the access gate holds for approval. The test plays Factory: it
 // reads the projection with ReadGates and admits the answer with
