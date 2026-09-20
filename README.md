@@ -24,7 +24,7 @@ and compared segment by segment, so a sibling package under
 Department, residency, HostLink, warm release and drain are built.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.35.0. Core is v0.11.0.
+`github.com/looprig/harness` v0.36.0. Core is v0.11.0.
 
 **A composed Host applies a command end to end: it attaches a disposition
 session, consumes its durable command stream, claims a command under its
@@ -33,8 +33,74 @@ that attempt's identity and settles the command from the runtime's own durable
 disposition.** Read the next section before you plan around it; the mechanism is
 measured, not cautionary.
 
-**Since v0.4.0 every gate an agent raises reaches Factory, and the user's answer
-settles through the same path** — see "Upgrading to v0.4.0: gates".
+**Since v0.5.0 a session's FIRST command settles** — see "Upgrading to v0.5.0:
+create and restore". **Since v0.4.0 every gate an agent raises reaches Factory,
+and the user's answer settles through the same path** — see "Upgrading to
+v0.4.0: gates".
+
+## Upgrading to v0.5.0: create and restore
+
+### Every session a v0.4.0 Host held was wedged on its first command
+
+Factory admits a session's first command as a `create` disposition record (a
+create's optional first message rides in its payload) and resumes a
+non-resident session with a `restore`. `runtimecommand.Kind` named only `input`,
+`interrupt` and `gate_response` through harness v0.35.0, so **this Host's
+adapter refused both AFTER it had durably begun the dispatch attempt**. No
+disposition frame was ever written, the store could never settle the record
+(`sessionstore: inbox evidence (disposition)` — absence of evidence, not a kind
+disagreement), the consumer never advanced its cursor past that command, and
+`Closure.Validate` refused the same kinds so no successor could close it either.
+The deadline sweeps skip an attempt-bearing record, so it never expired.
+
+**The user-visible effect: the session existed, the agent was resident, and
+nobody could talk to it.** The create's first message was lost, clients saw
+`accepted` forever, and Factory's placement kept the session as open work
+permanently.
+
+harness v0.36.0 adds `KindCreate` and `KindRestore`, and this release drives
+them:
+
+- **A create carrying a first message.** Host reads the stored Core
+  `CreateRequest` (`internal/createbody`) and hands its blocks to the
+  composition's `BlockDecoder` **in the input-shaped body that decoder already
+  reads**, byte-identical to the input Factory would have admitted for the same
+  message. A composition therefore names ONE encoding, not two. The command
+  settles `applied` and the message reaches the model.
+- **A bare create and a restore.** Core's `CreateRequest.Blocks` is optional and
+  `RestoreRequest` has no blocks member at all, so both cross carrying nothing
+  and settle `applied` — their effect is residency, which this Host has already
+  performed by the time the command is dispatched.
+- **A create carrying a message with no decoder bound is refused**, exactly as
+  an input is. A Host that applied an empty first turn would settle the record
+  perfectly while dropping the user's first words in silence, which is worse
+  than the wedge it replaces because the wedge was visible.
+
+### Migrating a session a v0.4.0 Host stranded
+
+Nothing needs to be done by hand. A create left `applying` with a durable
+attempt is closed `not_applied` by the next Host to take the session, under its
+own strictly later journal grant, and the session's command stream then
+continues from the command behind it. That closure is possible only because
+harness v0.36.0 widened `Closure.Validate` with the kinds; at v0.35.0 the
+recovery path refused exactly what the adapter did.
+
+**The create's first message is not recovered.** It was never delivered and the
+command is settled as not applied; a client that wants those words sent must
+send them again as an input.
+
+### ONE-WAY UPGRADE
+
+Once a session's journal holds any `create` or `restore` application prefix or
+disposition frame, harness ≤ v0.35.0 can neither replay nor reopen it — it fails
+closed on the unknown kind. **Never roll a Host back below v0.5.0 (harness
+v0.36.0) after it has applied either kind.** This is the same shape as v0.4.0's
+`gate_response` note and stacks with it.
+
+**Mixed fleets.** A create admitted while a v0.5.0 Host owns the session is
+refused by a v0.4.0 successor after its own attempt, which re-strands the
+record until a v0.5.0 Host takes it. **Do not run v0.4.0 and v0.5.0 Hosts over
+one session pool.**
 
 ## Upgrading to v0.4.0: gates
 
