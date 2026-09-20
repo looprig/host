@@ -1,0 +1,143 @@
+# Replace the image with a released product Host that supplies Bootstrap.
+# The generic github.com/looprig/host/cmd/host binary refuses to start alone.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pooled-host
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: pooled-host
+  template:
+    metadata:
+      labels:
+        app: pooled-host
+    spec:
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: host
+          image: registry.example.invalid/product-host:REPLACE_WITH_RELEASED_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: hostlink
+              containerPort: 7100
+              protocol: TCP
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HOST_GENERATION
+              value: "1"
+            - name: HOST_INTERNAL_ENDPOINT
+              value: "ws://$(POD_IP):7100"
+            - name: HOST_LISTEN_ADDRESS
+              value: "0.0.0.0:7100"
+            - name: HOST_ISOLATION_CLASS
+              value: cross_tenant_isolated
+            - name: HOST_PLACEMENT
+              value: pooled
+            - name: HOST_CAPACITY
+              value: "8"
+            - name: HOST_COMMAND_QUEUE_SIZE
+              value: "64"
+            - name: HOST_RECONCILE_BATCH
+              value: "32"
+            - name: HOST_MAX_BINDINGS
+              value: "8"
+            - name: HOST_MAX_BINDINGS_PER_LINK
+              value: "8"
+            - name: HOST_MAX_TENANT_LINKS
+              value: "8"
+            - name: HOST_WARM_TTL
+              value: 90s
+            - name: HOST_REGISTRY_HEARTBEAT
+              value: 10s
+            - name: HOST_REGISTRY_EXPIRY
+              value: 60s
+            - name: HOST_CLAIM_TTL
+              value: 5s
+            - name: HOST_APPLY_DEADLINE
+              value: 30s
+            - name: HOST_RECONCILE_INTERVAL
+              value: 1m
+            - name: HOST_DRAIN_GRACE
+              value: 60s
+            - name: HOST_DRAIN_IDLE_BOUNDARY
+              value: 10s
+            - name: HOST_DRAIN_PUBLISH_BOUND
+              value: 5s
+            - name: HOST_COMPATIBILITY_TIMEOUT
+              value: 20s
+            - name: HOST_WORK_POLL
+              value: 1s
+            # Product Bootstrap owns this input; adapt its name/key to that product.
+            - name: PRODUCT_HOSTLINK_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: product-hostlink-auth
+                  key: credential
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: hostlink
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: hostlink
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pooled-host-discovery
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app: pooled-host
+  ports:
+    - name: hostlink
+      port: 7100
+      targetPort: hostlink
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: pooled-host
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pooled-host
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
