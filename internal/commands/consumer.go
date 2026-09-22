@@ -568,6 +568,10 @@ type Consumer struct {
 	loaded   bool
 	failures int
 	last     PassResult
+
+	// halted makes every pass that starts after Halt return without reading
+	// the inbox. It is read under mu after the pass slot is taken.
+	halted bool
 }
 
 // NewConsumer validates options and returns a Consumer.
@@ -649,6 +653,42 @@ func (c *Consumer) Hint(sessionwire.CommandID) {
 // release may both reach it.
 func (c *Consumer) Stop() {
 	c.stopOnce.Do(func() { close(c.stopped) })
+}
+
+// Halt stops this consumer from claiming or applying anything more, and waits
+// — bounded by ctx — for a pass already in flight to finish.
+//
+// IT IS WHAT A WARM RELEASE NEEDS AND Stop IS NOT. Stop ends the loop but not a
+// pass it is in the middle of, and it cannot be undone; a warm release must be
+// able to re-read the durable inbox with no pass of this Host's able to claim
+// a command behind the read, and then either proceed (the consumer is stopped
+// for good by the release) or abort and Resume. After Halt returns nil, every
+// pass — from the loop, a hint or a direct Reconcile — returns at once and
+// claims nothing, so a command admitted after the re-read stays pending for
+// whoever next owns the session.
+//
+// On a ctx error the consumer is still halted and the in-flight pass may still
+// be running; a caller that gives up must Resume.
+func (c *Consumer) Halt(ctx context.Context) error {
+	c.mu.Lock()
+	c.halted = true
+	c.mu.Unlock()
+	select {
+	case c.passes <- struct{}{}:
+		<-c.passes
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Resume undoes Halt and wakes the loop, because a halted loop may have
+// dropped the hint that would otherwise have brought it back to work.
+func (c *Consumer) Resume() {
+	c.mu.Lock()
+	c.halted = false
+	c.mu.Unlock()
+	c.Hint("")
 }
 
 // Failures reports how many passes have returned an error.
@@ -792,6 +832,14 @@ func (c *Consumer) record(result PassResult, err error) {
 func (c *Consumer) Reconcile(ctx context.Context) (PassResult, error) {
 	c.acquirePass()
 	defer c.releasePass()
+
+	// A HALTED CONSUMER CLAIMS NOTHING. See Halt.
+	c.mu.Lock()
+	halted := c.halted
+	c.mu.Unlock()
+	if halted {
+		return PassResult{Cursor: c.heldCursor()}, nil
+	}
 
 	// REFUSED BEFORE THE READ, not only before the write. A Host that has lost
 	// the session lease has no business claiming commands out of an inbox a

@@ -2076,3 +2076,90 @@ func equalIDs(got, want []sessionwire.CommandID) bool {
 	}
 	return true
 }
+
+// TestHaltWaitsOutThePassInFlightAndClaimsNothingAfter is the warm release's
+// consumption fence: Halt returns only once a pass already processing a
+// command has finished, and every pass after it reads nothing, so a command
+// admitted after a releaser's inbox re-read stays pending for the successor.
+// Resume restores ordinary consumption.
+func TestHaltWaitsOutThePassInFlightAndClaimsNothingAfter(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	f := newConsumerFixture(t, func(f *consumerFixture) {
+		f.inbox.all = []Command{command(1, StatePending)}
+		f.processor.before = func(Command) {
+			select {
+			case entered <- struct{}{}:
+				<-proceed
+			default:
+			}
+		}
+	})
+
+	passDone := make(chan struct{})
+	go func() {
+		defer close(passDone)
+		_, _ = f.consumer.Reconcile(context.Background())
+	}()
+	<-entered
+
+	halted := make(chan error, 1)
+	go func() { halted <- f.consumer.Halt(context.Background()) }()
+	select {
+	case err := <-halted:
+		t.Fatalf("Halt returned %v while a pass was still processing a command", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(proceed)
+	<-passDone
+	if err := <-halted; err != nil {
+		t.Fatalf("Halt: %v", err)
+	}
+
+	// A command admitted after the halt is never listed or processed.
+	f.inbox.mu.Lock()
+	f.inbox.all = append(f.inbox.all, command(2, StatePending))
+	f.inbox.mu.Unlock()
+	lists := len(f.inbox.requests())
+	if _, err := f.consumer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("a halted Reconcile: %v", err)
+	}
+	if got := len(f.inbox.requests()); got != lists {
+		t.Fatalf("a halted consumer read the inbox (%d reads, was %d)", got, lists)
+	}
+	if ids := f.processor.processedIDs(); len(ids) != 1 {
+		t.Fatalf("processed %v after the halt, want only the command in flight before it", ids)
+	}
+
+	f.consumer.Resume()
+	if _, err := f.consumer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after Resume: %v", err)
+	}
+	if ids := f.processor.processedIDs(); len(ids) != 2 || ids[1] != commandID(2) {
+		t.Fatalf("after Resume processed %v, want the second command too", ids)
+	}
+}
+
+// TestHaltIsBoundedByItsContext: a pass that never finishes cannot hold a
+// releaser forever.
+func TestHaltIsBoundedByItsContext(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	f := newConsumerFixture(t, func(f *consumerFixture) {
+		f.inbox.all = []Command{command(1, StatePending)}
+		f.processor.before = func(Command) {
+			close(entered)
+			<-block
+		}
+	})
+	go func() { _, _ = f.consumer.Reconcile(context.Background()) }()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := f.consumer.Halt(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Halt over a pass that never ends = %v, want the context's deadline", err)
+	}
+}
