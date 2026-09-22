@@ -466,10 +466,27 @@ func (s *Service) Wake(key registry.Key) {
 // the composition's own handle on the session. A composition that kept it would
 // go on offering a released session to the drain, which would then take a
 // second session through a release protocol that has already run.
+//
+// A HELD SESSION IS KEPT, deliberately: its runtime did not release, so it is
+// still live under this Host's grant, and the drain is what must take it
+// through release (or end the process) — which it can do only if this handle
+// is still offered to it. It is logged, because nothing else reports it.
 func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 	s.metrics.WarmRelease(outcome)
-	if outcome.Kind == residency.WarmOutcomeReleased {
+	switch outcome.Kind {
+	case residency.WarmOutcomeReleased:
 		s.forget(outcome.Key, outcome.Generation)
+	case residency.WarmOutcomeHeld:
+		attrs := []slog.Attr{
+			slog.String("tenant_id", string(outcome.Key.TenantID)),
+			slog.String("session_id", string(outcome.Key.SessionID)),
+			slog.String("reason", outcome.Reason),
+		}
+		for _, failure := range outcome.Failures {
+			attrs = append(attrs, slog.String(string(failure.Step), failure.Err.Error()))
+		}
+		s.options.logger().LogAttrs(context.Background(), slog.LevelWarn,
+			"host: a warm release stopped because the runtime did not release; the session stays resident and not admitting until the drain", attrs...)
 	}
 }
 

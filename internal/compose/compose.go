@@ -257,6 +257,12 @@ type Service struct {
 	consumers   map[registry.Key]*commands.Consumer
 	leases      map[registry.Key]residency.Lease
 
+	// activityMu guards activity: the journal position each resident session's
+	// gate fold had reached at the sampler's last reading. The sampler writes
+	// it; ConfirmIdle compares against it at a warm expiry.
+	activityMu sync.Mutex
+	activity   map[registry.Key]activityMark
+
 	// stopping closes when this Host is stopped, so a compatibility wait ends
 	// with the process rather than outliving it.
 	stopping chan struct{}
@@ -321,6 +327,10 @@ func New(options Options) (*Service, error) {
 		Consumption: composed,
 		Admissions:  capacity,
 		Observer:    composed,
+		// THE EXPIRY RE-CONFIRMS, and the runtime release is bounded by the
+		// drain's own grace: see Service.ConfirmIdle and WarmOptions.
+		Confirm:      composed,
+		ReleaseBound: options.Grace,
 	})
 	if err != nil {
 		return nil, err
@@ -538,17 +548,12 @@ func (s *Service) sampleWork(ctx context.Context) {
 		return
 	}
 	reporter, _ := s.options.WorkStates.(activityReporter)
-	type mark struct {
-		generation uint64
-		position   uint64
-	}
-	marks := map[registry.Key]mark{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.options.Clock.After(s.options.WorkPoll):
-			seen := make(map[registry.Key]bool, len(marks))
+			seen := map[registry.Key]bool{}
 			for _, entry := range s.registry.Snapshot() {
 				state, known := s.options.WorkStates.WorkState(entry.Key)
 				if !known {
@@ -557,20 +562,14 @@ func (s *Service) sampleWork(ctx context.Context) {
 				if reporter != nil {
 					if position, ok := reporter.activity(entry.Key); ok {
 						seen[entry.Key] = true
-						last, had := marks[entry.Key]
-						marks[entry.Key] = mark{generation: entry.Generation, position: position}
-						if had && last.generation == entry.Generation && last.position != position {
+						if moved := s.markActivity(entry.Key, entry.Generation, position); moved {
 							s.warm.Observe(entry.Key, residency.WorkStateWorking)
 						}
 					}
 				}
 				s.warm.Observe(entry.Key, state)
 			}
-			for key := range marks {
-				if !seen[key] {
-					delete(marks, key)
-				}
-			}
+			s.pruneActivity(seen)
 		}
 	}
 }

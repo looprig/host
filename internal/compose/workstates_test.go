@@ -289,3 +289,125 @@ func TestDeriveWorkStatesIsRefusedWithoutGatesOrBesideASource(t *testing.T) {
 		})
 	}
 }
+
+// expireWarm delivers an expiry to every warm countdown the fixture's clock has
+// handed out.
+func expireWarm(f *fixture) {
+	f.clock.mu.Lock()
+	timers := append([]*fakeWarmTimer(nil), f.clock.timers...)
+	f.clock.mu.Unlock()
+	for _, timer := range timers {
+		select {
+		case timer.expiry <- time.Now():
+		default:
+		}
+	}
+}
+
+// neverReleased fails if the runtime is taken through ReleaseResidency within
+// a short window.
+func neverReleased(t *testing.T, f *fixture, why string) {
+	t.Helper()
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if f.runtime.Released() != 0 {
+			t.Fatalf("%s: the runtime was released (trace %v)", why, f.trace.trace())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestAnExpiryAfterTheRuntimeTurnedBusyReleasesNothing is the reviewer's F1
+// demonstration, inverted. The countdown is armed by an idle sample; a turn
+// starts before the next sample; the countdown expires. Nothing re-sampled,
+// and before the fix the release proceeded against a busy runtime. Now the
+// expiry re-confirms and takes nothing, and once the session is idle again a
+// fresh countdown releases it.
+func TestAnExpiryAfterTheRuntimeTurnedBusyReleasesNothing(t *testing.T) {
+	f, _ := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	awaitState(t, f, residency.WorkStateIdle)
+	fireFiled(t, f, f.svc.options.WorkPoll)
+	f.awaitRearming(t)
+
+	f.runtime.HoldIdle()
+	awaitState(t, f, residency.WorkStateWorking)
+	expireWarm(f)
+	neverReleased(t, f, "a runtime busy at expiry")
+	for _, step := range []string{"lease.release", "locations.tombstone"} {
+		if f.trace.count(step) != 0 {
+			t.Fatalf("a runtime busy at expiry reached %q: %v", step, f.trace.trace())
+		}
+	}
+
+	// The turn ends; the next idle sample arms a whole TTL, and it releases.
+	f.runtime.GoIdle()
+	fireFiled(t, f, f.svc.options.WorkPoll)
+	f.clock.awaitWaiters(t, f.svc.options.WorkPoll, 1)
+	if got := f.clock.rearmings(); len(got) != 2 {
+		t.Fatalf("after the turn the countdown was armed %v, want a second arming", got)
+	}
+	expireWarm(f)
+	deadline := time.Now().Add(5 * time.Second)
+	for f.runtime.Released() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the idle session was never released after its re-armed countdown (trace %v)", f.trace.trace())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestAnExpiryAfterWorkSinceTheLastSampleReleasesNothing: the runtime is idle
+// at expiry, but the journal moved since the sample that armed the countdown —
+// a whole short turn fell between samples. The expiry takes nothing.
+func TestAnExpiryAfterWorkSinceTheLastSampleReleasesNothing(t *testing.T) {
+	f, journal := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	awaitState(t, f, residency.WorkStateIdle)
+	fireFiled(t, f, f.svc.options.WorkPoll)
+	f.awaitRearming(t)
+
+	journal.append(event.TurnDone{}, 5)
+	fireFiled(t, f, testGateRetry)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if position, _ := f.svc.options.WorkStates.(activityReporter).activity(keyA); position == 6 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the publisher never folded the turn")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	expireWarm(f)
+	neverReleased(t, f, "a session that worked since its countdown was armed")
+}
+
+// TestAResidentWithNoGatePublisherIsNeverIdle is F4: the derived source's
+// "unknown is busy" branch for a session whose gates this Host cannot see.
+func TestAResidentWithNoGatePublisherIsNeverIdle(t *testing.T) {
+	f, _ := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	awaitState(t, f, residency.WorkStateIdle)
+
+	f.svc.mu.Lock()
+	held := f.svc.sessions[keyA]
+	work := held.work
+	held.work = &sessionWork{stop: work.stop}
+	f.svc.mu.Unlock()
+	t.Cleanup(func() {
+		f.svc.mu.Lock()
+		held.work = work
+		f.svc.mu.Unlock()
+	})
+
+	if state, known := f.svc.options.WorkStates.WorkState(keyA); !known || state != residency.WorkStateWorking {
+		t.Fatalf("a resident with no gate publisher reported (%q, %v), want (working, true)", state, known)
+	}
+	if f.svc.ConfirmIdle(keyA) {
+		t.Fatal("a resident with no gate publisher was confirmed idle")
+	}
+}

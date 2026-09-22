@@ -32,10 +32,12 @@ import (
 //     turn, where the runtime itself is idle.
 //   - the runtime is not idle NOW: working.
 //
-// Pending and in-flight commands are not this source's question. The warm
-// releaser's step 1 re-reads the durable inbox from the consumption cursor
-// before it takes anything, and a command that is accepted, claimed or applying
-// is above the cursor, so a release with work outstanding aborts there.
+// Pending and in-flight commands are not this source's question. At expiry the
+// warm releaser halts the session's consumer (waiting out a pass in flight),
+// re-confirms through ConfirmIdle, and re-reads the durable inbox from the
+// consumption cursor; a command that is accepted, claimed or applying is above
+// the cursor, so a release with work outstanding aborts there, and one admitted
+// after the re-read is never claimed by this Host.
 type derivedWorkStates struct {
 	service *Service
 }
@@ -119,3 +121,94 @@ func (s *Service) residentFor(key registry.Key) *resident {
 func (s *Service) warmSamples() bool {
 	return !(s.options.DeriveWorkStates && s.options.Host.Placement() == sessionwire.HostPlacementDedicated)
 }
+
+// activityMark is one sampled journal position, fenced by the residency
+// generation it was read under.
+type activityMark struct {
+	generation uint64
+	position   uint64
+}
+
+// markActivity records a sampled position and reports whether it moved since
+// the previous sample of the same residency.
+func (s *Service) markActivity(key registry.Key, generation, position uint64) bool {
+	s.activityMu.Lock()
+	defer s.activityMu.Unlock()
+	if s.activity == nil {
+		s.activity = map[registry.Key]activityMark{}
+	}
+	last, had := s.activity[key]
+	s.activity[key] = activityMark{generation: generation, position: position}
+	return had && last.generation == generation && last.position != position
+}
+
+// pruneActivity forgets the marks of sessions the last sample did not see.
+func (s *Service) pruneActivity(seen map[registry.Key]bool) {
+	s.activityMu.Lock()
+	defer s.activityMu.Unlock()
+	for key := range s.activity {
+		if !seen[key] {
+			delete(s.activity, key)
+		}
+	}
+}
+
+// ConfirmIdle is the warm releaser's re-confirmation at expiry
+// (residency.WarmConfirmer).
+//
+// A COUNTDOWN IS ARMED BY A SAMPLE AND FIRES BETWEEN SAMPLES, so the sample
+// that armed it says nothing about the instant it fires: a user's reply that
+// arrived after the last sample would otherwise be taken into a release. The
+// session must be idle NOW by the same source that armed it, and — where the
+// source reports a journal position — the position must be the one recorded by
+// the last sample. The countdown survives a sample only if that sample saw no
+// movement, so "unchanged since the last sample" is "unchanged since the
+// countdown was armed". Anything this cannot establish is false.
+func (s *Service) ConfirmIdle(key registry.Key) bool {
+	if s.options.WorkStates == nil {
+		return false
+	}
+	state, known := s.options.WorkStates.WorkState(key)
+	if !known || state != residency.WorkStateIdle {
+		return false
+	}
+	reporter, reports := s.options.WorkStates.(activityReporter)
+	if !reports {
+		return true
+	}
+	position, ok := reporter.activity(key)
+	if !ok {
+		return false
+	}
+	s.activityMu.Lock()
+	mark, had := s.activity[key]
+	s.activityMu.Unlock()
+	return had && mark.position == position
+}
+
+var _ residency.WarmConfirmer = (*Service)(nil)
+
+// Halt stops a resident session's command consumer and waits, bounded by ctx,
+// for its pass in flight (residency.ConsumptionHalter). A session with no
+// consumer has nothing to halt.
+func (s *Service) Halt(ctx context.Context, key registry.Key) error {
+	s.mu.Lock()
+	consumer, held := s.consumers[key]
+	s.mu.Unlock()
+	if !held {
+		return nil
+	}
+	return consumer.Halt(ctx)
+}
+
+// Resume undoes Halt for a warm release that aborted.
+func (s *Service) Resume(key registry.Key) {
+	s.mu.Lock()
+	consumer, held := s.consumers[key]
+	s.mu.Unlock()
+	if held {
+		consumer.Resume()
+	}
+}
+
+var _ residency.ConsumptionHalter = (*Service)(nil)

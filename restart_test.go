@@ -120,6 +120,9 @@ type realRuntimeWorld struct {
 
 	// model, when set, is the model every Host's rig talks to instead of llm.
 	model inference.Client
+
+	// define, when set, builds every Host's rig instead of harnesstest.Rig.
+	define func(testing.TB, *harnessstore.Store, inference.Client) *rig.Rig
 }
 
 func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
@@ -174,7 +177,11 @@ func (w *realRuntimeWorld) hostWith(t *testing.T, generation uint64, adjust func
 	if w.model != nil {
 		model = w.model
 	}
-	launcher := &capturingLauncher{rig: harnesstest.Rig(t, w.journal, model)}
+	define := harnesstest.Rig
+	if w.define != nil {
+		define = w.define
+	}
+	launcher := &capturingLauncher{rig: define(t, w.journal, model)}
 	adapter, err := harnessadapter.New(launcher)
 	if err != nil {
 		t.Fatalf("harnessadapter.New: %v", err)

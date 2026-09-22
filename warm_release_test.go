@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -18,8 +19,12 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/session"
+	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/inference"
+	"github.com/looprig/inference/model"
 	"github.com/looprig/inference/stream"
 	"github.com/looprig/sessionstore"
 
@@ -136,6 +141,22 @@ func TestAWarmReleasedSessionIsRestoredByTheNextHost(t *testing.T) {
 	if got := harnesstest.CountSessionStarted(t, world.journal, world.runtimeID); got != 1 {
 		t.Fatalf("%d SessionStarted after the restore, want 1", got)
 	}
+
+	// THE CONVERSATION CARRIED OVER: the next turn on Host B is run over Host
+	// A's, so the model is sent the word it was told before the release.
+	before := len(world.llm.Requests())
+	world.turn(t, secondLauncher.controller(), "what was the word?")
+	requests := world.llm.Requests()
+	if len(requests) <= before {
+		t.Fatal("the turn on Host B sent the model nothing")
+	}
+	sent, err := json.Marshal(requests[len(requests)-1].Messages)
+	if err != nil {
+		t.Fatalf("marshal the request: %v", err)
+	}
+	if !strings.Contains(string(sent), "PERSIMMON") {
+		t.Fatalf("the restored session's next turn does not carry the pre-release conversation; the model was sent %s", sent)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -151,18 +172,24 @@ const quietWindow = 10 * warmTTL
 // metrics endpoint, which is what an operator (or an HPA) would read.
 func residentSessions(t *testing.T, service *host.Service) int {
 	t.Helper()
+	return sessionsIn(t, service, "resident")
+}
+
+// sessionsIn reads host_sessions for one local residency state.
+func sessionsIn(t *testing.T, service *host.Service, state string) int {
+	t.Helper()
 	recorder := httptest.NewRecorder()
 	service.MetricsHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	for _, line := range strings.Split(recorder.Body.String(), "\n") {
-		if value, found := strings.CutPrefix(line, `host_sessions{state="resident"} `); found {
+		if value, found := strings.CutPrefix(line, `host_sessions{state="`+state+`"} `); found {
 			count, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil {
-				t.Fatalf("host_sessions{state=\"resident\"} = %q: %v", value, err)
+				t.Fatalf("host_sessions{state=%q} = %q: %v", state, value, err)
 			}
 			return count
 		}
 	}
-	t.Fatalf("the metrics carry no host_sessions{state=\"resident\"}:\n%s", recorder.Body.String())
+	t.Fatalf("the metrics carry no host_sessions{state=%q}:\n%s", state, recorder.Body.String())
 	return 0
 }
 
@@ -384,4 +411,301 @@ func TestAPendingCommandAbortsTheWarmReleaseAndIsApplied(t *testing.T) {
 	if got := countOf[event.TurnDone](t, world.journal, world.runtimeID); got != 1 {
 		t.Fatalf("%d TurnDone, want the pending input's turn", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The release window: after the inbox re-read, before the runtime release
+// ---------------------------------------------------------------------------
+
+// pausingCheckpointer holds the FIRST checkpoint — a warm release's step 3 —
+// until the test lets it go, so a test can act inside the release window.
+type pausingCheckpointer struct {
+	once    sync.Once
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func newPausingCheckpointer() *pausingCheckpointer {
+	return &pausingCheckpointer{entered: make(chan struct{}), proceed: make(chan struct{})}
+}
+
+func (c *pausingCheckpointer) Checkpoint(ctx context.Context, _ sessionwire.TenantID, _ sessionwire.SessionID) error {
+	first := false
+	c.once.Do(func() { first = true })
+	if !first {
+		return nil
+	}
+	close(c.entered)
+	select {
+	case <-c.proceed:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+// awaitEntered waits for the release to reach its checkpoint.
+func (c *pausingCheckpointer) awaitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the warm release never reached its checkpoint")
+	}
+}
+
+// inputDecoder is the input-shaped block decoder a composition binds.
+func inputDecoder(body []byte) ([]content.Block, error) {
+	var request sessionwire.InputRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	return content.UnmarshalBlocks(request.Blocks)
+}
+
+// admitInput admits an input exactly as Factory does and returns its id.
+func (w *gateE2EWorld) admitInput(t *testing.T, id sessionwire.CommandID, text string) {
+	t.Helper()
+	request := sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: id},
+		SessionID:       composeSession,
+		Blocks:          json.RawMessage(`[{"type":"text","text":` + strconv.Quote(text) + `}]`),
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCommand, err := uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, err := w.factory.AdmitDispositionCommand(t.Context(), sessionstore.AdmitDispositionCommandRequest{
+		TenantID: composeTenant, SessionID: composeSession, CommandID: id, Binding: w.binding,
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeCommand.String()),
+		Kind:                     "input", Payload: payload,
+		AcceptedAt: now, ApplyDeadline: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("admit the input: %v", err)
+	}
+}
+
+// TestACommandAdmittedDuringTheReleaseIsLeftForTheSuccessor is F2. The warm
+// release has re-read an empty inbox and is paused at its checkpoint; an input
+// is admitted durably, and the Host's consumer — reconciling every 50ms — would
+// claim it at once if it were running. It must not be claimed or applied under
+// the releasing lease. It stays pending; the release completes; the next Host
+// restores the session and applies it.
+func TestACommandAdmittedDuringTheReleaseIsLeftForTheSuccessor(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{})
+	world.decoder = inputDecoder
+	checkpointer := newPausingCheckpointer()
+	world.adjust = func(blueprint *host.Composition) {
+		blueprint.Options.WarmTTL = warmTTL
+		blueprint.WorkPoll = warmPoll
+		blueprint.Collaborators.Checkpointer = checkpointer
+	}
+	first, _, _ := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(first) })
+	checkpointer.awaitEntered(t)
+
+	const id = sessionwire.CommandID("admitted-mid-release")
+	world.admitInput(t, id, "arrived while the Host was releasing")
+	time.Sleep(10 * 50 * time.Millisecond) // ten reconcile intervals
+	if state := world.command(t, id).Record.State; state != sessionstore.InboxStatePending {
+		t.Fatalf("a command admitted after the release's inbox re-read went %q on the releasing Host; it must stay pending for the successor", state)
+	}
+	close(checkpointer.proceed)
+	awaitResidentSessions(t, first, 0, 20*time.Second)
+	if state := world.command(t, id).Record.State; state != sessionstore.InboxStatePending {
+		t.Fatalf("after the release the command is %q, want pending", state)
+	}
+
+	world.adjust = nil
+	second, secondLauncher, _ := world.host(t, 5)
+	t.Cleanup(func() { stopBounded(second) })
+	if _, restores := secondLauncher.counts(); len(restores) != 1 {
+		t.Fatalf("the successor restored %v, want the one session", restores)
+	}
+	if entry := world.settled(t, id); entry.Record.State != sessionstore.InboxStateApplied {
+		t.Fatalf("the successor settled the command %q, want applied", entry.Record.State)
+	}
+}
+
+// TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld is F3 over the
+// real harness runtime. A turn starts inside the release window (while the
+// release is paused at its checkpoint), so at step 4 the runtime is busy and
+// harness would wait for it. The runtime release is bounded by the drain's
+// grace; when it expires the session is HELD — still resident under its grant,
+// its live output still relayed — rather than torn down under a running turn
+// or wedging the releaser. The turn finishes, and the Host then stops cleanly.
+func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T) {
+	world := newRealRuntimeWorld(t)
+	model := &blockingLLM{inner: world.llm, opened: make(chan struct{})}
+	t.Cleanup(model.unblock)
+	world.model = model
+	checkpointer := newPausingCheckpointer()
+	service, launcher := world.hostWith(t, 4, func(blueprint *host.Composition) {
+		blueprint.Options.WarmTTL = warmTTL
+		blueprint.WorkPoll = warmPoll
+		blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 500 * time.Millisecond, PublishBound: 500 * time.Millisecond}
+		blueprint.Collaborators.Checkpointer = checkpointer
+	})
+	if _, err := attachAsFactoryDoes(t, service); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	checkpointer.awaitEntered(t)
+
+	if _, err := launcher.controller().Submit(t.Context(), []content.Block{&content.TextBlock{Text: "started inside the release"}}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for model.calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the turn never reached the model")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(checkpointer.proceed)
+
+	// Well past the grace: the release stopped at step 4, and the grant is
+	// still held by this Host.
+	time.Sleep(3 * time.Second)
+	if !world.residencyHeld(t) {
+		t.Fatal("the grant was handed back while the runtime was running a turn")
+	}
+	if got := sessionsIn(t, service, "releasing"); got != 1 {
+		t.Fatalf("host_sessions{state=\"releasing\"} = %d, want the one held session", got)
+	}
+	if got := countOf[event.SessionStopped](t, world.journal, world.runtimeID); got != 0 {
+		t.Fatalf("%d SessionStopped; a held session is not terminated", got)
+	}
+
+	model.unblock()
+	gateDeadline := time.Now().Add(10 * time.Second)
+	for countOf[event.TurnDone](t, world.journal, world.runtimeID) == 0 {
+		if time.Now().After(gateDeadline) {
+			t.Fatal("the held session's turn never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stopWithin(t, service)
+	if world.residencyHeld(t) {
+		t.Fatal("after the drain the held session's grant is still held")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A backgrounded delegate in flight
+// ---------------------------------------------------------------------------
+
+// delegatingLLM makes the primer start a BACKGROUND child and finish its own
+// turn at once, and holds the child's model call until it is unblocked.
+type delegatingLLM struct {
+	inner      *harnesstest.RecordingLLM
+	childCalls atomic.Int32
+	opened     chan struct{}
+	release    sync.Once
+}
+
+func (l *delegatingLLM) Invoke(ctx context.Context, request inference.Request) (*inference.Response, error) {
+	return l.inner.Invoke(ctx, request)
+}
+
+func (l *delegatingLLM) Stream(ctx context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	var chunk content.Chunk = &content.TextChunk{Text: "ok"}
+	if len(request.Messages) > 0 {
+		last := request.Messages[len(request.Messages)-1]
+		if _, isResult := last.(*content.ToolResultMessage); !isResult {
+			text, _ := json.Marshal(last)
+			switch {
+			case strings.Contains(string(text), "CHILD-WORK"):
+				l.childCalls.Add(1)
+				select {
+				case <-l.opened:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				chunk = &content.TextChunk{Text: "child done"}
+			case strings.Contains(string(text), "PLEASE-DELEGATE"):
+				chunk = &content.ToolUseChunk{Index: 0, ID: "use-start-agent", Name: "StartAgent",
+					InputJSON: `{"agent_type":"worker","instructions":"CHILD-WORK","wait_for_response":false}`}
+			}
+		}
+	}
+	sent := false
+	return stream.NewStreamReader(func() (content.Chunk, error) {
+		if sent {
+			return nil, io.EOF
+		}
+		sent = true
+		return chunk, nil
+	}, nil), nil
+}
+
+func (l *delegatingLLM) unblock() { l.release.Do(func() { close(l.opened) }) }
+
+// delegatingRig is a primer that may delegate, in the background, to a worker.
+func delegatingRig(t testing.TB, store *harnessstore.Store, llm inference.Client) *rig.Rig {
+	t.Helper()
+	testModel := model.Model{Provider: "test", APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost", Name: "model"}
+	evaluator, err := gate.NewInteractiveEvaluator(
+		[]gate.AccessBinding{{Kind: "tool.invoke", Source: gateE2EAccess{}}}, nil, loop.GateApprover(), gateE2ERules{}, nil)
+	if err != nil {
+		t.Fatalf("NewInteractiveEvaluator: %v", err)
+	}
+	primer, err := loop.Define(loop.WithName("agent"), loop.WithInference(llm, testModel),
+		loop.WithDelegates("worker"), loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
+		loop.WithAccessGate(evaluator), loop.WithPolicyRevision("warm-delegate"))
+	if err != nil {
+		t.Fatalf("define the primer: %v", err)
+	}
+	worker, err := loop.Define(loop.WithName("worker"), loop.WithInference(llm, testModel))
+	if err != nil {
+		t.Fatalf("define the worker: %v", err)
+	}
+	defined, err := rig.Define(rig.WithLoops(primer, worker), rig.WithPrimers("agent"), rig.WithSessionStore(store))
+	if err != nil {
+		t.Fatalf("define the rig: %v", err)
+	}
+	return defined
+}
+
+// TestASessionWithABackgroundDelegateInFlightIsNotWarmReleased is the case
+// the Host cannot see directly: the primer's own turn has ENDED, but a child
+// it started in the background is still running and will hand its result
+// back. harness holds a quiescence token for that hand-back, so the session
+// is not idle; the Host must keep it. When the child finishes and its result
+// is handed back, the session goes idle and is released.
+func TestASessionWithABackgroundDelegateInFlightIsNotWarmReleased(t *testing.T) {
+	world := newRealRuntimeWorld(t)
+	model := &delegatingLLM{inner: world.llm, opened: make(chan struct{})}
+	t.Cleanup(model.unblock)
+	world.model = model
+	world.define = delegatingRig
+	service, launcher := world.warmHost(t, 4)
+	t.Cleanup(func() { stopBounded(service) })
+	if _, err := attachAsFactoryDoes(t, service); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if _, err := launcher.controller().Submit(t.Context(), []content.Block{&content.TextBlock{Text: "PLEASE-DELEGATE"}}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for model.childCalls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the background child never reached the model")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The primer's own turn has ENDED: the session is quiet but for the child.
+	for countOf[event.TurnDone](t, world.journal, world.runtimeID) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the primer's turn never finished while its child ran")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stayResident(t, service, "a background delegate in flight")
+
+	model.unblock()
+	awaitResidentSessions(t, service, 0, 20*warmTTL+10*time.Second)
 }

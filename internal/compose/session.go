@@ -307,6 +307,23 @@ type warmSession struct {
 // warmSession is a residency.WarmSession.
 var _ residency.WarmSession = warmSession{}
 
+// ReleaseResidency waits — bounded by ctx — for the runtime to be idle BEFORE
+// it stops the session's work, then releases as the drain does.
+//
+// THE ORDER IS WHAT MAKES A HELD SESSION RECOVERABLE. A warm release that finds
+// the runtime busy stops there (residency.WarmOutcomeHeld). Had the work been
+// stopped first, the tail and the gate publisher would already be gone, and a
+// turn that then raised a gate would park with its question invisible to every
+// Factory. Waiting first leaves them running: live output is still relayed and
+// a gate is still published. The drain does not come through here, and keeps
+// its own order.
+func (s warmSession) ReleaseResidency(ctx context.Context) error {
+	if err := s.runtime.WaitIdle(ctx); err != nil {
+		return err
+	}
+	return s.resident.ReleaseResidency(ctx)
+}
+
 // FinishRelease writes the epoch-fenced tombstone and ends the heartbeat. It
 // does NOT release the lease: this seam gives that its own step.
 func (s warmSession) FinishRelease(ctx context.Context) error {
