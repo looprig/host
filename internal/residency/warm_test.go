@@ -171,6 +171,10 @@ type fakeWarmSession struct {
 	// block is closed by a test to release a step that is holding the
 	// release open, so the intermediate registry state can be sampled.
 	block map[string]chan struct{}
+
+	// waitsForIdle, when set, makes ReleaseResidency behave like a busy
+	// harness runtime: it waits until its context ends and returns its error.
+	waitsForIdle bool
 }
 
 func newFakeWarmSession(key registry.Key, generation uint64, trace *warmTrace) *fakeWarmSession {
@@ -200,12 +204,19 @@ func (s *fakeWarmSession) step(name string) error {
 	return err
 }
 
-func (s *fakeWarmSession) BeginRelease(context.Context) error     { return s.step("begin_release") }
-func (s *fakeWarmSession) Checkpoint(context.Context) error       { return s.step("checkpoint") }
-func (s *fakeWarmSession) ReleaseResidency(context.Context) error { return s.step("release_residency") }
-func (s *fakeWarmSession) FinishRelease(context.Context) error    { return s.step("finish_release") }
-func (s *fakeWarmSession) ReleaseLease(context.Context) error     { return s.step("release_lease") }
-func (s *fakeWarmSession) DropState(context.Context) error        { return s.step("drop_state") }
+func (s *fakeWarmSession) BeginRelease(context.Context) error { return s.step("begin_release") }
+func (s *fakeWarmSession) Checkpoint(context.Context) error   { return s.step("checkpoint") }
+func (s *fakeWarmSession) ReleaseResidency(ctx context.Context) error {
+	if s.waitsForIdle {
+		s.trace.record("release_residency")
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return s.step("release_residency")
+}
+func (s *fakeWarmSession) FinishRelease(context.Context) error { return s.step("finish_release") }
+func (s *fakeWarmSession) ReleaseLease(context.Context) error  { return s.step("release_lease") }
+func (s *fakeWarmSession) DropState(context.Context) error     { return s.step("drop_state") }
 
 func (s *fakeWarmSession) failAt(step string, err error) {
 	s.mu.Lock()
@@ -890,6 +901,9 @@ func TestTheTombstonePrecedesTheLeaseReleaseWhichPrecedesDroppingState(t *testin
 // loses a runtime's in-memory continuation, and the durable session and its
 // journal remain authoritative, so the price is a rehydration rather than lost
 // work. internal/lifecycle's drain makes the same trade for the same reason.
+//
+// release_residency IS THE ONE EXCEPTION: see
+// TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld.
 func TestAFailedStepAfterTheReleasingMarkIsRecordedAndTheReleaseContinues(t *testing.T) {
 	t.Parallel()
 
@@ -899,7 +913,6 @@ func TestAFailedStepAfterTheReleasingMarkIsRecordedAndTheReleaseContinues(t *tes
 	}{
 		{name: "begin_release", want: WarmStepBeginRelease},
 		{name: "checkpoint", want: WarmStepCheckpoint},
-		{name: "release_residency", want: WarmStepReleaseResidency},
 		{name: "finish_release", want: WarmStepFinishRelease},
 		{name: "release_lease", want: WarmStepReleaseLease},
 		{name: "drop_state", want: WarmStepDropState},
@@ -1280,5 +1293,156 @@ func TestAnIdleObservationDuringAReleaseDoesNotReArmTheWatch(t *testing.T) {
 	resume()
 	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeReleased {
 		t.Fatalf("outcome = %q (%s), want released", outcome.Kind, outcome.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Re-confirmation, consumption halt and the bounded runtime release
+// ---------------------------------------------------------------------------
+
+// fakeConfirmer answers ConfirmIdle from a settable value.
+type fakeConfirmer struct {
+	trace *warmTrace
+	mu    sync.Mutex
+	idle  bool
+}
+
+func (c *fakeConfirmer) ConfirmIdle(registry.Key) bool {
+	c.trace.record("confirm")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.idle
+}
+
+func (c *fakeConfirmer) setIdle(idle bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.idle = idle
+}
+
+// haltingConsumption is fakeConsumption with the optional halt.
+type haltingConsumption struct {
+	*fakeConsumption
+	err error
+}
+
+func (c *haltingConsumption) Halt(context.Context, registry.Key) error {
+	c.trace.record("consumption.halt")
+	return c.err
+}
+
+func (c *haltingConsumption) Resume(registry.Key) { c.trace.record("consumption.resume") }
+
+// TestAnExpiryThatIsNoLongerIdleReleasesNothing is F1: the session was idle
+// when the countdown was armed and is not when it expires. Nothing is taken,
+// the watch goes on, and the next idle observation arms a whole TTL again.
+func TestAnExpiryThatIsNoLongerIdleReleasesNothing(t *testing.T) {
+	t.Parallel()
+	trace := &warmTrace{}
+	confirm := &fakeConfirmer{trace: trace}
+	f := newWarmFixture(t, func(options *WarmOptions) { options.Confirm = confirm })
+	confirm.trace = f.trace
+	timer := f.clock.only(t)
+
+	f.releaser.Observe(f.key, WorkStateIdle)
+	timer.expire(t)
+	outcome := f.observer.await(t)
+	if outcome.Kind != WarmOutcomeAborted {
+		t.Fatalf("outcome = %q (%s), want %q", outcome.Kind, outcome.Reason, WarmOutcomeAborted)
+	}
+	for _, taken := range []string{"inbox.reread", "registry.stop_admitting", "begin_release", "release_residency"} {
+		if f.trace.index(taken) >= 0 {
+			t.Fatalf("a session that was not idle at expiry reached %q: %v", taken, f.trace.recorded())
+		}
+	}
+	if !f.entry().Accepting {
+		t.Fatal("a session that was not idle at expiry stopped admitting")
+	}
+
+	// The next idle observation arms again, and a confirmed expiry releases.
+	confirm.setIdle(true)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	if resets := timer.resetsSeen(); len(resets) != 2 {
+		t.Fatalf("the countdown was armed %d times, want 2: an unconfirmed expiry must leave the watch able to re-arm", len(resets))
+	}
+	timer.expire(t)
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeReleased {
+		t.Fatalf("after a confirmed expiry outcome = %q (%s), want released", outcome.Kind, outcome.Reason)
+	}
+}
+
+// TestConsumptionIsHaltedBeforeTheInboxIsReread is F2's ordering: the halt
+// precedes the re-read (so nothing can be claimed behind it), and an aborted
+// release resumes consumption.
+func TestConsumptionIsHaltedBeforeTheInboxIsReread(t *testing.T) {
+	t.Parallel()
+	var consumption *haltingConsumption
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
+		options.Consumption = consumption
+	})
+	f.inbox.mu.Lock()
+	f.inbox.accepted = true
+	f.inbox.mu.Unlock()
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.clock.only(t).expire(t)
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeAborted {
+		t.Fatalf("outcome = %q, want aborted", outcome.Kind)
+	}
+	halt, read, resume := f.trace.index("consumption.halt"), f.trace.index("inbox.reread"), f.trace.index("consumption.resume")
+	if halt < 0 || read < 0 || halt > read {
+		t.Fatalf("the halt must precede the inbox re-read: %v", f.trace.recorded())
+	}
+	if resume < read {
+		t.Fatalf("an aborted release did not resume consumption after the re-read: %v", f.trace.recorded())
+	}
+}
+
+// TestAHaltThatDoesNotFinishAbortsTheRelease: a pass that will not finish
+// within the bound is work in flight.
+func TestAHaltThatDoesNotFinishAbortsTheRelease(t *testing.T) {
+	t.Parallel()
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption), err: context.DeadlineExceeded}
+	})
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.clock.only(t).expire(t)
+	outcome := f.observer.await(t)
+	if outcome.Kind != WarmOutcomeAborted || len(outcome.Failures) != 1 || outcome.Failures[0].Step != WarmStepHaltConsumption {
+		t.Fatalf("outcome = %+v, want aborted at %q", outcome, WarmStepHaltConsumption)
+	}
+	if f.trace.index("inbox.reread") >= 0 || f.trace.index("consumption.resume") < 0 {
+		t.Fatalf("a failed halt must resume and take nothing: %v", f.trace.recorded())
+	}
+}
+
+// TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld is F3: the runtime
+// release is bounded, and a runtime that does not release in time — harness
+// refuses a busy one — leaves the session HELD: no tombstone, grant kept, state
+// kept, capacity not credited, and the watch ended so the drain owns it.
+func TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld(t *testing.T) {
+	t.Parallel()
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		options.ReleaseBound = 20 * time.Millisecond
+		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
+	})
+	f.session.waitsForIdle = true
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.clock.only(t).expire(t)
+
+	outcome := f.observer.await(t)
+	if outcome.Kind != WarmOutcomeHeld {
+		t.Fatalf("outcome = %q (%s), want %q", outcome.Kind, outcome.Reason, WarmOutcomeHeld)
+	}
+	for _, later := range []string{"finish_release", "release_lease", "drop_state", "admissions.release"} {
+		if f.trace.index(later) >= 0 {
+			t.Fatalf("%q ran after the runtime did not release: %v", later, f.trace.recorded())
+		}
+	}
+	if f.trace.index("consumption.resume") < f.trace.index("release_residency") {
+		t.Fatalf("a held session's consumption was not resumed after the runtime release: %v", f.trace.recorded())
+	}
+	if len(outcome.Failures) != 1 || !errors.Is(outcome.Failures[0].Err, context.Canceled) {
+		t.Fatalf("failures = %v, want the bounded runtime release's cancellation", outcome.Failures)
 	}
 }

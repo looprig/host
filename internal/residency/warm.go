@@ -111,6 +111,44 @@ type Consumption interface {
 	Wake(registry.Key)
 }
 
+// WarmConfirmer re-confirms, at expiry, that a session is still idle.
+//
+// IT CLOSES THE WINDOW A SAMPLED IDLE LEAVES OPEN. The countdown is armed by an
+// idle SAMPLE and is deliberately not re-armed by later idle samples, so a turn
+// that starts after the last sample and before the TTL fires is invisible to
+// the releaser unless something asks again at the instant it fires. The inbox
+// re-read cannot stand in for this: a command already applied has advanced the
+// cursor, and a turn started any other way was never in the inbox.
+//
+// It is OPTIONAL: a releaser without one releases on the arming alone, which
+// is what every releaser did before it existed.
+type WarmConfirmer interface {
+	// ConfirmIdle reports whether the session is idle NOW and has done no work
+	// since the observation that armed its countdown. Anything it cannot
+	// establish must be false.
+	ConfirmIdle(registry.Key) bool
+}
+
+// ConsumptionHalter is the optional half of Consumption a release uses to
+// keep this Host from claiming or applying a command while it releases.
+//
+// WITHOUT IT THE CONSUMER RUNS UNTIL STEP 4. Between the inbox re-read and the
+// runtime release it can be woken — by a hint delivered before admission
+// stopped, by the gate publisher, by its own timer — and claim a command
+// admitted after the re-read, starting a turn in a session that is being
+// released, or leaving an attempt in flight under a lease about to be handed
+// back. With it, the consumer is halted BEFORE the re-read and a pass already
+// in flight is waited out, so what the re-read saw is what this Host will ever
+// have applied; anything admitted later stays pending for the successor.
+type ConsumptionHalter interface {
+	// Halt stops the session's consumer claiming anything and waits, bounded
+	// by ctx, for a pass in flight to finish.
+	Halt(context.Context, registry.Key) error
+
+	// Resume undoes Halt, for a release that aborts.
+	Resume(registry.Key)
+}
+
 // WarmSession is one resident session, narrowed to the ordered steps a warm
 // release takes it through.
 //
@@ -181,6 +219,7 @@ type WarmObserver interface {
 type WarmStep string
 
 const (
+	WarmStepHaltConsumption  WarmStep = "halt_consumption"
 	WarmStepInbox            WarmStep = "inbox_reread"
 	WarmStepStopAdmitting    WarmStep = "stop_admitting"
 	WarmStepBeginRelease     WarmStep = "begin_release"
@@ -216,6 +255,14 @@ const (
 	// anything was taken. The session stays resident and accepting and is
 	// released on a later idle observation.
 	WarmOutcomeAborted WarmOutcomeKind = "aborted"
+
+	// WarmOutcomeHeld reports a release that stopped at step 4 because the
+	// runtime refused or did not finish its nonterminal release within the
+	// bound. Nothing after it ran: the tombstone is not written, the grant is
+	// still held and the session's state is not dropped, so the runtime — which
+	// is still live — keeps a valid owner and no successor can race it. The
+	// session stays with this Host, not admitting, until its drain.
+	WarmOutcomeHeld WarmOutcomeKind = "held"
 
 	// WarmOutcomeAbandoned reports a session this releaser has stopped
 	// watching without releasing it, because it no longer owns it: the grant
@@ -267,6 +314,14 @@ type WarmOptions struct {
 
 	// Observer receives every attempt's outcome. It is optional.
 	Observer WarmObserver
+
+	// Confirm re-confirms idle at expiry. It is optional; see WarmConfirmer.
+	Confirm WarmConfirmer
+
+	// ReleaseBound bounds the two steps that wait on the session rather than
+	// on a store: halting its consumption and releasing its runtime. Zero
+	// leaves them unbounded. See release.
+	ReleaseBound time.Duration
 }
 
 // WarmReleaser releases idle sessions after their warm TTL, and is safe for
@@ -551,15 +606,35 @@ func (w *WarmReleaser) report(outcome WarmOutcome) {
 	}
 }
 
+// bounded is the context for a step that waits on the session: Background,
+// cancelled after ReleaseBound when one is set. It is built from Background
+// and a timer rather than context.WithTimeout because this package's context
+// guard admits only Background, WithCancel and WithValue.
+func (w *WarmReleaser) bounded() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if w.options.ReleaseBound <= 0 {
+		return ctx, cancel
+	}
+	timer := time.AfterFunc(w.options.ReleaseBound, cancel)
+	return ctx, func() {
+		timer.Stop()
+		cancel()
+	}
+}
+
 // release runs 04-host.md's O6.1 algorithm for one session.
 //
 // THE CONTEXT IS Background AND NOT THE RELEASER'S LIFETIME. Cancelling a
 // release halfway leaves a live route with no owner, a lease nobody will renew,
 // and a Host that believes it still holds a session it has stopped serving —
 // which is strictly worse than any of the individual steps failing.
-// internal/lifecycle's drain makes the same choice for the same reason.
+// internal/lifecycle's drain makes the same choice for the same reason. The
+// two steps that wait on the SESSION rather than a store — the consumption
+// halt and the runtime release — are bounded by ReleaseBound instead, because
+// each can wait for as long as a turn lasts, and each has a safe way out.
 //
-// THE FAILURE POLICY CHANGES AT STEP 2, deliberately:
+// THE FAILURE POLICY CHANGES AT STEP 2, deliberately (step 4 is the one
+// exception after it; see there):
 //
 //   - BEFORE it, a failure ABORTS. Nothing has been taken, the session is going
 //     nowhere, and the cost of not releasing is a warm runtime that stays
@@ -577,6 +652,34 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	key, generation := session.Key(), session.Generation()
 	outcome := WarmOutcome{Key: key, Generation: generation}
 
+	// STEP 0. Halt this Host's consumption of the session, waiting out a pass
+	// in flight, so nothing can be claimed behind the re-reads below. A halt
+	// that does not finish within the bound aborts: a pass still running is
+	// work in flight.
+	halter, _ := w.options.Consumption.(ConsumptionHalter)
+	resume := func() {}
+	if halter != nil {
+		haltCtx, cancel := w.bounded()
+		err := halter.Halt(haltCtx, key)
+		cancel()
+		resume = func() { halter.Resume(key) }
+		if err != nil {
+			resume()
+			outcome.Kind = WarmOutcomeAborted
+			outcome.Reason = "a command pass in flight did not finish within the release bound"
+			outcome.Failures = append(outcome.Failures, WarmFailure{Step: WarmStepHaltConsumption, Err: err})
+			return outcome
+		}
+	}
+
+	// STEP 0b. Re-confirm idle at expiry. See WarmConfirmer.
+	if w.options.Confirm != nil && !w.options.Confirm.ConfirmIdle(key) {
+		resume()
+		outcome.Kind = WarmOutcomeAborted
+		outcome.Reason = "the session was no longer idle, or had worked since its countdown was armed, when the countdown expired"
+		return outcome
+	}
+
 	// STEP 1. Re-read the durable inbox. An unreadable inbox FAILS CLOSED: a
 	// store that will not answer has said nothing about whether work was
 	// accepted, and releasing on that silence releases a session that may hold
@@ -584,12 +687,14 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	accepted, err := w.options.Inbox.AcceptedWork(ctx, key)
 	switch {
 	case err != nil:
+		resume()
 		outcome.Kind = WarmOutcomeAborted
 		outcome.Reason = "the durable inbox could not be re-read, so this Host cannot say the session is free of accepted work"
 		outcome.Failures = append(outcome.Failures, WarmFailure{Step: WarmStepInbox, Err: err})
 		w.options.Consumption.Wake(key)
 		return outcome
 	case accepted:
+		resume()
 		outcome.Kind = WarmOutcomeAborted
 		outcome.Reason = "the durable inbox holds work accepted since this session went idle"
 		w.options.Consumption.Wake(key)
@@ -608,6 +713,7 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	// {resident, accepting:false}, and a command arriving in it is refused
 	// not_admitting by internal/realtime/hostlink.
 	if _, current := w.options.Registry.StopAdmitting(key, generation); !current {
+		resume()
 		outcome.Kind = WarmOutcomeAbandoned
 		outcome.Reason = "the residency was removed or replaced before admission could be stopped, so this warm timer owns nothing"
 		return outcome
@@ -623,7 +729,30 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	// STEP 3.
 	run(WarmStepCheckpoint, session.Checkpoint)
 	// STEP 4. Nonterminal: no terminal event is appended.
-	run(WarmStepReleaseResidency, session.ReleaseResidency)
+	//
+	// IT IS BOUNDED, AND A FAILURE HERE STOPS THE RELEASE rather than being
+	// recorded and passed over like the others. A runtime refuses its
+	// nonterminal release while it has work in flight — harness waits for
+	// whole-session idle and refuses before any teardown — so a failure means
+	// a LIVE runtime. Tombstoning it and handing its grant back would leave a
+	// running runtime with no owner for a successor to race; waiting on it
+	// unbounded would hold this releaser, and the Host's Stop behind it, for as
+	// long as the turn lasts. So the session is left HELD: grant kept, no
+	// tombstone, state kept, capacity not credited, consumption resumed, and
+	// the drain owns its release.
+	releaseCtx, cancel := w.bounded()
+	err = session.ReleaseResidency(releaseCtx)
+	cancel()
+	if err != nil {
+		// Consumption resumes: the session is still this Host's, under a
+		// live grant, and a turn that raises a gate must be able to have its
+		// answer applied. It is not admitting, so nothing new is placed here.
+		resume()
+		outcome.Failures = append(outcome.Failures, WarmFailure{Step: WarmStepReleaseResidency, Err: err})
+		outcome.Kind = WarmOutcomeHeld
+		outcome.Reason = "the runtime did not release within the bound, so the session stays with this Host under its grant until the drain"
+		return outcome
+	}
 	// STEP 5. The epoch-fenced tombstone and the visible registry entry.
 	run(WarmStepFinishRelease, session.FinishRelease)
 	// STEP 6. The lease FIRST, then in-memory state.
