@@ -576,6 +576,9 @@ func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T)
 	if got := sessionsIn(t, service, "releasing"); got != 1 {
 		t.Fatalf("host_sessions{state=\"releasing\"} = %d, want the one held session", got)
 	}
+	if got := releaseFailures(t, service); got != 1 {
+		t.Fatalf("host_release_failures_total = %d, want 1: the release must have STOPPED at the bounded runtime release, not still be waiting on it", got)
+	}
 	if got := countOf[event.SessionStopped](t, world.journal, world.runtimeID); got != 0 {
 		t.Fatalf("%d SessionStopped; a held session is not terminated", got)
 	}
@@ -591,6 +594,16 @@ func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T)
 	stopWithin(t, service)
 	if world.residencyHeld(t) {
 		t.Fatal("after the drain the held session's grant is still held")
+	}
+	// THE DRAIN RELEASED THE RUNTIME: a held session is still offered to it.
+	live, ok := launcher.controller().(session.Liveness)
+	if !ok {
+		t.Fatal("the harness session is not a session.Liveness")
+	}
+	select {
+	case <-live.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("after the drain the held session's runtime was never released")
 	}
 }
 
@@ -708,4 +721,65 @@ func TestASessionWithABackgroundDelegateInFlightIsNotWarmReleased(t *testing.T) 
 
 	model.unblock()
 	awaitResidentSessions(t, service, 0, 20*warmTTL+10*time.Second)
+}
+
+// releaseFailures reads host_release_failures_total off the Host's metrics.
+func releaseFailures(t *testing.T, service *host.Service) int {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	service.MetricsHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if value, found := strings.CutPrefix(line, "host_release_failures_total "); found {
+			count, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				t.Fatalf("host_release_failures_total = %q: %v", value, err)
+			}
+			return count
+		}
+	}
+	t.Fatalf("the metrics carry no host_release_failures_total:\n%s", recorder.Body.String())
+	return 0
+}
+
+// TestAHeldSessionStillPublishesAndAppliesTheAnswerToAGateItRaised is F3's
+// recoverability, over the real harness runtime. Inside the release window the
+// agent asks the user a question, so at step 4 the runtime is parked at a gate
+// and cannot release. After the bounded wait the session is HELD, and it is
+// still a working session: the gate is projected for Factory, the answer is
+// claimed and applied under this Host's live grant, and the agent continues.
+// Tearing its work down before the wait (or not bounding the wait) would leave
+// the question unanswerable.
+func TestAHeldSessionStillPublishesAndAppliesTheAnswerToAGateItRaised(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{})
+	checkpointer := newPausingCheckpointer()
+	world.adjust = func(blueprint *host.Composition) {
+		blueprint.Options.WarmTTL = warmTTL
+		blueprint.WorkPoll = warmPoll
+		blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 500 * time.Millisecond, PublishBound: 500 * time.Millisecond}
+		blueprint.Collaborators.Checkpointer = checkpointer
+	}
+	service, launcher, _ := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(service) })
+	checkpointer.awaitEntered(t)
+
+	world.submit(t, launcher.controller(), "PLEASE-ASK")
+	opened := world.gates(t, 1)[0]
+	close(checkpointer.proceed)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for releaseFailures(t, service) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the warm release never stopped at the runtime release; it is still waiting on a runtime parked at a gate")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := sessionsIn(t, service, "releasing"); got != 1 {
+		t.Fatalf("host_sessions{state=\"releasing\"} = %d, want the one held session", got)
+	}
+
+	id := world.answer(t, opened, "answer", answerValue())
+	if entry := world.settled(t, id); outcomeOf(t, entry) != "applied" {
+		t.Fatalf("the held session settled the answer %q, want applied", outcomeOf(t, entry))
+	}
+	gateE2EEventually(t, "the agent to continue with the answer", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
 }
