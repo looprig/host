@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/session"
 	harnessstore "github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/inference"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 
@@ -116,6 +117,9 @@ type realRuntimeWorld struct {
 	journal   *harnessstore.Store
 	llm       *harnesstest.RecordingLLM
 	runtimeID uuid.UUID
+
+	// model, when set, is the model every Host's rig talks to instead of llm.
+	model inference.Client
 }
 
 func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
@@ -156,7 +160,21 @@ func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
 // non-nil, replaces the composition's journal table.
 func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalStores map[host.EvidenceKey]sessionstore.DispositionEvidenceReader) (*host.Service, *capturingLauncher) {
 	t.Helper()
-	launcher := &capturingLauncher{rig: harnesstest.Rig(t, w.journal, w.llm)}
+	return w.hostWith(t, generation, func(blueprint *host.Composition) {
+		if journalStores != nil {
+			blueprint.Collaborators.JournalStores = journalStores
+		}
+	})
+}
+
+// hostWith is host with an arbitrary adjustment to the blueprint.
+func (w *realRuntimeWorld) hostWith(t *testing.T, generation uint64, adjust func(*host.Composition)) (*host.Service, *capturingLauncher) {
+	t.Helper()
+	var model inference.Client = w.llm
+	if w.model != nil {
+		model = w.model
+	}
+	launcher := &capturingLauncher{rig: harnesstest.Rig(t, w.journal, model)}
 	adapter, err := harnessadapter.New(launcher)
 	if err != nil {
 		t.Fatalf("harnessadapter.New: %v", err)
@@ -172,9 +190,7 @@ func (w *realRuntimeWorld) host(t *testing.T, generation uint64, journalStores m
 		}
 		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
 	})
-	if journalStores != nil {
-		blueprint.Collaborators.JournalStores = journalStores
-	}
+	adjust(&blueprint)
 	service, err := host.Compose(t.Context(), blueprint)
 	if err != nil {
 		t.Fatalf("Compose: %v", err)

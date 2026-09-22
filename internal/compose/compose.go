@@ -136,6 +136,15 @@ type Options struct {
 	// See WorkStates for what a composition without one loses.
 	WorkStates WorkStates
 
+	// DeriveWorkStates makes the composition its own work-state source,
+	// derived from each resident runtime's idle probe and its gate
+	// publisher's fold; see derivedWorkStates. It requires Gates, because a
+	// session whose gates this Host cannot see may have a human waiting at
+	// one, and it excludes WorkStates, because two sources would answer one
+	// question twice. A POOLED Host so composed warm-releases idle sessions
+	// after the Host's WarmTTL; a DEDICATED one does not (see warmSamples).
+	DeriveWorkStates bool
+
 	// Budget is the weighted memory limit reported by metrics. Its zero value
 	// is UNKNOWN, which is deliberately not a default; see
 	// lifecycle.MemoryBudget.
@@ -295,6 +304,10 @@ func New(options Options) (*Service, error) {
 		stopping:  make(chan struct{}),
 	}
 
+	if options.DeriveWorkStates {
+		composed.options.WorkStates = derivedWorkStates{service: composed}
+	}
+
 	composed.warm, err = residency.NewWarmReleaser(residency.WarmOptions{
 		Clock: warmClockAdapter{options.Clock},
 		// THE TTL COMES FROM THE WIRED HOST, and until this line nothing in the
@@ -409,6 +422,12 @@ func (o Options) validate() error {
 			return &InvalidOptionsError{Field: required.field, Reason: "must be set"}
 		}
 	}
+	if o.DeriveWorkStates && o.WorkStates != nil {
+		return &InvalidOptionsError{Field: "DeriveWorkStates", Reason: "excludes WorkStates; two work-state sources would answer one question twice"}
+	}
+	if o.DeriveWorkStates && o.Gates == nil {
+		return &InvalidOptionsError{Field: "DeriveWorkStates", Reason: "requires Gates; a session whose gates this Host cannot see may have a human waiting at one, so it could never be called idle"}
+	}
 	for _, positive := range []struct {
 		field string
 		value int
@@ -506,18 +525,50 @@ func (s *Service) Start(ctx context.Context) error {
 // fake observer and recorded that the composition owed the wiring. A Host
 // composed without a WorkStates source therefore never arms a warm countdown and
 // never evicts, which is an absence a test asserts rather than a sentence.
+//
+// A SESSION THAT WORKED BETWEEN TWO IDLE SAMPLES RESTARTS ITS COUNTDOWN. The
+// releaser keeps a running countdown across repeated idle observations — it
+// must, or a poll shorter than the TTL would defer the expiry forever — so a
+// short turn that began and ended between two polls would otherwise be
+// invisible and the session released a TTL after its EARLIER idle. A source
+// that reports a journal position is compared across samples, and a moved
+// position is reported to the releaser as work before the idle.
 func (s *Service) sampleWork(ctx context.Context) {
-	if s.options.WorkStates == nil {
+	if s.options.WorkStates == nil || !s.warmSamples() {
 		return
 	}
+	reporter, _ := s.options.WorkStates.(activityReporter)
+	type mark struct {
+		generation uint64
+		position   uint64
+	}
+	marks := map[registry.Key]mark{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.options.Clock.After(s.options.WorkPoll):
+			seen := make(map[registry.Key]bool, len(marks))
 			for _, entry := range s.registry.Snapshot() {
-				if state, known := s.options.WorkStates.WorkState(entry.Key); known {
-					s.warm.Observe(entry.Key, state)
+				state, known := s.options.WorkStates.WorkState(entry.Key)
+				if !known {
+					continue
+				}
+				if reporter != nil {
+					if position, ok := reporter.activity(entry.Key); ok {
+						seen[entry.Key] = true
+						last, had := marks[entry.Key]
+						marks[entry.Key] = mark{generation: entry.Generation, position: position}
+						if had && last.generation == entry.Generation && last.position != position {
+							s.warm.Observe(entry.Key, residency.WorkStateWorking)
+						}
+					}
+				}
+				s.warm.Observe(entry.Key, state)
+			}
+			for key := range marks {
+				if !seen[key] {
+					delete(marks, key)
 				}
 			}
 		}

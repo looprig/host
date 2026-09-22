@@ -986,12 +986,16 @@ func (s *controllableSession) HoldIdle() {
 }
 
 // WaitIdle returns immediately unless the session is being held non-idle.
+//
+// AN IDLE SESSION ANSWERS nil EVEN FOR A CONTEXT THAT IS ALREADY DONE, as
+// harness's hub does on its fast path and as department.IdleWaiter requires:
+// the derived work-state source probes idleness with exactly such a context.
 func (s *controllableSession) WaitIdle(ctx context.Context) error {
 	s.mu.Lock()
 	holding := s.holding
 	s.mu.Unlock()
 	if holding == nil {
-		return ctx.Err()
+		return nil
 	}
 	select {
 	case <-holding:

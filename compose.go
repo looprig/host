@@ -398,11 +398,14 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		CompatibilityTimeout: blueprint.CompatibilityTimeout,
 		WorkPoll:             blueprint.WorkPoll,
 		Logger:               collaborators.Logger,
-		// WorkStates IS NOT WIRED, and neither cmd/host nor this surface has
-		// ever wired it: the seam needs a reader of the runtime's gate state
-		// that department.Runtime does not expose. A Host composed here never
-		// warm-evicts and never returns a gate boundary from the compatibility
-		// wait. Stated rather than fixed; see the v0.2.0 result document.
+		// THE WORK STATE IS DERIVED, from each resident runtime's idle probe
+		// and its gate publisher's fold of the runtime journal. Until v0.6.1
+		// nothing here supplied one, so the warm releaser was never told a
+		// session was idle and a composed Host never warm-released: an idle
+		// pooled session held its capacity until the Host stopped. A pooled
+		// Host now releases a session idle for Options.WarmTTL, never with a
+		// gate open or durable work outstanding; a dedicated Host does not.
+		DeriveWorkStates: true,
 	})
 	if err != nil {
 		closeStore()

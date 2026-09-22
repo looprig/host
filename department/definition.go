@@ -329,6 +329,14 @@ type Identity interface {
 }
 
 // IdleWaiter blocks until the runtime has no work in flight. H4.1's shape.
+//
+// A RUNTIME THAT IS ALREADY IDLE MUST ANSWER nil WITHOUT WAITING, EVEN FOR A
+// CONTEXT THAT IS ALREADY DONE, and a busy one must answer an error at once for
+// such a context. That is harness's behaviour (its hub checks quiescence before
+// it consults the context), and a composed Host relies on it: it probes each
+// resident session with a done context to decide whether it is idle for warm
+// release. A runtime that consults its context first is fail-safe — it always
+// reads as busy and is never warm-released — but it is never released either.
 type IdleWaiter interface {
 	WaitIdle(context.Context) error
 }

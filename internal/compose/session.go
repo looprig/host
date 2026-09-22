@@ -8,6 +8,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/gates"
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
@@ -134,6 +135,10 @@ func (o *onceOnSuccess) run(action func() error) error {
 // command consumer and the live event tail.
 type sessionWork struct {
 	stop func()
+
+	// gates is the session's gate publisher, nil when this composition
+	// publishes no gates. The derived work-state source reads its fold.
+	gates *gates.Publisher
 }
 
 // Key identifies the session.

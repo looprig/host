@@ -210,6 +210,12 @@ type gateE2EWorld struct {
 	runtimeID uuid.UUID
 	binding   sessionstore.SessionBinding
 	nextID    atomic.Int32
+
+	// adjust, when set, changes every blueprint this world composes.
+	adjust func(*host.Composition)
+
+	// decoder, when set, is the block decoder input commands are read with.
+	decoder harnessadapter.BlockDecoder
 }
 
 // gateE2ETakeover is a journal leaser under which a later Acquire takes a held
@@ -366,7 +372,11 @@ func (h *heldAttach) finish(t *testing.T) {
 func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct{}) (*host.Service, *capturingLauncher) {
 	t.Helper()
 	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs), holdRestore: hold}
-	adapter, err := harnessadapter.New(launcher)
+	var options []harnessadapter.Option
+	if w.decoder != nil {
+		options = append(options, harnessadapter.WithBlockDecoder(w.decoder))
+	}
+	adapter, err := harnessadapter.New(launcher, options...)
 	if err != nil {
 		t.Fatalf("harnessadapter.New: %v", err)
 	}
@@ -391,6 +401,9 @@ func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct
 		}
 		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
 	})
+	if w.adjust != nil {
+		w.adjust(&blueprint)
+	}
 	service, err := host.Compose(t.Context(), blueprint)
 	if err != nil {
 		t.Fatalf("Compose: %v", err)
