@@ -193,11 +193,13 @@ func sessionsIn(t *testing.T, service *host.Service, state string) int {
 	return 0
 }
 
-// awaitResidentSessions waits up to bound for the Host to hold want sessions.
+// awaitResidentSessions waits up to bound for the Host to hold want resident
+// sessions. Waiting for zero also waits for no session to be RELEASING: a
+// release leaves the resident state at its step 2, long before it finishes.
 func awaitResidentSessions(t *testing.T, service *host.Service, want int, bound time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(bound)
-	for residentSessions(t, service) != want {
+	for residentSessions(t, service) != want || (want == 0 && sessionsIn(t, service, "releasing") != 0) {
 		if time.Now().After(deadline) {
 			t.Fatalf("the Host holds %d resident sessions after %v, want %d", residentSessions(t, service), bound, want)
 		}
@@ -516,6 +518,7 @@ func TestACommandAdmittedDuringTheReleaseIsLeftForTheSuccessor(t *testing.T) {
 	}
 	close(checkpointer.proceed)
 	awaitResidentSessions(t, first, 0, 20*time.Second)
+	world.awaitLeaseFree(t, 20*time.Second)
 	if state := world.command(t, id).Record.State; state != sessionstore.InboxStatePending {
 		t.Fatalf("after the release the command is %q, want pending", state)
 	}
@@ -782,4 +785,24 @@ func TestAHeldSessionStillPublishesAndAppliesTheAnswerToAGateItRaised(t *testing
 		t.Fatalf("the held session settled the answer %q, want applied", outcomeOf(t, entry))
 	}
 	gateE2EEventually(t, "the agent to continue with the answer", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
+}
+
+// awaitLeaseFree waits until another party could take the session's residency
+// lease, which is the moment a successor's attach can succeed.
+func (w *gateE2EWorld) awaitLeaseFree(t *testing.T, bound time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for {
+		lease, err := w.factory.AcquireResidency(t.Context(), sessionstore.AcquireResidencyRequest{TenantID: composeTenant, SessionID: composeSession})
+		if err == nil {
+			if err := lease.Release(t.Context()); err != nil {
+				t.Fatalf("release the probe lease: %v", err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the residency lease was still held after %v: %v", bound, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
