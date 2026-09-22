@@ -163,7 +163,10 @@ the one where the stolen doc came first.
 that listener internal, supply the product's tenant credential verifier, and
 terminate TLS before it. No browser Origin or CSRF policy is applied to
 HostLink. Pooled and dedicated are placement modes; shared store leases and
-Harness journals provide recovery. A dedicated controller owns
+Harness journals provide recovery. Only a pooled Host warm-releases idle
+sessions; a dedicated Host deliberately does not (a departure from runbook O6.2,
+see README), so do not "fix" `compose.Service.warmSamples` without a
+cross-module proof against Factory's dedicated placement and the controller. A dedicated controller owns
 terminal-drain-before-delete. Do not infer a disposition object store from
 SessionStore's legacy object-first `PutObject`. Gate responses require the
 advertised capability and the one-way Host upgrade rules in README; cold

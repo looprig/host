@@ -399,7 +399,7 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		WorkPoll:             blueprint.WorkPoll,
 		Logger:               collaborators.Logger,
 		// THE WORK STATE IS DERIVED, from each resident runtime's idle probe
-		// and its gate publisher's fold of the runtime journal. Until v0.6.1
+		// and its gate publisher's fold of the runtime journal. Before v0.7.0
 		// nothing here supplied one, so the warm releaser was never told a
 		// session was idle and a composed Host never warm-released: an idle
 		// pooled session held its capacity until the Host stopped. A pooled

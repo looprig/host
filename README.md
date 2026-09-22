@@ -26,8 +26,19 @@ Department, residency, HostLink, warm release and drain are built.
 `host.Compose` releases a session that has been whole-session idle for
 `Options.WarmTTL` — never one with a gate open, a turn in flight or durable
 command work outstanding — and the next command re-places and restores it.
-Before v0.7.0 no composed Host ever warm-released. A dedicated Host does not
-warm-release.
+Before v0.7.0 no composed Host ever warm-released. When the countdown fires the
+Host re-confirms the session is still idle and has done no work since it was
+armed, halts its command consumer (a command admitted from then on is left
+pending for the next Host), and bounds the runtime release by `Drain.Grace`; a
+runtime that does not release in time leaves the session held under this Host's
+grant until the drain, never torn down under a running turn.
+
+**A dedicated Host does not warm-release — a deliberate departure from runbook
+O6.2** ("the same release behavior as pooled"). A warm-released dedicated
+session would leave its Pod running with nothing resident while placement, the
+controller's desire and the Pod all still name it, and no released Factory or
+controller has been proven against that state. Its session ends through the
+controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
 `github.com/looprig/harness` v0.36.0. Core is v0.11.0.
