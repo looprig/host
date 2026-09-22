@@ -127,7 +127,12 @@ type Options struct {
 	// is REQUIRED for dedicated placement and REJECTED for pooled.
 	FixedSessionID sessionwire.SessionID
 
-	// WarmTTL is how long a released session stays warm before drain.
+	// WarmTTL is how long a POOLED session stays resident after it is observed
+	// whole-session idle before this Host warm-releases it: nonterminally, so
+	// the next command re-places and restores it. A session with a gate open,
+	// a turn in flight or durable command work outstanding is never released.
+	// A dedicated Host does not warm-release; its controller's drain ends the
+	// session.
 	WarmTTL time.Duration
 
 	// RegistryHeartbeat and RegistryExpiry are the advertisement lifetime.

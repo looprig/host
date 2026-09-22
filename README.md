@@ -22,6 +22,12 @@ and compared segment by segment, so a sibling package under
 ## Status
 
 Department, residency, HostLink, warm release and drain are built.
+**Warm release takes effect from v0.7.0:** a pooled Host composed with
+`host.Compose` releases a session that has been whole-session idle for
+`Options.WarmTTL` — never one with a gate open, a turn in flight or durable
+command work outstanding — and the next command re-places and restores it.
+Before v0.7.0 no composed Host ever warm-released. A dedicated Host does not
+warm-release.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
 `github.com/looprig/harness` v0.36.0. Core is v0.11.0.
