@@ -421,6 +421,16 @@ func (w *WarmReleaser) Observe(key registry.Key, state WorkState) {
 		return
 	}
 	if state == WorkStateIdle {
+		// A REPEATED IDLE LEAVES A RUNNING COUNTDOWN ALONE. The composition
+		// samples work state on a cadence, so a session that stays idle is
+		// reported idle on every poll; re-arming a whole TTL each time would
+		// push the expiry forward forever whenever the poll is shorter than
+		// the TTL, and no idle session would ever be released. The countdown
+		// runs from the first idle after work, which is what "arm on idle,
+		// reset on activity" means.
+		if watch.armed {
+			return
+		}
 		watch.armed = true
 		watch.timer.Reset(w.options.TTL)
 		return

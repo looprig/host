@@ -530,6 +530,39 @@ func TestTheWarmTimerIsArmedByIdleAndCancelledByWork(t *testing.T) {
 	}
 }
 
+// TestARepeatedIdleObservationDoesNotRestartTheCountdown: the composition
+// SAMPLES work state on a cadence, so a session that stays idle is reported
+// idle on every poll. If each of those re-armed the timer with a whole TTL, a
+// poll shorter than the TTL — which is every sane configuration — would push
+// the expiry forward forever and no idle session would ever be released. Only
+// the FIRST idle after an arming was cancelled (or never made) starts the
+// countdown; later idles leave it running.
+func TestARepeatedIdleObservationDoesNotRestartTheCountdown(t *testing.T) {
+	t.Parallel()
+	f := newWarmFixture(t)
+	timer := f.clock.only(t)
+
+	for range 5 {
+		f.releaser.Observe(f.key, WorkStateIdle)
+	}
+	if resets := timer.resetsSeen(); len(resets) != 1 {
+		t.Fatalf("five consecutive idle observations reset the timer %d times, want 1: a sampled idle must not restart the countdown", len(resets))
+	}
+
+	// Work in between cancels, and the next idle arms a whole TTL again.
+	f.releaser.Observe(f.key, WorkStateWorking)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	if resets := timer.resetsSeen(); len(resets) != 2 {
+		t.Fatalf("after work the timer was reset %d times in total, want 2", len(resets))
+	}
+
+	timer.expire(t)
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeReleased {
+		t.Fatalf("outcome = %q (%s), want %q", outcome.Kind, outcome.Reason, WarmOutcomeReleased)
+	}
+}
+
 // TestAGateWaitIsNotWholeSessionIdle is 04-host.md in terms: "A waiting
 // resident gate is not whole-session idle and therefore is not warm-evicted by
 // this plan."
