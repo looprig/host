@@ -190,6 +190,11 @@ type Publisher struct {
 	mu         sync.Mutex
 	superseded bool
 	passes     int
+
+	// What the last successful fold saw, published for Activity.
+	folded     bool
+	openCount  int
+	foldedNext uint64
 }
 
 // Start validates the options and starts publishing. The returned Publisher
@@ -253,6 +258,22 @@ func (p *Publisher) Converged() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.passes
+}
+
+// Activity reports what the publisher's last successful fold of the runtime
+// journal saw: how many gates the journal holds open, and the journal position
+// the fold reached. folded is false until the first fold has completed, and a
+// caller must then treat both numbers as unknown rather than as zero.
+//
+// IT IS THE HOST'S ONLY LOCAL READER OF A RUNTIME'S GATE STATE. The fold is the
+// same one the projection is converged on, so "open" here means exactly what a
+// Factory will be shown. The position moves on every journaled event, so a
+// caller comparing two readings learns that the runtime did something between
+// them even when it was idle at both.
+func (p *Publisher) Activity() (openGates int, position uint64, folded bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.openCount, p.foldedNext, p.folded
 }
 
 // Superseded reports whether the publisher stopped because a successor's
@@ -352,6 +373,9 @@ func (p *Publisher) pass(ctx context.Context) error {
 	if err := p.fold(ctx); err != nil {
 		return err
 	}
+	p.mu.Lock()
+	p.folded, p.openCount, p.foldedNext = true, len(p.open), p.next
+	p.mu.Unlock()
 	if !p.dirty {
 		return nil
 	}

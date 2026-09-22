@@ -732,3 +732,37 @@ func TestAGateBeyondTheCapIsPublishedByThePassThatFreesASlot(t *testing.T) {
 		t.Fatalf("%d WARN records, want the one for the gate that did not fit", records.count())
 	}
 }
+
+// TestActivityReportsTheFoldsOpenGatesAndPosition: Activity is the Host's only
+// local reader of a runtime's gate state, which the warm release consults
+// before evicting a session. It reports the gates the fold holds open and the
+// journal position the fold reached, and the position moves on an event that
+// is not a gate at all, because it is how the composition sees that an idle
+// runtime did something between two samples.
+func TestActivityReportsTheFoldsOpenGatesAndPosition(t *testing.T) {
+	session := &fakeSession{}
+	ask := opened(0x10, gate.KindAskUser, 0)
+	session.append(ask, 4)
+	h := start(t, session)
+	h.awaitConverged(t)
+	if open, position, folded := h.publisher.Activity(); !folded || open != 1 || position != 5 {
+		t.Fatalf("Activity() = (%d, %d, %v), want (1, 5, true): one open gate, folded through sequence 4", open, position, folded)
+	}
+
+	session.append(resolved(0x30, ask.Gate.ID), 6)
+	h.hints.hint()
+	h.awaitConverged(t)
+	if open, position, folded := h.publisher.Activity(); !folded || open != 0 || position != 7 {
+		t.Fatalf("after the resolve Activity() = (%d, %d, %v), want (0, 7, true)", open, position, folded)
+	}
+
+	session.append(event.TurnDone{}, 9)
+	h.hints.hint()
+	eventually(t, "the fold to pass a non-gate event", func() bool {
+		_, position, _ := h.publisher.Activity()
+		return position == 10
+	})
+	if open, _, _ := h.publisher.Activity(); open != 0 {
+		t.Fatalf("a non-gate event changed the open count to %d", open)
+	}
+}
