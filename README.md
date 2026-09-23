@@ -47,7 +47,7 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.38.0. Core is v0.11.0.
+`github.com/looprig/harness` v0.39.0. Core is v0.11.0.
 
 **host v0.7.1 pairs with harness v0.37.1**, which is v0.37.0 plus one further
 fix, and both matter to a pooled fleet.
@@ -147,6 +147,55 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Upgrading to v0.9.0: an open gate survives failover, and a pooled Host stops growing
+
+**host v0.9.0 pairs with harness v0.39.0**, whose restore keeps a session's open
+gate and resumes the turn that was parked at it. Nothing in Host's code path
+changes for it, but what an operator sees after a crash, a drain, a warm release
+or an outage abandon does:
+
+- **Permission gate:** the successor restores the gate open and resumes the parked
+  turn. The answer is applied there and **the approved tool runs exactly once**.
+  (Before, the turn was interrupted and the tool never ran.)
+- **ask_user gate:** for a tool that declares `tool.UserInputReplaySafe` —
+  `askuser.AskUser` from **tools v0.13.0** — the gate stays open and **the answer
+  reaches the waiting tool** as its result. A tool that does not declare it keeps
+  the old fail-safe: the gate is closed `restore_unavailable` and an answer settles
+  `no_op` (the user is asked again).
+- **A restored gated session is no longer idle.** Its resumed turn waits at the
+  gate, so a warm release leaves it resident, and **a drain of the Host that
+  restored it is crash-equivalent** exactly as a drain of the original Host is:
+  the release is refused within the grace, the runtime is left parked, the gate
+  stays projected, and the next Host restores it again. The same rule applies:
+  a Host that drains with a gate open MUST exit.
+- A restore may journal `GateResolved{abandoned}` for a restored gate the resumed
+  turn did not adopt, so a gate can carry more than one close. The gate projection
+  folds closes as a set; a duplicate is a no-op.
+
+Harness's known limits carry over: a gate raised by a subagent or foreign loop,
+or inside a turn that compacted, keeps the old closure; an answer saved between
+the gate closing and its step completing is lost if the runtime dies in that
+window (the tool never runs twice). v0.39.0 is **not** a one-way upgrade.
+
+Two booked Host defects are fixed:
+
+- **B1: a long-lived pooled Host no longer grows per session.** The residency
+  manager kept a record — the session context the runtime runs on and the
+  ownership handle, which reaches the runtime — for every session the Host had ever
+  held. Every path that ends a residency (warm release, drain, lost grant,
+  persistence fault) now prunes it and cancels the context once the runtime was
+  released or abandoned. A runtime left parked by a refused drain release keeps
+  its context uncancelled, as before.
+- **B2: no over-admission by one when a session is re-placed onto the same Host.**
+  The admission charge was keyed by session and `Admit` is idempotent, so a
+  successor attach that admitted the session after the old residency's registry
+  entry was removed and before its credit took the old charge, and the credit
+  then uncharged the successor. The charge is now owned by the residency's
+  generation: a re-admission claims it for the attach in flight, and only the
+  owning generation's credit returns it.
+
+There is no exported API change.
+
 ## Upgrading to v0.8.1: a draining Host stops applying commands first
 
 Before v0.8.1 a drain stopped a session's command consumer only when it released
@@ -187,8 +236,11 @@ are known limits under harness v0.38.0:
   if the resumed turn finished within the idle boundary, it released
   gracefully with the answer honoured.
 
-Both limits are harness bookings: restoring ask_user gates after failover, and
-continuing a restored permission-gated turn. The trade is deliberate. The
+Both limits are lifted from **host v0.9.0 with harness v0.39.0**: a permission
+answer runs the tool once on the successor, and with a replay-safe ask_user tool
+(tools ≥ v0.13.0) the answer reaches the tool. See "Upgrading to v0.9.0". They were
+harness bookings: restoring ask_user gates after failover, and continuing a
+restored permission-gated turn. The trade is deliberate. The
 alternative is applying commands under a `releasing` registration, which is
 the defect this release fixes.
 
@@ -459,8 +511,8 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
 - **After a restore**, a permission gate is restored open and answerable, but
   the turn that was parked at it is `TurnInterrupted`: the approval is applied
   and nothing runs the tool. An **ask_user** gate is closed at restore
-  (`restore_unavailable`) and an answer to it settles `no_op`. Both are booked
-  for harness v0.36.0.
+  (`restore_unavailable`) and an answer to it settles `no_op`. Both are lifted by
+  harness v0.39.0 (host v0.9.0); see "Upgrading to v0.9.0".
 - A crash between the runtime's `GateResolved` and its disposition frame leaves
   the command `applying` forever (never a false `not_applied`): the same
   liveness gap input has.
