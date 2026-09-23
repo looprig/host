@@ -145,8 +145,10 @@ func (f failingCommands) PublicCommand(context.Context, uuid.UUID, uint64) (sess
 func TestAMappingThatCannotBeReadFailsTheProjection(t *testing.T) {
 	cause := errors.New("store down")
 	body := `{"cause":{"command_id":"` + runtimeCommand + `"},"type":"X"}`
-	if _, err := Project(context.Background(), json.RawMessage(body), ids(failingCommands{cause}), 1); !errors.Is(err, cause) {
-		t.Fatalf("Project = %v, want the mapping's error", err)
+	_, err := Project(context.Background(), json.RawMessage(body), ids(failingCommands{cause}), 1)
+	var mapping *MappingError
+	if !errors.Is(err, cause) || !errors.As(err, &mapping) {
+		t.Fatalf("Project = %v, want the mapping's error as a *MappingError", err)
 	}
 }
 

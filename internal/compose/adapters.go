@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
+	"github.com/looprig/host/internal/service"
 )
 
 // clockAdapter narrows the composition's Clock to the two one-method time
@@ -193,7 +194,10 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	if err != nil {
 		return nil, err
 	}
-	tail, err := link.tails.PublishProjected(ctx, request.Key, request.Runtime, s.publicProjector(ctx, request))
+	projector := s.publicProjector(ctx, request)
+	tail, err := s.superviseTail(ctx, request.Key, func() (*service.Tail, error) {
+		return link.tails.PublishProjected(ctx, request.Key, request.Runtime, projector)
+	})
 	if err != nil {
 		return nil, err
 	}

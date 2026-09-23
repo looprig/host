@@ -70,6 +70,14 @@ type Identities struct {
 	Commands Commands
 }
 
+// MappingError reports a command mapping that could not be READ — a store or
+// journal failure, not a finding about the body. It is the one projection
+// failure a caller may retry: the same body projects once the read succeeds.
+type MappingError struct{ Cause error }
+
+func (e *MappingError) Error() string { return "publicbody: read the command mapping: " + e.Cause.Error() }
+func (e *MappingError) Unwrap() error { return e.Cause }
+
 // ErrNonCanonical reports a body this package would not hand on: one that is
 // not canonical JSON on the way in, or whose projection would not be.
 var ErrNonCanonical = errors.New("publicbody: the public body is not canonical JSON")
@@ -223,7 +231,11 @@ func (p projector) command(raw json.RawMessage) (sessionwire.CommandID, bool, er
 	if err != nil || runtime.IsZero() || p.ids.Commands == nil {
 		return "", false, nil
 	}
-	return p.ids.Commands.PublicCommand(p.ctx, runtime, p.seq)
+	public, ok, err := p.ids.Commands.PublicCommand(p.ctx, runtime, p.seq)
+	if err != nil {
+		return "", false, &MappingError{Cause: err}
+	}
+	return public, ok, nil
 }
 
 // projectArray projects each element of one array.

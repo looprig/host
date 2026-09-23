@@ -1161,3 +1161,36 @@ func awaitPublished(t *testing.T, tail *service.Tail, n uint64) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestAStopDuringAProjectionIsAStopNotARefusal is review F2's second half: a
+// projector blocked on a read when Host stops the tail returns the context's
+// error, and that must end the tail Stopped with every route left alone.
+func TestAStopDuringAProjectionIsAStopNotARefusal(t *testing.T) {
+	t.Parallel()
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	routes := &recordingRoutes{}
+	stream := make(chan sessionwire.EnduringPublication, 1)
+	stream <- sessionwire.EnduringPublication{
+		TenantID: key.TenantID, SessionID: key.SessionID, EventID: "event-1",
+		JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"x"}`),
+	}
+	entered := make(chan struct{})
+	tail, err := newTails(t, &recordingPublications{}, routes).PublishProjected(t.Context(), key, scriptedSubscriber{stream: stream},
+		func(ctx context.Context, _ json.RawMessage, _ uint64) (json.RawMessage, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	if err != nil {
+		t.Fatalf("PublishProjected: %v", err)
+	}
+	<-entered
+	tail.Stop()
+	<-tail.Done()
+	if end, _ := tail.End(); end != service.TailEndStopped {
+		t.Fatalf("a tail stopped during a projection ended %q, want stopped", end)
+	}
+	if got := routes.sessions(); len(got) != 0 {
+		t.Fatalf("a stop invalidated routes %v", got)
+	}
+}

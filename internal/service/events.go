@@ -320,6 +320,14 @@ func (t *Tails) relay(
 				return
 			}
 			if err := t.publish(ctx, tail, publication); err != nil {
+				// A STOP DURING A PUBLISH IS A STOP. A Projector blocked on a
+				// read returns the context's error when Host stops the tail,
+				// and recording that as a refusal would invalidate routes
+				// nobody lost (review F2).
+				if ctx.Err() != nil {
+					tail.finish(TailEndStopped, ctx.Err())
+					return
+				}
 				tail.finish(TailEndRefused, err)
 				t.invalidate(tail)
 				return
