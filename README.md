@@ -47,19 +47,37 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.37.0. Core is v0.11.0.
+`github.com/looprig/harness` v0.37.1. Core is v0.11.0.
 
-**host v0.7.1 pairs with harness v0.37.0**, which closes a crash window where an
-admitted input could settle `applied` with its effect lost, or a graceful
-shutdown could cancel an input the store already recorded applied: see harness's
-own v0.37.0 release notes for the mechanism (`Admission`, replay-from-intent on
-restore). It requires no Host code change and is not a one-way upgrade — a
-v0.36.0 runtime still opens a v0.37.0 journal, and a v0.37.0 runtime replays
-input debt a crashed v0.36.0 runtime owed. **Do not mix harness v0.36.0 and
-v0.37.0 runtimes over one Host pool**: only a v0.37.0 runtime performs the
+**host v0.7.1 pairs with harness v0.37.1**, which is v0.37.0 plus one further
+fix, and both matter to a pooled fleet.
+
+v0.37.0 closes a crash window where an admitted input could settle `applied`
+with its effect lost, or a graceful shutdown could cancel an input the store
+already recorded applied: see harness's own v0.37.0 release notes for the
+mechanism (`Admission`, replay-from-intent on restore). It requires no Host
+code change and is not a one-way upgrade — a v0.36.0 runtime still opens a
+v0.37.0 journal, and a v0.37.0 runtime replays input debt a crashed v0.36.0
+runtime owed. **Do not mix harness v0.36.0 and v0.37.0 (or v0.37.1) runtimes
+over one Host pool**: only a v0.37.0-or-later runtime performs the
 replay-on-restore that makes the fix effective, so a pool serving the same
 sessions from both leaves the outcome dependent on which runtime happens to
 restore a given session.
+
+**v0.37.1 lifts the obligation that every pooled Host must mount the
+workspace base at the same path.** Before it, restoring a session onto a Host
+whose per-session workspace base differed from the one it was created under
+(a pod-specific mount path, a rollout that changed the mount, pooled and
+dedicated Pods with different paths, a symlink resolving differently per
+node) was refused — `"restore rejected by policy: 1 warn category
+(workspace)"` — and the session was silently never re-placed. Restore now
+compares placements by mode alone; a placement-mode change, a different
+exclusive or shared fixed root, a placement added or removed, and a
+caller-supplied root still warn. The written fingerprint is byte-identical to
+v0.37.0, so this is also not a one-way upgrade by itself — but **a fleet that
+relocates workspace bases across Hosts needs v0.37.1 on every Host that may
+restore one of its sessions**; a v0.37.0 Host still refuses a relocated
+base.
 
 **A composed Host applies a command end to end: it attaches a disposition
 session, consumes its durable command stream, claims a command under its
