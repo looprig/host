@@ -50,13 +50,104 @@ const (
 	warmPoll = 20 * time.Millisecond
 )
 
-// warmHost composes and starts one Host with a short warm window.
+// warmHost composes and starts one Host with a short warm window and a fast
+// reconcile interval, so admitInput's durably admitted first command is found
+// and applied quickly rather than waiting out the composeFixture default of a
+// full minute.
 func (w *realRuntimeWorld) warmHost(t *testing.T, generation uint64) (*host.Service, *capturingLauncher) {
 	t.Helper()
 	return w.hostWith(t, generation, func(blueprint *host.Composition) {
 		blueprint.Options.WarmTTL = warmTTL
 		blueprint.WorkPoll = warmPoll
+		blueprint.Options.ReconcileInterval = warmPoll
 	})
+}
+
+// admitInput admits an input through the durable disposition inbox, exactly
+// as Factory does, and returns its id. Call it BEFORE attaching the Host that
+// will serve it.
+//
+// THAT ORDERING IS THE FIX FOR THE RACE CLAUDE_REVIEW_HOST_V071.md's N3
+// DESCRIBES. The old test attached, then called Submit directly on the raw
+// harness controller: nothing durable named the coming work until the runtime
+// itself picked it up, so a scheduler delay between attach and Submit let the
+// warm releaser arm, confirm idle over a truly EMPTY inbox, halt the consumer
+// and release — out from under a Submit that was about to happen. It is also
+// not how Factory ever attaches: Factory's PendingSweeper places a session
+// only once it already has open work (README, "A composed Host applies a
+// command end to end"), so admitting first is the realistic order, not a test
+// convenience.
+//
+// Admitting before attach means the pending command is already durable at
+// residency epoch zero. Even a long delay before the Host is ever asked to
+// look at it cannot lose the race: the warm release's own re-read of the
+// inbox — proven by TestAPendingCommandAbortsTheWarmReleaseAndIsApplied to run
+// BEFORE a release completes — finds the command REGARDLESS of how slowly the
+// consumer gets around to claiming it, so the release aborts every single
+// pass until the command is claimed and applying. The unsafe window the old
+// test could hit — a release completing over an inbox that is durably empty
+// because nothing has been admitted yet — cannot occur here, because
+// something is always durably pending from the first instant the session is
+// resident.
+func (w *realRuntimeWorld) admitInput(t *testing.T, text string) sessionwire.CommandID {
+	t.Helper()
+	id := sessionwire.CommandID("warm-release-turn-" + strconv.FormatInt(time.Now().UnixNano(), 36))
+	request := sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: id},
+		SessionID:       composeSession,
+		Blocks:          json.RawMessage(`[{"type":"text","text":` + strconv.Quote(text) + `}]`),
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCommand, err := uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, err := w.factory.AdmitDispositionCommand(t.Context(), sessionstore.AdmitDispositionCommandRequest{
+		TenantID: composeTenant, SessionID: composeSession, CommandID: id, Binding: w.binding,
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeCommand.String()),
+		Kind:                     "input", Payload: payload,
+		AcceptedAt: now, ApplyDeadline: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("admit the input %q: %v", text, err)
+	}
+	return id
+}
+
+// awaitApplied waits for an admitInput command to settle applied.
+//
+// IT DOES NOT WaitIdle ON THE CAPTURED CONTROLLER, deliberately: Applied is
+// the durable disposition outcome and is a STRONGER signal than idle — the
+// applier settles a command applied only once the runtime's own effect is
+// durably recorded (TestAPendingCommandAbortsTheWarmReleaseAndIsApplied
+// checks TurnDone only after Applied) — and under a delay long enough to
+// exercise the warm release, the session may already have been warm-released
+// by the time this returns, which retires the very controller a caller would
+// wait on. Waiting on it here would swap one race for another.
+func (w *realRuntimeWorld) awaitApplied(t *testing.T, id sessionwire.CommandID, text string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	var entry sessionstore.DispositionInboxEntry
+	for {
+		var err error
+		entry, err = w.factory.GetDispositionCommand(t.Context(), sessionstore.GetDispositionCommandRequest{TenantID: composeTenant, SessionID: composeSession, CommandID: id})
+		if err != nil {
+			t.Fatalf("GetDispositionCommand(%s): %v", id, err)
+		}
+		if entry.Record.State == sessionstore.InboxStateApplied || entry.Record.State == sessionstore.InboxStateRejected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the admitted input %q did not settle within 15s: command state %+v", text, entry.Record)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if entry.Record.State != sessionstore.InboxStateApplied {
+		t.Fatalf("the admitted input %q settled %q, want applied", text, entry.Record.State)
+	}
 }
 
 // residencyHeld reports whether some Host still holds the session's residency
@@ -94,12 +185,13 @@ func (w *realRuntimeWorld) awaitReleased(t *testing.T, bound time.Duration) bool
 // released it without stopping, and the journal records no SessionStopped.
 func TestAnIdlePooledSessionIsWarmReleasedByAComposedHost(t *testing.T) {
 	world := newRealRuntimeWorld(t)
-	service, launcher := world.warmHost(t, 4)
+	service, _ := world.warmHost(t, 4)
 	t.Cleanup(func() { stopBounded(service) })
+	id := world.admitInput(t, rememberedWord)
 	if _, err := attachAsFactoryDoes(t, service); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	world.turn(t, launcher.controller(), rememberedWord)
+	world.awaitApplied(t, id, rememberedWord)
 
 	if !world.awaitReleased(t, 20*warmTTL+5*time.Second) {
 		t.Fatalf("an idle pooled session was still resident %v after going idle with a %v warm TTL: the composed Host never warm-released it", 20*warmTTL+5*time.Second, warmTTL)
@@ -114,12 +206,13 @@ func TestAnIdlePooledSessionIsWarmReleasedByAComposedHost(t *testing.T) {
 // next command, and restores the same conversation rather than restarting it.
 func TestAWarmReleasedSessionIsRestoredByTheNextHost(t *testing.T) {
 	world := newRealRuntimeWorld(t)
-	first, firstLauncher := world.warmHost(t, 4)
+	first, _ := world.warmHost(t, 4)
 	t.Cleanup(func() { stopBounded(first) })
+	id := world.admitInput(t, rememberedWord)
 	if _, err := attachAsFactoryDoes(t, first); err != nil {
 		t.Fatalf("Host A attach: %v", err)
 	}
-	world.turn(t, firstLauncher.controller(), rememberedWord)
+	world.awaitApplied(t, id, rememberedWord)
 	if !world.awaitReleased(t, 20*warmTTL+5*time.Second) {
 		t.Fatal("Host A never warm-released the idle session")
 	}

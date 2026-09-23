@@ -118,6 +118,16 @@ type realRuntimeWorld struct {
 	llm       *harnesstest.RecordingLLM
 	runtimeID uuid.UUID
 
+	// factory is a second store handle over the same backend, opened exactly
+	// as Factory would: it is what admittedTurn uses to admit a command
+	// through the durable disposition inbox instead of calling Submit on the
+	// raw controller.
+	factory *sessionstore.Store
+
+	// binding is the session's storage binding, matching the catalog entry
+	// this world seeds and what admittedTurn's AdmitDispositionCommand names.
+	binding sessionstore.SessionBinding
+
 	// model, when set, is the model every Host's rig talks to instead of llm.
 	model inference.Client
 
@@ -132,8 +142,21 @@ func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
 	// be computed from, the Core session id. The binding is the only record of
 	// it, which is the point.
 	runtimeID := uuid.MustParse("0f4d2a6c-81b3-8e57-9c20-6a1e7d3b5f48")
-	world := &realRuntimeWorld{fixture: fixture, journal: fixture.journal, llm: &harnesstest.RecordingLLM{}, runtimeID: runtimeID}
 	other := fixture.otherParty(t)
+	binding := sessionstore.SessionBinding{
+		StorageBindingID: composeBinding,
+		BindingVersion:   "v1",
+		RuntimeSessionID: runtimeID.String(),
+		ProtocolMode:     sessionstore.ProtocolModeDisposition,
+	}
+	world := &realRuntimeWorld{
+		fixture:   fixture,
+		journal:   fixture.journal,
+		llm:       &harnesstest.RecordingLLM{},
+		runtimeID: runtimeID,
+		factory:   other,
+		binding:   binding,
+	}
 	now := time.Now().UTC()
 	if _, _, err := other.CreateCatalogEntry(t.Context(), sessionstore.CreateCatalogEntryRequest{
 		TenantID:               composeTenant,
@@ -146,12 +169,7 @@ func newRealRuntimeWorld(t *testing.T) *realRuntimeWorld {
 		Residency:              sessionwire.SessionResidencyCold,
 		DesiredPlacement:       sessionwire.HostPlacementPooled,
 		IdempotencyKey:         "idem-real",
-		Binding: sessionstore.SessionBinding{
-			StorageBindingID: composeBinding,
-			BindingVersion:   "v1",
-			RuntimeSessionID: runtimeID.String(),
-			ProtocolMode:     sessionstore.ProtocolModeDisposition,
-		},
+		Binding:                binding,
 	}); err != nil {
 		t.Fatalf("seed the catalog: %v", err)
 	}
@@ -182,7 +200,10 @@ func (w *realRuntimeWorld) hostWith(t *testing.T, generation uint64, adjust func
 		define = w.define
 	}
 	launcher := &capturingLauncher{rig: define(t, w.journal, model)}
-	adapter, err := harnessadapter.New(launcher)
+	// The input-shaped decoder is what lets a command admitted through the
+	// durable disposition inbox (admittedTurn) reach the runtime at all; it is
+	// inert for a test that only ever calls Submit on the raw controller.
+	adapter, err := harnessadapter.New(launcher, harnessadapter.WithBlockDecoder(inputDecoder))
 	if err != nil {
 		t.Fatalf("harnessadapter.New: %v", err)
 	}
