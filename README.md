@@ -47,7 +47,7 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.37.1. Core is v0.11.0.
+`github.com/looprig/harness` v0.38.0. Core is v0.11.0.
 
 **host v0.7.1 pairs with harness v0.37.1**, which is v0.37.0 plus one further
 fix, and both matter to a pooled fleet.
