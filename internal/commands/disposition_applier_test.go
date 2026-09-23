@@ -778,13 +778,15 @@ func TestDispositionClosesAPredecessorsStrandedAttempt(t *testing.T) {
 // THE SCENARIO: a predecessor's runtime committed the attempt's disposition
 // (durable "applied" evidence) and started the effect, but the predecessor
 // died or was paused before its own settle reached the store. A successor
-// takes over — its own claim already ratchets ClaimResidencyEpoch to its
-// higher residency — and is asked to apply the still-`applying` record. The
-// closer is wired to refuse with ErrEnduringEffect, exactly as harness <=
-// v0.36.0's AttemptCloser always did once ANY effect had committed under the
-// attempt: this is deliberately NOT relying on harness v0.37.0's
-// ClosureResult.AlreadyDisposed leniency, because the fix must hold
-// independent of that pairing.
+// with a higher residency epoch is asked to apply the still-`applying`
+// record — no NEW claim happens here: ClaimDispositionCommand never accepts a
+// record that is already `applying`, so ClaimResidencyEpoch already sits at
+// the successor's residency from whichever claim put the record into
+// `applying` in the first place. The closer is wired to refuse with
+// ErrEnduringEffect, exactly as harness <= v0.36.0's AttemptCloser always did
+// once ANY effect had committed under the attempt: this is deliberately NOT
+// relying on harness v0.37.0's ClosureResult.AlreadyDisposed leniency,
+// because the fix must hold independent of that pairing.
 //
 // BEFORE THE FIX (close-before-settle): the successor called the closer
 // first, the closer refused (an effect is already committed), and Process
@@ -800,9 +802,13 @@ func TestASuccessorSettlesAPredecessorsAlreadyDisposedAttemptWithoutTheCloser(t 
 	f := newDispositionFixture(t, func(f *dispositionFixture) {
 		stored := f.put(KindInput, StateApplying)
 		stored.record.Revision = testRevision
-		// The successor's OWN claim already ratcheted the high-water mark to
-		// its residency: a real ClaimDisposition call did this before Process
-		// was ever asked to settle this record.
+		// ClaimResidencyEpoch already sits at the successor's residency —
+		// from the claim that authorized this attempt, before the record
+		// went to `applying`, not from any new claim happening now (see the
+		// scenario comment above: ClaimDispositionCommand never accepts an
+		// already-`applying` record). This mark plays no role in refusing
+		// the predecessor's stale settle below; only the revision
+		// compare-and-swap does (see the assertion at the end of this test).
 		stored.record.ClaimResidencyEpoch = testEpoch
 		stored.record.ClaimExpiresAt = testClockAt.Add(time.Minute)
 		// The attempt is the PREDECESSOR's: an earlier journal grant, and a
@@ -846,7 +852,7 @@ func TestASuccessorSettlesAPredecessorsAlreadyDisposedAttemptWithoutTheCloser(t 
 		ResidencyEpoch:   testOtherEpoch,
 	})
 	if err == nil {
-		t.Fatal("the predecessor's stale settle succeeded; it must be refused by the record's revision/residency mark now that the successor has already settled")
+		t.Fatal("the predecessor's stale settle succeeded; it must be refused by the record's revision compare-and-swap alone, now that the successor's settle has already moved it")
 	}
 	if got := f.stored().record.State; got != StateApplied {
 		t.Errorf("after the stale settle attempt the durable record is %q, want it to remain %q as the successor left it", got, StateApplied)
