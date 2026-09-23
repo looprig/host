@@ -534,29 +534,40 @@ func TestACommandAdmittedDuringTheReleaseIsLeftForTheSuccessor(t *testing.T) {
 	}
 }
 
-// TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld is F3 over the
-// real harness runtime. A turn starts inside the release window (while the
-// release is paused at its checkpoint), so at step 4 the runtime is busy and
-// harness would wait for it. The runtime release is bounded by the drain's
-// grace; when it expires the session is HELD — still resident under its grant,
-// its live output still relayed — rather than torn down under a running turn
-// or wedging the releaser. The turn finishes, and the Host then stops cleanly.
-func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T) {
+// countingCheckpointer counts every checkpoint, pausing the first.
+type countingCheckpointer struct {
+	inner *pausingCheckpointer
+	calls atomic.Int32
+}
+
+func (c *countingCheckpointer) Checkpoint(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	c.calls.Add(1)
+	return c.inner.Checkpoint(ctx, tenant, session)
+}
+
+// TestARuntimeThatTurnsBusyInsideTheReleaseIsTakenBack is F3 and the regate's
+// G2 over the real harness runtime. A turn starts inside the release window,
+// so at step 4 the runtime is busy and harness would wait for it. The runtime
+// release is bounded by the drain's grace, and when it expires the release is
+// TAKEN BACK: the session is resident and admitting again under its grant,
+// never torn down under the turn.
+func TestARuntimeThatTurnsBusyInsideTheReleaseIsTakenBack(t *testing.T) {
 	world := newRealRuntimeWorld(t)
 	model := &blockingLLM{inner: world.llm, opened: make(chan struct{})}
 	t.Cleanup(model.unblock)
 	world.model = model
-	checkpointer := newPausingCheckpointer()
+	checkpointer := &countingCheckpointer{inner: newPausingCheckpointer()}
 	service, launcher := world.hostWith(t, 4, func(blueprint *host.Composition) {
 		blueprint.Options.WarmTTL = warmTTL
 		blueprint.WorkPoll = warmPoll
 		blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 500 * time.Millisecond, PublishBound: 500 * time.Millisecond}
 		blueprint.Collaborators.Checkpointer = checkpointer
 	})
+	t.Cleanup(func() { stopBounded(service) })
 	if _, err := attachAsFactoryDoes(t, service); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	checkpointer.awaitEntered(t)
+	checkpointer.inner.awaitEntered(t)
 
 	if _, err := launcher.controller().Submit(t.Context(), []content.Block{&content.TextBlock{Text: "started inside the release"}}); err != nil {
 		t.Fatalf("Submit: %v", err)
@@ -568,37 +579,89 @@ func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	close(checkpointer.proceed)
+	close(checkpointer.inner.proceed)
 
-	// Well past the grace: the release stopped at step 4, and the grant is
-	// still held by this Host.
-	time.Sleep(3 * time.Second)
-	if !world.residencyHeld(t) {
-		t.Fatal("the grant was handed back while the runtime was running a turn")
-	}
-	if got := sessionsIn(t, service, "releasing"); got != 1 {
-		t.Fatalf("host_sessions{state=\"releasing\"} = %d, want the one held session", got)
-	}
-	if got := releaseFailures(t, service); got != 1 {
-		t.Fatalf("host_release_failures_total = %d, want 1: the release must have STOPPED at the bounded runtime release, not still be waiting on it", got)
-	}
-	if got := countOf[event.SessionStopped](t, world.journal, world.runtimeID); got != 0 {
-		t.Fatalf("%d SessionStopped; a held session is not terminated", got)
-	}
-
-	model.unblock()
-	gateDeadline := time.Now().Add(10 * time.Second)
-	for countOf[event.TurnDone](t, world.journal, world.runtimeID) == 0 {
-		if time.Now().After(gateDeadline) {
-			t.Fatal("the held session's turn never finished")
+	// The release STOPPED at the bounded runtime release (one counted
+	// failure, not still waiting) and was taken back.
+	deadline = time.Now().Add(10 * time.Second)
+	for releaseFailures(t, service) != 1 || residentSessions(t, service) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the release was never taken back: failures %d, resident %d, releasing %d",
+				releaseFailures(t, service), residentSessions(t, service), sessionsIn(t, service, "releasing"))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	stopWithin(t, service)
-	if world.residencyHeld(t) {
-		t.Fatal("after the drain the held session's grant is still held")
+	if got := sessionsIn(t, service, "releasing"); got != 0 {
+		t.Fatalf("host_sessions{state=\"releasing\"} = %d after the release was taken back", got)
 	}
-	// THE DRAIN RELEASED THE RUNTIME: a held session is still offered to it.
+	if !world.residencyHeld(t) {
+		t.Fatal("the grant was handed back while the runtime was running a turn")
+	}
+	if got := countOf[event.SessionStopped](t, world.journal, world.runtimeID); got != 0 {
+		t.Fatalf("%d SessionStopped; a taken-back release terminates nothing", got)
+	}
+}
+
+// TestRegateHeldSessionIsCheckpointedAgainAtDrain is the regate reviewer's G1
+// test, kept by name and adapted to the G2 fix: the release step 3 took a
+// checkpoint while a turn was in flight, and the release was then taken back.
+// Whatever next hands the lease back — here the next warm release, once the
+// turn is done — must checkpoint AGAIN, after the turn's work, or a successor
+// restores a workspace that predates it. Red at 4a07e59 (the drain found the
+// checkpoint latched and never called the product).
+func TestRegateHeldSessionIsCheckpointedAgainAtDrain(t *testing.T) {
+	world := newRealRuntimeWorld(t)
+	model := &blockingLLM{inner: world.llm, opened: make(chan struct{})}
+	t.Cleanup(model.unblock)
+	world.model = model
+	checkpointer := &countingCheckpointer{inner: newPausingCheckpointer()}
+	service, launcher := world.hostWith(t, 4, func(blueprint *host.Composition) {
+		blueprint.Options.WarmTTL = warmTTL
+		blueprint.WorkPoll = warmPoll
+		blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 500 * time.Millisecond, PublishBound: 500 * time.Millisecond}
+		blueprint.Collaborators.Checkpointer = checkpointer
+	})
+	t.Cleanup(func() { stopBounded(service) })
+	if _, err := attachAsFactoryDoes(t, service); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	checkpointer.inner.awaitEntered(t)
+	if _, err := launcher.controller().Submit(t.Context(), []content.Block{&content.TextBlock{Text: "started inside the release"}}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for model.calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no model call")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(checkpointer.inner.proceed)
+	for releaseFailures(t, service) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the release never stopped at the runtime release")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	model.unblock()
+	for countOf[event.TurnDone](t, world.journal, world.runtimeID) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the turn never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	before := checkpointer.calls.Load()
+
+	// Hand the lease back by whichever path comes first: the next warm
+	// release (the session is idle again) or the drain.
+	if !world.awaitReleased(t, 20*time.Second) {
+		stopWithin(t, service)
+	}
+	after := checkpointer.calls.Load()
+	t.Logf("checkpoint calls: after the turn %d, when the lease was handed back %d", before, after)
+	if after == before {
+		t.Fatalf("the lease was handed back WITHOUT checkpointing the work done after the first release's checkpoint (calls stayed %d)", after)
+	}
 	live, ok := launcher.controller().(session.Liveness)
 	if !ok {
 		t.Fatal("the harness session is not a session.Liveness")
@@ -606,7 +669,10 @@ func TestARuntimeThatTurnsBusyInsideTheReleaseLeavesTheSessionHeld(t *testing.T)
 	select {
 	case <-live.Done():
 	case <-time.After(5 * time.Second):
-		t.Fatal("after the drain the held session's runtime was never released")
+		t.Fatal("the runtime was never released")
+	}
+	if got := countOf[event.SessionStopped](t, world.journal, world.runtimeID); got != 0 {
+		t.Fatalf("%d SessionStopped; releases are nonterminal", got)
 	}
 }
 
@@ -744,47 +810,126 @@ func releaseFailures(t *testing.T, service *host.Service) int {
 	return 0
 }
 
-// TestAHeldSessionStillPublishesAndAppliesTheAnswerToAGateItRaised is F3's
-// recoverability, over the real harness runtime. Inside the release window the
-// agent asks the user a question, so at step 4 the runtime is parked at a gate
-// and cannot release. After the bounded wait the session is HELD, and it is
-// still a working session: the gate is projected for Factory, the answer is
-// claimed and applied under this Host's live grant, and the agent continues.
-// Tearing its work down before the wait (or not bounding the wait) would leave
-// the question unanswerable.
-func TestAHeldSessionStillPublishesAndAppliesTheAnswerToAGateItRaised(t *testing.T) {
+// durableOwner reads the session's durable Host registration exactly as a
+// Factory does, and reports whether it is the owner Factory's
+// placement.ReusableOwner accepts: resident, accepting, this Host.
+func (w *gateE2EWorld) durableOwner(t *testing.T) sessionwire.HostLinkRegistryObservation {
+	t.Helper()
+	entry, err := w.factory.GetHostRegistration(t.Context(), sessionstore.GetHostRegistrationRequest{TenantID: composeTenant, SessionID: composeSession})
+	if err != nil {
+		t.Fatalf("read the durable Host registration: %v", err)
+	}
+	observation, err := entry.Registration.Observation()
+	if err != nil {
+		t.Fatalf("project the durable registration: %v", err)
+	}
+	return observation
+}
+
+// TestARefusedRuntimeReleaseIsTakenBackToAnOwnerFactoryWillUse is G2, end to
+// end over the real harness runtime and the real HostLink, against every
+// observable a released Factory (v0.7.1) acts on — Factory itself cannot be
+// imported here (import_boundary_test forbids it), so the cross-module run is
+// owed to `tests`:
+//
+//   - the durable registration Factory's placement.ReusableOwner reads
+//     (residency resident, accepting) — which admission of a gate_response
+//     requires, and whose absence makes placement churn;
+//   - a HostLink bind (a reconnecting viewer) is accepted;
+//   - a HostLink command delivery (a wake) is accepted, not refused `releasing`;
+//   - a gate_response admitted only after the owner check passes and woken
+//     over HostLink is applied through the disposition path.
+//
+// Inside the release window the agent asks the user a question, so at step 4
+// the runtime is parked at the gate and refuses to release. The release is
+// taken back. The reconcile interval is a minute, so the answer can only be
+// applied because the wake reached a consumer that is running again.
+func TestARefusedRuntimeReleaseIsTakenBackToAnOwnerFactoryWillUse(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{})
 	checkpointer := newPausingCheckpointer()
 	world.adjust = func(blueprint *host.Composition) {
 		blueprint.Options.WarmTTL = warmTTL
+		blueprint.Options.ReconcileInterval = time.Minute
 		blueprint.WorkPoll = warmPoll
 		blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 500 * time.Millisecond, PublishBound: 500 * time.Millisecond}
 		blueprint.Collaborators.Checkpointer = checkpointer
 	}
-	service, launcher, _ := world.host(t, 4)
+	service, launcher := world.compose(t, 4, nil)
 	t.Cleanup(func() { stopBounded(service) })
-	checkpointer.awaitEntered(t)
+	server := httptest.NewServer(service.Handler())
+	t.Cleanup(server.Close)
+	link := dialHostLink(t, server.URL, composeTenant)
+	t.Cleanup(func() { _ = link.Close() })
 
+	attach := rpcOver(t, link, 2, sessionwire.HostLinkMethodAttach, sessionwire.HostLinkAttachRequest{
+		Version: sessionwire.CurrentWireVersion, TenantID: composeTenant, SessionID: composeSession,
+		HostID: "host-a", HostGeneration: 4, AgentID: composeAgent, RuntimeCompatibilityID: string(composeCompat),
+		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory", IdempotencyKey: "attach-g2",
+	})
+	if attach.Error != nil {
+		t.Fatalf("attach over HostLink: %#v", *attach.Error)
+	}
+	var attached sessionwire.HostLinkRegistryObservation
+	if err := json.Unmarshal(attach.RPC.Data, &attached); err != nil {
+		t.Fatalf("decode the attach observation: %v", err)
+	}
+	bind := func(id uint32, key string) linkReply {
+		return rpcOver(t, link, id, sessionwire.HostLinkMethodBind, sessionwire.HostLinkBindRequest{
+			Version: sessionwire.CurrentWireVersion, TenantID: composeTenant, SessionID: composeSession,
+			HostID: "host-a", HostGeneration: 4, LeaseEpoch: attached.LeaseEpoch,
+			RuntimeCompatibilityID: string(composeCompat), IdempotencyKey: key,
+		})
+	}
+	assertAcceptedRPC(t, bind(3, "bind-before"), "bind before the release")
+
+	// THE RELEASE IS UNDER WAY: to Factory the session is releasing.
+	checkpointer.awaitEntered(t)
+	if owner := world.durableOwner(t); owner.Residency != sessionwire.SessionResidencyReleasing || owner.Accepting {
+		t.Fatalf("mid-release the durable registration is %s/accepting=%v, want releasing and not accepting", owner.Residency, owner.Accepting)
+	}
 	world.submit(t, launcher.controller(), "PLEASE-ASK")
 	opened := world.gates(t, 1)[0]
 	close(checkpointer.proceed)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for releaseFailures(t, service) == 0 {
+	// THE RELEASE IS TAKEN BACK: one counted failure, and the durable owner is
+	// resident and accepting again under the same epoch.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		owner := world.durableOwner(t)
+		if releaseFailures(t, service) == 1 && owner.Residency == sessionwire.SessionResidencyResident && owner.Accepting {
+			if owner.LeaseEpoch != attached.LeaseEpoch || owner.HostGeneration != 4 {
+				t.Fatalf("the taken-back owner is %+v, want the attach's epoch %d at generation 4", owner, attached.LeaseEpoch)
+			}
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("the warm release never stopped at the runtime release; it is still waiting on a runtime parked at a gate")
+			t.Fatalf("the release was never taken back: failures %d, durable owner %s/accepting=%v", releaseFailures(t, service), owner.Residency, owner.Accepting)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := sessionsIn(t, service, "releasing"); got != 1 {
-		t.Fatalf("host_sessions{state=\"releasing\"} = %d, want the one held session", got)
+	if got := sessionsIn(t, service, "releasing"); got != 0 {
+		t.Fatalf("host_sessions{state=\"releasing\"} = %d after the release was taken back", got)
 	}
 
+	// A RECONNECTING VIEWER BINDS.
+	assertAcceptedRPC(t, bind(4, "bind-after"), "bind after the release was taken back")
+
+	// THE ANSWER GOES THROUGH ADMISSION: the owner check Factory makes first,
+	// then the durable admission, then the HostLink wake.
+	if owner := world.durableOwner(t); owner.Residency != sessionwire.SessionResidencyResident || !owner.Accepting {
+		t.Fatalf("Factory's owner check would refuse the answer: %s/accepting=%v", owner.Residency, owner.Accepting)
+	}
 	id := world.answer(t, opened, "answer", answerValue())
-	if entry := world.settled(t, id); outcomeOf(t, entry) != "applied" {
-		t.Fatalf("the held session settled the answer %q, want applied", outcomeOf(t, entry))
+	channel := sessionwire.HostLinkChannel(composeTenant, composeSession)
+	assertAcceptedRPC(t, rpcOver(t, link, 5, channel, sessionwire.HostLinkCommandDelivery{CommandID: id}), "the gate_response wake")
+	if entry := world.settled(t, id); outcomeOf(t, entry) != "applied" || entry.Record.Attempt == nil {
+		t.Fatalf("the answer settled %q (attempt %+v), want applied through an authorized attempt", outcomeOf(t, entry), entry.Record.Attempt)
 	}
 	gateE2EEventually(t, "the agent to continue with the answer", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
+
+	// AND THE WATCH WENT ON: the session is idle again, so it is released.
+	awaitResidentSessions(t, service, 0, 20*time.Second)
+	world.awaitLeaseFree(t, 20*time.Second)
 }
 
 // awaitLeaseFree waits until another party could take the session's residency

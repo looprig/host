@@ -180,10 +180,16 @@ func (s *Service) ConfirmIdle(key registry.Key) bool {
 	if !ok {
 		return false
 	}
+	held := s.residentFor(key)
+	if held == nil {
+		return false
+	}
 	s.activityMu.Lock()
 	mark, had := s.activity[key]
 	s.activityMu.Unlock()
-	return had && mark.position == position
+	// FENCED BY GENERATION, so a mark sampled under a residency this one
+	// REPLACED under the same key can never confirm it.
+	return had && mark.generation == held.generation && mark.position == position
 }
 
 var _ residency.WarmConfirmer = (*Service)(nil)

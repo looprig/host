@@ -761,6 +761,7 @@ type fixture struct {
 	rig         *testkit.FakeRig
 	runtime     *controllableSession
 	work        *fakeWorkStates
+	inbox       *fakeInbox
 	auth        *fakeAuth
 	host        *hostconfig.Host
 	hostOptions hostconfig.Options
@@ -855,7 +856,7 @@ func newFixture(t *testing.T, adjust ...func(*Options, *hostconfig.Options)) *fi
 	}
 	return &fixture{
 		t: t, trace: trace, clock: clock, store: store, directory: directory,
-		rig: rig, runtime: runtimeSession, work: work, auth: auth, host: built, hostOptions: hostOptions, svc: composed,
+		rig: rig, runtime: runtimeSession, work: work, inbox: inbox, auth: auth, host: built, hostOptions: hostOptions, svc: composed,
 	}
 }
 

@@ -467,16 +467,29 @@ func (s *Service) Wake(key registry.Key) {
 // go on offering a released session to the drain, which would then take a
 // second session through a release protocol that has already run.
 //
-// A HELD SESSION IS KEPT, deliberately: its runtime did not release, so it is
-// still live under this Host's grant, and the drain is what must take it
-// through release (or end the process) — which it can do only if this handle
-// is still offered to it. It is logged, because nothing else reports it.
+// A RESUMED OR HELD SESSION IS KEPT, deliberately: its runtime did not
+// release, so it is still live under this Host's grant. A resumed one is an
+// ordinary resident again; a held one is the drain's to release (or to end the
+// process over), which it can do only if this handle is still offered to it.
+// Both are logged, because nothing else reports them.
 func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 	s.metrics.WarmRelease(outcome)
 	switch outcome.Kind {
 	case residency.WarmOutcomeReleased:
 		s.forget(outcome.Key, outcome.Generation)
+	case residency.WarmOutcomeResumed:
+		s.options.logger().LogAttrs(context.Background(), slog.LevelWarn,
+			"host: a warm release was taken back because the runtime did not release; the session is resident and admitting again",
+			slog.String("tenant_id", string(outcome.Key.TenantID)),
+			slog.String("session_id", string(outcome.Key.SessionID)))
 	case residency.WarmOutcomeHeld:
+		// THE DRAIN MUST CHECKPOINT AGAIN: see forgetReleaseProgress.
+		s.mu.Lock()
+		held, present := s.sessions[outcome.Key]
+		s.mu.Unlock()
+		if present && held.generation == outcome.Generation {
+			held.forgetReleaseProgress()
+		}
 		attrs := []slog.Attr{
 			slog.String("tenant_id", string(outcome.Key.TenantID)),
 			slog.String("session_id", string(outcome.Key.SessionID)),

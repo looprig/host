@@ -14,6 +14,7 @@ import (
 
 	"github.com/looprig/host/internal/gates"
 	"github.com/looprig/host/internal/hostconfig"
+	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 )
 
@@ -340,6 +341,21 @@ func TestAnExpiryAfterTheRuntimeTurnedBusyReleasesNothing(t *testing.T) {
 			t.Fatalf("a runtime busy at expiry reached %q: %v", step, f.trace.trace())
 		}
 	}
+	// AND ITS CONSUMER RUNS AGAIN (G3): a pass reads the inbox. A consumer
+	// left halted by this abort would apply nothing admitted to the session.
+	f.svc.mu.Lock()
+	consumer, held := f.svc.consumers[keyA]
+	f.svc.mu.Unlock()
+	if !held {
+		t.Fatal("the session has no consumer after the abort")
+	}
+	asks := len(f.inbox.asked())
+	if _, err := consumer.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile after the abort: %v", err)
+	}
+	if len(f.inbox.asked()) == asks {
+		t.Fatal("after an unconfirmed expiry the session's consumer is still halted")
+	}
 
 	// The turn ends; the next idle sample arms a whole TTL, and it releases.
 	f.runtime.GoIdle()
@@ -409,5 +425,89 @@ func TestAResidentWithNoGatePublisherIsNeverIdle(t *testing.T) {
 	}
 	if f.svc.ConfirmIdle(keyA) {
 		t.Fatal("a resident with no gate publisher was confirmed idle")
+	}
+}
+
+// TestAHeldReleaseLetsTheDrainCheckpointAgain is G1 at the composition: a
+// release that ended HELD had already checkpointed; the session goes on
+// working, so the drain's checkpoint must reach the product again rather than
+// find the step latched.
+func TestAHeldReleaseLetsTheDrainCheckpointAgain(t *testing.T) {
+	f, _ := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	held := f.svc.residentFor(keyA)
+	if err := held.Checkpoint(t.Context()); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := held.Checkpoint(t.Context()); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got := f.trace.count("checkpoint"); got != 1 {
+		t.Fatalf("two checkpoints in one release reached the product %d times, want 1 (the latch)", got)
+	}
+	f.svc.WarmRelease(residency.WarmOutcome{Key: keyA, Generation: held.generation, Kind: residency.WarmOutcomeHeld})
+	if err := held.Checkpoint(t.Context()); err != nil {
+		t.Fatalf("Checkpoint after the hold: %v", err)
+	}
+	if got := f.trace.count("checkpoint"); got != 2 {
+		t.Fatalf("after a held release the next checkpoint reached the product %d times in total, want 2", got)
+	}
+}
+
+// TestATakenBackReleaseForgetsItsProgressAndRefusesAfterWorkStopped: the warm
+// view's AbortRelease reverts and clears the checkpoint latch, and refuses a
+// session whose work the release already stopped.
+func TestATakenBackReleaseForgetsItsProgressAndRefusesAfterWorkStopped(t *testing.T) {
+	f, _ := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	held := f.svc.residentFor(keyA)
+	view := warmSession{resident: held}
+	if err := view.BeginRelease(t.Context()); err != nil {
+		t.Fatalf("BeginRelease: %v", err)
+	}
+	if err := view.Checkpoint(t.Context()); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := view.AbortRelease(t.Context()); err != nil {
+		t.Fatalf("AbortRelease: %v", err)
+	}
+	if entry, ok := f.svc.registry.Get(keyA); !ok || entry.State != registry.StateResident || !entry.Accepting {
+		t.Fatalf("after AbortRelease the registry holds %+v, want resident and accepting", entry)
+	}
+	if err := view.Checkpoint(t.Context()); err != nil {
+		t.Fatalf("Checkpoint after AbortRelease: %v", err)
+	}
+	if got := f.trace.count("checkpoint"); got != 2 {
+		t.Fatalf("a taken-back release's next checkpoint reached the product %d times in total, want 2", got)
+	}
+
+	held.stopWork()
+	if err := view.AbortRelease(t.Context()); !errors.Is(err, errWorkAlreadyStopped) {
+		t.Fatalf("AbortRelease after the work stopped = %v, want errWorkAlreadyStopped", err)
+	}
+}
+
+// TestConfirmIdleIsFencedByTheMarksGeneration (G4): a mark sampled under a
+// residency this one replaced under the same key cannot confirm it.
+func TestConfirmIdleIsFencedByTheMarksGeneration(t *testing.T) {
+	f, _ := derivedFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	awaitState(t, f, residency.WorkStateIdle)
+	held := f.svc.residentFor(keyA)
+	position, ok := f.svc.options.WorkStates.(activityReporter).activity(keyA)
+	if !ok {
+		t.Fatal("no activity position")
+	}
+	f.svc.markActivity(keyA, held.generation, position)
+	if !f.svc.ConfirmIdle(keyA) {
+		t.Fatal("the control: a same-generation mark at the current position did not confirm")
+	}
+	f.svc.pruneActivity(nil)
+	f.svc.markActivity(keyA, held.generation+1, position)
+	if f.svc.ConfirmIdle(keyA) {
+		t.Fatal("a mark from another residency generation confirmed this one")
 	}
 }

@@ -27,6 +27,7 @@ type releaseHalves interface {
 
 	BeginRelease(context.Context) error
 	FinishRelease(context.Context) error
+	AbortRelease(context.Context) error
 }
 
 // errNoReleaseHalves is what a composition reports when its Ownership returns a
@@ -322,6 +323,51 @@ func (s warmSession) ReleaseResidency(ctx context.Context) error {
 		return err
 	}
 	return s.resident.ReleaseResidency(ctx)
+}
+
+// AbortRelease takes a warm release back when the runtime refused to release:
+// the residency returns to resident and admitting under the same generation,
+// and the release progress this resident latched is forgotten, so the next
+// release — warm or drain — begins and CHECKPOINTS again.
+//
+// IT REFUSES IF THE SESSION'S WORK ALREADY STOPPED. The warm view waits for idle
+// before stopping work, so that is reached only when the runtime went idle and
+// then refused anyway; a resident whose consumer, tail and gate publisher are
+// gone cannot be offered to a Factory as a reusable owner, and the release is
+// left held for the drain instead.
+func (s warmSession) AbortRelease(ctx context.Context) error {
+	s.once.mu.Lock()
+	stopped := s.once.workDone
+	s.once.mu.Unlock()
+	if stopped {
+		return errWorkAlreadyStopped
+	}
+	if err := s.halves.AbortRelease(ctx); err != nil {
+		return err
+	}
+	s.forgetReleaseProgress()
+	return nil
+}
+
+// errWorkAlreadyStopped is AbortRelease's refusal for a session whose work the
+// release already stopped.
+var errWorkAlreadyStopped = errors.New("compose: the session's consumer, tail and gate publisher already stopped, so it cannot be offered as a resident again")
+
+// forgetReleaseProgress clears the success latches of the two release steps a
+// release that did not finish may have completed — the durable `releasing`
+// mark and the checkpoint — so the next release performs them again.
+//
+// THE CHECKPOINT IS THE ONE THAT MATTERS. The latches exist so that a warm
+// release and a drain RACING one step run it once; they were never meant to
+// make a checkpoint taken before later work stand for that work. A session
+// whose release was taken back (or held) goes on running turns and writing its
+// workspace, and a successor restores from the last checkpoint.
+func (r *resident) forgetReleaseProgress() {
+	for _, latch := range []*onceOnSuccess{&r.beginOnce, &r.checkpointOnce} {
+		latch.mu.Lock()
+		latch.done = false
+		latch.mu.Unlock()
+	}
 }
 
 // FinishRelease writes the epoch-fenced tombstone and ends the heartbeat. It
