@@ -218,6 +218,12 @@ func (s *Service) restartRefused(ctx context.Context, key registry.Key, supervis
 			if stopped || ctx.Err() != nil {
 				return
 			}
+			// R-F2b: the refused relay returned without cancelling its own
+			// subscription (see Tails.relay), so the old subscription's pump
+			// lives on unless something stops it. Stop it here, before the
+			// new one is opened, rather than leaving it to run until its
+			// buffer overflows or the residency ends.
+			current.Stop()
 			next, err := start()
 			if err != nil {
 				logger.LogAttrs(ctx, slog.LevelError, "host: the session's live tail could not be restarted; retrying",

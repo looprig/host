@@ -93,6 +93,7 @@ func (r *countingRoutes) InvalidateSession(registry.Key) []hostlink.Binding {
 type resubscribable struct {
 	mu      sync.Mutex
 	streams []chan sessionwire.EnduringPublication
+	ctxs    []context.Context
 	opened  chan struct{}
 }
 
@@ -102,9 +103,28 @@ func (r *resubscribable) SubscribeCommitted(ctx context.Context, _ sessionwire.E
 	stream := make(chan sessionwire.EnduringPublication, 4)
 	r.mu.Lock()
 	r.streams = append(r.streams, stream)
+	r.ctxs = append(r.ctxs, ctx)
 	r.mu.Unlock()
 	r.opened <- struct{}{}
 	return stream, nil
+}
+
+// ctxAt returns the context the i'th (0-based) SubscribeCommitted call was
+// opened with.
+func (r *resubscribable) ctxAt(i int) context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ctxs[i]
+}
+
+// closeCurrent closes the most recently opened stream with no error, as a
+// runtime adapter does when its own subscription ends without Host asking
+// (TailEndLost), rather than refusing a publication.
+func (r *resubscribable) closeCurrent() {
+	r.mu.Lock()
+	stream := r.streams[len(r.streams)-1]
+	r.mu.Unlock()
+	close(stream)
 }
 
 func (r *resubscribable) send(seq uint64, body string) {
@@ -259,5 +279,133 @@ func TestARefusedTailIsLoggedAndRestarted(t *testing.T) {
 	case <-runtime.opened:
 		t.Fatal("a stopped supervisor subscribed again")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestARestartStopsTheOldSubscriptionBeforeSubscribingTheNew is R-F2b: the
+// relay returns on refusal without cancelling its own subscription, so
+// without an explicit stop the old subscription's pump lives on until its
+// buffer overflows or the residency ends. The restart loop now stops it
+// itself, before the new one opens.
+func TestARestartStopsTheOldSubscriptionBeforeSubscribingTheNew(t *testing.T) {
+	svc := &Service{options: Options{Logger: discardLogger}, tailRestartBounds: fast}
+	wire := &wirePublications{failNext: true}
+	routes := &countingRoutes{}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: routes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newResubscribable()
+	supervised, err := svc.superviseTail(t.Context(), supervisedKey, func() (*service.Tail, error) {
+		return tails.PublishProjected(t.Context(), supervisedKey, runtime, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(supervised.Stop)
+	awaitSignal(t, runtime.opened, "the first subscription")
+	runtime.send(1, `{"type":"refused"}`)
+	awaitSignal(t, runtime.opened, "the restarted subscription")
+
+	old := runtime.ctxAt(0)
+	select {
+	case <-old.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the refused tail's own subscription was not stopped before the restart opened a new one")
+	}
+}
+
+// TestALostTailIsNotRestarted is the surviving mutant D: a tail that ends
+// Lost — its stream closed with no error, as when a mapping outage overflows
+// the adapter's buffer (R-F2a) — is deliberately left ended, unlike a
+// Refused one. Its causes cannot be told apart, and a resubscribe would loop
+// against some of them.
+func TestALostTailIsNotRestarted(t *testing.T) {
+	svc := &Service{options: Options{Logger: discardLogger}, tailRestartBounds: fast}
+	wire := &wirePublications{}
+	routes := &countingRoutes{}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: routes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newResubscribable()
+	supervised, err := svc.superviseTail(t.Context(), supervisedKey, func() (*service.Tail, error) {
+		return tails.PublishProjected(t.Context(), supervisedKey, runtime, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(supervised.Stop)
+	awaitSignal(t, runtime.opened, "the first subscription")
+	runtime.closeCurrent()
+
+	supervised.mu.Lock()
+	current := supervised.current
+	supervised.mu.Unlock()
+	awaitSignal(t, current.Done(), "the tail to end")
+	if end, _ := current.End(); end != service.TailEndLost {
+		t.Fatalf("the tail ended %q, want lost", end)
+	}
+	if routes.invalidated.Load() != 1 {
+		t.Fatalf("routes invalidated %d times, want once for the loss", routes.invalidated.Load())
+	}
+	select {
+	case <-runtime.opened:
+		t.Fatal("a Lost tail was restarted")
+	case <-time.After(50 * time.Millisecond):
+	}
+	supervised.mu.Lock()
+	same := supervised.current == current
+	supervised.mu.Unlock()
+	if !same {
+		t.Fatal("the supervised tail was replaced although it only ever ended Lost")
+	}
+}
+
+// TestAStopDuringABackoffWaitReturnsWellUnderTheCeiling is the surviving
+// mutant E. Stop does not cancel the context restartRefused's backoff wait
+// selects on — it only sets the supervisor's own stopped flag, which is
+// checked once the CURRENT backoff step's timer fires. So a Stop landing
+// while the loop sleeps is noticed at that step, not only once the growing
+// backoff reaches the ceiling. Bounds here are large enough to tell "one
+// step" from "the ceiling" apart; the production ceiling (5s) is named
+// directly so the assertion is about the real bound, not a scaled-down
+// stand-in.
+func TestAStopDuringABackoffWaitReturnsWellUnderTheCeiling(t *testing.T) {
+	bounds := backoff{floor: time.Second, ceiling: defaultTailRestart.ceiling}
+	svc := &Service{options: Options{Logger: discardLogger}, tailRestartBounds: bounds}
+	wire := &wirePublications{failNext: true}
+	routes := &countingRoutes{}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: routes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newResubscribable()
+	supervised, err := svc.superviseTail(t.Context(), supervisedKey, func() (*service.Tail, error) {
+		return tails.PublishProjected(t.Context(), supervisedKey, runtime, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitSignal(t, runtime.opened, "the first subscription")
+	runtime.send(1, `{"type":"refused"}`)
+
+	supervised.mu.Lock()
+	refused := supervised.current
+	supervised.mu.Unlock()
+	awaitSignal(t, refused.Done(), "the refusal")
+
+	// Stop lands while the restart loop is asleep on its first, one-second
+	// backoff step.
+	start := time.Now()
+	supervised.Stop()
+
+	select {
+	case <-runtime.opened:
+		t.Fatal("a stopped supervisor subscribed again")
+	case <-time.After(2 * bounds.floor):
+	}
+	if elapsed := time.Since(start); elapsed >= bounds.ceiling {
+		t.Fatalf("Stop during a backoff wait took %s, at least the %s ceiling", elapsed, bounds.ceiling)
 	}
 }
