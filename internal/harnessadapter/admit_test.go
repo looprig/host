@@ -648,6 +648,35 @@ func TestApplyCommandDistinguishesAnUnrecordableDisposition(t *testing.T) {
 	}
 }
 
+// D3 GATE F1. harness reports whether the application prefix committed before a
+// failure through the returned Disposition; the adapter must surface it as
+// department.ErrPrefixCommitted, joined, and only when it is true.
+func TestApplyCommandSurfacesAPrefixThatCommittedBeforeTheFailure(t *testing.T) {
+	failure := errors.New("harnessadapter_test: the disposition append failed")
+	for _, row := range []struct {
+		name      string
+		prefix    uint64
+		committed bool
+	}{
+		{"the prefix committed", 17, true},
+		{"nothing durable was written", 0, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			controller := newApplyingController(applierPart{available: true, err: failure, prefixOnErr: row.prefix})
+			runtime := boundFor(t, controller, WithBlockDecoder(func(body []byte) ([]content.Block, error) {
+				return []content.Block{&content.TextBlock{Text: string(body)}}, nil
+			}))
+			err := runtime.ApplyCommand(t.Context(), inputCommand())
+			if !errors.Is(err, failure) {
+				t.Fatalf("ApplyCommand = %v, want the runtime's failure to survive", err)
+			}
+			if got := errors.Is(err, department.ErrPrefixCommitted); got != row.committed {
+				t.Errorf("errors.Is(err, ErrPrefixCommitted) = %v, want %v", got, row.committed)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The recovery closure
 // ---------------------------------------------------------------------------

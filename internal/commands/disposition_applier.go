@@ -409,6 +409,14 @@ func (a *DispositionApplier) afterFailedDispatch(ctx context.Context, record Dis
 	if outcome, err := a.settle(ctx, record, applying); err == nil {
 		return outcome, nil
 	}
+	// A GATE ANSWER WHOSE PREFIX COMMITTED IS KEPT (D3 gate F1). Its GateResolved
+	// may already be durable with only the disposition lost — the enduring-effect
+	// gap no successor can settle either — and the live runtime is holding the
+	// answer for the agent. Abandoning it would lose the answer's effect and
+	// unwedge nothing, so the pass blocks here exactly as it did before D3.
+	if record.Kind == KindGateResponse && errors.Is(problem, ErrPrefixCommitted) {
+		return Outcome{State: StateApplying, PrefixOwned: true}, problem
+	}
 	if a.stranded != nil {
 		a.stranded(record.CommandID, problem)
 	}

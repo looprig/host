@@ -1,13 +1,18 @@
 package compose
 
 import (
+	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/hostconfig"
+	"github.com/looprig/host/internal/residency"
 )
 
 // awaitCondition polls a condition the composition reaches on its own goroutine.
@@ -120,5 +125,145 @@ func TestAStrandedAttemptReleasesTheRuntimeOnceAndOnlyForItsOwnResidency(t *test
 	}
 	if got := f.trace.count("lease.release"); got != 1 {
 		t.Errorf("the grant was released %d times, want exactly once", got)
+	}
+}
+
+// blockingFaultingSession is a publishing runtime whose dispatch blocks until
+// released and which offers the durable-health capability, so a test can fault it
+// while a consumer pass is inside ApplyCommand.
+type blockingFaultingSession struct {
+	*publishingSession
+	entered  chan struct{}
+	release  chan struct{}
+	faulted  chan struct{}
+	mu       sync.Mutex
+	inFlight bool
+	// abandonedInFlight records an abandon that arrived while a dispatch was
+	// still inside ApplyCommand — the ordering D3 gate F2 forbids.
+	abandonedInFlight bool
+	abandoned         int
+	// onAbandon runs inside AbandonResidency, before it returns.
+	onAbandon func()
+}
+
+func (s *blockingFaultingSession) ApplyCommand(ctx context.Context, command department.RuntimeCommand) error {
+	s.mu.Lock()
+	s.inFlight = true
+	s.mu.Unlock()
+	close(s.entered)
+	<-s.release
+	s.mu.Lock()
+	s.inFlight = false
+	s.mu.Unlock()
+	return s.publishingSession.ApplyCommand(ctx, command)
+}
+
+func (s *blockingFaultingSession) PersistenceFaulted() <-chan struct{} { return s.faulted }
+func (s *blockingFaultingSession) PersistenceFault() error             { return errors.New("injected fault") }
+func (s *blockingFaultingSession) AbandonResidency(context.Context) error {
+	if s.onAbandon != nil {
+		s.onAbandon()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.abandoned++
+	if s.inFlight {
+		s.abandonedInFlight = true
+	}
+	return nil
+}
+
+func (s *blockingFaultingSession) snapshot() (abandoned int, inFlight bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abandoned, s.abandonedInFlight
+}
+
+// TestAGiveUpWaitsForTheConsumerPassInFlight is D3 gate F2: the runtime is
+// abandoned only after the consumer's pass in flight has left ApplyCommand.
+// Consumer.Stop does not wait for a pass; Halt does, and it is what orders a
+// dispatch before the abandon.
+func TestAGiveUpWaitsForTheConsumerPassInFlight(t *testing.T) {
+	store := newDurableCommands(keyA)
+	inner := newPublishingSession()
+	inner.effects = store
+	runtime := &blockingFaultingSession{publishingSession: inner, entered: make(chan struct{}), release: make(chan struct{}), faulted: make(chan struct{})}
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
+		o.Inbox = store
+		o.Cursors = store
+		dispositions := newFakeDispositions(o.Clock.(*fakeClock), store)
+		dispositions.payloads = store
+		o.Records = dispositions
+		o.Writers = &fakeDispositionWriters{store: dispositions}
+		inner.disposition = func(command sessionwire.CommandID) { dispositions.setEvidence(command, "applied") }
+	})
+	f.rig.Session = runtime
+	f.start()
+	f.attach(tenantA, sessionA)
+	// The session's work must already be stopped when the runtime is abandoned:
+	// its consumer gone, so nothing can dispatch into a runtime mid-abandon.
+	var consumerAtAbandon atomic.Bool
+	runtime.onAbandon = func() {
+		_, held := f.svc.ConsumerFor(keyA)
+		consumerAtAbandon.Store(held)
+	}
+
+	store.accept(t, "command-in-flight", `{"blocks":[{"text":"hello"}]}`)
+	f.svc.Wake(keyA)
+	select {
+	case <-runtime.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the consumer never dispatched the command")
+	}
+
+	close(runtime.faulted)
+	time.Sleep(100 * time.Millisecond)
+	if abandoned, _ := runtime.snapshot(); abandoned != 0 {
+		t.Fatal("the runtime was abandoned while the consumer's pass was still inside ApplyCommand")
+	}
+	close(runtime.release)
+	awaitCondition(t, "the runtime to be abandoned once the pass left", func() bool {
+		abandoned, _ := runtime.snapshot()
+		return abandoned == 1
+	})
+	if _, inFlight := runtime.snapshot(); inFlight {
+		t.Fatal("the abandon arrived while a dispatch was in flight")
+	}
+	if consumerAtAbandon.Load() {
+		t.Fatal("the runtime was abandoned while the session's consumer was still running")
+	}
+}
+
+// TestAStaleGiveUpDoesNotUnchargeASuccessor is D3 gate F3: the capacity credit
+// and the warm forget are keyed by session only, so a give-up for a residency
+// that has since been REPLACED under the same key must leave them alone.
+func TestAStaleGiveUpDoesNotUnchargeASuccessor(t *testing.T) {
+	f := newFixture(t, func(_ *Options, host *hostconfig.Options) { host.Capacity = 1 })
+	f.start()
+	f.attach(tenantA, sessionA)
+	stale := f.svc.residentFor(keyA)
+	faults, ok := persistenceFaultsFor(stale.runtime)
+	if !ok {
+		t.Fatal("the fixture runtime offers no PersistenceFaults")
+	}
+	// A successor residency now holds the key (and its admission charge).
+	successor := &resident{key: stale.key, agent: stale.agent, generation: stale.generation + 1, runtime: stale.runtime}
+	f.svc.mu.Lock()
+	f.svc.sessions[keyA] = successor
+	f.svc.mu.Unlock()
+
+	f.svc.releaseUnusable(t.Context(), stale, faults, "test", errors.New("late"))
+
+	f.rig.Session = newControllableSession(testRigSessionID)
+	_, err := f.svc.Attach(t.Context(), residency.Request{
+		TenantID: tenantA, SessionID: sessionB, AgentID: testAgent, Mode: residency.ModeCreate,
+		Principal: residency.Principal{TenantID: tenantA, ActorID: "actor-a"},
+	})
+	var refused *residency.AttachError
+	if !errors.As(err, &refused) || refused.Code != sessionwire.HostLinkErrorNoCapacity {
+		t.Fatalf("attach into a Host whose one slot the successor holds = %v, want no_capacity: a stale give-up credited the slot back", err)
+	}
+	if f.svc.residentFor(keyA) != successor {
+		t.Error("a stale give-up removed the successor's residency")
 	}
 }

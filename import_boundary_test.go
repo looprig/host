@@ -51,7 +51,12 @@ var publishedLooprigVersions = map[string]string{
 	"sessionstore": "v0.12.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
-	"harness":      "v0.37.1",
+	// v0.38.0 is the release D3 needs (PersistenceFaultReporter,
+	// ResidencyAbandoner). It is named here AHEAD of its tag, deliberately: until
+	// go.mod is re-pinned with `go get github.com/looprig/harness@v0.38.0`, this
+	// guard fails on the v0.37.1 requirement, which is the reminder that the pin
+	// is owed and that this branch must not be released before it.
+	"harness": "v0.38.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package

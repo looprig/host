@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
@@ -68,8 +69,10 @@ func (s *Service) superviseFaults(ctx context.Context, held *resident) {
 // close it; a journal write that failed WITHOUT faulting the runtime (the
 // application prefix itself, during an outage) reaches Host only this way.
 //
-// It is called on the consumer's own goroutine, and the release stops that
-// consumer and waits for it, so the release runs on its own goroutine.
+// It is called on the consumer's own goroutine, in the middle of a pass, and the
+// release HALTS that consumer — waiting for the pass in flight to finish — before
+// it abandons the runtime. Waiting on its own goroutine would deadlock, so the
+// release runs on another.
 func (s *Service) strandedAttempt(key registry.Key, generation uint64, command sessionwire.CommandID, cause error) {
 	held := s.residentFor(key)
 	if held == nil || held.generation != generation {
@@ -131,6 +134,18 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	if err := held.BeginRelease(ctx); err != nil {
 		failures = append(failures, err)
 	}
+	// THE CONSUMER IS HALTED, AND WAITED FOR, BEFORE THE RUNTIME IS ABANDONED (D3
+	// gate F2). Consumer.Stop does not wait for a pass in flight, so a pass could
+	// otherwise still be dispatching into a runtime mid-abandon. Halt waits,
+	// bounded; a pass that outlives the bound is still harmless, because the
+	// abandon seals the runtime-command log and refuses its writes.
+	if s.residentFor(held.key) == held {
+		haltCtx, cancel := context.WithTimeout(ctx, giveUpHaltBound)
+		if err := s.Halt(haltCtx, held.key); err != nil {
+			failures = append(failures, fmt.Errorf("halt the consumer: %w", err))
+		}
+		cancel()
+	}
 	held.stopWork()
 	if err := held.residencyOnce.run(func() error { return faults.AbandonResidency(ctx) }); err != nil {
 		failures = append(failures, err)
@@ -140,9 +155,13 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	}
 	// The admission credit AFTER the lease release, for the warm release's
 	// reason: crediting capacity while still holding the grant would admit a
-	// replacement this Host has no room for.
-	s.capacity.Release(held.key)
-	s.warm.Forget(held.key)
+	// replacement this Host has no room for. BOTH ARE KEYED BY KEY ONLY, so they
+	// run only while this residency is still the one held (D3 gate F3): a late
+	// give-up for a replaced residency must not uncharge its successor.
+	if s.residentFor(held.key) == held {
+		s.capacity.Release(held.key)
+		s.warm.Forget(held.key)
+	}
 	s.forget(held.key, held.generation)
 
 	if err := errors.Join(failures...); err != nil {
@@ -153,6 +172,10 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "host: the unusable session was released", attrs...)
 }
+
+// giveUpHaltBound bounds how long a give-up waits for the session's in-flight
+// consumer pass before abandoning the runtime anyway.
+const giveUpHaltBound = 30 * time.Second
 
 // errorText renders an error for a log attribute, including nil.
 func errorText(err error) string {

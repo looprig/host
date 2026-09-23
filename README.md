@@ -174,6 +174,17 @@ journal and settles the stranded command truthfully: `applied` if its effect is 
 (an owed input is re-run by the restore), otherwise closed `not_applied`. Every later
 command is applied exactly once.
 
+**One exemption.** A `gate_response` whose runtime wrote its application prefix
+before the dispatch failed is never treated as stranded. That is the shape where the
+answer's `GateResolved` is durable and only its disposition was lost. Abandoning the
+runtime would throw away the answer the agent is holding and settle nothing, so the
+command stays `applying`, which is the known enduring-effect gap. The harness adapter
+reports the committed prefix as `department.ErrPrefixCommitted`.
+
+Before abandoning, Host halts the session's consumer and waits (bounded) for any pass in
+flight. It credits the capacity only while the released residency is still the one it
+holds.
+
 **Limits you must plan around:**
 
 - The acknowledged words of a command closed `not_applied` must be resent, as after any

@@ -378,3 +378,41 @@ func TestAFencedOutHostDoesNotDispatchAnAnswerToAnUnprojectedGate(t *testing.T) 
 		t.Fatal("a fenced-out Host dispatched the answer")
 	}
 }
+
+// D3 GATE F1. A gate answer whose runtime took the prefix and then failed (the
+// disposition append lost after GateResolved committed) is NOT reported stranded:
+// the answer may be durable with only its evidence missing, and the live runtime
+// holding it must be kept so the agent receives it. The same failure with nothing
+// durable, and an input whose prefix committed, are still reported.
+func TestAGateAnswerWhosePrefixCommittedIsNeverReportedStranded(t *testing.T) {
+	runtimeErr := errors.New("commands_test: the disposition append failed")
+	for _, row := range []struct {
+		name     string
+		gate     bool
+		err      error
+		stranded bool
+	}{
+		{name: "gate answer, prefix committed", gate: true, err: errors.Join(ErrPrefixCommitted, runtimeErr), stranded: false},
+		{name: "gate answer, nothing durable", gate: true, err: runtimeErr, stranded: true},
+		{name: "input, prefix committed", gate: false, err: errors.Join(ErrPrefixCommitted, runtimeErr), stranded: true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var f *dispositionFixture
+			if row.gate {
+				f = gateFixture(t, ownedGate(testEpoch), nil)
+			} else {
+				f = newDispositionFixture(t)
+			}
+			f.runtime.err = row.err
+			if _, err := f.process(); refusalOf(err) != RefusalRuntime || !errors.Is(err, runtimeErr) {
+				t.Fatalf("Process = %v, want the runtime's failure as %q", err, RefusalRuntime)
+			}
+			if got := len(f.stranded) == 1; got != row.stranded {
+				t.Fatalf("stranded reports = %v, want stranded=%t", f.stranded, row.stranded)
+			}
+			if state := f.stored().record.State; state != StateApplying {
+				t.Errorf("the durable record is %q, want %q", state, StateApplying)
+			}
+		})
+	}
+}

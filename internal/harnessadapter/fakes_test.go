@@ -190,7 +190,10 @@ type applierPart struct {
 	available  bool
 	nilApplier bool
 	err        error
-	admitted   *[]runtimecommand.Admitted
+	// prefixOnErr is the PrefixSequence returned alongside err: non-zero is
+	// harness's "the prefix committed before the failure".
+	prefixOnErr uint64
+	admitted    *[]runtimecommand.Admitted
 
 	// liveApplierWhenUnavailable makes RuntimeCommands report the capability
 	// UNAVAILABLE while still handing back a usable applier. A conforming
@@ -239,7 +242,7 @@ func (p applierPart) ApplyRuntimeCommand(_ context.Context, admitted runtimecomm
 		*p.admitted = append(*p.admitted, admitted)
 	}
 	if p.err != nil {
-		return runtimecommand.Disposition{}, p.err
+		return runtimecommand.Disposition{CommandID: admitted.CommandID, PrefixSequence: p.prefixOnErr}, p.err
 	}
 	return runtimecommand.Disposition{CommandID: admitted.CommandID, RuntimeCommandID: admitted.RuntimeCommandID}, nil
 }

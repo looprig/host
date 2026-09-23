@@ -444,6 +444,18 @@ type CommandApplier interface {
 // opposite: something may have happened.
 var ErrDispositionUnsupported = errors.New("department: this runtime's durable log cannot record a command disposition, so nothing was dispatched and nothing durable was written")
 
+// ErrPrefixCommitted marks a dispatch that FAILED AFTER the runtime durably wrote
+// the command's application prefix. It is JOINED to the runtime's own error, never
+// substituted for it.
+//
+// IT SAYS THE RUNTIME TOOK THE COMMAND, not that the effect committed. What it
+// licenses is narrow: for a gate_response it means the answer's GateResolved may
+// already be durable with only its disposition lost (the enduring-effect gap), and
+// the runtime holding the answer in memory must then be KEPT — abandoning it would
+// throw the answer away without settling anything. A dispatch failed with nothing
+// durable (a zero prefix) never carries it.
+var ErrPrefixCommitted = errors.New("department: the runtime durably recorded the command's application prefix before the dispatch failed")
+
 // ErrEnduringEffect reports a recovery closure refused because the runtime's
 // journal holds an enduring event caused by the command being closed.
 //

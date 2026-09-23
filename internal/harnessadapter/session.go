@@ -222,8 +222,9 @@ func (s *boundSession) ApplyCommand(ctx context.Context, command department.Runt
 	if err != nil {
 		return err
 	}
-	if _, err := applier.ApplyRuntimeCommand(ctx, admitted); err != nil {
-		return classifyDispatch(err)
+	disposition, err := applier.ApplyRuntimeCommand(ctx, admitted)
+	if err != nil {
+		return classifyDispatch(disposition, err)
 	}
 	return nil
 }
@@ -241,10 +242,20 @@ func (s *boundSession) ApplyCommand(ctx context.Context, command department.Runt
 // THE RELEASED ERROR ALWAYS SURVIVES. The sentinel is JOINED rather than
 // substituted, so a caller that needs the identities harness named still reaches
 // them through errors.As, and every other failure crosses untouched.
-func classifyDispatch(err error) error {
+//
+// THE DISPOSITION IS READ TOO (D3 gate F1). harness returns a NON-zero
+// PrefixSequence alongside an error when the application prefix committed before
+// the failure, and a zero one when nothing durable was written. Host needs that
+// fact to tell a gate answer whose GateResolved may be durable (keep the runtime)
+// from a command that never reached the journal (give the runtime up), so it is
+// joined as department.ErrPrefixCommitted rather than discarded.
+func classifyDispatch(disposition runtimecommand.Disposition, err error) error {
 	var unsupported *runtimecommand.DispositionUnsupportedError
 	if errors.As(err, &unsupported) {
 		return errors.Join(department.ErrDispositionUnsupported, err)
+	}
+	if disposition.PrefixSequence != 0 {
+		return errors.Join(department.ErrPrefixCommitted, err)
 	}
 	return err
 }

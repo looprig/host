@@ -324,6 +324,10 @@ var (
 	// an optional capability satisfies the interface for every runtime it wraps,
 	// so an assertion can no longer answer the question.
 	ErrNoAttemptCloser = department.ErrNoAttemptCloser
+
+	// ErrPrefixCommitted marks a dispatch that failed after the runtime durably
+	// recorded the command's application prefix.
+	ErrPrefixCommitted = department.ErrPrefixCommitted
 )
 
 // ErrEvidenceUnroutable reports a settlement whose evidence could not be OBTAINED
