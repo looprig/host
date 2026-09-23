@@ -455,6 +455,16 @@ func (w *WarmReleaser) Watch(session WarmSession) error {
 	return nil
 }
 
+// Watching reports whether a watch is held for key. It is a snapshot: a lost
+// grant ends a watch on its own goroutine, so a caller waiting for that end
+// polls it.
+func (w *WarmReleaser) Watching(key registry.Key) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, held := w.watches[key]
+	return held
+}
+
 // Forget stops watching a session WITHOUT releasing it. It is what a caller
 // uses when the residency has gone by another path — a teardown, a drain, an
 // attach that replaced it — and repeating it is safe.

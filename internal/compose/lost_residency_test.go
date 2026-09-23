@@ -218,6 +218,21 @@ func TestALostResidencyOvertakenByASuccessorStillCancelsItsContext(t *testing.T)
 	f.store.leaseOf(keyA).onRelease = func() {
 		// The old path has released its grant and not yet forgotten the
 		// residency: the successor attaches entirely inside that window.
+		//
+		// FIRST THE OLD WARM WATCH MUST BE GONE. It ends itself on the closed
+		// Lost() channel, on its own goroutine, and releaseLost's warm.Forget
+		// comes only after this hook; a successor whose Watch lands before
+		// either is refused ErrWarmSessionWatched. That refusal is the same
+		// benign race in production (Factory retries the attach), and it is
+		// not what this test is about.
+		deadline := time.Now().Add(5 * time.Second)
+		for f.svc.warm.Watching(keyA) {
+			if time.Now().After(deadline) {
+				successorErr <- errors.New("the lost residency's warm watch never ended")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
 		f.rig.Session = newControllableSession(testRigSessionID)
 		_, err := f.svc.Attach(context.Background(), residency.Request{
 			TenantID: tenantA, SessionID: sessionA, AgentID: testAgent, Mode: residency.ModeCreate,
