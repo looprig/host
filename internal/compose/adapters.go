@@ -572,33 +572,85 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 		append(attrs, slog.String("reason", string(reason)))...)
 
 	var failures []error
-	haltCtx, cancel := context.WithTimeout(ctx, giveUpHaltBound)
-	if err := s.Halt(haltCtx, held.key); err != nil {
-		failures = append(failures, fmt.Errorf("halt the consumer: %w", err))
+	// KEYED CALLS RUN ONLY WHILE THIS RESIDENCY IS STILL THE ONE HELD (D3 gate
+	// F3, as releaseUnusable): Halt, the admission credit and the warm forget
+	// name the session and not the residency, so a late call would reach a
+	// successor's consumer, charge or warm watch.
+	if s.residentFor(held.key) == held {
+		haltCtx, cancel := context.WithTimeout(ctx, giveUpHaltBound)
+		if err := s.Halt(haltCtx, held.key); err != nil {
+			failures = append(failures, fmt.Errorf("halt the consumer: %w", err))
+		}
+		cancel()
 	}
-	cancel()
 	held.stopWork()
+	abandoned := false
 	if faults, ok := persistenceFaultsFor(held.runtime); ok {
+		abandoned = true
 		if err := held.residencyOnce.run(func() error { return faults.AbandonResidency(ctx) }); err != nil {
 			failures = append(failures, err)
 		}
-	} else if err := held.ReleaseResidency(ctx); err != nil {
-		failures = append(failures, err)
+	} else {
+		// BOUNDED, because a nonterminal release waits for whole-session idle:
+		// a turn in flight or a gate would otherwise hold FinishRelease — and so
+		// the registry entry F5 is about — for as long as the turn runs.
+		releaseCtx, cancel := context.WithTimeout(ctx, lostReleaseBound)
+		if err := held.ReleaseResidency(releaseCtx); err != nil {
+			failures = append(failures, fmt.Errorf("release the runtime: %w", err))
+		}
+		cancel()
 	}
-	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
+	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil && !onlyLostGrant(err) {
 		failures = append(failures, err)
 	}
 	if s.residentFor(held.key) == held {
 		s.capacity.Release(held.key)
+		s.warm.Forget(held.key)
 	}
-	s.warm.Forget(held.key)
 	s.forget(held.key, held.generation)
 
 	if err := errors.Join(failures...); err != nil {
-		logger.LogAttrs(ctx, slog.LevelWarn,
-			"host: the lost session's release wrote nothing durable (expected under a lost grant); its lease and registry row lapse on expiry",
-			append(attrs, slog.String("error", err.Error()))...)
+		message := "host: the lost session's runtime did not release; it may keep running until it stops by itself, and its journal lease lapses on expiry"
+		if abandoned {
+			message = "host: the lost session's runtime could not be abandoned cleanly; its journal lease lapses on expiry"
+		}
+		logger.LogAttrs(ctx, slog.LevelWarn, message, append(attrs, slog.String("error", err.Error()))...)
 	}
+}
+
+// lostReleaseBound bounds the nonterminal runtime release of a lost residency
+// whose runtime offers no crash-equivalent abandon. A variable so a test can
+// shorten it.
+var lostReleaseBound = giveUpHaltBound
+
+// onlyLostGrant reports whether FinishRelease failed ONLY in the ways a lost
+// grant makes certain: the tombstone refused by the ended fence (nothing
+// durable is written under a lost epoch, by design) and the provider refusing
+// to release a lease it already declared lost. Those are the expected shape of
+// this path, not failures of it, and reporting them would make the WARN fire on
+// every loss.
+func onlyLostGrant(err error) bool {
+	var release *residency.ReleaseError
+	for _, part := range flatten(err) {
+		if errors.As(part, &release) && errors.Is(part, residency.ErrLeaseNotHeld) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// flatten returns the leaves of an errors.Join tree, one level at a time.
+func flatten(err error) []error {
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return []error{err}
+	}
+	var out []error
+	for _, part := range joined.Unwrap() {
+		out = append(out, flatten(part)...)
+	}
+	return out
 }
 
 // forget drops the composition's handle on one residency, fenced by generation
