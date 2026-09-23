@@ -27,11 +27,17 @@ Department, residency, HostLink, warm release and drain are built.
 `Options.WarmTTL` — never one with a gate open, a turn in flight or durable
 command work outstanding — and the next command re-places and restores it.
 Before v0.7.0 no composed Host ever warm-released. When the countdown fires the
-Host re-confirms the session is still idle and has done no work since it was
-armed, halts its command consumer (a command admitted from then on is left
-pending for the next Host), and bounds the runtime release by `Drain.Grace`; a
-runtime that does not release in time leaves the session held under this Host's
-grant until the drain, never torn down under a running turn.
+Host first halts the session's command consumer, waiting out a pass in flight
+(a command admitted from then on is left pending for the next Host), then
+re-confirms the session is still idle and has done no work since the countdown
+was armed, then re-reads the durable inbox. The runtime release is bounded by
+`Drain.Grace`. A runtime that does not release in time — a turn that started
+inside the release window — is never torn down under that turn: the release is
+**taken back**, and the session is an ordinary resident, admitting session
+again under the same grant and generation (Factory can bind to it, wake it and
+answer its gates), and the next idle countdown tries again. Only if that revert
+is refused (the Host is draining, or the grant is gone) is the session held for
+the drain. Both are counted in `host_release_failures_total`.
 
 **A dedicated Host does not warm-release — a deliberate departure from runbook
 O6.2** ("the same release behavior as pooled"). A warm-released dedicated
