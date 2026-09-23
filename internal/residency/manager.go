@@ -918,7 +918,23 @@ func (m *Manager) acquireKey(key registry.Key) func() {
 // a resident session still holds a runtime built by the old one, so the build
 // the caller was placed on must be compared with the build actually running.
 // The tenant needs no check because it is half of the key.
+//
+// A RESIDENCY WHOSE TEARDOWN IS CLAIMED IS NOT REPORTED AS RESIDENT (finding F5
+// hardening). registry.BeginTeardown's only caller is Heartbeat.surrender, so
+// TeardownOwned means this Host's grant for the session is GONE and the entry is
+// waiting for its teardown owner to remove it. Answering an attach with it was
+// the silent half of F5: Factory was told the session was resident here while
+// nothing consumed its inbox. It is refused as not_admitting instead — retryable,
+// and visible — and the retry finds the entry removed and attaches afresh.
 func existingResidency(entry registry.Entry, key registry.Key, request Request) (Residency, error) {
+	if entry.TeardownOwned {
+		return Residency{}, &AttachError{
+			Step:   StepValidate,
+			Code:   sessionwire.HostLinkErrorNotAdmitting,
+			Key:    key,
+			Reason: "this Host's residency grant for the session is gone and its local teardown has not finished; retry",
+		}
+	}
 	if entry.AgentID != request.AgentID {
 		return Residency{}, &AttachError{
 			Step:                   StepValidate,
