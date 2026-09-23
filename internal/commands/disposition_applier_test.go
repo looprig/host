@@ -913,6 +913,34 @@ func TestDispositionNeverClosesItsOwnAttempt(t *testing.T) {
 	}
 }
 
+// THE NEGATIVE ROW THAT MAKES THE DISCRIMINATOR A COMPARISON AGAIN. Under
+// settle-first (D1), the previous test's own-attempt row settles from durable
+// evidence before settleOrRecover's `AttemptJournalEpoch >= journalEpoch` check
+// is ever reached, so it no longer distinguishes that comparison from mere
+// reachability — mutating `>=` to `>` survives the suite (CLAUDE_REVIEW_HOST_V071_FINAL.md,
+// N1). This row removes the evidence, so settle fails and Process must reach
+// the guard with something for it to actually decide. The closer here carries
+// no error, so it WOULD succeed if called: only the guard stops it, not an
+// absence of anything to close.
+func TestDispositionNeverClosesItsOwnAttemptWithNoEvidence(t *testing.T) {
+	f := newDispositionFixture(t, func(f *dispositionFixture) {
+		stored := f.put(KindInput, StateApplying)
+		stored.record.ClaimResidencyEpoch = testEpoch
+		stored.record.AttemptID = "this-runtimes-own-attempt"
+		stored.record.AttemptJournalEpoch = testJournalEpoch
+		stored.record.AttemptResidencyEpoch = testEpoch
+		// stored.evidence is left at its zero value: the journal holds none.
+	})
+
+	_, err := f.process()
+	if refusalOf(err) != RefusalEvidenceUnavailable {
+		t.Fatalf("Process = %v (%q), want %q", err, refusalOf(err), RefusalEvidenceUnavailable)
+	}
+	if got := f.closer.closures(); len(got) != 0 {
+		t.Errorf("the closer saw %v, want none: a runtime may not close its own attempt even with no evidence to settle from and a closer that would succeed", got)
+	}
+}
+
 // A RECORD THAT IS NOT THE ONE ASKED FOR IS REFUSED. Three rows, because a page
 // is a snapshot and a record read fresh may disagree with it in three separable
 // ways; each is a different comparison, and a single row would credit one guard
