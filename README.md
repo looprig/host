@@ -150,46 +150,62 @@ v0.5.0. A cold AskUser answer/resume remains unsupported.
 ## Upgrading to v0.10.0: no runtime identity reaches a client
 
 **Finding W1.** A harness public event body names the **runtime** session id
-(`session_id`, also under `cause`) and, on an event a command caused, the
-**runtime** command id (`cause.command_id`). Both are private: the runtime session
-id is the durable binding's, and the runtime command id is the mapping Factory's
-store keeps beside the command a client admitted. Host relayed those bodies
-verbatim, and Factory serves them to browsers on the live tail and from `/journal`.
+(`session_id`, also under `cause`, and in some error text) and, on an event a
+command caused, the **runtime** command id (`cause.command_id`). Both are private:
+the runtime session id is the durable binding's, and the runtime command id is the
+mapping Factory's store keeps beside the command a client admitted. Host relayed
+those bodies verbatim, and Factory serves them to browsers on the live tail and
+from `/journal`.
 
 v0.10.0 rewrites them, and nothing else:
 
-- every `session_id` equal to the runtime session id becomes the **public** session id;
-- `cause.command_id` becomes the **public** command id the client admitted, or is
-  **removed** when the command has none (a machine-originated cause such as a
-  subagent hand-back); a `cause` left empty is removed with it.
+- **Runtime session id → public session id, everywhere.** This covers every
+  `session_id` value at any depth, and any mention inside a string: a
+  `TurnFailed`/`RestoreErrored` message, a capture-spill path.
+- **`cause.command_id` → the public command id the client admitted.** Any other
+  mention of that same runtime command id is replaced too.
+- **Commands with no public id.** A machine-originated cause, such as a subagent
+  hand-back, is **removed** from `cause`, and a `cause` left empty is removed with it.
 
-Member order and every other byte are kept, so the body is still canonical. Loop,
-turn and step ids stay; they are the runtime's own content identities.
+Member order and every other byte are kept, so the body is still canonical. The cost
+is linear in the body whatever its nesting. Loop, turn and step ids stay; they are
+the runtime's own content identities. **Projected bodies are not harness events any
+more**: a public command id need not be a UUID, and a reply to a machine command
+loses its cause. Do not decode them with harness.
 
-**The live tail is projected by Host with no action needed.** It reads the command
-mapping from the session's disposition inbox. A runtime that reports no runtime
-session id (one not launched through `department`'s rig adapter) is relayed
-unprojected, and Host logs a WARN at attach.
+**The live tail is projected by Host with no action needed.**
 
-**`/journal` is NOT covered by Host alone.** Factory reads a Host session's journal
-directly through its `JournalResolver`, never through Host. So a composition must
-wrap the reader it returns in **`host.PublicJournal`**. That type applies the same
-function, taking the mapping from the journal's own application prefixes, so a
-live body and a durable body are byte-identical:
+- **Command mapping:** read from the session's disposition inbox.
+- **Mapping read fails:** the publication is retried with bounded backoff (WARN per
+  attempt) until the session's work stops. The tail does not end.
+- **Publication genuinely refused** (a body that is not canonical, or a transport
+  refusal): it is logged at ERROR with its cause. The session's routes are
+  invalidated, so every Factory replica resets its viewers from the durable journal,
+  and a new tail is subscribed from the live tip.
+- **Stop during a read:** a stop, with no route invalidation.
+- **Runtimes with no runtime session id** (not launched through `department`'s rig
+  adapter): relayed **unprojected**, with a WARN at attach. That is the one place
+  W1 is not enforced.
+
+**`/journal` needs factory ≥ v0.10.0.** Factory reads a Host session's journal
+directly through its resolver, never through Host. So a composition must wrap the
+reader it returns in **`host.PublicJournal`**. That type applies the same function,
+taking the mapping from the journal's own application prefixes, so a live body and a
+durable body are byte-identical. The wrapper needs the **public** session id, which
+only factory v0.10.0's `WithSessionJournalResolver` hands a resolver:
 
 ```go
 journals := host.NewPublicJournals(0) // one per process; keeps each session's mapping
-resolver := func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
+factory.WithSessionJournalResolver(func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
 	store := runtimeJournalFor(tenant, binding) // sessionstore.Open(..., WithLegacySingleTenant(tenant))
 	return journals.Reader(store, tenant, session, binding)
-}
+})
 ```
 
-`PublicJournal` needs the **public** session id, and Factory ≤ v0.9.0's resolver is
-not given it. So `/journal` is projected only once Factory hands its resolver the
-public session id. Until then a composition cannot close W1 on `/journal`. A
-`PublicJournal` refuses (`ErrPublicJournalScope`) any read that is not for the
-bound tenant and the binding's runtime session.
+A kept mapping reads through the reader handed most recently for its session. A
+`PublicJournal` refuses (`ErrPublicJournalScope`) any read that is not for the bound
+tenant and the binding's runtime session. Its errors never quote the runtime id. With
+factory ≤ v0.9.0 `/journal` still serves runtime ids.
 
 **Consumers that correlated on runtime ids must switch.** Any consumer matching
 `cause.command_id` against a runtime command id, or `session_id` against the
@@ -200,6 +216,10 @@ successor attach of the same session completed first, kept its session context
 uncancelled for the life of the process. The Manager now sets an overtaken record
 aside, and the late end cancels it when its runtime released. A runtime whose
 release failed still keeps its context.
+
+A known benign race is unchanged. A same-Host successor attach that lands after a
+lost residency's lease is released, but before its warm watch has ended, is refused
+(`already watched for warm release`), and Factory retries it.
 
 ## Upgrading to v0.9.0: an open gate survives failover, and a pooled Host stops growing
 
