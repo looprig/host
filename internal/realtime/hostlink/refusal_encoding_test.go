@@ -41,6 +41,61 @@ const (
 	badCompat  = "has a space\x00"
 )
 
+// attachOutcome is the ONE outcome a table row may produce: either the
+// transport answers 100 with no body, or a specific, fully-named Core class.
+//
+// A ROW HAS EXACTLY ONE RIGHT ANSWER, never "this code or that one". The
+// earlier version of this table accepted 100 for EVERY row and accepted
+// either the Attacher's code or the runtime_unavailable downgrade for a
+// published one — which is how mutant MA (reverting the per-class member
+// switch in Multiplexer.attachRefusal to copy both members unconditionally)
+// survived: a regression that turns, say, no_capacity carrying an epoch into
+// an unpublishable record and hence a 100 still passed, because 100 was
+// always an acceptable answer. Asserting the EXACT outcome closes that.
+type attachOutcome struct {
+	transportInternal bool // true: reply.Error.Code == 100, no body
+	code              sessionwire.HostLinkErrorCode
+	epoch             uint64
+	compat            string
+}
+
+// expectedAttachOutcome is attachRefusal's contract, restated as data. It
+// mirrors internal/realtime/hostlink/attach.go's attachRefusal exactly:
+//
+//   - code == "" or an unknown code: this Host cannot encode a class, so the
+//     transport answers 100 regardless of anything else the Attacher named.
+//   - epoch_mismatch: an epoch of 0 is Core-unencodable for the class, so it
+//     downgrades to runtime_unavailable; a non-zero epoch is published AS
+//     epoch_mismatch, but attachRefusal's per-class switch never copies a
+//     compat id onto this class, so compat is dropped regardless of what the
+//     Attacher named.
+//   - runtime_mismatch: an empty or Core-invalid compat id cannot be
+//     encoded, so it downgrades to runtime_unavailable; a valid one is
+//     published AS runtime_mismatch, with epoch dropped (the switch never
+//     copies it onto this class).
+//   - every other valid code (not_admitting, releasing, no_capacity,
+//     runtime_unavailable): published exactly as that code, with BOTH members
+//     dropped — neither rides with a class that carries neither.
+func expectedAttachOutcome(code sessionwire.HostLinkErrorCode, epoch uint64, compat string) attachOutcome {
+	switch code {
+	case "", "not_a_core_code":
+		return attachOutcome{transportInternal: true}
+	case sessionwire.HostLinkErrorEpochMismatch:
+		if epoch == 0 {
+			return attachOutcome{code: sessionwire.HostLinkErrorRuntimeUnavailable}
+		}
+		return attachOutcome{code: sessionwire.HostLinkErrorEpochMismatch, epoch: epoch}
+	case sessionwire.HostLinkErrorRuntimeMismatch:
+		valid := (sessionwire.HostLinkError{Code: code, RuntimeCompatibilityID: compat}).Validate() == nil
+		if !valid {
+			return attachOutcome{code: sessionwire.HostLinkErrorRuntimeUnavailable}
+		}
+		return attachOutcome{code: sessionwire.HostLinkErrorRuntimeMismatch, compat: compat}
+	default:
+		return attachOutcome{code: code}
+	}
+}
+
 func TestEveryAttacherRefusalShapeIsCoreEncodableOrAnInternalFailure(t *testing.T) {
 	attacher := &recordingAttacher{answer: acceptedObservation(testSession)}
 	f := newFixture(t, withAttacher(attacher))
@@ -77,24 +132,26 @@ func TestEveryAttacherRefusalShapeIsCoreEncodableOrAnInternalFailure(t *testing.
 				reply := rpc(t, connection, id, hostlink.MethodAttach, attachRequest(testSession))
 				id++
 				row := fmt.Sprintf("code=%q epoch=%d compat=%q", code, epoch, compat)
-				if reply.Error != nil {
-					if reply.Error.Code != 100 {
-						t.Errorf("%s: answered transport code %d; an attacher's refusal is never the caller's fault, so it must be a Core body or 100 (internal)", row, reply.Error.Code)
+				want := expectedAttachOutcome(code, epoch, compat)
+				if want.transportInternal {
+					if reply.Error == nil || reply.Error.Code != 100 {
+						t.Errorf("%s: reply = %#v, want transport 100 (internal): this Host can encode no class for this row", row, reply)
 					}
 					continue
 				}
+				if reply.Error != nil {
+					t.Errorf("%s: answered transport code %d, want the published class %q", row, reply.Error.Code, want.code)
+					continue
+				}
 				wire := refusedRPC(t, reply)
-				// The decoder above is Core's, and it validates. What is left is
-				// that a published class is the one the Attacher decided, or a
-				// documented downgrade to runtime_unavailable.
-				if wire.Code != code && wire.Code != sessionwire.HostLinkErrorRuntimeUnavailable {
-					t.Errorf("%s: published %q, want %q or the runtime_unavailable downgrade", row, wire.Code, code)
+				if wire.Code != want.code {
+					t.Errorf("%s: published %q, want exactly %q", row, wire.Code, want.code)
 				}
-				if wire.Code == sessionwire.HostLinkErrorRuntimeMismatch && wire.RuntimeCompatibilityID != compat {
-					t.Errorf("%s: runtime_mismatch names build %q, want the attacher's %q", row, wire.RuntimeCompatibilityID, compat)
+				if wire.CurrentLeaseEpoch != want.epoch {
+					t.Errorf("%s: epoch_mismatch names epoch %d, want %d", row, wire.CurrentLeaseEpoch, want.epoch)
 				}
-				if wire.Code == sessionwire.HostLinkErrorEpochMismatch && wire.CurrentLeaseEpoch != epoch {
-					t.Errorf("%s: epoch_mismatch names epoch %d, want the attacher's %d", row, wire.CurrentLeaseEpoch, epoch)
+				if wire.RuntimeCompatibilityID != want.compat {
+					t.Errorf("%s: runtime_mismatch names build %q, want %q", row, wire.RuntimeCompatibilityID, want.compat)
 				}
 			}
 		}
