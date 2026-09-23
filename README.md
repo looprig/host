@@ -181,7 +181,13 @@ loses its cause. Do not decode them with harness.
 - **Publication genuinely refused** (a body that is not canonical, or a transport
   refusal): it is logged at ERROR with its cause. The session's routes are
   invalidated, so every Factory replica resets its viewers from the durable journal,
-  and a new tail is subscribed from the live tip.
+  a new tail is subscribed from the live tip, and the refused subscription is
+  stopped first, before the new one opens.
+- **A mapping outage longer than the adapter's 256-event buffer** still ends the
+  live tail — as **Lost**, not Refused, because the buffer overflows and the
+  channel closes underneath the retry (the pre-existing slow-consumer policy). A
+  Lost tail is deliberately **not** restarted. Viewers repair from the durable
+  journal, same as any other Lost ending.
 - **Stop during a read:** a stop, with no route invalidation.
 - **Runtimes with no runtime session id** (not launched through `department`'s rig
   adapter): relayed **unprojected**, with a WARN at attach. That is the one place
