@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -80,6 +79,11 @@ func TestAMachineCauseLosesItsCommandID(t *testing.T) {
 			name: "cause keeps its other members",
 			body: `{"cause":{"loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","command_id":"` + machineCommand + `","session_id":"` + runtimeSession + `"},"type":"TurnStarted"}`,
 			want: `{"cause":{"loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"session-public-1"},"type":"TurnStarted"}`,
+		},
+		{
+			name: "only command_id is a command",
+			body: `{"cause":{"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","agency":1,"command_id":"` + machineCommand + `"},"type":"X"}`,
+			want: `{"cause":{"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","agency":1},"type":"X"}`,
 		},
 		{
 			name: "command id that is no uuid",
@@ -164,15 +168,31 @@ func TestTheProjectionRequiresBothSessionIdentities(t *testing.T) {
 	}
 }
 
-// TestTheRuntimeSessionIsMatchedAsAValueNotASubstring: a string that merely
-// contains the id (a path, a message) is content and is left alone.
-func TestTheRuntimeSessionIsMatchedAsAValueNotASubstring(t *testing.T) {
-	body := `{"path":"/ws/` + runtimeSession + `/x","session_id":"prefix-` + runtimeSession + `"}`
-	if got := projectBody(t, body, nil); got != body {
-		t.Fatalf("projected %s", got)
+// TestFreeTextNamingARuntimeIdentityIsProjectedToo is review S2's probe:
+// harness formats the runtime session id into error text (`journal: session
+// <id> ...`, a capture-spill path under it), and a TurnFailed projects that
+// text as its message. A mapped command's runtime id is as private and goes
+// the same way; a machine command's is not private and is left in the text.
+func TestFreeTextNamingARuntimeIdentityIsProjectedToo(t *testing.T) {
+	body := `{"cause":{"command_id":"` + runtimeCommand + `"},"error":{"kind":"journal","message":"journal: session ` + runtimeSession + ` lease lost; spill /var/capture/` + runtimeSession + `/tool-1; command ` + runtimeCommand + `; machine ` + machineCommand + `"},"other":"22222222-2222-4222-8222-222222222222","type":"TurnFailed"}`
+	want := `{"cause":{"command_id":"command-public-1"},"error":{"kind":"journal","message":"journal: session session-public-1 lease lost; spill /var/capture/session-public-1/tool-1; command command-public-1; machine ` + machineCommand + `"},"other":"22222222-2222-4222-8222-222222222222","type":"TurnFailed"}`
+	if got := projectBody(t, body, mapCommands{runtimeCommand: publicCommand}); got != want {
+		t.Fatalf("projected\n got %s\nwant %s", got, want)
 	}
-	if !strings.Contains(body, runtimeSession) {
-		t.Fatal("fixture lost its id")
+}
+
+// TestAPublicIdIsWrittenAsJSONStringContent: a public id carrying a character
+// JSON escapes is written escaped, so the body stays canonical.
+func TestAPublicIdIsWrittenAsJSONStringContent(t *testing.T) {
+	body := `{"message":"at ` + runtimeSession + `"}`
+	out, err := Project(context.Background(), json.RawMessage(body), Identities{
+		RuntimeSessionID: uuid.MustParse(runtimeSession), SessionID: "a<b&c",
+	}, 1)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if want := `{"message":"at a\u003cb\u0026c"}`; string(out) != want {
+		t.Fatalf("projected %s, want %s", out, want)
 	}
 }
 

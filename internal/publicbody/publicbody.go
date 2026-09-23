@@ -22,18 +22,24 @@
 //
 // WHAT IT CHANGES, and nothing else:
 //
-//   - every object member named `session_id`, at any depth, whose value is the
-//     runtime session id becomes the public session id;
+//   - every occurrence of the runtime session id — any `session_id` value at any
+//     depth, and any mention inside a string (an error message, a path) —
+//     becomes the public session id;
 //   - the top-level `cause.command_id` becomes the public command id the
-//     client admitted, or is REMOVED when the runtime command has no public
-//     identity (a machine-originated cause: a subagent hand-back, a compaction
-//     waiter); a `cause` left empty by that removal is removed too, which is
-//     how the runtime encodes a zero cause.
+//     client admitted, and so does every other occurrence of that runtime
+//     command id; or, when the runtime command has no public identity (a
+//     machine-originated cause: a subagent hand-back, a compaction waiter),
+//     it is REMOVED from `cause`, and a `cause` left empty by that removal is
+//     removed too, which is how the runtime encodes a zero cause.
 //
-// Every other byte is carried: members keep their order, untouched values keep
-// their exact encoding, and an object nothing changed in is not re-encoded at
-// all. Loop, turn and step ids are the runtime's own content identities with no
-// private record behind them, and they stay.
+// Every other byte is carried: members keep their order, and a body naming
+// neither identity is returned as the same bytes. Loop, turn and step ids are
+// the runtime's own content identities with no private record behind them,
+// and they stay.
+//
+// PROJECTED BODIES ARE NOT HARNESS EVENTS ANY MORE, and no consumer should
+// decode them with harness: a public command id need not be a UUID, and a
+// Reply whose cause was a machine command loses the cause harness requires.
 package publicbody
 
 import (
@@ -75,7 +81,9 @@ type Identities struct {
 // failure a caller may retry: the same body projects once the read succeeds.
 type MappingError struct{ Cause error }
 
-func (e *MappingError) Error() string { return "publicbody: read the command mapping: " + e.Cause.Error() }
+func (e *MappingError) Error() string {
+	return "publicbody: read the command mapping: " + e.Cause.Error()
+}
 func (e *MappingError) Unwrap() error { return e.Cause }
 
 // ErrNonCanonical reports a body this package would not hand on: one that is
@@ -84,6 +92,24 @@ var ErrNonCanonical = errors.New("publicbody: the public body is not canonical J
 
 // Project returns body with its private identities replaced. seq is the
 // event's journal sequence (see Commands).
+//
+// IT IS LINEAR IN THE BODY, WHATEVER ITS NESTING (review S1). A body can carry
+// model-controlled JSON — a tool call's input is embedded raw — so a projection
+// that re-tokenised every subtree at every level cost depth × size (7.4 s for
+// depth 1000 around a 1 MiB leaf). It now makes a fixed number of passes:
+//
+//   - THE RUNTIME SESSION ID IS REPLACED AS BYTES, everywhere. A UUID is ASCII
+//     hex and hyphens, which JSON never escapes, so its encoding occurs only
+//     inside string tokens, literally; replacing it there rewrites every
+//     `session_id` value at any depth AND every free-text mention (review S2:
+//     a TurnFailed or RestoreErrored message, a capture-spill path) with one
+//     rule, and cannot produce invalid JSON because the replacement is the
+//     public id's own string encoding;
+//   - the TOP-LEVEL object alone is split into members, once, to find the
+//     header's `cause`. A mapped runtime command id is then replaced as bytes
+//     too, everywhere (it is as private as the session id); an unmapped one
+//     is a machine id, is removed from `cause` only, and an emptied `cause`
+//     goes with it.
 func Project(ctx context.Context, body json.RawMessage, ids Identities, seq uint64) (json.RawMessage, error) {
 	if ids.RuntimeSessionID.IsZero() {
 		return nil, errors.New("publicbody: no runtime session id to project")
@@ -91,14 +117,14 @@ func Project(ctx context.Context, body json.RawMessage, ids Identities, seq uint
 	if err := ids.SessionID.Validate(); err != nil {
 		return nil, fmt.Errorf("publicbody: the public session id is invalid: %w", err)
 	}
-	// ONE CHECK, ON THE WAY OUT. A body nothing changed is returned as the
-	// same bytes, and a changed one is rebuilt from the original fragments, so
-	// a non-canonical input is refused here either way.
-	p := projector{ctx: ctx, ids: ids, runtime: ids.RuntimeSessionID.String(), seq: seq}
-	out, _, err := p.value(body, true)
+	out := replaceAll(body, ids.RuntimeSessionID.String(), string(ids.SessionID))
+	out, err := projectCause(ctx, out, ids, seq)
 	if err != nil {
 		return nil, err
 	}
+	// ONE CHECK, ON THE WAY OUT. Unchanged bytes are the input's, and changed
+	// ones are the input's fragments with string contents replaced, so a
+	// non-canonical input is refused here either way.
 	if !canonical(out) {
 		return nil, ErrNonCanonical
 	}
@@ -113,160 +139,78 @@ func Projection(ids Identities) func(context.Context, json.RawMessage, uint64) (
 	}
 }
 
-// projector is one projection in progress.
-type projector struct {
-	ctx     context.Context
-	ids     Identities
-	runtime string
-	seq     uint64
-}
-
-// value projects one JSON value, reporting whether it changed. An unchanged
-// value is returned as the SAME bytes it arrived as.
-func (p projector) value(raw json.RawMessage, top bool) (json.RawMessage, bool, error) {
-	switch firstByte(raw) {
-	case '{':
-		return p.projectObject(raw, top)
-	case '[':
-		return p.projectArray(raw)
-	default:
-		return raw, false, nil
+// replaceAll replaces every occurrence of a UUID's text with a string's JSON
+// content encoding. The input is returned as the same bytes when it does not
+// name the UUID.
+func replaceAll(body json.RawMessage, uuidText, replacement string) json.RawMessage {
+	old := []byte(uuidText)
+	if !bytes.Contains(body, old) {
+		return body
 	}
+	quoted := mustString(replacement)
+	return bytes.ReplaceAll(body, old, quoted[1:len(quoted)-1])
 }
 
-// projectObject projects one object; top marks the event's own header level,
-// the only level whose `cause` is the command cause.
-func (p projector) projectObject(raw json.RawMessage, top bool) (json.RawMessage, bool, error) {
-	members, err := objectMembers(raw)
+// projectCause maps or removes the header cause's command id.
+func projectCause(ctx context.Context, body json.RawMessage, ids Identities, seq uint64) (json.RawMessage, error) {
+	if firstByte(body) != '{' || !bytes.Contains(body, []byte(`"command_id"`)) {
+		return body, nil
+	}
+	members, err := objectMembers(body)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	changed := false
-	kept := members[:0:0]
-	for _, m := range members {
-		switch {
-		case m.key == "session_id" && isString(m.value, p.runtime):
-			m.value = mustString(string(p.ids.SessionID))
-			changed = true
-		case top && m.key == "cause" && firstByte(m.value) == '{':
-			cause, drop, causeChanged, err := p.cause(m.value)
-			if err != nil {
-				return nil, false, err
-			}
-			if drop {
-				changed = true
-				continue
-			}
-			if causeChanged {
-				m.value, changed = cause, true
-			}
-		default:
-			projected, valueChanged, err := p.value(m.value, false)
-			if err != nil {
-				return nil, false, err
-			}
-			if valueChanged {
-				m.value, changed = projected, true
-			}
+	at := -1
+	for i, m := range members {
+		if m.key == "cause" && firstByte(m.value) == '{' {
+			at = i
 		}
-		kept = append(kept, m)
 	}
-	if !changed {
-		return raw, false, nil
+	if at < 0 {
+		return body, nil
 	}
-	return encodeObject(kept), true, nil
-}
-
-// cause projects the top-level cause, reporting whether it is now empty and
-// must be dropped.
-func (p projector) cause(raw json.RawMessage) (json.RawMessage, bool, bool, error) {
-	members, err := objectMembers(raw)
+	cause, err := objectMembers(members[at].value)
 	if err != nil {
-		return nil, false, false, err
+		return nil, err
 	}
-	changed := false
-	kept := members[:0:0]
-	for _, m := range members {
-		switch {
-		case m.key == "session_id" && isString(m.value, p.runtime):
-			m.value, changed = mustString(string(p.ids.SessionID)), true
-		case m.key == "command_id":
-			public, ok, err := p.command(m.value)
-			if err != nil {
-				return nil, false, false, err
-			}
-			changed = true
-			if !ok {
-				continue
-			}
-			m.value = mustString(string(public))
-		default:
-			projected, valueChanged, err := p.value(m.value, false)
-			if err != nil {
-				return nil, false, false, err
-			}
-			if valueChanged {
-				m.value, changed = projected, true
-			}
+	for i, m := range cause {
+		if m.key != "command_id" {
+			continue
 		}
-		kept = append(kept, m)
+		runtime, public, mapped, err := resolveCommand(ctx, m.value, ids, seq)
+		if err != nil {
+			return nil, err
+		}
+		if mapped {
+			return replaceAll(body, runtime.String(), string(public)), nil
+		}
+		cause = append(cause[:i:i], cause[i+1:]...)
+		if len(cause) == 0 {
+			members = append(members[:at:at], members[at+1:]...)
+		} else {
+			members[at].value = encodeObject(cause)
+		}
+		return encodeObject(members), nil
 	}
-	if !changed {
-		return raw, false, false, nil
-	}
-	if len(kept) == 0 {
-		return nil, true, true, nil
-	}
-	return encodeObject(kept), false, true, nil
+	return body, nil
 }
 
-// command resolves one cause.command_id. A value that is not a runtime command
-// id at all has no public identity either, and is removed rather than carried.
-func (p projector) command(raw json.RawMessage) (sessionwire.CommandID, bool, error) {
+// resolveCommand resolves one cause.command_id. A value that is not a runtime
+// command id at all has no public identity either.
+func resolveCommand(ctx context.Context, raw json.RawMessage, ids Identities, seq uint64) (uuid.UUID, sessionwire.CommandID, bool, error) {
 	var text string
 	if err := json.Unmarshal(raw, &text); err != nil {
-		return "", false, nil
+		return uuid.UUID{}, "", false, nil
 	}
 	runtime, err := uuid.Parse(text)
-	if err != nil || runtime.IsZero() || p.ids.Commands == nil {
-		return "", false, nil
+	if err != nil || runtime.IsZero() || ids.Commands == nil {
+		return uuid.UUID{}, "", false, nil
 	}
-	public, ok, err := p.ids.Commands.PublicCommand(p.ctx, runtime, p.seq)
+	public, ok, err := ids.Commands.PublicCommand(ctx, runtime, seq)
 	if err != nil {
-		return "", false, &MappingError{Cause: err}
+		return uuid.UUID{}, "", false, &MappingError{Cause: err}
 	}
-	return public, ok, nil
-}
-
-// projectArray projects each element of one array.
-func (p projector) projectArray(raw json.RawMessage) (json.RawMessage, bool, error) {
-	var elements []json.RawMessage
-	if err := json.Unmarshal(raw, &elements); err != nil {
-		return nil, false, ErrNonCanonical
-	}
-	changed := false
-	for i, element := range elements {
-		projected, elementChanged, err := p.value(element, false)
-		if err != nil {
-			return nil, false, err
-		}
-		if elementChanged {
-			elements[i], changed = projected, true
-		}
-	}
-	if !changed {
-		return raw, false, nil
-	}
-	var out bytes.Buffer
-	out.WriteByte('[')
-	for i, element := range elements {
-		if i > 0 {
-			out.WriteByte(',')
-		}
-		out.Write(element)
-	}
-	out.WriteByte(']')
-	return out.Bytes(), true, nil
+	return runtime, public, ok, nil
 }
 
 // member is one object member with its key's ORIGINAL bytes, so re-encoding an
@@ -320,14 +264,6 @@ func encodeObject(members []member) json.RawMessage {
 	}
 	out.WriteByte('}')
 	return out.Bytes()
-}
-
-func isString(raw json.RawMessage, want string) bool {
-	if firstByte(raw) != '"' {
-		return false
-	}
-	var text string
-	return json.Unmarshal(raw, &text) == nil && text == want
 }
 
 func mustString(text string) json.RawMessage {

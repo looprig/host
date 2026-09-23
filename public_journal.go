@@ -68,21 +68,33 @@ type PublicJournal struct {
 // from the journal; a composition that builds one per read pays a scan of the
 // journal's records up to the page each time. PublicJournals keeps them.
 func NewPublicJournal(reader RuntimeJournalReader, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (*PublicJournal, error) {
+	journal, _, err := newPublicJournal(reader, tenant, session, binding)
+	return journal, err
+}
+
+// newPublicJournal is NewPublicJournal, also returning the handle its mapping
+// reads the runtime journal through.
+func newPublicJournal(reader RuntimeJournalReader, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (*PublicJournal, *currentJournal, error) {
 	if reader == nil {
-		return nil, errors.New("host: a public journal needs a runtime journal reader")
+		return nil, nil, errors.New("host: a public journal needs a runtime journal reader")
 	}
 	if err := tenant.Validate(); err != nil {
-		return nil, fmt.Errorf("host: public journal tenant: %w", err)
+		return nil, nil, fmt.Errorf("host: public journal tenant: %w", err)
 	}
 	if err := session.Validate(); err != nil {
-		return nil, fmt.Errorf("host: public journal session: %w", err)
+		return nil, nil, fmt.Errorf("host: public journal session: %w", err)
 	}
+	// THE ERROR NEVER CARRIES THE ID (review L3). The runtime session id is the
+	// value this type exists to keep from a client, and a composition may
+	// surface a resolver's error text; the parse error would quote it too.
 	runtimeID, err := uuid.Parse(binding.RuntimeSessionID)
 	if err != nil || runtimeID.IsZero() {
-		return nil, fmt.Errorf("host: the binding's runtime session id %q is not a runtime session: %w", binding.RuntimeSessionID, errors.Join(err, ErrPublicJournalScope))
+		return nil, nil, fmt.Errorf("host: the binding's runtime session id is not a runtime session: %w", ErrPublicJournalScope)
 	}
 	runtime := sessionwire.SessionID(binding.RuntimeSessionID)
-	index := publicbody.NewIndex(publicbody.JournalSource{Journal: reader, TenantID: tenant, RuntimeSessionID: runtime})
+	current := &currentJournal{}
+	current.use(reader)
+	index := publicbody.NewIndex(publicbody.JournalSource{Journal: current, TenantID: tenant, RuntimeSessionID: runtime})
 	return &PublicJournal{
 		reader:  reader,
 		tenant:  tenant,
@@ -92,7 +104,7 @@ func NewPublicJournal(reader RuntimeJournalReader, tenant sessionwire.TenantID, 
 			SessionID:        session,
 			Commands:         index,
 		},
-	}, nil
+	}, current, nil
 }
 
 // ReadPublicJournal reads one page of the runtime journal and projects every
@@ -141,8 +153,31 @@ type publicJournalKey struct {
 }
 
 type cachedIndex struct {
-	index *publicbody.Index
-	used  uint64
+	index   *publicbody.Index
+	current *currentJournal
+	used    uint64
+}
+
+// currentJournal is the runtime journal a kept mapping reads through: the
+// reader most recently handed for its session.
+type currentJournal struct {
+	mu     sync.Mutex
+	reader publicbody.RuntimeJournal
+}
+
+// use makes reader the one the mapping reads through from now on.
+func (c *currentJournal) use(reader publicbody.RuntimeJournal) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reader = reader
+}
+
+// ReadRuntimeJournal reads through the current reader.
+func (c *currentJournal) ReadRuntimeJournal(ctx context.Context, req sessionstore.ReadRuntimeJournalRequest) (sessionstore.RuntimePage, error) {
+	c.mu.Lock()
+	reader := c.reader
+	c.mu.Unlock()
+	return reader.ReadRuntimeJournal(ctx, req)
 }
 
 // DefaultPublicJournalCapacity is the session count NewPublicJournals keeps
@@ -159,7 +194,7 @@ func NewPublicJournals(capacity int) *PublicJournals {
 
 // Reader is NewPublicJournal sharing this cache's mapping for the session.
 func (p *PublicJournals) Reader(reader RuntimeJournalReader, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (*PublicJournal, error) {
-	fresh, err := NewPublicJournal(reader, tenant, session, binding)
+	fresh, current, err := newPublicJournal(reader, tenant, session, binding)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +203,11 @@ func (p *PublicJournals) Reader(reader RuntimeJournalReader, tenant sessionwire.
 	defer p.mu.Unlock()
 	p.clock++
 	if cached, ok := p.indexes[key]; ok {
+		// THE MAPPING IS KEPT; THE READER IS NOT (review L1). A resolver may
+		// hand a new or rotated store per call, and the kept mapping must go on
+		// reading through the one it was handed most recently.
 		cached.used = p.clock
+		cached.current.use(reader)
 		fresh.identity.Commands = cached.index
 		return fresh, nil
 	}
@@ -182,6 +221,6 @@ func (p *PublicJournals) Reader(reader RuntimeJournalReader, tenant sessionwire.
 		}
 		delete(p.indexes, oldest)
 	}
-	p.indexes[key] = &cachedIndex{index: fresh.identity.Commands.(*publicbody.Index), used: p.clock}
+	p.indexes[key] = &cachedIndex{index: fresh.identity.Commands.(*publicbody.Index), current: current, used: p.clock}
 	return fresh, nil
 }

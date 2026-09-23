@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -105,5 +106,31 @@ func TestAPublicJournalRefusesWhatItCannotProject(t *testing.T) {
 		if _, err := reader.ReadPublicJournal(t.Context(), req); !errors.Is(err, host.ErrPublicJournalScope) {
 			t.Errorf("read %s/%s = %v, want ErrPublicJournalScope", req.TenantID, req.SessionID, err)
 		}
+	}
+}
+
+// TestPublicJournalsReadTheMappingThroughTheLatestReader is review L1: a
+// resolver may hand a new store per call, and a kept mapping must not go on
+// reading through the first one it was ever handed.
+func TestPublicJournalsReadTheMappingThroughTheLatestReader(t *testing.T) {
+	journals := host.NewPublicJournals(4)
+	first, second := &countingJournal{}, &countingJournal{}
+	// The first reader is only constructed with; the mapping is first read
+	// through the second.
+	if _, err := journals.Reader(first, composeTenant, composeSession, cacheBinding(cacheRuntimeSession)); err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	readOnce(t, journals, second, composeSession, cacheRuntimeSession)
+	if first.runtimeReads.Load() != 0 || second.runtimeReads.Load() == 0 {
+		t.Fatalf("mapping reads: first reader %d, second %d; want all through the second", first.runtimeReads.Load(), second.runtimeReads.Load())
+	}
+}
+
+// TestAPublicJournalErrorDoesNotQuoteTheRuntimeSession is review L3.
+func TestAPublicJournalErrorDoesNotQuoteTheRuntimeSession(t *testing.T) {
+	const almost = "0f4d2a6c-81b3-4e57-9c20-6a1e7d3b5f4" // one digit short of a UUID
+	_, err := host.NewPublicJournal(&countingJournal{}, composeTenant, composeSession, cacheBinding(almost))
+	if err == nil || strings.Contains(err.Error(), almost) {
+		t.Fatalf("NewPublicJournal = %v, want a refusal that does not quote the id", err)
 	}
 }
