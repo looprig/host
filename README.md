@@ -47,7 +47,19 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.36.0. Core is v0.11.0.
+`github.com/looprig/harness` v0.37.0. Core is v0.11.0.
+
+**host v0.7.1 pairs with harness v0.37.0**, which closes a crash window where an
+admitted input could settle `applied` with its effect lost, or a graceful
+shutdown could cancel an input the store already recorded applied: see harness's
+own v0.37.0 release notes for the mechanism (`Admission`, replay-from-intent on
+restore). It requires no Host code change and is not a one-way upgrade — a
+v0.36.0 runtime still opens a v0.37.0 journal, and a v0.37.0 runtime replays
+input debt a crashed v0.36.0 runtime owed. **Do not mix harness v0.36.0 and
+v0.37.0 runtimes over one Host pool**: only a v0.37.0 runtime performs the
+replay-on-restore that makes the fix effective, so a pool serving the same
+sessions from both leaves the outcome dependent on which runtime happens to
+restore a given session.
 
 **A composed Host applies a command end to end: it attaches a disposition
 session, consumes its durable command stream, claims a command under its

@@ -6,11 +6,12 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/looprig/core v0.11.0
-	github.com/looprig/harness v0.36.0
+	github.com/looprig/harness v0.37.0
 	github.com/looprig/inference v0.12.0
 	github.com/looprig/sessionstore v0.12.0
 	github.com/looprig/storage v0.6.0
 	github.com/prometheus/client_golang v1.23.2
+	go.yaml.in/yaml/v2 v2.4.2
 	golang.org/x/mod v0.40.0
 )
 
@@ -36,7 +37,6 @@ require (
 	github.com/segmentio/encoding v0.5.3 // indirect
 	github.com/shadowspore/fossil-delta v0.0.0-20241213113458-1d797d70cbe3 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

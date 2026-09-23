@@ -51,17 +51,18 @@ var publishedLooprigVersions = map[string]string{
 	"sessionstore": "v0.12.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
-	"harness":      "v0.36.0",
+	"harness":      "v0.37.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
 	// internal/harnesstest does, because harness's loop.WithInference takes an
 	// inference.Client and a real rig cannot run a turn without one. harness
-	// v0.36.0 requires inference v0.12.0, so binding to harness names it in
-	// go.mod whether or not Host wanted a decision about it — which is exactly
-	// the indirect arrival the comment on requireViolations describes, and the
-	// reason that check consults this map rather than the import set. The
-	// version is the one harness v0.36.0 pins and is published.
+	// v0.37.0 still requires inference v0.12.0 (unchanged from v0.36.0), so
+	// binding to harness names it in go.mod whether or not Host wanted a
+	// decision about it — which is exactly the indirect arrival the comment on
+	// requireViolations describes, and the reason that check consults this map
+	// rather than the import set. The version is the one harness v0.37.0
+	// pins and is published.
 	"inference": "v0.12.0",
 }
 
