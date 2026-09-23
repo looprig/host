@@ -1247,12 +1247,19 @@ type commandFixture struct {
 // four unwired ones are what the attempt-aware applier will be measured against.
 func newCommandFixture(t *testing.T) *commandFixture {
 	t.Helper()
+	return newCommandFixtureWith(t)
+}
+
+// newCommandFixtureWith is newCommandFixture with further composition
+// adjustments applied after the command seams are wired.
+func newCommandFixtureWith(t *testing.T, adjust ...func(*Options, *hostconfig.Options)) *commandFixture {
+	t.Helper()
 	store := newDurableCommands(keyA)
 	runtime := newPublishingSession()
 	runtime.effects = store
 
 	var dispositions *fakeDispositions
-	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
+	f := newFixture(t, append([]func(*Options, *hostconfig.Options){func(o *Options, _ *hostconfig.Options) {
 		o.Inbox = store
 		o.Cursors = store
 		// ONE SOURCE OF ROWS. The applier reads the records the consumer lists,
@@ -1264,7 +1271,7 @@ func newCommandFixture(t *testing.T) *commandFixture {
 		dispositions.payloads = store
 		o.Records = dispositions
 		o.Writers = &fakeDispositionWriters{store: dispositions}
-	})
+	}}, adjust...)...)
 	// A REAL DISPATCH ENDS IN A DURABLE DISPOSITION. The runtime writes one
 	// when it is driven, which is what the settlement then reads; a fixture
 	// whose runtime recorded nothing would measure the evidence boundary's

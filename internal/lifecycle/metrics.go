@@ -36,10 +36,12 @@ type Ledger interface {
 
 // GateWaits reports how many resident sessions are waiting on a gate.
 //
-// It is OPTIONAL because no production source exists in this module yet — a
-// resident gate wait is §9.4 state that lives in the runtime, and the adapter
-// that surfaces it is O7.1's composition. A Host composed without one reports
-// zero, and the metric is documented as absent rather than as none.
+// It is OPTIONAL IN SHAPE AND WIRED IN FACT as of host v0.8.1: the
+// composition satisfies it from each resident session's gate publisher fold,
+// the same fold the derived work-state source reads. Before that nothing wired
+// it and the gauge read zero while a session was parked at a gate (tests lane
+// I2.3, finding 2). A Host composed without a source — or without gate
+// publishing — still reports zero, which is absent rather than none.
 type GateWaits interface {
 	GateWaiting() uint64
 }
@@ -62,10 +64,9 @@ type GateWaits interface {
 // runtime and could not be settled, or could not be dispatched at all. An
 // operator reading the old sentence would have treated a real wedge as normal.
 //
-// IT IS OPTIONAL IN SHAPE AND WIRED IN FACT, which is the difference between it
-// and GateWaits below. GateWaits has no production source at all; this one is
-// satisfied by the composition, so the gauge is live in a real binary rather
-// than reserved for a later one.
+// IT IS OPTIONAL IN SHAPE AND WIRED IN FACT, as GateWaits now is too: the
+// composition satisfies it, so the gauge is live in a real binary rather than
+// reserved for a later one.
 //
 // A NON-ZERO VALUE IS NOT AN ERROR. It says work is durably present and this
 // Host is not advancing past it — which is expected while dispatch is refused,

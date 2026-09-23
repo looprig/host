@@ -374,7 +374,11 @@ func New(options Options) (*Service, error) {
 		// FAULT rather than a designed state — see lifecycle.BlockedConsumers,
 		// whose HELP string is what an operator actually reads.
 		Blocked: composed,
-		Budget:  options.Budget,
+		// THE GATE WAIT, which read 0 while a session was parked at a gate
+		// (tests lane I2.3, finding 2): the gate publisher already folds each
+		// resident session's open gates. See Service.GateWaiting.
+		GateWaits: composed,
+		Budget:    options.Budget,
 	})
 	if err != nil {
 		return nil, err
@@ -716,8 +720,9 @@ func (s *Service) logAttach(ctx context.Context, request residency.Request, err 
 //  1. the drain stops admission, publishes nonaccepting durably, and only then
 //     acknowledges — internal/lifecycle owns that sequence and this does not
 //     restate it;
-//  2. every resident session is released through BeginRelease, WaitIdle,
-//     Checkpoint, ReleaseResidency and FinishRelease;
+//  2. every resident session is released through HaltConsumption, BeginRelease,
+//     WaitIdle, Checkpoint, ReleaseResidency and FinishRelease, and each step
+//     that fails is logged with the session's residency epoch;
 //  3. the advertisement heartbeat stops, AFTER the drain rather than before,
 //     because a heartbeat stopped first would leave the last derivation this
 //     Host published standing until it expired;
@@ -751,6 +756,7 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 		return lifecycle.Report{}, err
 	}
 	report := s.drainer.Wait()
+	s.logDrainFailures(ctx, report)
 
 	s.mu.Lock()
 	cancel, done := s.stopHeartbeat, s.heartbeatDone
@@ -857,6 +863,32 @@ func (s *Service) StartDrain(scope hostlink.DrainScope) (hostlink.DrainStatus, e
 	return s.drainer.StartDrain(scope)
 }
 
+// logDrainFailures writes one record per failed drain step, naming the
+// session, the step, the residency epoch it was held under and this Host's
+// generation.
+//
+// A FORCED RELEASE IS AN ERROR AND NAMES ITS EPOCH, because nothing else does:
+// a runtime that refused its release journals no SessionResidencyReleased, and
+// Core's two-valued drain state carries no failures, so without this record
+// the grant a successor will fence appears nowhere an operator can read it.
+// Every other step failure is a WARN.
+func (s *Service) logDrainFailures(ctx context.Context, report lifecycle.Report) {
+	logger := s.options.logger()
+	for _, failure := range report.Failures {
+		level := slog.LevelWarn
+		if failure.Step == lifecycle.StepReleaseResidency {
+			level = slog.LevelError
+		}
+		logger.LogAttrs(ctx, level, "host: drain step failed",
+			slog.String("tenant_id", string(failure.Key.TenantID)),
+			slog.String("session_id", string(failure.Key.SessionID)),
+			slog.String("step", string(failure.Step)),
+			slog.Uint64("residency_epoch", failure.ResidencyEpoch),
+			slog.Uint64("host_generation", report.Generation),
+			slog.String("error", failure.Err.Error()))
+	}
+}
+
 // releaseRefused reports whether any session's runtime refused its release.
 func releaseRefused(report lifecycle.Report) bool {
 	for _, failure := range report.Failures {
@@ -873,7 +905,7 @@ func (s *Service) ResidentSessions() []lifecycle.Session {
 	defer s.mu.Unlock()
 	held := make([]lifecycle.Session, 0, len(s.sessions))
 	for _, session := range s.sessions {
-		held = append(held, releaseSession{resident: session})
+		held = append(held, releaseSession{resident: session, halter: s})
 	}
 	return held
 }

@@ -130,6 +130,37 @@ type Session interface {
 	WaitIdle(context.Context) error
 }
 
+// ConsumptionHalter is the optional step a Session offers to stop applying
+// durable commands for the rest of its drain.
+//
+// IT IS THE WARM RELEASE'S STEP 0, AND THE DRAIN USED TO HAVE NO EQUIVALENT.
+// The drain stopped a session's command consumer only inside ReleaseResidency,
+// AFTER the idle wait and the checkpoint, so a command admitted while the drain
+// waited or checkpointed was applied by the draining Host under its own epoch
+// while its registration said `releasing` (measured by the tests lane, I2.3).
+// Halting first means what the drain checkpoints is the session's last state
+// under this Host, and anything admitted later stays pending for the successor.
+//
+// The halt waits for a pass already in flight and must honour cancellation; the
+// drain bounds it by the idle boundary and the platform grace. A halt that is
+// cut short leaves consumption halted — only the in-flight pass may still land.
+// The drain never takes a halt back: no drain path returns a session to
+// resident, so there is nothing to resume.
+type ConsumptionHalter interface {
+	HaltConsumption(context.Context) error
+}
+
+// EpochReporter is the optional Session method that names the RESIDENCY epoch
+// the session is held under, so each Failure records the epoch it happened at.
+//
+// It is spelled ResidencyEpoch and never LeaseEpoch on purpose: this package
+// reads neither half of registry.Entry's two-domain LeaseEpoch (see
+// TestTheDrainReadsNeitherHalfOfTheRegistryEntrySeam), and the value here is
+// the residency grant's — never the runtime's journal epoch.
+type EpochReporter interface {
+	ResidencyEpoch() uint64
+}
+
 // Residents enumerates the sessions this Host holds.
 type Residents interface {
 	// ResidentSessions returns the sessions held at the moment of the call.
@@ -232,6 +263,7 @@ func (e *InvalidOptionsError) Error() string {
 type Step string
 
 const (
+	StepHaltConsumption  Step = "halt_consumption"
 	StepBeginRelease     Step = "begin_release"
 	StepWaitIdle         Step = "wait_idle"
 	StepCheckpoint       Step = "checkpoint"
@@ -257,10 +289,21 @@ type Failure struct {
 	Key  registry.Key
 	Step Step
 	Err  error
+
+	// ResidencyEpoch is the residency epoch the session was held under when
+	// the step failed, or zero when the session does not report one
+	// (EpochReporter). It is what lets an operator tie a forced,
+	// crash-equivalent release — which journals no SessionResidencyReleased —
+	// to the grant its successor fences. It is never a journal epoch.
+	ResidencyEpoch uint64
 }
 
 func (f Failure) Error() string {
-	return "lifecycle: session " + strconv.Quote(string(f.Key.SessionID)) + " failed at " + string(f.Step) + ": " + f.Err.Error()
+	epoch := ""
+	if f.ResidencyEpoch != 0 {
+		epoch = " (residency epoch " + strconv.FormatUint(f.ResidencyEpoch, 10) + ")"
+	}
+	return "lifecycle: session " + strconv.Quote(string(f.Key.SessionID)) + epoch + " failed at " + string(f.Step) + ": " + f.Err.Error()
 }
 
 func (f Failure) Unwrap() error { return f.Err }
@@ -661,14 +704,28 @@ func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
 // fallback this layer cannot express.
 func (d *Drainer) release(graceCtx context.Context, session Session) {
 	key := session.Key()
+	var epoch uint64
+	if reporter, ok := session.(EpochReporter); ok {
+		epoch = reporter.ResidencyEpoch()
+	}
+	record := func(step Step, err error) {
+		d.record(Failure{Key: key, Step: step, Err: err, ResidencyEpoch: epoch})
+	}
 	run := func(step Step, action func(context.Context) error) {
 		if err := action(context.Background()); err != nil {
-			d.record(Failure{Key: key, Step: step, Err: err})
+			record(step, err)
 		}
 	}
 
+	// STEP 0, as the warm release's: stop applying commands before anything
+	// is marked, waited on or checkpointed. See ConsumptionHalter.
+	if halter, ok := session.(ConsumptionHalter); ok {
+		if err := d.bounded(graceCtx, halter.HaltConsumption); err != nil {
+			record(StepHaltConsumption, err)
+		}
+	}
 	run(StepBeginRelease, session.BeginRelease)
-	d.waitIdle(graceCtx, session, key)
+	d.waitIdle(graceCtx, session, record)
 	run(StepCheckpoint, session.Checkpoint)
 	// THE RUNTIME'S RELEASE IS BOUNDED BY THE PLATFORM GRACE, and it is the one
 	// step that is. harness refuses a nonterminal release of a session that is
@@ -680,14 +737,47 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	// the process exits, so the session's successor restores it the way it
 	// restores a crashed Host's.
 	if err := session.ReleaseResidency(graceCtx); err != nil {
-		d.record(Failure{Key: key, Step: StepReleaseResidency, Err: err})
+		record(StepReleaseResidency, err)
 	}
 	run(StepFinishRelease, session.FinishRelease)
 }
 
+// bounded runs one cancellable step under the idle boundary and the platform
+// grace, whichever ends first, and reports ErrIdleBoundary joined with the
+// step's own answer when a bound ended it. Like waitIdle it takes the step's
+// answer if it arrives, and abandons it with ErrWaitAbandoned only once the
+// grace is gone.
+func (d *Drainer) bounded(graceCtx context.Context, action func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(graceCtx)
+	defer cancel()
+	answered := make(chan error, 1)
+	go func() { answered <- action(ctx) }()
+	select {
+	case err := <-answered:
+		return err
+	case <-d.options.Clock.After(d.options.IdleBoundary):
+	case <-graceCtx.Done():
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-answered:
+	case <-graceCtx.Done():
+		select {
+		case err = <-answered:
+		default:
+			err = ErrWaitAbandoned
+		}
+	}
+	if err == nil {
+		err = context.DeadlineExceeded
+	}
+	return errors.Join(ErrIdleBoundary, err)
+}
+
 // waitIdle bounds one session's wait by the idle boundary and by the platform
 // grace, whichever ends first, and cancels the wait it hands the session.
-func (d *Drainer) waitIdle(graceCtx context.Context, session Session, key registry.Key) {
+func (d *Drainer) waitIdle(graceCtx context.Context, session Session, record func(Step, error)) {
 	idleCtx, stopWaiting := context.WithCancel(graceCtx)
 	defer stopWaiting()
 
@@ -703,7 +793,7 @@ func (d *Drainer) waitIdle(graceCtx context.Context, session Session, key regist
 	select {
 	case err := <-waited:
 		if err != nil {
-			d.record(Failure{Key: key, Step: StepWaitIdle, Err: err})
+			record(StepWaitIdle, err)
 		}
 		return
 	case <-d.options.Clock.After(d.options.IdleBoundary):
@@ -743,7 +833,7 @@ func (d *Drainer) waitIdle(graceCtx context.Context, session Session, key regist
 		if err == nil {
 			err = context.DeadlineExceeded
 		}
-		d.record(Failure{Key: key, Step: StepWaitIdle, Err: errors.Join(ErrIdleBoundary, err)})
+		record(StepWaitIdle, errors.Join(ErrIdleBoundary, err))
 	}
 }
 

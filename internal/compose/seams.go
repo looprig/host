@@ -36,10 +36,10 @@ type TargetDirectory interface {
 
 // WorkStates reports what one resident session is currently doing.
 //
-// IT IS OPTIONAL AND NOTHING IN THIS MODULE IMPLEMENTS IT. A resident gate wait
-// is §9.4 state that lives inside the runtime, and department.Runtime exposes
-// no reader for it; internal/lifecycle's GateWaits records the same absence
-// from the metrics side. The seam is here because two consumers need the same
+// IT IS OPTIONAL. A resident gate wait is §9.4 state that lives inside the
+// runtime, and department.Runtime exposes no reader for it; the composition
+// derives one from its gate publisher when DeriveWorkStates is set (see
+// derivedWorkStates), and the metrics' GateWaits reads the same fold. The seam is here because two consumers need the same
 // answer and must not develop two — the warm releaser, which must not evict a
 // session with a human waiting at a gate, and the compatibility wait, whose
 // gate boundary is one of its five outcomes.

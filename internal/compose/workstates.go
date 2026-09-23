@@ -5,6 +5,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
+	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/residency"
 )
@@ -208,13 +209,50 @@ func (s *Service) Halt(ctx context.Context, key registry.Key) error {
 }
 
 // Resume undoes Halt for a warm release that aborted.
+//
+// IT REFUSES, SILENTLY, TO UNDO A DRAIN'S HALT. A warm release runs
+// concurrently with a drain until Stop stops the releaser, and every warm
+// abort path resumes the consumer it halted. The halt is one flag, not a
+// count, so without this a warm abort racing the drain would restart
+// consumption on a session the drain is releasing — the defect the drain's
+// halt exists to close.
 func (s *Service) Resume(key registry.Key) {
 	s.mu.Lock()
 	consumer, held := s.consumers[key]
+	session := s.sessions[key]
 	s.mu.Unlock()
+	if session != nil && session.drainHalted.Load() {
+		return
+	}
 	if held {
 		consumer.Resume()
 	}
 }
+
+// GateWaiting counts the resident sessions parked at a gate, from each
+// session's gate publisher fold (lifecycle.GateWaits). A session with no
+// publisher, or one that has not folded yet, is not counted: this gauge
+// reports gates this Host can see, and the derived work-state source already
+// treats the unknown case as work.
+func (s *Service) GateWaiting() uint64 {
+	s.mu.Lock()
+	held := make([]*resident, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		held = append(held, session)
+	}
+	s.mu.Unlock()
+	var waiting uint64
+	for _, session := range held {
+		if session.work == nil || session.work.gates == nil {
+			continue
+		}
+		if open, _, folded := session.work.gates.Activity(); folded && open > 0 {
+			waiting++
+		}
+	}
+	return waiting
+}
+
+var _ lifecycle.GateWaits = (*Service)(nil)
 
 var _ residency.ConsumptionHalter = (*Service)(nil)

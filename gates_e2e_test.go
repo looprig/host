@@ -760,6 +760,11 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 		if failure.SessionID == composeSession && failure.Step == "release_residency" {
 			refused = true
 		}
+		// The drain halts the consumer first; a parked gate holds no pass in
+		// flight, so that halt must not be what costs this drain its bound.
+		if failure.Step == "halt_consumption" {
+			t.Errorf("the drain could not halt a gated session's consumer: %v", failure)
+		}
 	}
 	if !refused {
 		t.Fatalf("drain failures = %+v, want the runtime's refused release recorded", report.Failures)

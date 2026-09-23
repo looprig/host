@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
@@ -107,6 +108,11 @@ type resident struct {
 	// giveUpOnce makes the crash-equivalent release of an unusable runtime run
 	// once, whether a persistence fault or a stranded attempt reported it first.
 	giveUpOnce sync.Once
+
+	// drainHalted records that a drain halted this session's consumer. It is
+	// never cleared: no drain path returns a session to resident, so a warm
+	// release racing the drain must not Resume what the drain halted.
+	drainHalted atomic.Bool
 
 	checkpointOnce onceOnSuccess
 	beginOnce      onceOnSuccess
@@ -279,10 +285,48 @@ func (r *resident) dropState(ctx context.Context) error {
 // warm path's: tombstone, then heartbeat, then lease, then local state.
 type releaseSession struct {
 	*resident
+
+	// halter stops the session's consumer; it is the composition itself.
+	halter residency.ConsumptionHalter
 }
 
-// releaseSession is a lifecycle.Session.
-var _ lifecycle.Session = releaseSession{}
+// releaseSession is a lifecycle.Session, and offers both optional drain steps.
+var (
+	_ lifecycle.Session           = releaseSession{}
+	_ lifecycle.ConsumptionHalter = releaseSession{}
+	_ lifecycle.EpochReporter     = releaseSession{}
+)
+
+// HaltConsumption stops this session's command consumer claiming or applying
+// anything more, waiting — bounded by ctx — for a pass already in flight.
+//
+// IT IS THE DRAIN'S STEP 0, AND WARM RELEASE ALREADY HAD IT. Before it, the
+// drain stopped the consumer only in ReleaseResidency, after the idle wait and
+// the checkpoint, and an input admitted in between was applied by this
+// draining Host under its own epoch while its registration said `releasing`
+// (tests lane I2.3, finding 1). The halt is latched on the resident first, so a
+// warm release racing this drain cannot Resume it; see Service.Resume.
+//
+// A GATE ANSWER ADMITTED DURING THE DRAIN IS NOT APPLIED EITHER. That is the
+// same rule, not an exception: a session parked at a gate when the drain
+// begins is released crash-equivalently, and the answer stays pending for the
+// successor that restores the session.
+func (s releaseSession) HaltConsumption(ctx context.Context) error {
+	s.drainHalted.Store(true)
+	if s.halter == nil {
+		return nil
+	}
+	return s.halter.Halt(ctx, s.key)
+}
+
+// ResidencyEpoch is the residency grant's epoch this session is held under, so
+// every drain failure — a forced release above all — names it.
+func (s releaseSession) ResidencyEpoch() uint64 {
+	if s.lease == nil {
+		return 0
+	}
+	return uint64(s.lease.Epoch())
+}
 
 // FinishRelease writes the tombstone, ends the heartbeat, releases the residency
 // grant and drops local state, which is what this seam's FinishRelease means.
