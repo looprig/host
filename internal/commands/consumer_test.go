@@ -2084,16 +2084,18 @@ func equalIDs(got, want []sessionwire.CommandID) bool {
 // Resume restores ordinary consumption.
 func TestHaltWaitsOutThePassInFlightAndClaimsNothingAfter(t *testing.T) {
 	t.Parallel()
-	entered := make(chan struct{})
+	// entered is buffered so the first pass's signal can never be dropped by a
+	// non-blocking send racing the main goroutine's receive: the send always
+	// succeeds (into the buffer if the receiver isn't there yet), and a later
+	// pass's send (after Resume, once proceed is already closed) finds the
+	// buffer free and returns immediately with nothing left to read it.
+	entered := make(chan struct{}, 1)
 	proceed := make(chan struct{})
 	f := newConsumerFixture(t, func(f *consumerFixture) {
 		f.inbox.all = []Command{command(1, StatePending)}
 		f.processor.before = func(Command) {
-			select {
-			case entered <- struct{}{}:
-				<-proceed
-			default:
-			}
+			entered <- struct{}{}
+			<-proceed
 		}
 	})
 
