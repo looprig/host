@@ -12,6 +12,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/harness/pkg/event"
 
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/lifecycle"
@@ -198,4 +199,103 @@ func TestAForcedReleaseRecordsAndLogsTheResidencyEpoch(t *testing.T) {
 		return
 	}
 	t.Fatalf("no drain failure was logged for the forced release: %+v", handler.snapshot())
+}
+
+// holdingApplySession is a publishing runtime whose FIRST dispatch blocks until
+// released, so a test can hold a consumer pass in flight while a drain waits
+// for it. Later dispatches pass straight through, so a consumer wrongly resumed
+// shows up as a second application rather than a hang.
+type holdingApplySession struct {
+	*publishingSession
+	entered chan struct{}
+	release chan struct{}
+	first   sync.Once
+}
+
+// ApplyCommand blocks the first dispatch until release closes.
+func (s *holdingApplySession) ApplyCommand(ctx context.Context, command department.RuntimeCommand) error {
+	s.first.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.publishingSession.ApplyCommand(ctx, command)
+}
+
+// TestAResumeWhileTheDrainWaitsOutAPassCannotUndoTheHalt is gate F2: the drain
+// latches its halt BEFORE it waits for the pass in flight, under the lock
+// Service.Resume checks it with. A warm release aborting while the drain waits
+// is exactly the window a latch set after the wait would leave open: its
+// Resume would clear the consumer's halt, and the consumer would go on
+// applying commands mid-drain.
+func TestAResumeWhileTheDrainWaitsOutAPassCannotUndoTheHalt(t *testing.T) {
+	hold := newHoldingCheckpointer()
+	t.Cleanup(hold.open)
+	store := newDurableCommands(keyA)
+	inner := newPublishingSession()
+	inner.effects = store
+	runtime := &holdingApplySession{publishingSession: inner, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-runtime.release:
+		default:
+			close(runtime.release)
+		}
+	})
+	f := newFixture(t, func(o *Options, _ *hostconfig.Options) {
+		o.Inbox = store
+		o.Cursors = store
+		dispositions := newFakeDispositions(o.Clock.(*fakeClock), store)
+		dispositions.payloads = store
+		o.Records = dispositions
+		o.Writers = &fakeDispositionWriters{store: dispositions}
+		o.Checkpointer = hold
+		inner.disposition = func(command sessionwire.CommandID) { dispositions.setEvidence(command, "applied") }
+	})
+	f.rig.Session = runtime
+	f.start()
+	f.attach(tenantA, sessionA)
+
+	store.accept(t, "command-in-flight", `{"blocks":[{"text":"first"}]}`)
+	f.svc.Wake(keyA)
+	select {
+	case <-runtime.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the consumer never dispatched the first command")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		_, _ = f.svc.Stop(context.Background())
+	}()
+	// The drain publishes nonaccepting before it touches a session, then halts
+	// the consumer, which waits for the pass held above.
+	awaitCondition(t, "the drain to publish nonaccepting", func() bool { return len(f.directory.withdrawals()) > 0 })
+	time.Sleep(100 * time.Millisecond)
+
+	f.svc.Resume(keyA)
+	close(runtime.release)
+	select {
+	case <-hold.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain never reached the checkpoint")
+	}
+
+	late := store.accept(t, "command-after-resume", `{"blocks":[{"text":"late"}]}`)
+	f.svc.Wake(keyA)
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, applied := range inner.appliedCommands() {
+			if applied.CommandID == late {
+				t.Fatal("a Resume during the drain's halt restarted consumption: the draining Host applied a later command")
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	hold.open()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return")
+	}
 }

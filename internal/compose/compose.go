@@ -905,7 +905,7 @@ func (s *Service) ResidentSessions() []lifecycle.Session {
 	defer s.mu.Unlock()
 	held := make([]lifecycle.Session, 0, len(s.sessions))
 	for _, session := range s.sessions {
-		held = append(held, releaseSession{resident: session, halter: s})
+		held = append(held, releaseSession{resident: session, service: s})
 	}
 	return held
 }

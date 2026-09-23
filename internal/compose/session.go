@@ -286,8 +286,9 @@ func (r *resident) dropState(ctx context.Context) error {
 type releaseSession struct {
 	*resident
 
-	// halter stops the session's consumer; it is the composition itself.
-	halter residency.ConsumptionHalter
+	// service is the composition, which owns the consumers and the lock the
+	// drain's halt latch shares with Service.Resume.
+	service *Service
 }
 
 // releaseSession is a lifecycle.Session, and offers both optional drain steps.
@@ -304,19 +305,21 @@ var (
 // drain stopped the consumer only in ReleaseResidency, after the idle wait and
 // the checkpoint, and an input admitted in between was applied by this
 // draining Host under its own epoch while its registration said `releasing`
-// (tests lane I2.3, finding 1). The halt is latched on the resident first, so a
-// warm release racing this drain cannot Resume it; see Service.Resume.
+// (tests lane I2.3, finding 1). The halt is latched on the resident first,
+// under the lock Service.Resume checks it with, so a warm release racing this
+// drain cannot Resume it — not even while the halt waits for a pass in flight;
+// see Service.haltForDrain.
 //
 // A GATE ANSWER ADMITTED DURING THE DRAIN IS NOT APPLIED EITHER. That is the
 // same rule, not an exception: a session parked at a gate when the drain
 // begins is released crash-equivalently, and the answer stays pending for the
 // successor that restores the session.
 func (s releaseSession) HaltConsumption(ctx context.Context) error {
-	s.drainHalted.Store(true)
-	if s.halter == nil {
+	if s.service == nil {
+		s.drainHalted.Store(true)
 		return nil
 	}
-	return s.halter.Halt(ctx, s.key)
+	return s.service.haltForDrain(ctx, s.resident)
 }
 
 // ResidencyEpoch is the residency grant's epoch this session is held under, so

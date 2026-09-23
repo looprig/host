@@ -216,17 +216,40 @@ func (s *Service) Halt(ctx context.Context, key registry.Key) error {
 // count, so without this a warm abort racing the drain would restart
 // consumption on a session the drain is releasing — the defect the drain's
 // halt exists to close.
+//
+// THE CHECK AND THE RESUME HAPPEN UNDER s.mu, the lock haltForDrain latches
+// under, so the two cannot interleave: a Resume that runs before the latch
+// completes before the drain's Halt sets the consumer halted, and one that runs
+// after it sees the latch. Consumer.Resume only flips a flag and sends a
+// non-blocking hint, so holding s.mu across it costs nothing.
 func (s *Service) Resume(key registry.Key) {
 	s.mu.Lock()
-	consumer, held := s.consumers[key]
-	session := s.sessions[key]
-	s.mu.Unlock()
-	if session != nil && session.drainHalted.Load() {
+	defer s.mu.Unlock()
+	if session := s.sessions[key]; session != nil && session.drainHalted.Load() {
 		return
 	}
-	if held {
+	if consumer, held := s.consumers[key]; held {
 		consumer.Resume()
 	}
+}
+
+// haltForDrain latches a drain's halt on the resident and then halts its
+// consumer, waiting — bounded by ctx — for a pass in flight.
+//
+// THE LATCH PRECEDES THE HALT AND IS TAKEN UNDER s.mu. Latched after the halt
+// returned, a warm release's Resume arriving while the halt waited out a pass
+// would clear the consumer's halt, and the consumer would apply commands for
+// the rest of the drain (TestAResumeWhileTheDrainWaitsOutAPassCannotUndoTheHalt).
+// The wait itself runs outside the lock.
+func (s *Service) haltForDrain(ctx context.Context, held *resident) error {
+	s.mu.Lock()
+	held.drainHalted.Store(true)
+	consumer, ok := s.consumers[held.key]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return consumer.Halt(ctx)
 }
 
 // GateWaiting counts the resident sessions parked at a gate, from each
