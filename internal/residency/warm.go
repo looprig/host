@@ -798,7 +798,12 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	// rest of it, AFTER the lease release: a Host that credited its capacity
 	// while still holding the grant would admit a replacement it has no room
 	// for.
-	w.options.Admissions.Release(key)
+	//
+	// OWNED BY THIS GENERATION (booked finding B2): once FinishRelease removed
+	// the registry entry a successor may already have admitted the session,
+	// claiming this charge, and a credit keyed by session alone would uncharge
+	// it.
+	w.options.Admissions.ReleaseOwned(key, generation)
 	run(WarmStepDropState, session.DropState)
 
 	outcome.Kind = WarmOutcomeReleased

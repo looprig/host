@@ -370,8 +370,22 @@ type Admissions interface {
 	// repeated (key, agent).
 	Admit(registry.Key, sessionwire.AgentID) error
 
-	// Release credits an admitted session's weight back.
+	// Release credits an admitted session's weight back, whoever owns it. Only
+	// an attach's own rollback uses it: the charge is that attach's.
 	Release(registry.Key) bool
+
+	// Own binds the session's charge to the residency generation that
+	// installed it, and reports whether it is now that generation's. A
+	// re-admission of the session (a successor's) claims the charge back for
+	// the attach in flight; see ReleaseOwned.
+	Own(registry.Key, uint64) bool
+
+	// ReleaseOwned credits the charge back only while it still belongs to the
+	// releasing generation (booked finding B2). Every path that ends a
+	// residency credits through it: a successor that admitted the session
+	// between the old residency's registry removal and its credit holds the
+	// charge, and a credit keyed by session alone uncharged it.
+	ReleaseOwned(registry.Key, uint64) bool
 
 	// Draining reports whether this Host has begun graceful drain.
 	//
@@ -754,6 +768,15 @@ func (m *Manager) SessionContext(key registry.Key) (context.Context, bool) {
 	return record.ctx, true
 }
 
+// Records reports how many residency records this Manager holds: one per
+// attached residency that has not ended. It is what shows a long-lived Host
+// does not grow per session it has ever held (booked finding B1).
+func (m *Manager) Records() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
+}
+
 // Close cancels this Manager's root session context, which cancels every
 // session derived from it and therefore every ownership started under one.
 //
@@ -768,15 +791,43 @@ func (m *Manager) SessionContext(key registry.Key) (context.Context, bool) {
 // flight when it arrives still rolls back completely: see the rollback context
 // in attach, which Close deliberately cannot cancel.
 //
-// FOR O3.2/O6.1, WITH O3.1's REACHABILITY STATED: m.sessions is never pruned by
-// this package, because nothing here ends a residency. If a record is ever
-// orphaned — its registry entry replaced under the same key by another writer,
-// which needs a second writer to that registry and so cannot happen in O3.1 —
-// the record stays forever holding a live session context and an ownership
-// handle, and every later attach for that key launches a runtime and discards
-// it. Release owns the pruning, under the same mutex that writes the record.
+// A residency's record is pruned by EndResidency, which every path that ends a
+// residency calls; Close is only the process-wide backstop.
 func (m *Manager) Close() {
 	m.cancelRoot()
+}
+
+// EndResidency prunes the record of a residency that has ENDED — released,
+// abandoned, lost or drained, with its registry entry already removed — and
+// reports whether it pruned one.
+//
+// IT IS FENCED BY GENERATION, so a late end of an old residency cannot prune
+// the residency that replaced it under the same key.
+//
+// Before it existed nothing pruned these records (booked finding B1): every
+// session that ever left a long-lived pooled Host kept an uncancelled session
+// context and an ownership handle whose heartbeat reaches the runtime, so the
+// Host grew by one record per distinct session it had held.
+//
+// runtimeReleased says whether the session context may be CANCELLED. The
+// runtime was launched on it, so it may be cancelled only once the runtime was
+// released or abandoned. A runtime whose release was refused — a drain of a
+// session parked at a gate — is left PARKED: cancelled, it would interrupt its
+// turn and abandon the gate after this Host stopped publishing it. Its record
+// is still pruned; its context stays a child of the root, which Close cancels.
+func (m *Manager) EndResidency(key registry.Key, generation uint64, runtimeReleased bool) bool {
+	m.mu.Lock()
+	record, held := m.sessions[key]
+	if !held || record.generation != generation {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.sessions, key)
+	m.mu.Unlock()
+	if runtimeReleased {
+		record.cancel()
+	}
+	return true
 }
 
 // Attach creates or restores a session under its lease and reports the
@@ -1376,6 +1427,11 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// elsewhere and remains resumable — and leaves the shared admission and
 		// workspace to the winner. Leaving the runtime live is the bug this
 		// branch exists to fix.
+		//
+		// The charge goes BACK to the winner: this attach's Admit claimed it
+		// (see Admissions.Own), and a charge nobody owns is one no release
+		// would ever credit.
+		m.admissions.Own(key, entry.Generation)
 		unreleased := unwound.unwind(rollbackCtx, false)
 		residency, mismatch := existingResidency(entry, key, request)
 		if mismatch != nil {
@@ -1432,6 +1488,15 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		}
 		return nil
 	})
+
+	// THE CHARGE BELONGS TO THIS RESIDENCY FROM HERE (booked finding B2), so
+	// the credit of whichever path ends it returns this charge and no other.
+	// Refused only if the ledger lost the charge or another generation holds
+	// it, and a residency its end could not credit is refused rather than
+	// installed.
+	if !m.admissions.Own(key, entry.Generation) {
+		return fail(StepInstall, "", "the admission charge could not be bound to the installed residency", nil)
+	}
 
 	// -- 6. the epoch-fenced durable residency projection --------------------
 	observation := m.observation(key, request.AgentID, target.compatibility, epoch, sessionwire.SessionResidencyAttaching, false)

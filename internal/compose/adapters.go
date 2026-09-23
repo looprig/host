@@ -604,7 +604,7 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 		failures = append(failures, err)
 	}
 	if s.residentFor(held.key) == held {
-		s.capacity.Release(held.key)
+		s.capacity.ReleaseOwned(held.key, held.generation)
 		s.warm.Forget(held.key)
 	}
 	s.forget(held.key, held.generation)
@@ -653,14 +653,23 @@ func flatten(err error) []error {
 	return out
 }
 
-// forget drops the composition's handle on one residency, fenced by generation
-// so a late caller cannot remove the residency that REPLACED it.
+// forget drops the composition's handle on one residency, and the Manager's
+// record of it, fenced by generation so a late caller cannot remove the
+// residency that REPLACED it.
+//
+// THE MANAGER'S RECORD GOES TOO (booked finding B1): it holds the session
+// context the runtime runs on and the ownership handle, and nothing else ever
+// pruned it. Its context is cancelled only if the runtime was released or
+// abandoned; one left running is not cancelled out from under itself.
 func (s *Service) forget(key registry.Key, generation uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if held, present := s.sessions[key]; present && held.generation == generation {
+	held, present := s.sessions[key]
+	current := present && held.generation == generation
+	if current {
 		delete(s.sessions, key)
 	}
+	s.mu.Unlock()
+	s.manager.EndResidency(key, generation, current && held.runtimeReleased())
 }
 
 // leaseFor returns the residency grant recorded for a key by the lease recorder.

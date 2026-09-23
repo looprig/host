@@ -199,6 +199,14 @@ func (r *resident) ReleaseResidency(ctx context.Context) error {
 	return r.residencyOnce.run(func() error { return r.runtime.ReleaseResidency(ctx) })
 }
 
+// runtimeReleased reports whether the runtime was released or abandoned, so
+// the session context it runs on may be cancelled.
+func (r *resident) runtimeReleased() bool {
+	r.residencyOnce.mu.Lock()
+	defer r.residencyOnce.mu.Unlock()
+	return r.residencyOnce.done
+}
+
 // stopWork ends the consumer and the tail, once.
 func (r *resident) stopWork() {
 	r.once.mu.Lock()
@@ -346,6 +354,13 @@ func (s releaseSession) FinishRelease(ctx context.Context) error {
 	}
 	if err := s.dropState(ctx); err != nil {
 		failures = append(failures, err)
+	}
+	// THE DRAIN'S END OF THE RESIDENCY (booked finding B1): the Manager's
+	// record is pruned here, and its context cancelled only if the runtime
+	// released — a refused one is left parked. The lost and fault paths reach
+	// this method with no service and prune through Service.forget instead.
+	if s.service != nil {
+		s.service.manager.EndResidency(s.key, s.generation, s.runtimeReleased())
 	}
 	return errors.Join(failures...)
 }

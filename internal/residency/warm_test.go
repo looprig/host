@@ -302,18 +302,28 @@ func (c *fakeConsumption) wakeCount() int {
 type fakeWarmAdmissions struct {
 	trace *warmTrace
 
-	mu       sync.Mutex
-	released []registry.Key
+	mu          sync.Mutex
+	released    []registry.Key
+	generations []uint64
 }
 
 func (a *fakeWarmAdmissions) Admit(registry.Key, sessionwire.AgentID) error { return nil }
 func (a *fakeWarmAdmissions) Draining() bool                                { return false }
 
-func (a *fakeWarmAdmissions) Release(key registry.Key) bool {
+func (a *fakeWarmAdmissions) Own(registry.Key, uint64) bool { return true }
+
+// Release is the attach rollback's credit, which a warm release never uses.
+func (a *fakeWarmAdmissions) Release(registry.Key) bool {
+	a.trace.record("admissions.release_unowned")
+	return true
+}
+
+func (a *fakeWarmAdmissions) ReleaseOwned(key registry.Key, generation uint64) bool {
 	a.trace.record("admissions.release")
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.released = append(a.released, key)
+	a.generations = append(a.generations, generation)
 	return true
 }
 
@@ -501,6 +511,28 @@ func TestAnIdleSessionIsReleasedInTheSpecifiedOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("the release ran\n  %v\nwant\n  %v", got, want)
 		}
+	}
+}
+
+// TestAWarmReleaseCreditsOnlyTheChargeItsGenerationOwns is booked finding B2
+// on the warm path: the credit runs after FinishRelease removed the registry
+// entry, when a successor may already have admitted the session, so it names
+// the RELEASED generation and the ledger credits only a charge that generation
+// still owns (service.CapacityPublisher.ReleaseOwned).
+func TestAWarmReleaseCreditsOnlyTheChargeItsGenerationOwns(t *testing.T) {
+	t.Parallel()
+
+	f := newWarmFixture(t)
+	generation := f.entry().Generation
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.clock.only(t).expire(t)
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeReleased {
+		t.Fatalf("outcome = %q, want released", outcome.Kind)
+	}
+	f.admissions.mu.Lock()
+	defer f.admissions.mu.Unlock()
+	if len(f.admissions.generations) != 1 || f.admissions.generations[0] != generation {
+		t.Fatalf("credited generations %v, want exactly the released residency's %d", f.admissions.generations, generation)
 	}
 }
 

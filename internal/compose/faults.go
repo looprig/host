@@ -155,11 +155,13 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	}
 	// The admission credit AFTER the lease release, for the warm release's
 	// reason: crediting capacity while still holding the grant would admit a
-	// replacement this Host has no room for. BOTH ARE KEYED BY KEY ONLY, so they
-	// run only while this residency is still the one held (D3 gate F3): a late
-	// give-up for a replaced residency must not uncharge its successor.
+	// replacement this Host has no room for. The warm forget is keyed by key
+	// only, so it runs only while this residency is still the one held (D3 gate
+	// F3); the credit is also fenced by generation in the ledger itself (booked
+	// finding B2), because a successor can claim the charge BEFORE it is the
+	// one held: a late give-up must not uncharge its successor.
 	if s.residentFor(held.key) == held {
-		s.capacity.Release(held.key)
+		s.capacity.ReleaseOwned(held.key, held.generation)
 		s.warm.Forget(held.key)
 	}
 	s.forget(held.key, held.generation)

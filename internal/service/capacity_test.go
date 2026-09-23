@@ -1397,6 +1397,8 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"CapacityPublisher.Publish":          true,
 		"CapacityPublisher.Admit":            true,
 		"CapacityPublisher.Release":          true,
+		"CapacityPublisher.Own":              true,
+		"CapacityPublisher.ReleaseOwned":     true,
 		"CapacityPublisher.BeginDrain":       true,
 		"CapacityPublisher.Draining":         true,
 		"CapacityPublisher.ConsumedWeight":   true,
@@ -2818,4 +2820,66 @@ func TestTheIsolationClassIsThePooledAdmissionRule(t *testing.T) {
 			t.Fatalf("the Host stayed bound to a tenant with nothing resident: %v", err)
 		}
 	})
+}
+
+// TestACreditBelongsToTheResidencyThatOwnsTheCharge is booked finding B2. The
+// ledger is keyed by session and Admit is idempotent, so a SUCCESSOR attach
+// admitting the session between the old residency's registry removal and its
+// credit found the old charge, took it as its own and charged nothing — and
+// the old path's credit then uncharged the successor: over-admission by one.
+// The charge is now OWNED by a residency generation: a re-admission claims it
+// for the attach in flight, and only the owning generation's credit returns it.
+func TestACreditBelongsToTheResidencyThatOwnsTheCharge(t *testing.T) {
+	t.Parallel()
+
+	options := pooledOptions(t, newFakeClock())
+	options.Capacity = 2
+	options.Department = testDepartment(t, registration("reviewer", pooledCapabilities(2)))
+	publisher := newPublisher(t, options)
+	key := registry.Key{TenantID: testTenant, SessionID: "session-r"}
+
+	// The old residency, generation 7, charged and owned.
+	if err := publisher.Admit(key, "reviewer"); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if !publisher.Own(key, 7) {
+		t.Fatal("Own of a fresh charge refused")
+	}
+	// THE RACE: the successor's step 1 lands before the old path's credit.
+	if err := publisher.Admit(key, "reviewer"); err != nil {
+		t.Fatalf("the successor's Admit: %v", err)
+	}
+	if publisher.ReleaseOwned(key, 7) {
+		t.Fatal("the old residency's credit returned a charge the successor had claimed")
+	}
+	if got := publisher.ConsumedWeight(); got != 2 {
+		t.Fatalf("ConsumedWeight = %d after the stale credit, want 2: the successor is resident and uncharged", got)
+	}
+	// The successor installs as generation 8 and owns the charge; a stale
+	// credit still does nothing, and its own credit returns it exactly once.
+	if !publisher.Own(key, 8) {
+		t.Fatal("the successor could not own the charge it claimed")
+	}
+	if publisher.Own(key, 7) {
+		t.Fatal("a stale generation took the charge back from its owner")
+	}
+	if publisher.ReleaseOwned(key, 7) || publisher.ConsumedWeight() != 2 {
+		t.Fatal("a stale credit returned the successor's owned charge")
+	}
+	if !publisher.ReleaseOwned(key, 8) || publisher.ConsumedWeight() != 0 {
+		t.Fatalf("the owner's credit = %d consumed, want 0", publisher.ConsumedWeight())
+	}
+	if publisher.ReleaseOwned(key, 8) {
+		t.Fatal("a second credit of the same residency returned weight twice")
+	}
+
+	// And the ordinary order: the old credit lands first, the successor
+	// charges afresh.
+	if err := publisher.Admit(key, "reviewer"); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	publisher.Own(key, 9)
+	if !publisher.ReleaseOwned(key, 9) || publisher.ConsumedWeight() != 0 {
+		t.Fatal("an owner's credit before any successor did not return the charge")
+	}
 }

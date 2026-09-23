@@ -500,6 +500,15 @@ func (a *tracingAdmissions) Admit(key registry.Key, agent sessionwire.AgentID) e
 	return a.inner.Admit(key, agent)
 }
 
+func (a *tracingAdmissions) Own(key registry.Key, generation uint64) bool {
+	return a.inner.Own(key, generation)
+}
+
+func (a *tracingAdmissions) ReleaseOwned(key registry.Key, generation uint64) bool {
+	a.trace.record("admission.release_owned")
+	return a.inner.ReleaseOwned(key, generation)
+}
+
 func (a *tracingAdmissions) Release(key registry.Key) bool {
 	a.mu.Lock()
 	a.releases++
@@ -1549,6 +1558,16 @@ func TestTheRegistryLoserLeavesTheWinnersSharedResourcesAlone(t *testing.T) {
 	// this row a manager that released and re-admitted would look identical.
 	if _, releases := f.admissions.counts(); releases != 0 {
 		t.Errorf("the loser credited the admission ledger back %d time(s); that charge is the resident session's", releases)
+	}
+	// And the charge is the WINNER's to credit (booked finding B2): the
+	// loser's Admit claimed it, so a loser that did not hand it back would
+	// leave a charge no residency's release ever returns.
+	winner, held := f.registry.Get(f.key())
+	if !held {
+		t.Fatal("the winner's residency is gone")
+	}
+	if !f.publisher.ReleaseOwned(f.key(), winner.Generation) {
+		t.Error("the winner's release could not credit the charge the loser claimed")
 	}
 }
 

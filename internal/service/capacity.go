@@ -177,6 +177,11 @@ type CapacityOptions struct {
 type admission struct {
 	agent  sessionwire.AgentID
 	weight uint64
+
+	// owner is the registry generation of the residency the charge belongs to,
+	// or zero while it belongs to an attach that has not installed one yet.
+	// See Own and ReleaseOwned.
+	owner uint64
 }
 
 // CapacityPublisher derives the Department's target advertisements.
@@ -471,6 +476,15 @@ func (p *CapacityPublisher) Admit(key registry.Key, agent sessionwire.AgentID) e
 		if existing.agent != agent {
 			return &AdmissionConflictError{Key: key, Admitted: existing.agent, Requested: agent}
 		}
+		// THE CHARGE IS CLAIMED FOR THE ATTACH IN FLIGHT (booked finding
+		// B2). A residency's attach never re-admits its own session — the
+		// Manager answers a resident session before admission — so a repeat
+		// Admit is a SUCCESSOR's, arriving while the residency that took the
+		// charge is ending and has not credited it yet. The weight stays
+		// charged, once, and the ending residency's ReleaseOwned becomes a
+		// no-op, so the successor is never left resident and uncharged.
+		existing.owner = 0
+		p.admitted[key] = existing
 		return nil
 	}
 	if p.draining {
@@ -555,6 +569,51 @@ func (p *CapacityPublisher) Release(key registry.Key) bool {
 
 	entry, admitted := p.admitted[key]
 	if !admitted {
+		return false
+	}
+	delete(p.admitted, key)
+	p.consumed -= entry.weight
+	return true
+}
+
+// Own binds a session's charge to the residency generation that installed it,
+// and reports whether the charge is now that generation's.
+//
+// A charge that belongs to no residency yet (a fresh Admit, or one a
+// successor's Admit claimed) is bound; a charge the generation already owns is
+// reported owned; a charge another generation owns, or no charge, is refused.
+func (p *CapacityPublisher) Own(key registry.Key, generation uint64) bool {
+	if generation == 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, admitted := p.admitted[key]
+	switch {
+	case !admitted:
+		return false
+	case entry.owner == 0:
+		entry.owner = generation
+		p.admitted[key] = entry
+		return true
+	default:
+		return entry.owner == generation
+	}
+}
+
+// ReleaseOwned credits a session's charge back ONLY while it still belongs to
+// the residency generation releasing it, and reports whether it did.
+//
+// It is the credit every path that ends a residency uses (booked finding B2).
+// Release, keyed by session alone, credited whatever charge the key held — and
+// between the old residency's registry removal and its credit a successor may
+// already have claimed that charge with an idempotent Admit, so the credit
+// uncharged a resident session and the Host over-admitted by one.
+func (p *CapacityPublisher) ReleaseOwned(key registry.Key, generation uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, admitted := p.admitted[key]
+	if !admitted || generation == 0 || entry.owner != generation {
 		return false
 	}
 	delete(p.admitted, key)
