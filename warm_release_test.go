@@ -408,11 +408,15 @@ func TestASessionWaitingAtAGateIsNotWarmReleased(t *testing.T) {
 	awaitResidentSessions(t, service, 0, 20*warmTTL+5*time.Second)
 }
 
-// TestARestoredSessionWithAnOpenGateIsNotWarmReleased is the case the runtime's
-// own idle cannot see. Host A's agent raises a permission gate and A crashes;
-// Host B restores the session, and harness restores the gate OPEN under an
-// interrupted turn — so B's runtime is idle while a human still has a question
-// to answer. B keeps the session; once the approval settles, B releases it.
+// TestARestoredSessionWithAnOpenGateIsNotWarmReleased: Host A's agent raises a
+// permission gate and A crashes; Host B restores the session. Since harness
+// v0.39.0 the restore RESUMES the parked turn, so B's runtime is not idle while
+// the human's question is open (before, it restored the gate under an
+// interrupted, idle turn — the case the Host's own gate check still covers for
+// a turn harness does not resume: a subagent loop, or a compaction inside the
+// turn; see residency's TestAGateWaitIsNotWholeSessionIdle). B keeps the
+// session for ten warm TTLs; once the approval settles and the resumed turn
+// finishes, B releases it.
 func TestARestoredSessionWithAnOpenGateIsNotWarmReleased(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
 	first, firstLauncher, _ := world.host(t, 4)
@@ -433,19 +437,23 @@ func TestARestoredSessionWithAnOpenGateIsNotWarmReleased(t *testing.T) {
 	if !ok {
 		t.Fatal("the restored harness session is not a session.IdleWaiter")
 	}
-	idleCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	idleCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
-	if err := idle.WaitIdle(idleCtx); err != nil {
-		t.Fatalf("the restored runtime never went idle: %v", err)
+	if err := idle.WaitIdle(idleCtx); err == nil {
+		t.Fatal("the restored runtime went idle with its gate open; harness v0.39.0 resumes the parked turn")
 	}
-	stayResident(t, second, "a restored open permission gate under an idle runtime")
+	stayResident(t, second, "a restored open permission gate under a resumed turn")
 
 	id := world.answer(t, opened, string(gate.ApprovalApprove), map[string]json.RawMessage{})
 	if entry := world.settled(t, id); outcomeOf(t, entry) != "applied" {
 		t.Fatalf("the approval settled %q, want applied", outcomeOf(t, entry))
 	}
 	world.gates(t, 0)
+	gateE2EEventually(t, "the approved tool to run on Host B", func() bool { return world.llm.sawToolResult("GATED-TOOL-RAN") })
 	awaitResidentSessions(t, second, 0, 20*warmTTL+5*time.Second)
+	if got := world.runs.Load(); got != 1 {
+		t.Fatalf("the approved tool ran %d times, want exactly once", got)
+	}
 }
 
 // TestAPendingCommandAbortsTheWarmReleaseAndIsApplied: a command is durably

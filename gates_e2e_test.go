@@ -129,7 +129,15 @@ type gateE2ERules struct{}
 func (gateE2ERules) WriteRules(context.Context, []tool.RuleCandidate) error { return nil }
 
 // gateE2EAsk asks the user through a real ask_user gate and returns the answer.
-type gateE2EAsk struct{}
+// replaySafe is what it declares through tool.UserInputReplaySafe: harness
+// v0.39.0 keeps a restored ask_user gate open (and re-runs the call to hand it
+// the answer) only for a tool that declares it; runs counts executions.
+type gateE2EAsk struct {
+	replaySafe bool
+	runs       *atomic.Int32
+}
+
+func (a gateE2EAsk) UserInputReplaySafe() bool { return a.replaySafe }
 
 func (gateE2EAsk) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{Name: "Ask", Schema: json.RawMessage(`{"type":"object"}`)}, nil
@@ -141,7 +149,10 @@ func (gateE2EAsk) PrepareCall(context.Context, uuid.UUID, string) (tool.Request,
 	}}}, nil, nil
 }
 
-func (gateE2EAsk) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+func (a gateE2EAsk) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	if a.runs != nil {
+		a.runs.Add(1)
+	}
 	answer, err := loop.RequestUserInput(ctx, "What is your favourite colour?", nil)
 	if err != nil {
 		return nil, err
@@ -168,7 +179,7 @@ func (g gateE2EGated) InvokableRun(context.Context, string) (*tool.ToolResult, e
 }
 
 // gateE2ERig defines a real rig whose one loop can raise both gate kinds.
-func gateE2ERig(t *testing.T, store *harnessstore.Store, llm inference.Client, runs *atomic.Int32) *rig.Rig {
+func gateE2ERig(t *testing.T, store *harnessstore.Store, llm inference.Client, runs *atomic.Int32, ask gateE2EAsk) *rig.Rig {
 	t.Helper()
 	evaluator, err := gate.NewInteractiveEvaluator(
 		[]gate.AccessBinding{{Kind: "tool.invoke", Source: gateE2EAccess{}}}, nil, loop.GateApprover(), gateE2ERules{}, nil)
@@ -180,7 +191,7 @@ func gateE2ERig(t *testing.T, store *harnessstore.Store, llm inference.Client, r
 		loop.WithInference(llm, model.Model{Provider: "test", APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost", Name: "model"}),
 		loop.WithTools(
 			tool.NewDefinition("Ask", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
-				return []tool.InvokableTool{gateE2EAsk{}}, nil
+				return []tool.InvokableTool{ask}, nil
 			}),
 			tool.NewDefinition("Gated", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 				return []tool.InvokableTool{gateE2EGated{runs: runs}}, nil
@@ -210,6 +221,9 @@ type gateE2EWorld struct {
 	runtimeID uuid.UUID
 	binding   sessionstore.SessionBinding
 	nextID    atomic.Int32
+
+	// ask is the Ask tool every rig this world composes carries.
+	ask gateE2EAsk
 
 	// adjust, when set, changes every blueprint this world composes.
 	adjust func(*host.Composition)
@@ -256,6 +270,9 @@ type gateE2EOptions struct {
 	// residency lease and the runtime's journal lease — at a strictly greater
 	// epoch, which is how a lease that lapsed with its process looks.
 	takeover bool
+	// replaySafeAsk makes the Ask tool declare tool.UserInputReplaySafe, as
+	// tools' askuser.AskUser does from tools v0.13.0.
+	replaySafeAsk bool
 }
 
 // newGateE2EWorld seeds the session over a runtime journal shaped by options.
@@ -294,6 +311,7 @@ func newGateE2EWorld(t *testing.T, options gateE2EOptions) *gateE2EWorld {
 		llm:       &gateE2ELLM{},
 		runs:      &atomic.Int32{},
 		runtimeID: uuid.MustParse("5b0e8c1d-2f3a-8b4c-9d5e-6f7a8b9c0d1e"),
+		ask:       gateE2EAsk{replaySafe: options.replaySafeAsk, runs: &atomic.Int32{}},
 	}
 	world.binding = sessionstore.SessionBinding{
 		StorageBindingID: composeBinding,
@@ -371,7 +389,7 @@ func (h *heldAttach) finish(t *testing.T) {
 // runtime restores until closed.
 func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct{}) (*host.Service, *capturingLauncher) {
 	t.Helper()
-	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs), holdRestore: hold}
+	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs, w.ask), holdRestore: hold}
 	var options []harnessadapter.Option
 	if w.decoder != nil {
 		options = append(options, harnessadapter.WithBlockDecoder(w.decoder))
@@ -623,9 +641,10 @@ func TestTwoAnswersToOneGateApplyOnceAndTheSecondIsANoOp(t *testing.T) {
 // TestAPermissionGateOpenAcrossAReplacementIsAnsweredOnTheSuccessor: Host A's
 // agent raises a permission gate and A publishes it; A crashes with the gate
 // open; Host B restores the session (harness restores a permission gate with
-// its ORIGINAL GateOpened), makes its fencing write — the mark moves to B's
-// residency, so A could no longer write — and the answer Factory admits against
-// the projection A published is applied on B, and B's agent runs the tool.
+// its ORIGINAL GateOpened and, since harness v0.39.0, resumes the parked turn),
+// makes its fencing write — the mark moves to B's residency, so A could no
+// longer write — and the answer Factory admits against the projection A
+// published is applied on B, and B's agent runs the tool exactly once.
 func TestAPermissionGateOpenAcrossAReplacementIsAnsweredOnTheSuccessor(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
 	first, firstLauncher, firstEpoch := world.host(t, 4)
@@ -677,15 +696,15 @@ func TestAPermissionGateOpenAcrossAReplacementIsAnsweredOnTheSuccessor(t *testin
 		t.Fatalf("the GateResolved's cause = %v, want the admitted runtime command %v", resolved[0].Cause.CommandID, runtimeCommand)
 	}
 
-	// HARNESS v0.35.0'S LIMIT, PINNED SO A CHANGE IS NOTICED: restore marks
-	// the turn that was parked at the gate TurnInterrupted, so the approval is
-	// applied to the restored gate and nothing is waiting to run the tool.
-	// Resuming that turn is harness's to do (booked for v0.36.0).
-	if got := countOf[event.TurnInterrupted](t, world.journal, world.runtimeID); got != 1 {
-		t.Fatalf("%d TurnInterrupted, want the restore's one", got)
+	// HARNESS v0.39.0 RESUMES THE PARKED TURN: the restore does not interrupt
+	// it, the batch re-runs against the restored gate, and the approved tool
+	// runs EXACTLY ONCE, on Host B, with its result reaching the agent.
+	gateE2EEventually(t, "the approved tool to run on Host B", func() bool { return world.llm.sawToolResult("GATED-TOOL-RAN") })
+	if got := world.runs.Load(); got != 1 {
+		t.Fatalf("the approved tool ran %d times, want exactly once", got)
 	}
-	if world.runs.Load() != 0 {
-		t.Fatal("the gated tool ran after a restore; harness now resumes the interrupted turn, so update this test and the README")
+	if got := countOf[event.TurnInterrupted](t, world.journal, world.runtimeID); got != 0 {
+		t.Fatalf("%d TurnInterrupted, want none: harness v0.39.0 resumes the parked turn", got)
 	}
 	// The session itself goes on: the next turn runs on Host B.
 	done := countOf[event.TurnDone](t, world.journal, world.runtimeID)
@@ -695,12 +714,59 @@ func TestAPermissionGateOpenAcrossAReplacementIsAnsweredOnTheSuccessor(t *testin
 	})
 }
 
-// TestAnAskUserGateClosedAtRestoreSettlesNoOp documents harness v0.35.0's
-// limit: restore closes an ask_user gate (CloseRestoreUnavailable). The
+// TestAnAskUserGateOpenAcrossARestoreIsAnsweredOnTheSuccessor (harness
+// v0.39.0, with a tool declaring tool.UserInputReplaySafe as tools v0.13.0's
+// askuser.AskUser does): Host A's agent asks the user and A crashes with the
+// gate open. Host B fences, restores — the gate stays OPEN and the parked turn
+// resumes — and the answer Factory admits against A's projection settles
+// `applied` on B and reaches the waiting tool as its result.
+func TestAnAskUserGateOpenAcrossARestoreIsAnsweredOnTheSuccessor(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{takeover: true, replaySafeAsk: true})
+	first, firstLauncher, firstEpoch := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(first) })
+	world.submit(t, firstLauncher.controller(), "PLEASE-ASK")
+	opened := world.gates(t, 1)[0]
+
+	second, _, secondEpoch := world.host(t, 5)
+	t.Cleanup(func() { stopBounded(second) })
+	gateE2EEventually(t, "Host B's fencing write", func() bool { return world.mark(t) == secondEpoch })
+	if secondEpoch <= firstEpoch {
+		t.Fatalf("Host B's residency %d is not above A's %d", secondEpoch, firstEpoch)
+	}
+	if still := world.gates(t, 1)[0]; still.GateID != opened.GateID {
+		t.Fatalf("after the restore the projection holds %+v, want the same open gate %+v", still, opened)
+	}
+
+	id := world.answer(t, opened, "answer", answerValue())
+	entry := world.settled(t, id)
+	if entry.Record.State != sessionstore.InboxStateApplied || outcomeOf(t, entry) != "applied" {
+		t.Fatalf("the answer to a restored ask_user gate settled %q/%q, want applied/applied", entry.Record.State, outcomeOf(t, entry))
+	}
+	if entry.Record.Attempt == nil || uint64(entry.Record.Attempt.ResidencyEpoch) != secondEpoch {
+		t.Fatalf("the answer's attempt = %+v, want it authorized under Host B's residency %d", entry.Record.Attempt, secondEpoch)
+	}
+	gateE2EEventually(t, "the answer to reach the tool on Host B", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
+	// Once on A (whose zombie stays parked) and once replayed on B.
+	if got := world.ask.runs.Load(); got != 2 {
+		t.Fatalf("the Ask tool ran %d times, want twice: A's original call and B's replay", got)
+	}
+	world.gates(t, 0)
+	resolved := world.resolutions(t, opened.GateID)
+	if len(resolved) != 1 || resolved[0].Source.Kind != gate.ResponseFromUser || resolved[0].Reason == gate.CloseRestoreUnavailable {
+		t.Fatalf("the gate's resolutions = %+v, want exactly one, the user's answer", resolved)
+	}
+	if got := countOf[event.TurnInterrupted](t, world.journal, world.runtimeID); got != 0 {
+		t.Fatalf("%d TurnInterrupted, want none: the parked turn resumes", got)
+	}
+}
+
+// TestAnAskUserGateOfAReplayUnsafeToolIsClosedAtRestoreAndSettlesNoOp: a tool
+// that does NOT declare tool.UserInputReplaySafe keeps harness's fail-safe
+// behaviour — restore closes its gate (CloseRestoreUnavailable). The
 // successor's fold sees that GateResolved and clears the projection, and an
 // answer admitted before it could see so settles no_op — never a rejection and
 // never an answer to a gate that no longer exists.
-func TestAnAskUserGateClosedAtRestoreSettlesNoOp(t *testing.T) {
+func TestAnAskUserGateOfAReplayUnsafeToolIsClosedAtRestoreAndSettlesNoOp(t *testing.T) {
 	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
 	first, firstLauncher, firstEpoch := world.host(t, 4)
 	t.Cleanup(func() { stopBounded(first) })
@@ -786,7 +852,7 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 
 	blueprint := world.fixture.blueprint(t)
 	blueprint.Generation = 5
-	launcher := &capturingLauncher{rig: gateE2ERig(t, world.journal, world.llm, world.runs)}
+	launcher := &capturingLauncher{rig: gateE2ERig(t, world.journal, world.llm, world.runs, world.ask)}
 	adapter, err := harnessadapter.New(launcher)
 	if err != nil {
 		t.Fatal(err)
@@ -810,6 +876,62 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 	}
 	if _, err := attachAsFactoryDoes(t, second); err == nil || !strings.Contains(err.Error(), "lease held") {
 		t.Fatalf("a successor's attach while the drained runtime still holds its journal = %v, want the journal lease refusal", err)
+	}
+}
+
+// TestADrainOfARestoredPermissionGatedSessionIsCrashEquivalent (harness
+// v0.39.0): a restored permission-gated session is no longer idle — its parked
+// turn resumed and waits at the restored gate — so draining the Host that
+// restored it takes the same crash-equivalent path as draining the original:
+// the runtime's release is refused within the grace, it is left parked and
+// writes nothing, the gate stays projected, and a THIRD Host restores the
+// session again and the approval runs the tool exactly once there.
+func TestADrainOfARestoredPermissionGatedSessionIsCrashEquivalent(t *testing.T) {
+	world := newGateE2EWorld(t, gateE2EOptions{takeover: true})
+	first, firstLauncher, _ := world.host(t, 4)
+	t.Cleanup(func() { stopBounded(first) })
+	world.submit(t, firstLauncher.controller(), "PLEASE-RUN-GATED")
+	opened := world.gates(t, 1)[0]
+
+	second, _, secondEpoch := world.host(t, 5)
+	gateE2EEventually(t, "Host B's fencing write", func() bool { return world.mark(t) == secondEpoch })
+	before := len(harnesstest.Events(t, world.journal, world.runtimeID))
+	report, err := stopReport(t, second)
+	if err != nil {
+		t.Fatalf("Stop of the restoring Host with a gate open = %v, want it to end within its grace", err)
+	}
+	refused := false
+	for _, failure := range report.Failures {
+		if failure.SessionID == composeSession && failure.Step == "release_residency" {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatalf("drain failures = %+v, want the restored runtime's refused release recorded", report.Failures)
+	}
+	time.Sleep(time.Second)
+	for _, ev := range harnesstest.Events(t, world.journal, world.runtimeID)[before:] {
+		switch ev := ev.(type) {
+		case event.GateResolved:
+			t.Fatalf("the drain resolved the restored gate (%q); a parked runtime writes nothing", ev.Reason)
+		case event.TurnInterrupted:
+			t.Fatal("the drain interrupted the resumed turn; the runtime was cancelled")
+		}
+	}
+	if still := world.gates(t, 1)[0]; still.GateID != opened.GateID {
+		t.Fatalf("the projection after the drain holds %+v, want the open gate", still)
+	}
+
+	third, _, thirdEpoch := world.host(t, 6)
+	t.Cleanup(func() { stopBounded(third) })
+	gateE2EEventually(t, "Host C's fencing write", func() bool { return world.mark(t) == thirdEpoch })
+	id := world.answer(t, opened, string(gate.ApprovalApprove), map[string]json.RawMessage{})
+	if entry := world.settled(t, id); outcomeOf(t, entry) != "applied" || uint64(entry.Record.Attempt.ResidencyEpoch) != thirdEpoch {
+		t.Fatalf("the approval settled %q under %+v, want applied under Host C's residency %d", outcomeOf(t, entry), entry.Record.Attempt, thirdEpoch)
+	}
+	gateE2EEventually(t, "the approved tool to run on Host C", func() bool { return world.llm.sawToolResult("GATED-TOOL-RAN") })
+	if got := world.runs.Load(); got != 1 {
+		t.Fatalf("the approved tool ran %d times across three Hosts, want exactly once", got)
 	}
 }
 

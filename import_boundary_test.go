@@ -51,22 +51,20 @@ var publishedLooprigVersions = map[string]string{
 	"sessionstore": "v0.12.0",
 	"fsstore":      "v0.5.1",
 	"natsstore":    "v0.5.1",
-	// v0.38.0 is the release D3 needs (PersistenceFaultReporter,
-	// ResidencyAbandoner). It is named here AHEAD of its tag, deliberately: until
-	// go.mod is re-pinned with `go get github.com/looprig/harness@v0.38.0`, this
-	// guard fails on the v0.37.1 requirement, which is the reminder that the pin
-	// is owed and that this branch must not be released before it.
-	"harness": "v0.38.0",
+	// v0.39.0 is the release whose open gates survive failover: a restored
+	// ask_user gate on a replay-safe tool, and a restored permission gate, are
+	// answered and the tool runs (once) on the successor.
+	"harness": "v0.39.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
 	// internal/harnesstest does, because harness's loop.WithInference takes an
 	// inference.Client and a real rig cannot run a turn without one. harness
-	// v0.37.1 still requires inference v0.12.0 (unchanged since v0.36.0), so
+	// v0.39.0 still requires inference v0.12.0 (unchanged since v0.36.0), so
 	// binding to harness names it in go.mod whether or not Host wanted a
 	// decision about it — which is exactly the indirect arrival the comment on
 	// requireViolations describes, and the reason that check consults this map
-	// rather than the import set. The version is the one harness v0.37.1
+	// rather than the import set. The version is the one harness v0.39.0
 	// pins and is published.
 	"inference": "v0.12.0",
 }

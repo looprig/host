@@ -766,3 +766,49 @@ func TestActivityReportsTheFoldsOpenGatesAndPosition(t *testing.T) {
 		t.Fatalf("a non-gate event changed the open count to %d", open)
 	}
 }
+
+// TestADuplicateAbandonedResolutionIsTolerated (harness v0.39.0): a successor
+// restoring a parked permission turn closes every restored gate its access pass
+// did not adopt `abandoned`, and a gate may already carry a close from before
+// the failover, so the journal can hold two GateResolved for one gate — in one
+// fold, or across passes. The fold is a set: the second close is a no-op, the
+// gate is never re-projected, a gate opened after both is still published, and
+// the publisher keeps converging rather than failing or stopping.
+func TestADuplicateAbandonedResolutionIsTolerated(t *testing.T) {
+	abandoned := func(seed byte, id gate.ID) event.GateResolved {
+		ev := resolved(seed, id)
+		ev.Reason, ev.Action = gate.CloseAbandoned, ""
+		return ev
+	}
+	session := &fakeSession{}
+	parked := opened(0x10, gate.KindPermission, 0)
+	session.append(parked, 4)
+	session.append(abandoned(0x20, parked.Gate.ID), 5)
+	session.append(abandoned(0x30, parked.Gate.ID), 6)
+	session.projected = []coresessionwire.GateProjection{{GateID: gateIDOf(parked), OpenedJournalSeq: 4}}
+	h := start(t, session)
+	h.awaitConverged(t)
+	if _, projected, _ := session.snapshot(); len(projected) != 0 {
+		t.Fatalf("projection = %+v after a doubly abandoned gate, want none", projected)
+	}
+
+	// A third close in a LATER pass, then a new gate: still converges, the
+	// abandoned gate stays closed and the new one is published.
+	session.append(abandoned(0x40, parked.Gate.ID), 8)
+	next := opened(0x50, gate.KindPermission, 0)
+	session.append(next, 9)
+	h.hints.hint()
+	h.awaitConverged(t)
+	calls, projected, _ := session.snapshot()
+	if len(projected) != 1 || projected[0].GateID != gateIDOf(next) {
+		t.Fatalf("projection = %+v, want only the gate opened after the duplicate closes", projected)
+	}
+	for _, call := range calls {
+		if call == "open:"+string(gateIDOf(parked)) {
+			t.Fatalf("the abandoned gate was re-opened; calls = %v", calls)
+		}
+	}
+	if h.publisher.Superseded() {
+		t.Fatal("a duplicate close stopped the publisher")
+	}
+}
