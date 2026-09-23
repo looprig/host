@@ -147,6 +147,60 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Upgrading to v0.10.0: no runtime identity reaches a client
+
+**Finding W1.** A harness public event body names the **runtime** session id
+(`session_id`, also under `cause`) and, on an event a command caused, the
+**runtime** command id (`cause.command_id`). Both are private: the runtime session
+id is the durable binding's, and the runtime command id is the mapping Factory's
+store keeps beside the command a client admitted. Host relayed those bodies
+verbatim, and Factory serves them to browsers on the live tail and from `/journal`.
+
+v0.10.0 rewrites them, and nothing else:
+
+- every `session_id` equal to the runtime session id becomes the **public** session id;
+- `cause.command_id` becomes the **public** command id the client admitted, or is
+  **removed** when the command has none (a machine-originated cause such as a
+  subagent hand-back); a `cause` left empty is removed with it.
+
+Member order and every other byte are kept, so the body is still canonical. Loop,
+turn and step ids stay; they are the runtime's own content identities.
+
+**The live tail is projected by Host with no action needed.** It reads the command
+mapping from the session's disposition inbox. A runtime that reports no runtime
+session id (one not launched through `department`'s rig adapter) is relayed
+unprojected, and Host logs a WARN at attach.
+
+**`/journal` is NOT covered by Host alone.** Factory reads a Host session's journal
+directly through its `JournalResolver`, never through Host. So a composition must
+wrap the reader it returns in **`host.PublicJournal`**. That type applies the same
+function, taking the mapping from the journal's own application prefixes, so a
+live body and a durable body are byte-identical:
+
+```go
+journals := host.NewPublicJournals(0) // one per process; keeps each session's mapping
+resolver := func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
+	store := runtimeJournalFor(tenant, binding) // sessionstore.Open(..., WithLegacySingleTenant(tenant))
+	return journals.Reader(store, tenant, session, binding)
+}
+```
+
+`PublicJournal` needs the **public** session id, and Factory ≤ v0.9.0's resolver is
+not given it. So `/journal` is projected only once Factory hands its resolver the
+public session id. Until then a composition cannot close W1 on `/journal`. A
+`PublicJournal` refuses (`ErrPublicJournalScope`) any read that is not for the
+bound tenant and the binding's runtime session.
+
+**Consumers that correlated on runtime ids must switch.** Any consumer matching
+`cause.command_id` against a runtime command id, or `session_id` against the
+binding's runtime session id, must use the public ids.
+
+Also fixed: **R1**. A lost, warm-released or faulted residency, when a same-Host
+successor attach of the same session completed first, kept its session context
+uncancelled for the life of the process. The Manager now sets an overtaken record
+aside, and the late end cancels it when its runtime released. A runtime whose
+release failed still keeps its context.
+
 ## Upgrading to v0.9.0: an open gate survives failover, and a pooled Host stops growing
 
 **host v0.9.0 pairs with harness v0.39.0**, whose restore keeps a session's open
