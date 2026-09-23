@@ -606,6 +606,38 @@ func TestAnAskUserGateReachesFactoryAndItsAnswerSettlesApplied(t *testing.T) {
 	if len(resolved) != 1 || resolved[0].Source.Kind != gate.ResponseFromUser {
 		t.Fatalf("the journal resolved the gate %d times (%+v), want once, by the user", len(resolved), resolved)
 	}
+	// W1 over the gate vocabulary: GateOpened and the GateResolved the answer
+	// caused read, through host.PublicJournal, with no runtime identity at all,
+	// and the resolution names the answer the client admitted.
+	assertNoRuntimeIdentity(t, world.fixture.journalBackend, world.binding, id, string(entry.Record.Descriptor.RuntimeCommandID))
+}
+
+// assertNoRuntimeIdentity reads a session's whole journal through
+// host.PublicJournal and fails on any body naming the runtime session or the
+// given runtime command, and unless some body names the public command.
+func assertNoRuntimeIdentity(t *testing.T, backend *storage.Composite, binding sessionstore.SessionBinding, command sessionwire.CommandID, runtimeCommand string) {
+	t.Helper()
+	runtimeStore, err := sessionstore.Open(t.Context(), backend, sessionstore.WithLegacySingleTenant(composeTenant))
+	if err != nil {
+		t.Fatalf("open the runtime journal: %v", err)
+	}
+	public, err := host.NewPublicJournal(runtimeStore, composeTenant, composeSession, binding)
+	if err != nil {
+		t.Fatalf("NewPublicJournal: %v", err)
+	}
+	named := false
+	for _, event := range readWholeJournal(t, public, sessionwire.SessionID(binding.RuntimeSessionID)) {
+		body := string(event.Body)
+		if strings.Contains(body, binding.RuntimeSessionID) || strings.Contains(body, runtimeCommand) {
+			t.Errorf("the public body at %d names a runtime identity: %s", event.JournalSeq, body)
+		}
+		if strings.Contains(body, `"command_id":"`+string(command)+`"`) {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("no public body names the admitted command %s", command)
+	}
 }
 
 // TestTwoAnswersToOneGateApplyOnceAndTheSecondIsANoOp: Factory may admit two

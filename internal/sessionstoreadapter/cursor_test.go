@@ -76,9 +76,11 @@ func TestListOrderedReadsTheSessionStreamStrictlyAfterTheBoundAndBoundedByTheLim
 	createDispositionSession(t, released)
 
 	var orders []uint64
+	var runtimeIDs []string
 	for _, id := range []sessionwire.CommandID{"command-a", "command-b", "command-c"} {
 		entry := admitDispositionCommand(t, released, id, string(commands.KindInput))
 		orders = append(orders, entry.AcceptedOrder)
+		runtimeIDs = append(runtimeIDs, string(entry.Record.Descriptor.RuntimeCommandID))
 	}
 	if orders[0] >= orders[1] || orders[1] >= orders[2] {
 		t.Fatalf("the store allocated acceptance orders %v, which are not strictly increasing; every assertion below reads them", orders)
@@ -102,6 +104,11 @@ func TestListOrderedReadsTheSessionStreamStrictlyAfterTheBoundAndBoundedByTheLim
 		}
 		if record.State != commands.StatePending {
 			t.Errorf("page[%d].State = %q, want pending; admission produces nothing else", index, record.State)
+		}
+		// W1: the live tail's projection names the admitted command in place
+		// of this runtime identity, so the listing must carry it.
+		if record.RuntimeCommandID.IsZero() || record.RuntimeCommandID.String() != runtimeIDs[index] {
+			t.Errorf("page[%d].RuntimeCommandID = %s, want the store's %s", index, record.RuntimeCommandID, runtimeIDs[index])
 		}
 	}
 	if page[0].CommandID != "command-a" || page[2].CommandID != "command-c" {

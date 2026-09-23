@@ -193,7 +193,7 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	if err != nil {
 		return nil, err
 	}
-	tail, err := link.tails.Publish(ctx, request.Key, request.Runtime)
+	tail, err := link.tails.PublishProjected(ctx, request.Key, request.Runtime, s.publicProjector(ctx, request))
 	if err != nil {
 		return nil, err
 	}

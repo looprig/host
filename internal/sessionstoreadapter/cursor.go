@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/sessionstore"
 
 	"github.com/looprig/host/internal/commands"
@@ -77,12 +78,21 @@ func (s *Store) ListOrdered(
 		if err != nil {
 			return nil, err
 		}
+		// AN UNPARSEABLE RUNTIME ID IS LEFT ZERO RATHER THAN FAILING THE PAGE:
+		// the consumer does not read it, and failing here would stop a
+		// session's command stream over a field only the public projection
+		// uses. A zero id maps nothing, so the projection omits it.
+		runtimeID, err := uuid.Parse(string(entry.Record.Descriptor.RuntimeCommandID))
+		if err != nil {
+			runtimeID = uuid.UUID{}
+		}
 		records = append(records, commands.Command{
-			TenantID:      entry.Record.Descriptor.TenantID,
-			SessionID:     entry.Record.Descriptor.SessionID,
-			CommandID:     entry.Record.Descriptor.CommandID,
-			AcceptedOrder: entry.AcceptedOrder,
-			State:         state,
+			TenantID:         entry.Record.Descriptor.TenantID,
+			SessionID:        entry.Record.Descriptor.SessionID,
+			CommandID:        entry.Record.Descriptor.CommandID,
+			AcceptedOrder:    entry.AcceptedOrder,
+			State:            state,
+			RuntimeCommandID: runtimeID,
 		})
 	}
 	return records, nil

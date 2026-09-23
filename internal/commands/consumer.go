@@ -33,6 +33,7 @@ import (
 	"sync"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 
 	hostconfig "github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
@@ -118,6 +119,12 @@ type Command struct {
 
 	// State is the durable processing state.
 	State State
+
+	// RuntimeCommandID is the once-allocated runtime identity the acceptance
+	// record maps CommandID to, or zero when the record's is unreadable. The
+	// consumer does not read it; the live tail's public projection does
+	// (finding W1), to name the command a client admitted in place of it.
+	RuntimeCommandID uuid.UUID
 }
 
 // ---------------------------------------------------------------------------

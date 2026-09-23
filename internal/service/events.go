@@ -84,6 +84,13 @@ func (e *InvalidTailOptionsError) Error() string {
 // (core@v0.7.0 sessionwire/v1/publications.go:152-154). Body is a
 // json.RawMessage on both sides of this package, so the bytes are carried, not
 // parsed.
+//
+// THE ONE EXCEPTION IS A Projector (finding W1). A runtime's canonical body
+// names its PRIVATE runtime session and command ids, and every reader of this
+// stream is a client's, so a composed Host rewrites exactly those identities
+// before publishing. That is not a second projection in the sense above: it is
+// a deterministic function of the stored body that the durable read applies
+// too (host.PublicJournal), so live and durable bodies stay byte-identical.
 type Tails struct {
 	publications Publications
 	routes       Routes
@@ -149,6 +156,9 @@ type Tail struct {
 
 	stop context.CancelFunc
 	done chan struct{}
+
+	// rewrite is the tail's public-body projection, or nil for none.
+	rewrite Projector
 
 	mu        sync.Mutex
 	end       TailEnd
@@ -220,6 +230,32 @@ func (t *Tails) Publish(
 	key registry.Key,
 	subscriber department.PublicationSubscriber,
 ) (*Tail, error) {
+	return t.PublishProjected(ctx, key, subscriber, nil)
+}
+
+// Projector rewrites one committed public body before it is published, and
+// nothing else about the publication. A nil Projector relays bodies verbatim.
+//
+// IT IS THE ONE EXCEPTION TO "THE BYTES ARE CARRIED", and it is one on purpose
+// (finding W1): a runtime's body names the RUNTIME session and command ids,
+// which are private, and every consumer of this stream is a client's. The
+// exception is a DETERMINISTIC function of the stored body and immutable
+// identities, applied identically to the durable read (see host.PublicJournal),
+// so the live body still equals the one /journal serves for the same event.
+// A projection that fails refuses the publication (TailEndRefused): relaying
+// the unprojected body would leak, and skipping it would leave a hole.
+//
+// It is handed the body and the event's journal sequence, and nothing it could
+// use to move the event: identity, sequence and coverage are relayed unchanged.
+type Projector func(ctx context.Context, body json.RawMessage, journalSeq uint64) (json.RawMessage, error)
+
+// PublishProjected is Publish with each body rewritten by rewrite first.
+func (t *Tails) PublishProjected(
+	ctx context.Context,
+	key registry.Key,
+	subscriber department.PublicationSubscriber,
+	rewrite Projector,
+) (*Tail, error) {
 	if subscriber == nil {
 		return nil, &InvalidTailOptionsError{
 			Field:  "PublicationSubscriber",
@@ -245,6 +281,7 @@ func (t *Tails) Publish(
 		stop:    cancel,
 		done:    make(chan struct{}),
 		end:     TailEndRunning,
+		rewrite: rewrite,
 	}
 	go t.relay(runCtx, tail, published)
 	return tail, nil
@@ -282,7 +319,7 @@ func (t *Tails) relay(
 				t.invalidate(tail)
 				return
 			}
-			if err := t.publish(tail, publication); err != nil {
+			if err := t.publish(ctx, tail, publication); err != nil {
 				tail.finish(TailEndRefused, err)
 				t.invalidate(tail)
 				return
@@ -299,9 +336,16 @@ func (t *Tails) relay(
 // wire. A record Core refuses is not published at all: an unencodable
 // publication is a hole in the stream, and a Factory must learn that from a
 // reset rather than from a body it cannot parse.
-func (t *Tails) publish(tail *Tail, publication sessionwire.EnduringPublication) error {
+func (t *Tails) publish(ctx context.Context, tail *Tail, publication sessionwire.EnduringPublication) error {
 	if publication.TenantID != tail.key.TenantID || publication.SessionID != tail.key.SessionID {
 		return ErrForeignPublication
+	}
+	if tail.rewrite != nil {
+		body, err := tail.rewrite(ctx, publication.Body, publication.JournalSeq)
+		if err != nil {
+			return err
+		}
+		publication.Body = body
 	}
 	payload, err := json.Marshal(publication)
 	if err != nil {

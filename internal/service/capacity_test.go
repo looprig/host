@@ -1443,6 +1443,11 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"Tail.End":                      true,
 		"Tail.Published":                true,
 		"ErrForeignPublication":         true,
+
+		// v0.10.0, finding W1. The same live tail with each body's private
+		// runtime identities rewritten first; it returns *Tail like Publish.
+		"Projector":              true,
+		"Tails.PublishProjected": true,
 	}
 
 	// The FILE SET is enumerated too, and that is not tidiness. A probe measured

@@ -1072,3 +1072,92 @@ func (r stubRigs) RigForCreate(context.Context, department.RigCreateRequest) (ha
 func (r stubRigs) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessadapter.Launcher, error) {
 	return r.launcher, nil
 }
+
+// TestAProjectedTailPublishesTheProjectedBody is finding W1 at the tail: the
+// body on the wire is the projector's, the rest of the publication is the
+// runtime's, and a projection that fails refuses the publication — it neither
+// leaks the unprojected body nor skips the event.
+func TestAProjectedTailPublishesTheProjectedBody(t *testing.T) {
+	t.Parallel()
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	publication := sessionwire.EnduringPublication{
+		TenantID: key.TenantID, SessionID: key.SessionID, EventID: "event-1",
+		JournalSeq: 4, CoveredThrough: 4, Body: json.RawMessage(`{"session_id":"runtime"}`),
+	}
+
+	t.Run("projected", func(t *testing.T) {
+		t.Parallel()
+		publications := &recordingPublications{}
+		stream := make(chan sessionwire.EnduringPublication, 1)
+		stream <- publication
+		var seen sessionwire.EnduringPublication
+		tail, err := newTails(t, publications, &recordingRoutes{}).PublishProjected(t.Context(), key, scriptedSubscriber{stream: stream},
+			func(_ context.Context, body json.RawMessage, seq uint64) (json.RawMessage, error) {
+				seen = sessionwire.EnduringPublication{Body: body, JournalSeq: seq}
+				return json.RawMessage(`{"session_id":"session-a"}`), nil
+			})
+		if err != nil {
+			t.Fatalf("PublishProjected: %v", err)
+		}
+		t.Cleanup(tail.Stop)
+		awaitPublished(t, tail, 1)
+		if seen.JournalSeq != 4 || string(seen.Body) != `{"session_id":"runtime"}` {
+			t.Fatalf("the projector was handed %+v, want the runtime's publication", seen)
+		}
+		var wire struct {
+			Body       json.RawMessage `json:"body"`
+			JournalSeq uint64          `json:"journal_seq"`
+			EventID    string          `json:"event_id"`
+		}
+		got := publications.recorded()
+		if len(got) != 1 {
+			t.Fatalf("published %d messages, want 1", len(got))
+		}
+		if err := json.Unmarshal(got[0].payload, &wire); err != nil {
+			t.Fatalf("decode the published payload: %v", err)
+		}
+		if string(wire.Body) != `{"session_id":"session-a"}` || wire.JournalSeq != 4 || wire.EventID != "event-1" {
+			t.Fatalf("published %s, want the projected body under the runtime's identity and sequence", got[0].payload)
+		}
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+		publications := &recordingPublications{}
+		routes := &recordingRoutes{}
+		stream := make(chan sessionwire.EnduringPublication, 1)
+		stream <- publication
+		refusal := errors.New("mapping unreadable")
+		tail, err := newTails(t, publications, routes).PublishProjected(t.Context(), key, scriptedSubscriber{stream: stream},
+			func(context.Context, json.RawMessage, uint64) (json.RawMessage, error) { return nil, refusal })
+		if err != nil {
+			t.Fatalf("PublishProjected: %v", err)
+		}
+		t.Cleanup(tail.Stop)
+		select {
+		case <-tail.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("a failed projection did not end the tail")
+		}
+		if end, cause := tail.End(); end != service.TailEndRefused || !errors.Is(cause, refusal) {
+			t.Fatalf("tail ended as %q (%v), want refused with the projection's error", end, cause)
+		}
+		if got := publications.recorded(); len(got) != 0 {
+			t.Fatalf("an unprojected body reached the wire: %v", got)
+		}
+		if got := routes.sessions(); !slices.Equal(got, []registry.Key{key}) {
+			t.Fatalf("invalidated %v, want this session's routes", got)
+		}
+	})
+}
+
+func awaitPublished(t *testing.T, tail *service.Tail, n uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for tail.Published() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("published %d, want %d", tail.Published(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
