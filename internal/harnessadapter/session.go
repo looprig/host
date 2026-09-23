@@ -35,6 +35,8 @@ type boundSession struct {
 	releaser   session.Releaser
 	committed  session.CommittedPublicEventSource
 	leaseEpoch session.LeaseEpochReporter
+	faults     session.PersistenceFaultReporter
+	abandoner  session.ResidencyAbandoner
 
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
@@ -65,6 +67,18 @@ func (s *boundSession) ReleaseResidency(ctx context.Context) error {
 // and a Host reading a silent (0, false) would conclude the runtime holds no
 // journal grant and refuse every command it could in fact apply.
 func (s *boundSession) LeaseEpoch() (uint64, bool) { return s.leaseEpoch.LeaseEpoch() }
+
+// PersistenceFaulted closes when the runtime latches a terminal persistence
+// fault. It is a straight forward of harness's capability.
+func (s *boundSession) PersistenceFaulted() <-chan struct{} { return s.faults.PersistenceFaulted() }
+
+// PersistenceFault reports the latched fault, or nil.
+func (s *boundSession) PersistenceFault() error { return s.faults.PersistenceFault() }
+
+// AbandonResidency gives the runtime up crash-equivalently, writing nothing.
+func (s *boundSession) AbandonResidency(ctx context.Context) error {
+	return s.abandoner.AbandonResidency(ctx)
+}
 
 // ErrResumeUnsupported is the refusal SubscribeCommitted returns for a non-empty
 // resume point.

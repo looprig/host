@@ -504,6 +504,35 @@ type AttemptCloser interface {
 	CloseAttempt(ctx context.Context, command sessionwire.CommandID, runtimeCommand uuid.UUID, kind string, attempt string, attemptJournalEpoch uint64) error
 }
 
+// PersistenceFaults is a runtime's durable-health capability, and the one way
+// to give up a runtime whose durable log can no longer be trusted. It is harness
+// v0.38.0's session.PersistenceFaultReporter and session.ResidencyAbandoner,
+// together, verbatim.
+//
+// A RUNTIME THAT HAS LATCHED A PERSISTENCE FAULT IS NOT RESIDENT IN ANY USEFUL
+// SENSE. One failed journal append — a brief database or object-store outage is
+// enough — faults it for good, by design, and it refuses every command after:
+// the next attempt sits `applying` with nothing to close it and the stream
+// behind it never moves (D3). The runtime cannot recover in place, because the
+// failed append may or may not have landed; a successor RESTORING from the
+// journal can. So Host treats PersistenceFaulted closing as loss of residency:
+// it stops the session's work, calls AbandonResidency — crash-equivalent, it
+// writes nothing — and releases the session so a successor restores it and
+// closes the in-flight attempt through the ordinary recovery path.
+//
+// IT IS OPTIONAL. A runtime without it is never supervised for faults, which is
+// the pre-v0.8.0 behaviour; its composition owns noticing a wedged session.
+// PersistenceFaulted must return the same channel on every call.
+type PersistenceFaults interface {
+	PersistenceFaulted() <-chan struct{}
+	PersistenceFault() error
+	AbandonResidency(context.Context) error
+}
+
+// ErrNoPersistenceFaults is what a department runtime wrapper answers from
+// AbandonResidency when the runtime it wraps offers no PersistenceFaults.
+var ErrNoPersistenceFaults = errors.New("department: this runtime reports no persistence faults and cannot be abandoned")
+
 // LeaseEpochReporter reports the JOURNAL single-writer lease epoch the RUNTIME
 // holds. It is harness v0.33.0's session.LeaseEpochReporter shape, verbatim, for
 // the reason every other shape in this block is verbatim: a capability declared

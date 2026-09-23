@@ -134,6 +134,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 			build: func() session.SessionController {
 				return &struct {
 					controllerBase
+					faultsPart
 					livenessPart
 					releaserPart
 					committedPart
@@ -147,6 +148,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 			build: func() session.SessionController {
 				return &struct {
 					controllerBase
+					faultsPart
 					idlePart
 					releaserPart
 					committedPart
@@ -160,6 +162,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 			build: func() session.SessionController {
 				return &struct {
 					controllerBase
+					faultsPart
 					idlePart
 					livenessPart
 					committedPart
@@ -173,11 +176,46 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 			build: func() session.SessionController {
 				return &struct {
 					controllerBase
+					faultsPart
 					idlePart
 					livenessPart
 					releaserPart
 					leaseEpochPart
 				}{leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
+			},
+		},
+		{
+			// D3. A faulted runtime that Host cannot see is a session wedged for
+			// good, so the fault report is required of every harness session.
+			omit:    "PersistenceFaulted",
+			missing: "session.PersistenceFaultReporter",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					livenessPart
+					releaserPart
+					committedPart
+					leaseEpochPart
+					abandonerOnly
+				}{committedPart: committedPart{available: true}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
+			},
+		},
+		{
+			// D3. Without the crash-equivalent release a faulted runtime could
+			// only be shut down, which would make the session terminal.
+			omit:    "AbandonResidency",
+			missing: "session.ResidencyAbandoner",
+			build: func() session.SessionController {
+				return &struct {
+					controllerBase
+					idlePart
+					livenessPart
+					releaserPart
+					committedPart
+					leaseEpochPart
+					reporterOnly
+				}{committedPart: committedPart{available: true}, leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 			},
 		},
 		{
@@ -190,6 +228,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 			build: func() session.SessionController {
 				return &struct {
 					controllerBase
+					faultsPart
 					idlePart
 					livenessPart
 					releaserPart
@@ -225,6 +264,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 func TestBindRefusesASessionWhoseCommittedEventsAreUnavailable(t *testing.T) {
 	controller := &struct {
 		controllerBase
+		faultsPart
 		idlePart
 		livenessPart
 		releaserPart
@@ -255,6 +295,7 @@ func TestBindRefusesASessionWhoseCommittedEventsAreUnavailable(t *testing.T) {
 func TestBindRefusesANilCommittedEventSource(t *testing.T) {
 	controller := &struct {
 		controllerBase
+		faultsPart
 		idlePart
 		livenessPart
 		releaserPart
@@ -276,8 +317,8 @@ func TestBindNamesEveryMissingCapabilityAtOnce(t *testing.T) {
 	if !errors.As(err, &incapable) {
 		t.Fatalf("bind of a bare controller = %v, want IncapableSessionError", err)
 	}
-	if len(incapable.Missing) != 5 {
-		t.Fatalf("Missing = %v, want all five capabilities", incapable.Missing)
+	if len(incapable.Missing) != 7 {
+		t.Fatalf("Missing = %v, want all seven capabilities", incapable.Missing)
 	}
 	if !strings.Contains(incapable.Error(), "session.IdleWaiter") {
 		t.Fatalf("Error() = %q, want it to name the missing capabilities", incapable.Error())
@@ -556,6 +597,7 @@ func TestSubscribeCommittedReportsASubscribeFailure(t *testing.T) {
 	sentinel := errors.New("the hub cannot serve committed public events")
 	controller := &struct {
 		controllerBase
+		faultsPart
 		idlePart
 		livenessPart
 		releaserPart
@@ -812,6 +854,7 @@ func TestTheBoundSessionForwardsTheRuntimesLeaseEpoch(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			controller := &struct {
 				controllerBase
+				faultsPart
 				idlePart
 				livenessPart
 				releaserPart
@@ -825,5 +868,37 @@ func TestTheBoundSessionForwardsTheRuntimesLeaseEpoch(t *testing.T) {
 				t.Fatalf("LeaseEpoch() = (%d, %t), want the controller's (%d, %t)", epoch, held, row.epoch, row.held)
 			}
 		})
+	}
+}
+
+// TestTheBoundSessionForwardsThePersistenceFaultPair holds D3's adapter half: a
+// wrapper that did not forward harness's fault broadcast and abandon would leave
+// every faulted session resident and wedged with the capability one layer down.
+func TestTheBoundSessionForwardsThePersistenceFaultPair(t *testing.T) {
+	fault := errors.New("journal append failed")
+	faulted := make(chan struct{})
+	close(faulted)
+	abandoned := 0
+	abandonErr := errors.New("lease release failed")
+	controller := newFullController(nil, nil, nil)
+	controller.faultsPart = faultsPart{faulted: faulted, fault: fault, abandoned: &abandoned, err: abandonErr}
+
+	adapter := newAdapter(t, stubRigs{})
+	launched, err := adapter.bind(controller, testTenant, testSession)
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	faults, ok := launched.(department.PersistenceFaults)
+	if !ok {
+		t.Fatalf("the bound session %T does not offer department.PersistenceFaults", launched)
+	}
+	if faults.PersistenceFaulted() != (<-chan struct{})(faulted) {
+		t.Error("PersistenceFaulted is not the runtime's own channel")
+	}
+	if got := faults.PersistenceFault(); !errors.Is(got, fault) {
+		t.Errorf("PersistenceFault = %v, want the runtime's fault", got)
+	}
+	if got := faults.AbandonResidency(t.Context()); !errors.Is(got, abandonErr) || abandoned != 1 {
+		t.Errorf("AbandonResidency = %v after %d calls, want the runtime's answer after 1", got, abandoned)
 	}
 }

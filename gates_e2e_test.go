@@ -954,7 +954,23 @@ func TestACrashBetweenTheAnswerAndItsDispositionIsNeverATombstone(t *testing.T) 
 	// HERE, on the event itself, because once B restores it holds the journal
 	// and A's loop can no longer reach the model (quality gate F4: asserted
 	// after B's attach, this raced B's fence 9/20 at -race -cpu 1).
-	gateE2EEventually(t, "the agent to receive the answer before the crash", func() bool { return world.llm.sawToolResult(gateE2EAnswer) })
+	//
+	// OR HOST A GAVE ITS RUNTIME UP FIRST (D3). The lost disposition strands
+	// the attempt under A's own grant, and A now abandons a runtime holding an
+	// attempt only a successor can close — the crash this test stages, done by
+	// A itself. Either way the answer is durable, which is what B is judged on.
+	liveness, ok := firstLauncher.controller().(session.Liveness)
+	if !ok {
+		t.Fatal("the harness session is not a session.Liveness")
+	}
+	gateE2EEventually(t, "the agent to receive the answer, or Host A to give its runtime up", func() bool {
+		select {
+		case <-liveness.Done():
+			return true
+		default:
+			return world.llm.sawToolResult(gateE2EAnswer)
+		}
+	})
 	// Host A crashes here: it is abandoned, not drained, and its leases lapse.
 
 	second, _, secondEpoch := world.host(t, 5)

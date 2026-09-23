@@ -1024,6 +1024,16 @@ func (c *liveController) ReleaseResidency(context.Context) error { return nil }
 // which nothing here holds either.
 func (c *liveController) LeaseEpoch() (uint64, bool) { return 1, true }
 
+// PersistenceFaulted satisfies session.PersistenceFaultReporter: this runtime
+// never faults.
+func (c *liveController) PersistenceFaulted() <-chan struct{} { return nil }
+
+// PersistenceFault satisfies session.PersistenceFaultReporter.
+func (c *liveController) PersistenceFault() error { return nil }
+
+// AbandonResidency satisfies session.ResidencyAbandoner.
+func (c *liveController) AbandonResidency(context.Context) error { return nil }
+
 // CommittedPublicEvents answers with the real hub, and answers the CAPABILITY
 // question from the hub rather than unconditionally: a hub over an appender
 // that cannot report stored bytes must report false, which is what the released

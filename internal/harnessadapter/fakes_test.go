@@ -131,6 +131,35 @@ type leaseEpochPart struct {
 
 func (p leaseEpochPart) LeaseEpoch() (uint64, bool) { return p.epoch, p.held }
 
+// faultsPart is harness v0.38.0's durable-health pair: the fault broadcast and
+// the crash-equivalent release.
+type faultsPart struct {
+	faulted   chan struct{}
+	fault     error
+	abandoned *int
+	err       error
+}
+
+func (p faultsPart) PersistenceFaulted() <-chan struct{} { return p.faulted }
+func (p faultsPart) PersistenceFault() error             { return p.fault }
+func (p faultsPart) AbandonResidency(context.Context) error {
+	if p.abandoned != nil {
+		*p.abandoned++
+	}
+	return p.err
+}
+
+// reporterOnly and abandonerOnly are each half of faultsPart, for the rows that
+// omit the other half.
+type reporterOnly struct{}
+
+func (reporterOnly) PersistenceFaulted() <-chan struct{} { return nil }
+func (reporterOnly) PersistenceFault() error             { return nil }
+
+type abandonerOnly struct{}
+
+func (abandonerOnly) AbandonResidency(context.Context) error { return nil }
+
 // fullController has every capability Host requires.
 type fullController struct {
 	controllerBase
@@ -139,6 +168,7 @@ type fullController struct {
 	releaserPart
 	committedPart
 	leaseEpochPart
+	faultsPart
 }
 
 func newFullController(subscription event.Subscription, filters *[]event.EventFilter, released *int) *fullController {
@@ -148,6 +178,7 @@ func newFullController(subscription event.Subscription, filters *[]event.EventFi
 		releaserPart:   releaserPart{released: released},
 		committedPart:  committedPart{available: true, subscription: subscription, filters: filters},
 		leaseEpochPart: leaseEpochPart{epoch: 7, held: true},
+		faultsPart:     faultsPart{faulted: make(chan struct{})},
 	}
 }
 
@@ -394,6 +425,9 @@ func (*nilSessionController) Shutdown(context.Context) error { return errNotImpl
 func (*nilSessionController) WaitIdle(context.Context) error         { return errNotImplemented }
 func (*nilSessionController) Done() <-chan struct{}                  { return nil }
 func (*nilSessionController) ReleaseResidency(context.Context) error { return errNotImplemented }
+func (*nilSessionController) PersistenceFaulted() <-chan struct{}    { return nil }
+func (*nilSessionController) PersistenceFault() error                { return nil }
+func (*nilSessionController) AbandonResidency(context.Context) error { return errNotImplemented }
 func (*nilSessionController) CommittedPublicEvents() (session.CommittedPublicEventSource, bool) {
 	return committedPart{}, true
 }

@@ -100,6 +100,9 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 		_ = handle.Stop(ctx)
 		return nil, err
 	}
+	if held := o.service.residentFor(request.Key); held != nil && held.generation == request.Generation {
+		o.service.superviseFaults(ctx, held)
+	}
 	return handle, nil
 }
 
@@ -166,6 +169,9 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 		Closer:        closerOrNil(closer),
 		Gates:         s.options.GateReads,
 		Fence:         guard,
+		Stranded: func(command sessionwire.CommandID, cause error) {
+			s.strandedAttempt(request.Key, request.Generation, command, cause)
+		},
 	})
 	if err != nil {
 		return nil, err

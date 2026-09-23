@@ -104,6 +104,10 @@ type resident struct {
 	// Neither seam retries a step within its own sequence — both run each step
 	// exactly once and record the failure — so these guards only ever fire
 	// ACROSS the two seams, which is the race they exist for.
+	// giveUpOnce makes the crash-equivalent release of an unusable runtime run
+	// once, whether a persistence fault or a stranded attempt reported it first.
+	giveUpOnce sync.Once
+
 	checkpointOnce onceOnSuccess
 	beginOnce      onceOnSuccess
 	finishOnce     onceOnSuccess

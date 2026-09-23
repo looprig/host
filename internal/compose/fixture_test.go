@@ -970,10 +970,54 @@ type controllableSession struct {
 	stopped  chan struct{}
 	epoch    uint64
 	held     bool
+
+	// The durable-health capability (harness v0.38.0's pair): faulted closes
+	// when Fault latches, and AbandonResidency is counted and stops the runtime.
+	faulted   chan struct{}
+	fault     error
+	abandoned int
+	stopOnce  sync.Once
 }
 
 func newControllableSession(id uuid.UUID) *controllableSession {
-	return &controllableSession{id: id, stopped: make(chan struct{}), epoch: 1, held: true}
+	return &controllableSession{id: id, stopped: make(chan struct{}), faulted: make(chan struct{}), epoch: 1, held: true}
+}
+
+// Fault latches a terminal persistence fault, as harness does on a failed
+// required journal append.
+func (s *controllableSession) Fault(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fault == nil {
+		s.fault = err
+		close(s.faulted)
+	}
+}
+
+// PersistenceFaulted closes when Fault latches.
+func (s *controllableSession) PersistenceFaulted() <-chan struct{} { return s.faulted }
+
+// PersistenceFault reports the latched fault.
+func (s *controllableSession) PersistenceFault() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fault
+}
+
+// AbandonResidency records a crash-equivalent release and stops the runtime.
+func (s *controllableSession) AbandonResidency(context.Context) error {
+	s.mu.Lock()
+	s.abandoned++
+	s.mu.Unlock()
+	s.stopOnce.Do(func() { close(s.stopped) })
+	return nil
+}
+
+// Abandoned reports how many times the runtime was abandoned.
+func (s *controllableSession) Abandoned() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abandoned
 }
 
 // ID is Harness's identity for this session.
@@ -1021,7 +1065,7 @@ func (s *controllableSession) GoIdle() {
 func (s *controllableSession) Done() <-chan struct{} { return s.stopped }
 
 // Stop makes the runtime stop answering.
-func (s *controllableSession) Stop() { close(s.stopped) }
+func (s *controllableSession) Stop() { s.stopOnce.Do(func() { close(s.stopped) }) }
 
 // ReleaseResidency records a nonterminal release.
 func (s *controllableSession) ReleaseResidency(context.Context) error {

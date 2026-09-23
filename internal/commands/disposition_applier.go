@@ -58,6 +58,16 @@ type DispositionApplierOptions struct {
 
 	// Fence is the lease-epoch guard every durable write goes through.
 	Fence Fence
+
+	// Stranded, when set, is told that this runtime failed a command AFTER its
+	// attempt was durably authorized and recorded no disposition for it (D3).
+	// Such an attempt names this runtime's OWN journal grant, so nothing this
+	// runtime can do will ever close it — only a successor under a strictly
+	// later grant can — and every later command queues behind it. A composition
+	// answers by giving the runtime up so a successor restores the session. It
+	// is called on the consumer's goroutine and must not block on it. Optional:
+	// nil keeps the pre-D3 behaviour of blocking the pass.
+	Stranded func(command sessionwire.CommandID, cause error)
 }
 
 // DispositionApplier claims, authorizes, dispatches and settles one command at a
@@ -76,6 +86,7 @@ type DispositionApplier struct {
 	closer    AttemptClosers
 	gates     Gates
 	fence     Fence
+	stranded  func(sessionwire.CommandID, error)
 }
 
 // The disposition applier is the seam the consumer hands commands to.
@@ -139,6 +150,7 @@ func NewDispositionApplier(options DispositionApplierOptions) (*DispositionAppli
 		closer:    options.Closer,
 		gates:     options.Gates,
 		fence:     options.Fence,
+		stranded:  options.Stranded,
 	}, nil
 }
 
@@ -371,9 +383,36 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 	// recoverable by whoever holds the session next, which is exactly what that
 	// field means.
 	if problem := a.dispatch(ctx, record, payload, attempt); problem != nil {
-		return Outcome{State: StateApplying, PrefixOwned: true}, problem
+		return a.afterFailedDispatch(ctx, record, applying, problem)
 	}
 	return a.settle(ctx, record, applying)
+}
+
+// afterFailedDispatch handles a runtime that failed a command after its attempt
+// became durable.
+//
+// THE EVIDENCE IS READ FIRST. A runtime that failed the effect may still
+// have written a `refused` disposition, and then the store settles the command now
+// and nothing is stranded. Only when there is nothing to settle from is the
+// attempt stranded: it names this runtime's own grant, settleOrRecover will
+// never close it (a runtime closing its own attempt would tombstone work it may
+// still be doing), and the pass blocks here for good. That is the wedge a brief
+// journal outage produced (D3), so the composition is told.
+//
+// A CANCELLED PASS IS NOT A STRANDED ATTEMPT. The Host stopping cancels the
+// dispatch, and a successor recovers that attempt through the ordinary path.
+func (a *DispositionApplier) afterFailedDispatch(ctx context.Context, record DispositionRecord, applying uint64, problem error) (Outcome, error) {
+	var refusal *ApplyError
+	if !errors.As(problem, &refusal) || refusal.Refusal != RefusalRuntime || ctx.Err() != nil {
+		return Outcome{State: StateApplying, PrefixOwned: true}, problem
+	}
+	if outcome, err := a.settle(ctx, record, applying); err == nil {
+		return outcome, nil
+	}
+	if a.stranded != nil {
+		a.stranded(record.CommandID, problem)
+	}
+	return Outcome{State: StateApplying, PrefixOwned: true}, problem
 }
 
 // checkCreate distinguishes immutable malformed bytes from a version this Host

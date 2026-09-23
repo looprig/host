@@ -305,6 +305,12 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	if capability, ok := session.(AttemptCloser); ok {
 		adapted.closer = capability
 	}
+	// OPTIONAL AND FORWARDED, for the closer's reasons: a wrapper that dropped it
+	// would leave every faulted session resident and wedged with the capability
+	// one layer down, and a typed nil would advertise an abandon that panics.
+	if capability, ok := session.(PersistenceFaults); ok {
+		adapted.faults = capability
+	}
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
@@ -340,7 +346,41 @@ type rigRuntime struct {
 	// So this is deliberately NOT embedded, and CloseAttempt below is a method
 	// that refuses rather than a promoted one that crashes.
 	closer AttemptCloser
+
+	// faults is OPTIONAL and nil for a runtime that offers none; not embedded,
+	// for the reason closer is not.
+	faults PersistenceFaults
 }
+
+// PersistenceFaulted forwards the runtime's fault broadcast. For a runtime with
+// no PersistenceFaults it is a nil channel, which never fires: such a runtime is
+// simply not supervised for faults.
+func (r *rigRuntime) PersistenceFaulted() <-chan struct{} {
+	if r.faults == nil {
+		return nil
+	}
+	return r.faults.PersistenceFaulted()
+}
+
+// PersistenceFault forwards the runtime's latched fault, or nil.
+func (r *rigRuntime) PersistenceFault() error {
+	if r.faults == nil {
+		return nil
+	}
+	return r.faults.PersistenceFault()
+}
+
+// AbandonResidency forwards the crash-equivalent release, or refuses.
+func (r *rigRuntime) AbandonResidency(ctx context.Context) error {
+	if r.faults == nil {
+		return ErrNoPersistenceFaults
+	}
+	return r.faults.AbandonResidency(ctx)
+}
+
+// PersistenceFaultsAvailable reports the wrapper's actual forwarded capability,
+// which an interface assertion on the wrapper cannot.
+func (r *rigRuntime) PersistenceFaultsAvailable() bool { return r.faults != nil }
 
 // CloseAttempt forwards to the runtime's own closer, or refuses.
 //

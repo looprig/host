@@ -1562,3 +1562,63 @@ func TestALaunchUnderAnotherHarnessIdentityIsRefused(t *testing.T) {
 		}
 	})
 }
+
+// faultingSession is a full session that also offers PersistenceFaults.
+type faultingSession struct {
+	*testkit.FullSession
+	faulted   chan struct{}
+	fault     error
+	abandoned int
+}
+
+func (s *faultingSession) PersistenceFaulted() <-chan struct{} { return s.faulted }
+func (s *faultingSession) PersistenceFault() error             { return s.fault }
+func (s *faultingSession) AbandonResidency(context.Context) error {
+	s.abandoned++
+	return nil
+}
+
+// TestTheRuntimeForwardsPersistenceFaultsOnlyWhenOffered holds D3's department
+// half both ways: offered, the wrapper forwards all three methods; absent, the
+// wrapper reports unavailable, never fires, and refuses the abandon — rather
+// than advertising a capability that panics.
+func TestTheRuntimeForwardsPersistenceFaultsOnlyWhenOffered(t *testing.T) {
+	t.Parallel()
+	type availability interface{ PersistenceFaultsAvailable() bool }
+
+	t.Run("offered", func(t *testing.T) {
+		t.Parallel()
+		session := &faultingSession{FullSession: testkit.NewFullSession(rigSessionUUID), faulted: make(chan struct{}), fault: errors.New("append failed")}
+		runtime, err := rigTarget(t, &testkit.FakeRig{Session: session}).Create(t.Context(), launchRequest())
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		faults, ok := runtime.(department.PersistenceFaults)
+		if !ok || !runtime.(availability).PersistenceFaultsAvailable() {
+			t.Fatal("the wrapper does not report the offered capability")
+		}
+		if faults.PersistenceFaulted() != (<-chan struct{})(session.faulted) || !errors.Is(faults.PersistenceFault(), session.fault) {
+			t.Error("the wrapper does not forward the runtime's fault")
+		}
+		if err := faults.AbandonResidency(t.Context()); err != nil || session.abandoned != 1 {
+			t.Errorf("AbandonResidency = %v after %d calls, want nil after 1", err, session.abandoned)
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		t.Parallel()
+		runtime, err := rigTarget(t, &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}).Create(t.Context(), launchRequest())
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if runtime.(availability).PersistenceFaultsAvailable() {
+			t.Fatal("the wrapper reports a capability the runtime does not offer")
+		}
+		faults := runtime.(department.PersistenceFaults)
+		if faults.PersistenceFaulted() != nil || faults.PersistenceFault() != nil {
+			t.Error("an unsupervisable runtime reports a fault channel or a fault")
+		}
+		if err := faults.AbandonResidency(t.Context()); !errors.Is(err, department.ErrNoPersistenceFaults) {
+			t.Errorf("AbandonResidency = %v, want ErrNoPersistenceFaults", err)
+		}
+	})
+}

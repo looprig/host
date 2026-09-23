@@ -374,6 +374,10 @@ type dispositionFixture struct {
 	gates    *fakeGates
 	epoch    uint64
 	applier  *DispositionApplier
+
+	// stranded records every Stranded report, in order.
+	stranded []sessionwire.CommandID
+	causes   []error
 }
 
 const testJournalEpoch uint64 = 41
@@ -434,6 +438,10 @@ func (f *dispositionFixture) rebuild() {
 		Closer:         closer,
 		Gates:          gates,
 		Fence:          f.fence,
+		Stranded: func(command sessionwire.CommandID, cause error) {
+			f.stranded = append(f.stranded, command)
+			f.causes = append(f.causes, cause)
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewDispositionApplier: %v", err)
@@ -1359,4 +1367,66 @@ func TestAClaimThisHostHoldsResumesAtTheAttempt(t *testing.T) {
 	if got := f.store.operations(); !equalStrings(got, want) {
 		t.Fatalf("the store saw %v, want %v", got, want)
 	}
+}
+
+// D3. A RUNTIME THAT FAILS A COMMAND AFTER ITS ATTEMPT AND RECORDS NOTHING HAS
+// STRANDED IT: the attempt names this runtime's own grant, so no pass under this
+// runtime may close it, and every later command queues behind it. The
+// composition is told once, with the runtime's failure, so it can hand the
+// session to a successor; the record itself is left applying, unconcluded.
+func TestDispositionReportsAnAttemptTheRuntimeStranded(t *testing.T) {
+	runtimeErr := errors.New("commands_test: the journal append failed")
+	f := newDispositionFixture(t, func(f *dispositionFixture) { f.runtime.err = runtimeErr })
+
+	_, err := f.process()
+	if refusalOf(err) != RefusalRuntime {
+		t.Fatalf("Process = %v (%q), want %q", err, refusalOf(err), RefusalRuntime)
+	}
+	if len(f.stranded) != 1 || f.stranded[0] != f.stored().record.CommandID || !errors.Is(f.causes[0], runtimeErr) {
+		t.Fatalf("stranded reports = %v (causes %v), want exactly this command with the runtime's failure", f.stranded, f.causes)
+	}
+	if got := f.stored().record.State; got != StateApplying {
+		t.Errorf("the durable record is %q, want it left %q for a successor", got, StateApplying)
+	}
+}
+
+// The controls: a runtime that failed the effect but RECORDED a disposition has
+// stranded nothing — the store settles it now — and neither has a runtime that
+// wrote nothing durable at all (it may be re-offered), nor a pass the Host
+// itself cancelled.
+func TestDispositionReportsNothingStrandedWhenTheCommandCanStillSettle(t *testing.T) {
+	runtimeErr := errors.New("commands_test: the effect failed")
+	t.Run("the runtime recorded refused", func(t *testing.T) {
+		f := newDispositionFixture(t)
+		f.runtime.err = runtimeErr
+		f.runtime.before = func() { f.setEvidence(f.stored().record.CommandID, "refused") }
+		outcome, err := f.process()
+		if err != nil || outcome.State != StateRejected {
+			t.Fatalf("Process = (%q, %v), want the store's rejected settlement", outcome.State, err)
+		}
+		if len(f.stranded) != 0 {
+			t.Errorf("stranded reported %v for a settleable command", f.stranded)
+		}
+	})
+	t.Run("the runtime cannot record a disposition", func(t *testing.T) {
+		f := newDispositionFixture(t, func(f *dispositionFixture) { f.runtime.err = ErrDispositionUnsupported })
+		if _, err := f.process(); refusalOf(err) != RefusalDispositionUnsupported {
+			t.Fatalf("Process = %v, want %q", err, RefusalDispositionUnsupported)
+		}
+		if len(f.stranded) != 0 {
+			t.Errorf("stranded reported %v for a command nothing durable was written for", f.stranded)
+		}
+	})
+	t.Run("the pass was cancelled", func(t *testing.T) {
+		f := newDispositionFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.runtime.err = runtimeErr
+		f.runtime.before = cancel
+		if _, err := f.applier.Process(ctx, command(1, f.stored().record.State)); refusalOf(err) != RefusalRuntime {
+			t.Fatalf("Process = %v, want %q", err, RefusalRuntime)
+		}
+		if len(f.stranded) != 0 {
+			t.Errorf("stranded reported %v for a pass the Host cancelled", f.stranded)
+		}
+	})
 }

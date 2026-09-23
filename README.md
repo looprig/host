@@ -147,6 +147,46 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Upgrading to v0.8.0: a storage outage no longer wedges a session
+
+Before v0.8.0 a brief PostgreSQL or S3 outage under a runtime's journal could wedge a
+session for good. One failed journal write, and the command being applied stayed
+`applying` under the runtime's own grant. No runtime may close its own attempt, so every
+later command queued behind it until the apply deadline rejected it. There were two
+shapes:
+
+- **The runtime latched a persistence fault.** harness does this by design: the durable
+  state can no longer be proven, so the runtime refuses every later command.
+- **The runtime refused one command without faulting.** For example, its application
+  prefix could not be written.
+
+v0.8.0 treats either as loss of residency. Host watches harness v0.38.0's
+`PersistenceFaulted`, and the disposition applier reports an attempt the runtime
+failed and recorded nothing for. On either signal Host:
+
+1. marks the session releasing;
+2. stops its work;
+3. abandons the runtime crash-equivalently with `AbandonResidency`, which writes nothing;
+4. tombstones the route, releases the grant and credits the capacity.
+
+Factory's pending sweep then re-places the session. The successor restores it from the
+journal and settles the stranded command truthfully: `applied` if its effect is durable
+(an owed input is re-run by the restore), otherwise closed `not_applied`. Every later
+command is applied exactly once.
+
+**Limits you must plan around:**
+
+- The acknowledged words of a command closed `not_applied` must be resent, as after any
+  crash.
+- A runtime that does not offer `department.PersistenceFaults` is not supervised. It
+  stays resident and blocked, and an ERROR is logged.
+- If the outage is still on, the release's own durable writes fail. The grant stops
+  renewing and lapses, and the registry row expires. Re-placement therefore waits for
+  those bounds, and a restore attempted while storage is still down is refused.
+
+**Pin harness ≥ v0.38.0 with host ≥ v0.8.0.** The reference adapter requires the two
+capabilities.
+
 ## Upgrading to v0.5.0: create and restore
 
 ### Every session a v0.4.0 Host held was wedged on its first command

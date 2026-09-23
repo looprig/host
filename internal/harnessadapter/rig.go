@@ -283,6 +283,21 @@ func (a *Adapter) bind(
 		missing = append(missing, "session.LeaseEpochReporter")
 	}
 
+	// REQUIRED HERE, THOUGH OPTIONAL IN department. Every harness session this
+	// module pins has both, so requiring them refuses nothing harness produces
+	// and makes a drift in harness's shape a refused attach rather than a
+	// faulted session Host silently never notices (D3).
+	if capability, ok := controller.(session.PersistenceFaultReporter); ok {
+		bound.faults = capability
+	} else {
+		missing = append(missing, "session.PersistenceFaultReporter")
+	}
+	if capability, ok := controller.(session.ResidencyAbandoner); ok {
+		bound.abandoner = capability
+	} else {
+		missing = append(missing, "session.ResidencyAbandoner")
+	}
+
 	// THE TWO-RESULT FORM, AND NOT A BARE ASSERTION ON THE SOURCE. Harness
 	// publishes both session.CommittedPublicEventSource and the
 	// session.CommittedPublicEventProvider that reports whether the source will
