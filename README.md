@@ -159,14 +159,38 @@ not necessarily the session's last state.
 The drain now halts each session's consumer first, the same step 0 a warm release
 takes. It waits, bounded by `HOST_DRAIN_IDLE_BOUNDARY` and the grace, for a pass
 already in flight. A halt that does not finish in time is recorded as
-`halt_consumption` and the release continues. A command admitted during the drain
-stays pending, and the successor applies it. A warm release racing the drain can
-no longer resume a consumer the drain halted.
+`halt_consumption` and the release continues. **A pass that was already running
+when the halt timed out finishes its whole batch** (up to the reconcile batch
+size), so it may still apply commands after the checkpoint. This is the same as
+for a warm release. A command admitted during the drain stays pending, and the
+successor applies it. A warm release racing the drain can no longer resume a
+consumer the drain halted.
+
+**The halt and the idle wait each get their own `HOST_DRAIN_IDLE_BOUNDARY`.** A
+session may therefore wait up to twice the idle boundary before its release
+begins. The drain as a whole is still bounded by `HOST_DRAIN_GRACE`, because
+every wait also stops at the grace. If the idle boundary equals the grace, a
+halt that uses its whole boundary leaves no time for the idle wait, and the
+release is crash-equivalent.
 
 **This includes a gate answer.** An answer admitted after a drain begins is not
 applied by the draining Host. A session parked at a gate is released
-crash-equivalently, as before, and its successor applies the answer after
-restoring the session.
+crash-equivalently, as before. What happens next depends on the gate. These
+are known limits under harness v0.38.0:
+
+- **Permission gate:** the successor applies the answer after restoring the
+  session. But the restored turn is interrupted, so **the tool does not run**.
+- **ask_user gate:** the restore closes the gate `restore_unavailable`, so the
+  pending answer settles `no_op` and **is dropped. The user must be asked
+  again.** This is a regression from v0.8.0 for ask_user answers. There, the
+  draining Host sometimes applied an answer admitted before the checkpoint, and
+  if the resumed turn finished within the idle boundary, it released
+  gracefully with the answer honoured.
+
+Both limits are harness bookings: restoring ask_user gates after failover, and
+continuing a restored permission-gated turn. The trade is deliberate. The
+alternative is applying commands under a `releasing` registration, which is
+the defect this release fixes.
 
 Also in v0.8.1:
 
@@ -177,6 +201,10 @@ Also in v0.8.1:
   A refused runtime release (the crash-equivalent case) is logged at ERROR, the
   rest at WARN. The epoch is also kept durably, by sessionstore's retained
   epoch-fenced registration tombstone.
+
+- The v0.8.0 section below is corrected. The command in flight at a storage
+  outage may settle `refused` in the S3 shape too, and every runtime adapter must
+  forward `department.PersistenceFaults`.
 
 There is no exported API change.
 
@@ -203,9 +231,24 @@ failed and recorded nothing for. On either signal Host:
 4. tombstones the route, releases the grant and credits the capacity.
 
 Factory's pending sweep then re-places the session. The successor restores it from the
-journal and settles the stranded command truthfully: `applied` if its effect is durable
-(an owed input is re-run by the restore), otherwise closed `not_applied`. Every later
-command is applied exactly once.
+journal. Every later command is applied exactly once.
+
+**The one command in flight at the outage may end in any of four states:** `applied`,
+or `rejected` with the outcome `refused` or `not_applied`. (The v0.8.0 notes said
+`applied` for the S3 shape. The tests lane measured `refused` in about a third of
+S3-crash runs. The sealed runtime had already written the input's application
+prefix and recorded a `refused` disposition, with no effect.) Every non-applied
+outcome is honest: the input was never partly applied, and the model never saw
+it. **The user must resend it.**
+
+**EVERY PRODUCT RUNTIME ADAPTER MUST FORWARD `department.PersistenceFaults`.** The
+capability is optional, which makes it easy to miss. It is harness's
+`PersistenceFaultReporter` and `ResidencyAbandoner`, surfaced through your adapter.
+Host discovers it by type assertion, so a wrapper that does not forward it compiles
+and runs. Without it Host never sees the fault, and a storage outage wedges the
+session exactly as before v0.8.0. Carbon and every other composer owe this, and
+test kits do too. Add a compile-time assertion that your runtime type implements
+`department.PersistenceFaults`.
 
 **One exemption.** A `gate_response` whose runtime wrote its application prefix
 before the dispatch failed is never treated as stranded. That is the shape where the
@@ -223,7 +266,8 @@ holds.
 - The acknowledged words of a command closed `not_applied` must be resent, as after any
   crash.
 - A runtime that does not offer `department.PersistenceFaults` is not supervised. It
-  stays resident and blocked, and an ERROR is logged.
+  stays resident and blocked, and an ERROR is logged. See the forwarding obligation
+  above.
 - If the outage is still on, the release's own durable writes fail. The grant stops
   renewing and lapses, and the registry row expires. Re-placement therefore waits for
   those bounds, and a restore attempted while storage is still down is refused.
