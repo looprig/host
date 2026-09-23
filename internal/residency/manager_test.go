@@ -2,6 +2,7 @@ package residency
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -1822,6 +1823,7 @@ func TestFailureAtEverySequenceStepReleasesEverythingItTook(t *testing.T) {
 			if attach.Code != row.wantCode {
 				t.Errorf("the failure carries HostLink code %q, want %q", attach.Code, row.wantCode)
 			}
+			requireCoreEncodable(t, attach)
 			for _, forbidden := range row.forbidden {
 				if at := f.trace.indexOf(forbidden); at >= 0 {
 					t.Errorf("step %q ran at index %d, after the failure; a failed step must not be followed by the next one (trace: %v)", forbidden, at, f.trace.recorded())
@@ -2316,6 +2318,7 @@ func TestAttachRefusesAnInvalidRequestBeforeTakingAnything(t *testing.T) {
 			if attach.Code != row.wantCode {
 				t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, row.wantCode)
 			}
+			requireCoreEncodable(t, attach)
 			// NOTHING was taken: validation precedes the ledger and the lease.
 			if steps := f.trace.recorded(); len(steps) != 0 {
 				t.Errorf("a refused request reached %v; step 1 precedes every collaborator", steps)
@@ -2351,6 +2354,7 @@ func TestADedicatedHostRefusesASessionItIsNotBoundTo(t *testing.T) {
 	if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
 		t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
 	}
+	requireCoreEncodable(t, attach)
 	requireSteps(t, f.trace.recorded(), before)
 }
 
@@ -2416,6 +2420,7 @@ func TestTheAdmissionLedgerIsTheOneServiceAlreadyOwns(t *testing.T) {
 	if attach.Code != sessionwire.HostLinkErrorNoCapacity {
 		t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorNoCapacity)
 	}
+	requireCoreEncodable(t, attach)
 	var refused *service.AdmissionRefusedError
 	if !errors.As(err, &refused) {
 		t.Errorf("the refusal does not unwrap to service's own *AdmissionRefusedError, so it did not come from the Host's ledger: %v", err)
@@ -2885,6 +2890,7 @@ func TestAResidentSessionIsValidatedLikeAColdOne(t *testing.T) {
 			if attach.Code != row.wantCode {
 				t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, row.wantCode)
 			}
+			requireCoreEncodable(t, attach)
 			requireSteps(t, f.trace.recorded(), before)
 			if entry, held := f.registry.Get(f.key()); !held || entry.Generation != first.Generation {
 				t.Error("the refused warm attach disturbed the resident session")
@@ -2923,6 +2929,7 @@ func TestAResidentSessionIsRefusedForARuntimeBuildItIsNotRunning(t *testing.T) {
 	if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
 		t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
 	}
+	requireCoreEncodable(t, attach)
 
 	// THE FOURTH DIRECTION, and the one that had no row: the build the resident
 	// runtime was ACTUALLY BUILT BY must be ACCEPTED. Refusing the upgraded
@@ -3379,6 +3386,7 @@ func TestALoserWhoseRivalIsADifferentSessionNamesWhatIsStillHeld(t *testing.T) {
 	if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
 		t.Errorf("the failure carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
 	}
+	requireCoreEncodable(t, attach)
 	for _, want := range []string{"admission", "workspace"} {
 		found := false
 		for _, held := range attach.Unreleased {
@@ -4406,5 +4414,28 @@ func TestAnExplicitRestoreIsNotGatedOnTheRuntimeJournal(t *testing.T) {
 		if len(f.target.restoreRequests()) != 1 || len(f.target.createRequests()) != 0 {
 			t.Fatalf("RuntimeJournal %v: restores = %d, creates = %d; want one restore", journal, len(f.target.restoreRequests()), len(f.target.createRequests()))
 		}
+	}
+}
+
+// requireCoreEncodable fails unless the refusal is a record Core's own
+// HostLinkError encoder accepts, which is what a Factory receives over
+// HostLink. Core requires runtime_mismatch to name a build and refuses the
+// record otherwise; a refusal Core cannot encode reached a Factory as a
+// transport-level bad request (D3.1 F1).
+func requireCoreEncodable(t *testing.T, attach *AttachError) {
+	t.Helper()
+	if attach.Code == "" {
+		if attach.RuntimeCompatibilityID != "" {
+			t.Errorf("a failure with no HostLink class names build %q", attach.RuntimeCompatibilityID)
+		}
+		return
+	}
+	wire := sessionwire.HostLinkError{Code: attach.Code, RuntimeCompatibilityID: string(attach.RuntimeCompatibilityID)}
+	if attach.Code == sessionwire.HostLinkErrorEpochMismatch {
+		// The holder's epoch is lifted by compose, not the manager.
+		wire.CurrentLeaseEpoch = 1
+	}
+	if _, err := json.Marshal(wire); err != nil {
+		t.Errorf("the %s refusal is a record Core refuses to encode: %v", attach.Code, err)
 	}
 }

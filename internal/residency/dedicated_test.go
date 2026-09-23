@@ -123,6 +123,7 @@ func TestADedicatedHostRefusesAnyOtherSessionWhateverItsTenantOrMode(t *testing.
 				if attach.Code != sessionwire.HostLinkErrorRuntimeMismatch {
 					t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, sessionwire.HostLinkErrorRuntimeMismatch)
 				}
+				requireCoreEncodable(t, attach)
 				// Step 1 precedes every collaborator, so the refusal took
 				// nothing. This is the clause that distinguishes "refused" from
 				// "refused after launching a runtime for it".
@@ -210,6 +211,7 @@ func TestADedicatedHostRefusesASecondRuntimeForItsFixedSession(t *testing.T) {
 			if attach.Code != row.wantCode {
 				t.Errorf("the refusal carries HostLink code %q, want %q", attach.Code, row.wantCode)
 			}
+			requireCoreEncodable(t, attach)
 			if made := len(f.target.producedRuntimes()); made != 1 {
 				t.Errorf("%d runtimes were launched for the fixed session, want 1", made)
 			}

@@ -116,8 +116,13 @@ func attachRefusal(err error) *hostlink.AttachRefusal {
 	}
 	code, _ := refused.HostLinkCode()
 	refusal := &hostlink.AttachRefusal{Code: code, Reason: refused.Reason, Cause: err}
-	if code == sessionwire.HostLinkErrorEpochMismatch {
+	switch code {
+	case sessionwire.HostLinkErrorEpochMismatch:
 		refusal.CurrentLeaseEpoch, _ = LeaseHolderEpoch(err)
+	case sessionwire.HostLinkErrorRuntimeMismatch:
+		// Core requires runtime_mismatch to name a build and refuses to
+		// encode it otherwise (D3.1 F1). The manager records this Host's.
+		refusal.RuntimeCompatibilityID = string(refused.RuntimeCompatibilityID)
 	}
 	return refusal
 }

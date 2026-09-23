@@ -574,6 +574,15 @@ type AttachError struct {
 	Reason string
 	Cause  error
 
+	// RuntimeCompatibilityID is the build THIS Host runs or launches for the
+	// refused request — the resident runtime's on the warm path, the launch
+	// target's on the cold one — and is set exactly when Code is
+	// runtime_mismatch. Core refuses to encode that class without it, so a
+	// runtime_mismatch without one could not reach a Factory as a refusal at
+	// all (D3.1 F1). It is never the caller's value and never the durable
+	// state's: a Factory reading it learns what this Host offers.
+	RuntimeCompatibilityID department.CompatibilityID
+
 	// Unreleased names every compensation that itself failed, so a caller can
 	// tell "the attach failed and took nothing" from "the attach failed and
 	// something is still held". The second is an operator's problem — a live
@@ -912,18 +921,20 @@ func (m *Manager) acquireKey(key registry.Key) func() {
 func existingResidency(entry registry.Entry, key registry.Key, request Request) (Residency, error) {
 	if entry.AgentID != request.AgentID {
 		return Residency{}, &AttachError{
-			Step:   StepValidate,
-			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
-			Key:    key,
-			Reason: "the session is resident as agent " + strconv.Quote(string(entry.AgentID)) + " and cannot also be attached as " + strconv.Quote(string(request.AgentID)),
+			Step:                   StepValidate,
+			Code:                   sessionwire.HostLinkErrorRuntimeMismatch,
+			Key:                    key,
+			RuntimeCompatibilityID: entry.CompatibilityID,
+			Reason:                 "the session is resident as agent " + strconv.Quote(string(entry.AgentID)) + " and cannot also be attached as " + strconv.Quote(string(request.AgentID)),
 		}
 	}
 	if request.CompatibilityID != "" && request.CompatibilityID != entry.CompatibilityID {
 		return Residency{}, &AttachError{
-			Step:   StepValidate,
-			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
-			Key:    key,
-			Reason: "the session is resident on runtime " + strconv.Quote(string(entry.CompatibilityID)) + " and the request was placed on " + strconv.Quote(string(request.CompatibilityID)),
+			Step:                   StepValidate,
+			Code:                   sessionwire.HostLinkErrorRuntimeMismatch,
+			Key:                    key,
+			RuntimeCompatibilityID: entry.CompatibilityID,
+			Reason:                 "the session is resident on runtime " + strconv.Quote(string(entry.CompatibilityID)) + " and the request was placed on " + strconv.Quote(string(request.CompatibilityID)),
 		}
 	}
 	// THE JOURNAL EPOCH IS READ LIVE ON THE WARM PATH TOO, from the resident
@@ -1047,21 +1058,24 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	// refused anyway.
 	if request.CompatibilityID != "" && request.CompatibilityID != target.compatibility {
 		return Residency{}, &AttachError{
-			Step:   StepValidate,
-			Code:   sessionwire.HostLinkErrorRuntimeMismatch,
-			Key:    key,
-			Reason: "the session was placed on runtime " + strconv.Quote(string(request.CompatibilityID)) + " and this Host launches " + strconv.Quote(string(target.compatibility)),
+			Step:                   StepValidate,
+			Code:                   sessionwire.HostLinkErrorRuntimeMismatch,
+			Key:                    key,
+			RuntimeCompatibilityID: target.compatibility,
+			Reason:                 "the session was placed on runtime " + strconv.Quote(string(request.CompatibilityID)) + " and this Host launches " + strconv.Quote(string(target.compatibility)),
 		}
 	}
 	capabilities := target.capabilities
 
 	if err := m.admissions.Admit(key, request.AgentID); err != nil {
+		code := admissionCode(err)
 		return Residency{}, &AttachError{
-			Step:   StepValidate,
-			Code:   admissionCode(err),
-			Key:    key,
-			Reason: "this Host would not admit the session",
-			Cause:  err,
+			Step:                   StepValidate,
+			Code:                   code,
+			Key:                    key,
+			Reason:                 "this Host would not admit the session",
+			Cause:                  err,
+			RuntimeCompatibilityID: mismatchBuild(code, target.compatibility),
 		}
 	}
 	unwound := &unwinder{}
@@ -1099,7 +1113,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 
 	fail := func(step Step, code sessionwire.HostLinkErrorCode, reason string, cause error) (Residency, error) {
 		unreleased := unwound.unwind(rollbackCtx, true)
-		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased}
+		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased, RuntimeCompatibilityID: mismatchBuild(code, target.compatibility)}
 	}
 
 	// -- 2. the SessionStore lease and its new epoch -------------------------
@@ -1361,8 +1375,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 			// workspace behind in silence.
 			var refusal *AttachError
 			code := sessionwire.HostLinkErrorCode("")
+			var build department.CompatibilityID
 			if errors.As(mismatch, &refusal) {
-				code = refusal.Code
+				code, build = refusal.Code, refusal.RuntimeCompatibilityID
 			}
 			return Residency{}, &AttachError{
 				Step:       StepInstall,
@@ -1371,6 +1386,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 				Reason:     "the session is resident under an attach this request does not describe",
 				Cause:      mismatch,
 				Unreleased: append(unreleased, unwound.sharedHeld()...),
+				// The WINNER's build, which existingResidency named: it is what
+				// this Host now runs for the session.
+				RuntimeCompatibilityID: build,
 			}
 		}
 		if len(unreleased) > 0 {
@@ -1553,8 +1571,7 @@ func (m *Manager) validateRequest(key registry.Key, request Request) error {
 		return refuse("", "the session identity is not a permitted sessionwire identity: "+err.Error(), err)
 	}
 	if fixed := m.host.FixedSessionID(); fixed != "" && fixed != request.SessionID {
-		return refuse(sessionwire.HostLinkErrorRuntimeMismatch,
-			"this dedicated Host is bound to session "+strconv.Quote(string(fixed))+" and cannot hold another", nil)
+		return m.refuseForeignSession(key, fixed, request.AgentID)
 	}
 	if err := request.AgentID.Validate(); err != nil {
 		return refuse("", "the agent identity is not a permitted sessionwire identity: "+err.Error(), err)
@@ -1571,6 +1588,35 @@ func (m *Manager) validateRequest(key registry.Key, request Request) error {
 		return refuse(sessionwire.HostLinkErrorRuntimeUnavailable, "this Host's Department registers no launch target for that agent", err)
 	}
 	return nil
+}
+
+// refuseForeignSession is a dedicated Host's refusal of a session other than
+// the one it is fixed to.
+//
+// THE CLASS IS runtime_mismatch BECAUSE CORE NAMES IT: its attach record lists
+// "a dedicated Host is fixed to a different session" under that class, and the
+// vocabulary is closed. Core then REQUIRES the class to carry a
+// runtime_compatibility_id and refuses to encode it without one, which is
+// D3.1 F1: this refusal carried none, so it reached a Factory as Centrifuge 107
+// bad request — the caller's fault — instead of as a placement outcome.
+//
+// The id is the build this Host would launch for the requested agent, read from
+// the Department (a map read; the target is discarded, as validateRequest's own
+// lookup does). A Host with no usable target for that agent has no build to
+// name, and Core lists "the Host registers no usable target for the agent"
+// under runtime_unavailable, which is then equally true and encodable; the
+// refusal takes nothing either way.
+func (m *Manager) refuseForeignSession(key registry.Key, fixed sessionwire.SessionID, agent sessionwire.AgentID) error {
+	reason := "this dedicated Host is bound to session " + strconv.Quote(string(fixed)) + " and cannot hold another"
+	target, err := m.host.Department().Target(agent)
+	if err != nil {
+		return &AttachError{Step: StepValidate, Code: sessionwire.HostLinkErrorRuntimeUnavailable, Key: key, Reason: reason + ", and its Department registers no launch target for that agent", Cause: err}
+	}
+	build := target.CompatibilityID()
+	if err := build.Validate(); err != nil {
+		return &AttachError{Step: StepValidate, Code: sessionwire.HostLinkErrorRuntimeUnavailable, Key: key, Reason: reason + ", and the agent's launch target reports an unusable compatibility id", Cause: err}
+	}
+	return &AttachError{Step: StepValidate, Code: sessionwire.HostLinkErrorRuntimeMismatch, Key: key, Reason: reason, RuntimeCompatibilityID: build}
 }
 
 // resolveTarget takes the snapshot, and it is called ONLY WITH THE KEY SLOT
@@ -1714,6 +1760,17 @@ func (m *Manager) Observe(key registry.Key) (sessionwire.HostLinkRegistryObserva
 		return sessionwire.HostLinkRegistryObservation{}, false
 	}
 	return m.observation(key, entry.AgentID, entry.CompatibilityID, ResidencyEpoch(entry.LeaseEpoch), residencyOf(entry.State), entry.Accepting), true
+}
+
+// mismatchBuild is the build a refusal names: this Host's, and only when the
+// class is runtime_mismatch, the one class Core attaches it to. Every other
+// class must carry none, so deriving it from the code keeps a caller from
+// attaching a member Core would refuse to encode.
+func mismatchBuild(code sessionwire.HostLinkErrorCode, build department.CompatibilityID) department.CompatibilityID {
+	if code != sessionwire.HostLinkErrorRuntimeMismatch {
+		return ""
+	}
+	return build
 }
 
 // admissionCode carries service's own HostLink refusal class through, rather

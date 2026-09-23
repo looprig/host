@@ -160,9 +160,9 @@ func drainReply(observation sessionwire.HostLinkDrainObservation, err error) ([]
 	}
 	wire, published := refusal.HostLinkError()
 	if !published {
-		return nil, errUnroutableRPC
+		return nil, refusal.unpublished()
 	}
-	return json.Marshal(wire)
+	return encodeRefusal(wire)
 }
 
 // ---------------------------------------------------------------------------

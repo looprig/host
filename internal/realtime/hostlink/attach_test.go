@@ -177,11 +177,35 @@ func TestTheAttachRefusalLadderAnswersWithItsFirstFailingCheck(t *testing.T) {
 		{
 			name: "attacher refuses with a class",
 			perturb: func(a *recordingAttacher, _ *hostlink.MultiplexerOptions, _ *sessionwire.HostLinkAttachRequest) {
-				a.refuseWith = &hostlink.AttachRefusal{Code: sessionwire.HostLinkErrorRuntimeMismatch, Reason: "wrong build"}
+				a.refuseWith = &hostlink.AttachRefusal{Code: sessionwire.HostLinkErrorRuntimeMismatch, RuntimeCompatibilityID: testRuntime, Reason: "wrong build"}
 			},
 			refusal: hostlink.RefusalAttachRefused,
 			code:    sessionwire.HostLinkErrorRuntimeMismatch,
 			calls:   1,
+			check: func(t *testing.T, refusal *hostlink.BindError) {
+				wire, _ := refusal.HostLinkError()
+				if wire.RuntimeCompatibilityID != testRuntime {
+					t.Fatalf("runtime_compatibility_id = %q, want the attacher's %q", wire.RuntimeCompatibilityID, testRuntime)
+				}
+			},
+		},
+		{
+			// D3.1 F1: Core refuses to encode runtime_mismatch without a build
+			// id, so a refusal that names none is downgraded rather than sent
+			// to the transport as a marshal failure (107, the caller's fault).
+			name: "attacher refuses runtime_mismatch naming no build",
+			perturb: func(a *recordingAttacher, _ *hostlink.MultiplexerOptions, _ *sessionwire.HostLinkAttachRequest) {
+				a.refuseWith = &hostlink.AttachRefusal{Code: sessionwire.HostLinkErrorRuntimeMismatch, Reason: "wrong build"}
+			},
+			refusal: hostlink.RefusalMismatchBuildUnknown,
+			code:    sessionwire.HostLinkErrorRuntimeUnavailable,
+			calls:   1,
+			check: func(t *testing.T, refusal *hostlink.BindError) {
+				wire, _ := refusal.HostLinkError()
+				if err := wire.Validate(); err != nil {
+					t.Fatalf("the downgraded refusal is still a record Core refuses: %v", err)
+				}
+			},
 		},
 		{
 			name: "attacher refuses no_capacity",

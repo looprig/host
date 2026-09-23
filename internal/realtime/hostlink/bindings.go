@@ -259,6 +259,14 @@ const (
 	// ground, which is that the registry the caller placed from is stale.
 	RefusalHolderEpochUnknown Refusal = "holder_epoch_unknown"
 
+	// RefusalMismatchBuildUnknown reports an attach the Attacher refused as
+	// runtime_mismatch without naming a build Core will publish. Core requires
+	// runtime_mismatch to carry runtime_compatibility_id and refuses to encode
+	// it otherwise, so the class is downgraded to runtime_unavailable on the
+	// wire, as RefusalHolderEpochUnknown downgrades an epoch_mismatch with no
+	// holder epoch; the local value keeps the real ground.
+	RefusalMismatchBuildUnknown Refusal = "mismatch_build_unknown"
+
 	// RefusalUnpublishableAttach reports an Attacher that attached and then
 	// produced an observation Core refuses to publish. The session may be
 	// resident, so no Core class is sent — re-placement would be wrong — and
@@ -310,15 +318,56 @@ func (e *BindError) Unwrap() error { return e.Cause }
 // It is a two-value accessor for the reason residency.AttachError.HostLinkCode
 // is: the absent code is a real state, and a bare accessor would hand a caller
 // a record Core's own Validate refuses.
+//
+// IT IS FALSE, TOO, FOR A RECORD CORE WOULD REFUSE TO ENCODE. Core's encoder
+// validates — epoch_mismatch needs its epoch, runtime_mismatch its build id,
+// every other class neither — and a record it refuses cannot reach the wire as
+// a refusal at all. Reporting it as published would hand the transport a
+// marshal error, which reached a Factory as 107 bad request: the caller's
+// fault, for a record this Host built wrong (D3.1 F1). Refusing it here sends
+// it down the no-class path, which the transport answers as this Host's own
+// failure; see errUnpublishableRefusal.
 func (e *BindError) HostLinkError() (sessionwire.HostLinkError, bool) {
 	if e.wire == "" {
 		return sessionwire.HostLinkError{}, false
 	}
-	return sessionwire.HostLinkError{
+	wire := sessionwire.HostLinkError{
 		Code:                   e.wire,
 		CurrentLeaseEpoch:      e.currentLeaseEpoch,
 		RuntimeCompatibilityID: e.runtimeCompatibilityID,
-	}, true
+	}
+	if wire.Validate() != nil {
+		return sessionwire.HostLinkError{}, false
+	}
+	return wire, true
+}
+
+// unpublished is the transport error for a refusal HostLinkError declined to
+// publish: bad request when the refusal has no class because the CALLER sent
+// something unreadable or unroutable, internal when it has a class this Host
+// could not encode.
+func (e *BindError) unpublished() error {
+	if e.wire != "" {
+		return errUnpublishableRefusal
+	}
+	return errUnroutableRPC
+}
+
+// errUnpublishableRefusal reaches the transport when a refusal names a Core
+// class but its record is one Core refuses to encode. That is a HOST defect —
+// the caller's request was readable and was refused — so it is answered
+// ErrorInternal and never ErrorBadRequest, which a Factory reads as its own
+// malformed request.
+var errUnpublishableRefusal = errors.New("hostlink: the refusal's Core class could not be encoded")
+
+// encodeRefusal encodes a published refusal. HostLinkError has already
+// validated it, so a failure here is this Host's and is answered as one.
+func encodeRefusal(wire sessionwire.HostLinkError) ([]byte, error) {
+	body, err := json.Marshal(wire)
+	if err != nil {
+		return nil, errUnpublishableRefusal
+	}
+	return body, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,13 +1090,9 @@ func (m *Multiplexer) dispatch(ctx context.Context, link LinkID, method string, 
 	}
 	wire, published := refusal.HostLinkError()
 	if !published {
-		return nil, errUnroutableRPC
+		return nil, refusal.unpublished()
 	}
-	body, marshalErr := json.Marshal(wire)
-	if marshalErr != nil {
-		return nil, marshalErr
-	}
-	return body, nil
+	return encodeRefusal(wire)
 }
 
 // install attaches this Multiplexer's handlers to one physical connection.
@@ -1073,7 +1118,7 @@ func (m *Multiplexer) install(client *centrifuge.Client) {
 		answer := func() {
 			body, err := m.dispatch(client.Context(), link, event.Method, event.Data)
 			switch {
-			case errors.Is(err, errAttachFailed):
+			case errors.Is(err, errAttachFailed), errors.Is(err, errUnpublishableRefusal):
 				callback(centrifuge.RPCReply{}, centrifuge.ErrorInternal)
 			case err != nil:
 				callback(centrifuge.RPCReply{}, centrifuge.ErrorBadRequest)

@@ -70,11 +70,19 @@ type Attacher interface {
 // Attacher that knows the lease is held elsewhere but not by whom must still
 // set the Code: this package substitutes a publishable class rather than put
 // an invalid body on the wire. See RefusalHolderEpochUnknown.
+//
+// RuntimeCompatibilityID is the build THIS Host launches or runs for the
+// refused request, and is read only for runtime_mismatch, which Core refuses
+// to encode without it. A runtime_mismatch whose id is absent or not a value
+// Core accepts is published as runtime_unavailable instead; see
+// RefusalMismatchBuildUnknown. Neither member is ever published under a class
+// Core does not attach it to.
 type AttachRefusal struct {
-	Code              sessionwire.HostLinkErrorCode
-	CurrentLeaseEpoch uint64
-	Reason            string
-	Cause             error
+	Code                   sessionwire.HostLinkErrorCode
+	CurrentLeaseEpoch      uint64
+	RuntimeCompatibilityID string
+	Reason                 string
+	Cause                  error
 }
 
 func (e *AttachRefusal) Error() string {
@@ -148,7 +156,7 @@ func attachReply(observation sessionwire.HostLinkRegistryObservation, err error)
 		}
 		return nil, errAttachFailed
 	}
-	return json.Marshal(wire)
+	return encodeRefusal(wire)
 }
 
 // ---------------------------------------------------------------------------
@@ -283,12 +291,33 @@ func (m *Multiplexer) attachRefusal(key registry.Key, err error) error {
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
 		}
 	}
-	return &BindError{
-		Refusal:           RefusalAttachRefused,
-		Key:               key,
-		Reason:            "the attacher refused the attach: " + strconv.Quote(refused.Reason),
-		Cause:             err,
-		wire:              refused.Code,
-		currentLeaseEpoch: refused.CurrentLeaseEpoch,
+	if refused.Code == sessionwire.HostLinkErrorRuntimeMismatch &&
+		(sessionwire.HostLinkError{Code: refused.Code, RuntimeCompatibilityID: refused.RuntimeCompatibilityID}).Validate() != nil {
+		return &BindError{
+			Refusal: RefusalMismatchBuildUnknown,
+			Key:     key,
+			Reason:  "the attach disagrees with what this Host runs and the attacher named no publishable build, so the class is downgraded",
+			Cause:   err,
+			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
+		}
 	}
+	refusal := &BindError{
+		Refusal: RefusalAttachRefused,
+		Key:     key,
+		Reason:  "the attacher refused the attach: " + strconv.Quote(refused.Reason),
+		Cause:   err,
+		wire:    refused.Code,
+	}
+	// EACH MEMBER RIDES ONLY WITH ITS CLASS. Core refuses a current_lease_epoch
+	// on anything but epoch_mismatch and a runtime_compatibility_id on anything
+	// but runtime_mismatch, so copying both unconditionally made a refusal
+	// unencodable whenever an Attacher filled in a member its class does not
+	// carry.
+	switch refused.Code {
+	case sessionwire.HostLinkErrorEpochMismatch:
+		refusal.currentLeaseEpoch = refused.CurrentLeaseEpoch
+	case sessionwire.HostLinkErrorRuntimeMismatch:
+		refusal.runtimeCompatibilityID = refused.RuntimeCompatibilityID
+	}
+	return refusal
 }
