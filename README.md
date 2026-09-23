@@ -147,6 +147,39 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Upgrading to v0.8.1: a draining Host stops applying commands first
+
+Before v0.8.1 a drain stopped a session's command consumer only when it released
+the runtime, after the idle wait and the checkpoint. A command admitted while the
+drain was waiting or checkpointing was applied by the draining Host under its own
+epoch, while its registration already said `releasing`. A long turn started there
+could turn a graceful release into a crash-equivalent one, and the checkpoint was
+not necessarily the session's last state.
+
+The drain now halts each session's consumer first, the same step 0 a warm release
+takes. It waits, bounded by `HOST_DRAIN_IDLE_BOUNDARY` and the grace, for a pass
+already in flight. A halt that does not finish in time is recorded as
+`halt_consumption` and the release continues. A command admitted during the drain
+stays pending, and the successor applies it. A warm release racing the drain can
+no longer resume a consumer the drain halted.
+
+**This includes a gate answer.** An answer admitted after a drain begins is not
+applied by the draining Host. A session parked at a gate is released
+crash-equivalently, as before, and its successor applies the answer after
+restoring the session.
+
+Also in v0.8.1:
+
+- `host_sessions_gate_waiting` counts the resident sessions parked at a gate.
+  Before, no source was wired, so it always read 0.
+- Each failed drain step is logged as `host: drain step failed`, with
+  `tenant_id`, `session_id`, `step`, `residency_epoch` and `host_generation`.
+  A refused runtime release (the crash-equivalent case) is logged at ERROR, the
+  rest at WARN. The epoch is also kept durably, by sessionstore's retained
+  epoch-fenced registration tombstone.
+
+There is no exported API change.
+
 ## Upgrading to v0.8.0: a storage outage no longer wedges a session
 
 Before v0.8.0 a brief PostgreSQL or S3 outage under a runtime's journal could wedge a
