@@ -1233,3 +1233,31 @@ func TestStopAdmittingRefusesAReplacedResidency(t *testing.T) {
 		t.Error("StopAdmitting succeeded on an absent key")
 	}
 }
+
+// TestResumeResidentRevertsOnlyAWarmReleaseOfTheSameGeneration: the one way
+// back from releasing. It returns the entry to resident and accepting under the
+// same generation, and refuses a stale generation, a residency claimed for
+// teardown, and a draining one.
+func TestResumeResidentRevertsOnlyAWarmReleaseOfTheSameGeneration(t *testing.T) {
+	t.Parallel()
+	index := registry.New(newClock())
+	key := registry.Key{TenantID: "tenant-r1", SessionID: "session-r1"}
+	entry, _ := index.Insert(key, admission("a"))
+	index.StopAdmitting(key, entry.Generation)
+	index.MarkReleasing(key, entry.Generation)
+
+	if _, ok := index.ResumeResident(key, entry.Generation+1); ok {
+		t.Fatal("a stale generation reverted the residency")
+	}
+	resumed, ok := index.ResumeResident(key, entry.Generation)
+	if !ok || resumed.State != registry.StateResident || !resumed.Accepting || resumed.Generation != entry.Generation {
+		t.Fatalf("ResumeResident = (%+v, %v), want resident, accepting, same generation", resumed, ok)
+	}
+
+	if _, claimed := index.BeginTeardown(key, entry.Generation); !claimed {
+		t.Fatal("BeginTeardown did not claim")
+	}
+	if _, ok := index.ResumeResident(key, entry.Generation); ok {
+		t.Fatal("a residency claimed for teardown was reverted to resident")
+	}
+}

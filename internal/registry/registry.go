@@ -228,6 +228,31 @@ func (r *Registry) MarkReleasing(key Key, generation uint64) (Entry, bool) {
 	return *entry, true
 }
 
+// ResumeResident returns a residency a release had begun on to StateResident
+// and accepting, under the same generation.
+//
+// IT IS THE ONE WAY BACK, AND IT IS NARROW ON PURPOSE. A release that has
+// published `releasing` cannot in general be taken back — a Factory may already
+// have stopped routing to it — so nothing here offered this until a warm
+// release found a runtime that REFUSED to release. Such a session never stopped
+// being live under this Host's grant: no tombstone was written and no successor
+// could attach. Leaving it `releasing` made it unanswerable through Factory
+// (no reusable owner, bind and wake refused) until the Host drained. So a warm
+// release may revert, and only that: a residency claimed for teardown or
+// draining is refused, because its owner is the drain and not the warm path.
+func (r *Registry) ResumeResident(key Key, generation uint64) (Entry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.current(key, generation)
+	if !ok || entry.TeardownOwned || (entry.State != StateReleasing && entry.State != StateResident) {
+		return Entry{}, false
+	}
+	entry.State = StateResident
+	entry.Accepting = true
+	entry.LastActivity = r.clock.Now()
+	return *entry, true
+}
+
 // BeginTeardown claims teardown for a residency. Exactly one caller wins.
 //
 // The claim is recorded on the entry rather than inferred from the state,

@@ -2434,3 +2434,73 @@ func TestTheHeartbeatWritesThroughTheGrantsFenceNotACopy(t *testing.T) {
 		t.Errorf("BeginRelease reported %v, want ErrLeaseNotHeld", err)
 	}
 }
+
+// TestAbortReleaseReturnsTheResidencyToResidentAndAdmitting is G2's durable
+// half: a release begun on a session whose runtime then refused to release is
+// taken back. The registry entry is resident and accepting again under the
+// SAME generation, `resident, accepting` is published under the held epoch,
+// later beats keep saying so, and a later release can begin again.
+func TestAbortReleaseReturnsTheResidencyToResidentAndAdmitting(t *testing.T) {
+	f := newHeartbeatFixture(t)
+	f.pulse(t)
+	if err := f.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("BeginRelease: %v", err)
+	}
+	if err := f.beat.AbortRelease(context.Background()); err != nil {
+		t.Fatalf("AbortRelease: %v", err)
+	}
+	entry, held := f.registry.Get(f.key())
+	if !held || entry.State != registry.StateResident || !entry.Accepting || entry.Generation != f.entry.Generation {
+		t.Fatalf("after AbortRelease the entry is %+v, want resident, accepting, generation %d", entry, f.entry.Generation)
+	}
+	published := f.locations.publishedAll()
+	last := published[len(published)-1]
+	if last.Residency != sessionwire.SessionResidencyResident || !last.Accepting || last.LeaseEpoch != uint64(testEpoch) {
+		t.Fatalf("AbortRelease published %+v, want resident, accepting, under epoch %d", last, testEpoch)
+	}
+	f.pulse(t)
+	published = f.locations.publishedAll()
+	if beat := published[len(published)-1]; beat.Residency != sessionwire.SessionResidencyResident || !beat.Accepting {
+		t.Fatalf("a beat after AbortRelease published %q accepting %t, want resident and true", beat.Residency, beat.Accepting)
+	}
+
+	// The begin latch was cleared: a later release begins again for real.
+	before := len(f.trace.recorded())
+	if err := f.beat.BeginRelease(context.Background()); err != nil {
+		t.Fatalf("a second BeginRelease: %v", err)
+	}
+	if again := f.trace.recorded()[before:]; !reflect.DeepEqual(again, []string{"registry.releasing", "location.publish:releasing"}) {
+		t.Fatalf("a second BeginRelease did %v; the first release's latch was not cleared", again)
+	}
+}
+
+// TestAbortReleaseIsRefusedAfterTheReleaseFinishedOrUnderALostGrant: the
+// revert is only for a release that stopped before its tombstone, under a
+// grant this Host still holds.
+func TestAbortReleaseIsRefusedAfterTheReleaseFinishedOrUnderALostGrant(t *testing.T) {
+	t.Run("finished", func(t *testing.T) {
+		f := newHeartbeatFixture(t)
+		if err := f.beat.BeginRelease(context.Background()); err != nil {
+			t.Fatalf("BeginRelease: %v", err)
+		}
+		if err := f.beat.FinishRelease(context.Background()); err != nil {
+			t.Fatalf("FinishRelease: %v", err)
+		}
+		if err := f.beat.AbortRelease(context.Background()); err == nil {
+			t.Fatal("AbortRelease after FinishRelease succeeded")
+		}
+	})
+	t.Run("lost grant", func(t *testing.T) {
+		f := newHeartbeatFixture(t)
+		if err := f.beat.BeginRelease(context.Background()); err != nil {
+			t.Fatalf("BeginRelease: %v", err)
+		}
+		f.fence.end(LossReasonLeaseLost)
+		if err := f.beat.AbortRelease(context.Background()); err == nil {
+			t.Fatal("AbortRelease under a lost grant succeeded")
+		}
+		if entry, _ := f.registry.Get(f.key()); entry.Accepting {
+			t.Fatal("a refused AbortRelease reopened admission")
+		}
+	})
+}

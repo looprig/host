@@ -200,6 +200,14 @@ type WarmSession interface {
 
 	// DropState drops in-memory state and disposable local materializations.
 	DropState(context.Context) error
+
+	// AbortRelease returns a session whose runtime refused to release to an
+	// ordinary resident, admitting session under the same generation: the
+	// registry and the durable observation go back to `resident, accepting`
+	// and BeginRelease and Checkpoint may run again. It must refuse when it
+	// cannot deliver that — the session's work already stopped, the Host is
+	// draining, the grant is gone — and the release is then left held.
+	AbortRelease(context.Context) error
 }
 
 // WarmObserver is handed the outcome of every warm release attempt.
@@ -228,6 +236,7 @@ const (
 	WarmStepFinishRelease    WarmStep = "finish_release"
 	WarmStepReleaseLease     WarmStep = "release_lease"
 	WarmStepDropState        WarmStep = "drop_state"
+	WarmStepAbortRelease     WarmStep = "abort_release"
 )
 
 // WarmFailure is one step that did not succeed.
@@ -255,6 +264,13 @@ const (
 	// anything was taken. The session stays resident and accepting and is
 	// released on a later idle observation.
 	WarmOutcomeAborted WarmOutcomeKind = "aborted"
+
+	// WarmOutcomeResumed reports a release whose runtime did not release
+	// within the bound (step 4) and that was then TAKEN BACK: the session is
+	// an ordinary resident, admitting session again under the same
+	// generation, its consumption resumed, and the watch goes on exactly as
+	// after an abort. It carries the step-4 failure, so it is counted.
+	WarmOutcomeResumed WarmOutcomeKind = "resumed"
 
 	// WarmOutcomeHeld reports a release that stopped at step 4 because the
 	// runtime refused or did not finish its nonterminal release within the
@@ -471,8 +487,8 @@ func (w *WarmReleaser) Observe(key registry.Key, state WorkState) {
 	watch.mu.Lock()
 	defer watch.mu.Unlock()
 	if watch.releasing {
-		// The release is already past step 1 and cannot be taken back. See
-		// release: there is no ResumeAdmitting and no MarkResident.
+		// The release is already past step 1. Only its own step 4 can take
+		// it back (WarmSession.AbortRelease); an observation cannot.
 		return
 	}
 	if state == WorkStateIdle {
@@ -566,7 +582,7 @@ func (w *WarmReleaser) run(watch *warmWatch) {
 
 			outcome := w.release(session)
 
-			if outcome.Kind == WarmOutcomeAborted {
+			if outcome.Kind == WarmOutcomeAborted || outcome.Kind == WarmOutcomeResumed {
 				// The session stays resident and is released on a later idle
 				// observation. "Abort THIS release attempt" is the runbook's
 				// wording; a releaser that stopped watching would leave the
@@ -647,6 +663,11 @@ func (w *WarmReleaser) bounded() (context.Context, context.CancelFunc) {
 //     resource into several. A failed required checkpoint costs a rehydration,
 //     because the durable session and its journal remain authoritative; it does
 //     not cost work.
+//   - THE ONE EXCEPTION IS A RUNTIME THAT REFUSES TO RELEASE (step 4). That
+//     session never stopped being live under this Host's grant and nothing
+//     after step 4 has run, so the release is TAKEN BACK through
+//     WarmSession.AbortRelease — the one narrow revert the registry and the
+//     heartbeat offer — rather than parked where no Factory can reach it.
 func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	ctx := context.Background()
 	key, generation := session.Key(), session.Generation()
@@ -744,13 +765,29 @@ func (w *WarmReleaser) release(session WarmSession) WarmOutcome {
 	err = session.ReleaseResidency(releaseCtx)
 	cancel()
 	if err != nil {
-		// Consumption resumes: the session is still this Host's, under a
-		// live grant, and a turn that raises a gate must be able to have its
-		// answer applied. It is not admitting, so nothing new is placed here.
-		resume()
 		outcome.Failures = append(outcome.Failures, WarmFailure{Step: WarmStepReleaseResidency, Err: err})
+		// THE RELEASE IS TAKEN BACK. The runtime is live and this Host still
+		// holds its grant; no tombstone was written, so no successor could
+		// have attached. Leaving it `releasing` would make it unanswerable
+		// through Factory — no reusable owner, bind and wake refused — until
+		// the Host drained. So it returns to an ordinary resident, admitting
+		// session, and its consumption resumes after the revert so nothing is
+		// applied into a session still advertised as going away.
+		if abortErr := session.AbortRelease(ctx); abortErr == nil {
+			resume()
+			outcome.Kind = WarmOutcomeResumed
+			outcome.Reason = "the runtime did not release within the bound, so the release was taken back and the session is resident and admitting again"
+			return outcome
+		} else {
+			outcome.Failures = append(outcome.Failures, WarmFailure{Step: WarmStepAbortRelease, Err: abortErr})
+		}
+		// The revert was refused (the Host is draining, the grant is gone, or
+		// the session's work already stopped): the session is HELD for the
+		// drain. Consumption resumes so a gate answer can still be applied
+		// under the live grant.
+		resume()
 		outcome.Kind = WarmOutcomeHeld
-		outcome.Reason = "the runtime did not release within the bound, so the session stays with this Host under its grant until the drain"
+		outcome.Reason = "the runtime did not release within the bound and the release could not be taken back, so the session stays with this Host under its grant until the drain"
 		return outcome
 	}
 	// STEP 5. The epoch-fenced tombstone and the visible registry entry.

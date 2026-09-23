@@ -198,6 +198,7 @@ func (f *epochFence) write(run func() error) error {
 type HeartbeatRegistry interface {
 	Get(registry.Key) (registry.Entry, bool)
 	MarkReleasing(registry.Key, uint64) (registry.Entry, bool)
+	ResumeResident(registry.Key, uint64) (registry.Entry, bool)
 	BeginTeardown(registry.Key, uint64) (registry.Entry, bool)
 	RemoveByGeneration(registry.Key, uint64) bool
 }
@@ -450,6 +451,48 @@ func (h *Heartbeat) BeginRelease(ctx context.Context) error {
 	h.begun = true
 	h.beginErr = h.beginRelease(ctx)
 	return h.beginErr
+}
+
+// AbortRelease undoes BeginRelease for a release that could not finish because
+// the runtime refused to release: the entry returns to resident and accepting
+// under the same generation, the `resident, accepting` observation is written
+// under the held epoch, and the begin latch is cleared so a later release can
+// begin again.
+//
+// It REFUSES after FinishRelease (the entry is gone), under a lost grant, while
+// the Host is draining (the drain owns every session then), and for a
+// residency claimed for teardown. A refusal leaves the release where it was.
+//
+// A FAILED OBSERVATION WRITE IS NOT A REFUSAL. The entry is already resident
+// locally, and the next beat republishes it; only a fence that ended is
+// reported, because then this Host no longer owns the session at all.
+func (h *Heartbeat) AbortRelease(ctx context.Context) error {
+	h.releaseMu.Lock()
+	defer h.releaseMu.Unlock()
+	if h.finished {
+		return &ReleaseError{Key: h.key, Unwritten: []string{"resident observation: the release already finished"}, Cause: ErrNothingToRelease}
+	}
+	if err := h.leaseHeld(); err != nil {
+		return &ReleaseError{Key: h.key, Unwritten: []string{"resident observation: " + err.Error()}, Cause: err}
+	}
+	if h.options.Admissions.Draining() {
+		return &ReleaseError{Key: h.key, Unwritten: []string{"resident observation: the Host is draining"}, Cause: ErrNothingToRelease}
+	}
+
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	entry, current := h.options.Registry.ResumeResident(h.key, h.generation)
+	if !current {
+		return &ReleaseError{Key: h.key, Unwritten: []string{"resident observation: " + ErrNothingToRelease.Error()}, Cause: ErrNothingToRelease}
+	}
+	h.begun, h.beginErr = false, nil
+	observation := h.observation(entry, sessionwire.SessionResidencyResident, true)
+	if err := h.fence.write(func() error { return h.options.Locations.PublishResidency(ctx, observation) }); err != nil {
+		if _, ended := h.fence.endedBy(); ended {
+			return &ReleaseError{Key: h.key, Unwritten: []string{"resident observation: " + err.Error()}, Cause: err}
+		}
+	}
+	return nil
 }
 
 // FinishRelease is §9.3 steps 4 and 5' location half: stop the loop, write the

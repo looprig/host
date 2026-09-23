@@ -1340,7 +1340,10 @@ func TestAnExpiryThatIsNoLongerIdleReleasesNothing(t *testing.T) {
 	t.Parallel()
 	trace := &warmTrace{}
 	confirm := &fakeConfirmer{trace: trace}
-	f := newWarmFixture(t, func(options *WarmOptions) { options.Confirm = confirm })
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		options.Confirm = confirm
+		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
+	})
 	confirm.trace = f.trace
 	timer := f.clock.only(t)
 
@@ -1357,6 +1360,12 @@ func TestAnExpiryThatIsNoLongerIdleReleasesNothing(t *testing.T) {
 	}
 	if !f.entry().Accepting {
 		t.Fatal("a session that was not idle at expiry stopped admitting")
+	}
+	// ITS CONSUMPTION RESUMES. This is the commonest abort, and without the
+	// resume the session stays resident with a consumer halted for good:
+	// nothing admitted to it would ever be applied.
+	if halt, resume := f.trace.index("consumption.halt"), f.trace.index("consumption.resume"); halt < 0 || resume < halt {
+		t.Fatalf("an unconfirmed expiry left consumption halted: %v", f.trace.recorded())
 	}
 
 	// The next idle observation arms again, and a confirmed expiry releases.
@@ -1416,17 +1425,68 @@ func TestAHaltThatDoesNotFinishAbortsTheRelease(t *testing.T) {
 	}
 }
 
-// TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld is F3: the runtime
-// release is bounded, and a runtime that does not release in time — harness
-// refuses a busy one — leaves the session HELD: no tombstone, grant kept, state
-// kept, capacity not credited, and the watch ended so the drain owns it.
-func TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld(t *testing.T) {
+// TestARuntimeThatDoesNotReleaseIsTakenBackToAResidentSession is F3 as the
+// regate (G2) requires it: the runtime release is bounded, and a runtime that
+// does not release in time — harness refuses a busy one — is TAKEN BACK. The
+// release reverts (AbortRelease), consumption resumes only after the revert,
+// nothing after step 4 runs, capacity is not credited, and the watch goes on:
+// the next idle observation arms a whole TTL and the next expiry tries again.
+func TestARuntimeThatDoesNotReleaseIsTakenBackToAResidentSession(t *testing.T) {
 	t.Parallel()
 	f := newWarmFixture(t, func(options *WarmOptions) {
 		options.ReleaseBound = 20 * time.Millisecond
 		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
 	})
 	f.session.waitsForIdle = true
+	timer := f.clock.only(t)
+	f.releaser.Observe(f.key, WorkStateIdle)
+	timer.expire(t)
+
+	outcome := f.observer.await(t)
+	if outcome.Kind != WarmOutcomeResumed {
+		t.Fatalf("outcome = %q (%s), want %q", outcome.Kind, outcome.Reason, WarmOutcomeResumed)
+	}
+	if len(outcome.Failures) != 1 || outcome.Failures[0].Step != WarmStepReleaseResidency || !errors.Is(outcome.Failures[0].Err, context.Canceled) {
+		t.Fatalf("failures = %v, want only the bounded runtime release's cancellation", outcome.Failures)
+	}
+	for _, later := range []string{"finish_release", "release_lease", "drop_state", "admissions.release"} {
+		if f.trace.index(later) >= 0 {
+			t.Fatalf("%q ran after the runtime did not release: %v", later, f.trace.recorded())
+		}
+	}
+	abort, resume := f.trace.index("abort_release"), f.trace.index("consumption.resume")
+	if abort < 0 || resume < abort {
+		t.Fatalf("consumption must resume only AFTER the release is taken back: %v", f.trace.recorded())
+	}
+
+	// The watch goes on: a later idle arms a whole TTL, and the next expiry
+	// makes a fresh attempt.
+	reads := f.inbox.readCount()
+	f.session.waitsForIdle = false
+	f.releaser.Observe(f.key, WorkStateIdle)
+	if resets := timer.resetsSeen(); len(resets) != 2 {
+		t.Fatalf("the countdown was armed %d times, want 2: a taken-back release must leave the watch able to re-arm", len(resets))
+	}
+	timer.expire(t)
+	if next := f.observer.await(t); next.Kind != WarmOutcomeReleased {
+		t.Fatalf("the next attempt = %q (%s), want released", next.Kind, next.Reason)
+	}
+	if f.inbox.readCount() != reads+1 {
+		t.Fatal("the next attempt did not re-read the inbox")
+	}
+}
+
+// TestARuntimeThatDoesNotReleaseAndCannotBeTakenBackIsHeld: when the revert is
+// refused (the Host is draining, the grant is gone, the work already stopped)
+// the session is HELD for the drain, with consumption resumed.
+func TestARuntimeThatDoesNotReleaseAndCannotBeTakenBackIsHeld(t *testing.T) {
+	t.Parallel()
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		options.ReleaseBound = 20 * time.Millisecond
+		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
+	})
+	f.session.waitsForIdle = true
+	f.session.failAt("abort_release", errors.New("the Host is draining"))
 	f.releaser.Observe(f.key, WorkStateIdle)
 	f.clock.only(t).expire(t)
 
@@ -1434,15 +1494,37 @@ func TestARuntimeThatDoesNotReleaseLeavesTheSessionHeld(t *testing.T) {
 	if outcome.Kind != WarmOutcomeHeld {
 		t.Fatalf("outcome = %q (%s), want %q", outcome.Kind, outcome.Reason, WarmOutcomeHeld)
 	}
+	if len(outcome.Failures) != 2 || outcome.Failures[1].Step != WarmStepAbortRelease {
+		t.Fatalf("failures = %v, want the runtime release and the refused revert", outcome.Failures)
+	}
 	for _, later := range []string{"finish_release", "release_lease", "drop_state", "admissions.release"} {
 		if f.trace.index(later) >= 0 {
 			t.Fatalf("%q ran after the runtime did not release: %v", later, f.trace.recorded())
 		}
 	}
-	if f.trace.index("consumption.resume") < f.trace.index("release_residency") {
-		t.Fatalf("a held session's consumption was not resumed after the runtime release: %v", f.trace.recorded())
+	if f.trace.index("consumption.resume") < f.trace.index("abort_release") {
+		t.Fatalf("a held session's consumption was not resumed: %v", f.trace.recorded())
 	}
-	if len(outcome.Failures) != 1 || !errors.Is(outcome.Failures[0].Err, context.Canceled) {
-		t.Fatalf("failures = %v, want the bounded runtime release's cancellation", outcome.Failures)
+}
+
+func (s *fakeWarmSession) AbortRelease(context.Context) error { return s.step("abort_release") }
+
+// TestAnUnreadableInboxAbortResumesConsumption (G3): the inbox-error abort must
+// hand the session's consumption back, or it stays halted for good.
+func TestAnUnreadableInboxAbortResumesConsumption(t *testing.T) {
+	t.Parallel()
+	f := newWarmFixture(t, func(options *WarmOptions) {
+		options.Consumption = &haltingConsumption{fakeConsumption: options.Consumption.(*fakeConsumption)}
+	})
+	f.inbox.mu.Lock()
+	f.inbox.err = errors.New("the store did not answer")
+	f.inbox.mu.Unlock()
+	f.releaser.Observe(f.key, WorkStateIdle)
+	f.clock.only(t).expire(t)
+	if outcome := f.observer.await(t); outcome.Kind != WarmOutcomeAborted {
+		t.Fatalf("outcome = %q, want aborted", outcome.Kind)
+	}
+	if read, resume := f.trace.index("inbox.reread"), f.trace.index("consumption.resume"); resume < read {
+		t.Fatalf("an unreadable-inbox abort left consumption halted: %v", f.trace.recorded())
 	}
 }

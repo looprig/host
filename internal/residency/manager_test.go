@@ -840,6 +840,11 @@ func (s *spyRegistry) MarkReleasing(key registry.Key, generation uint64) (regist
 	return s.inner.MarkReleasing(key, generation)
 }
 
+func (s *spyRegistry) ResumeResident(key registry.Key, generation uint64) (registry.Entry, bool) {
+	s.trace.record("registry.resume_resident")
+	return s.inner.ResumeResident(key, generation)
+}
+
 func (s *spyRegistry) BeginTeardown(key registry.Key, generation uint64) (registry.Entry, bool) {
 	s.trace.record("registry.teardown")
 	return s.inner.BeginTeardown(key, generation)
