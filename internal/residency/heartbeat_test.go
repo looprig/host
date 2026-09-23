@@ -2474,10 +2474,10 @@ func TestAbortReleaseReturnsTheResidencyToResidentAndAdmitting(t *testing.T) {
 	}
 }
 
-// TestAbortReleaseIsRefusedAfterTheReleaseFinishedOrUnderALostGrant: the
+// TestAbortReleaseIsRefusedAfterFinishWhileDrainingOrUnderALostGrant: the
 // revert is only for a release that stopped before its tombstone, under a
 // grant this Host still holds.
-func TestAbortReleaseIsRefusedAfterTheReleaseFinishedOrUnderALostGrant(t *testing.T) {
+func TestAbortReleaseIsRefusedAfterFinishWhileDrainingOrUnderALostGrant(t *testing.T) {
 	t.Run("finished", func(t *testing.T) {
 		f := newHeartbeatFixture(t)
 		if err := f.beat.BeginRelease(context.Background()); err != nil {
@@ -2488,6 +2488,19 @@ func TestAbortReleaseIsRefusedAfterTheReleaseFinishedOrUnderALostGrant(t *testin
 		}
 		if err := f.beat.AbortRelease(context.Background()); err == nil {
 			t.Fatal("AbortRelease after FinishRelease succeeded")
+		}
+	})
+	t.Run("draining", func(t *testing.T) {
+		f := newHeartbeatFixture(t)
+		if err := f.beat.BeginRelease(context.Background()); err != nil {
+			t.Fatalf("BeginRelease: %v", err)
+		}
+		f.publisher.BeginDrain()
+		if err := f.beat.AbortRelease(context.Background()); err == nil {
+			t.Fatal("AbortRelease while the Host drains succeeded; the drain owns every session then")
+		}
+		if entry, _ := f.registry.Get(f.key()); entry.Accepting || entry.State != registry.StateReleasing {
+			t.Fatalf("a refused AbortRelease changed the entry to %+v", entry)
 		}
 	})
 	t.Run("lost grant", func(t *testing.T) {
