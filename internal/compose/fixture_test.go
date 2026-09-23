@@ -295,12 +295,19 @@ type fakeLease struct {
 	trace *recorder
 	epoch residency.ResidencyEpoch
 	lost  chan struct{}
+
+	// onRelease, when set, runs inside Release before it returns, so a test can
+	// stand between a lost residency's lease release and the rest of its path.
+	onRelease func()
 }
 
 func (l *fakeLease) Epoch() residency.ResidencyEpoch { return l.epoch }
 func (l *fakeLease) Lost() <-chan struct{}           { return l.lost }
 func (l *fakeLease) Release(context.Context) error {
 	l.trace.record("lease.release")
+	if l.onRelease != nil {
+		l.onRelease()
+	}
 	return nil
 }
 
@@ -1142,6 +1149,13 @@ func (r *recorder) count(step string) int {
 		}
 	}
 	return total
+}
+
+// leaseOf returns the grant the store last minted for a key.
+func (s *fakeStore) leaseOf(key registry.Key) *fakeLease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leases[key]
 }
 
 // loseLease closes a session's residency grant loss channel.

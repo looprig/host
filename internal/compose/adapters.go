@@ -343,7 +343,7 @@ func (s *Service) trackResident(request residency.OwnershipRequest, halves relea
 	s.sessions[request.Key] = held
 	s.mu.Unlock()
 	if err := s.warm.Watch(warmSession{resident: held}); err != nil && !errors.Is(err, residency.ErrWarmReleaserStopped) {
-		s.forget(request.Key, request.Generation)
+		s.forgetResident(held)
 		return err
 	}
 	return nil
@@ -483,7 +483,10 @@ func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 	s.metrics.WarmRelease(outcome)
 	switch outcome.Kind {
 	case residency.WarmOutcomeReleased:
-		s.forget(outcome.Key, outcome.Generation)
+		// A RELEASED OUTCOME MEANS THE RUNTIME RELEASED (the warm protocol stops
+		// at step 4 otherwise), so its context may be cancelled whether or not a
+		// successor has been tracked under the key since (review finding R1).
+		s.forgetReleased(outcome.Key, outcome.Generation)
 	case residency.WarmOutcomeResumed:
 		s.options.logger().LogAttrs(context.Background(), slog.LevelWarn,
 			"host: a warm release was taken back because the runtime did not release; the session is resident and admitting again",
@@ -607,7 +610,7 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 		s.capacity.ReleaseOwned(held.key, held.generation)
 		s.warm.Forget(held.key)
 	}
-	s.forget(held.key, held.generation)
+	s.forgetResident(held)
 
 	if err := errors.Join(failures...); err != nil {
 		message := "host: the lost session's runtime did not release; it may keep running until it stops by itself, and its journal lease lapses on expiry"
@@ -670,6 +673,34 @@ func (s *Service) forget(key registry.Key, generation uint64) {
 	}
 	s.mu.Unlock()
 	s.manager.EndResidency(key, generation, current && held.runtimeReleased())
+}
+
+// forgetReleased is forget for a residency whose runtime is KNOWN to have
+// released, which the caller knows from its own outcome rather than from the
+// handle the key maps to now.
+func (s *Service) forgetReleased(key registry.Key, generation uint64) {
+	s.mu.Lock()
+	if held, present := s.sessions[key]; present && held.generation == generation {
+		delete(s.sessions, key)
+	}
+	s.mu.Unlock()
+	s.manager.EndResidency(key, generation, true)
+}
+
+// forgetResident is forget for a caller that HOLDS the residency it is ending.
+//
+// THE RELEASE IS READ FROM THAT RESIDENCY, NOT FROM WHATEVER THE KEY NOW MAPS
+// TO (review finding R1). A successor of the same key can be tracked between
+// this residency's lease release and its forget; forget then sees a residency
+// that is not current, and answering "not released" for it left the abandoned
+// runtime's context uncancelled although its runtime had been released.
+func (s *Service) forgetResident(held *resident) {
+	s.mu.Lock()
+	if current, present := s.sessions[held.key]; present && current == held {
+		delete(s.sessions, held.key)
+	}
+	s.mu.Unlock()
+	s.manager.EndResidency(held.key, held.generation, held.runtimeReleased())
 }
 
 // leaseFor returns the residency grant recorded for a key by the lease recorder.

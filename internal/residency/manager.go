@@ -680,6 +680,13 @@ type sessionRecord struct {
 	ownership  OwnershipHandle
 }
 
+// overtakenKey names one residency — a key AND a generation — because two
+// residencies of one key can both have unfinished ends.
+type overtakenKey struct {
+	key        registry.Key
+	generation uint64
+}
+
 // Manager creates and restores sessions under the durable session lease.
 type Manager struct {
 	host       *hostconfig.Host
@@ -702,6 +709,13 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[registry.Key]*sessionRecord
+
+	// overtaken holds the record of a residency whose key a SUCCESSOR attach
+	// installed over before the old residency's own end reached EndResidency
+	// (review finding R1). Step 8 moves the older record here rather than
+	// dropping it, so the old path's late EndResidency still finds it, prunes
+	// it, and cancels its context if — and only if — its runtime released.
+	overtaken map[overtakenKey]*sessionRecord
 
 	// attaching serializes attaches of one key. See Manager.acquireKey.
 	attaching map[registry.Key]chan struct{}
@@ -753,6 +767,7 @@ func NewManager(options Options) (*Manager, error) {
 		root:       root,
 		cancelRoot: cancel,
 		sessions:   map[registry.Key]*sessionRecord{},
+		overtaken:  map[overtakenKey]*sessionRecord{},
 		attaching:  map[registry.Key]chan struct{}{},
 	}, nil
 }
@@ -774,7 +789,7 @@ func (m *Manager) SessionContext(key registry.Key) (context.Context, bool) {
 func (m *Manager) Records() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.sessions)
+	return len(m.sessions) + len(m.overtaken)
 }
 
 // Close cancels this Manager's root session context, which cancels every
@@ -815,14 +830,25 @@ func (m *Manager) Close() {
 // session parked at a gate — is left PARKED: cancelled, it would interrupt its
 // turn and abandon the gate after this Host stopped publishing it. Its record
 // is still pruned; its context stays a child of the root, which Close cancels.
+//
+// AN OVERTAKEN RESIDENCY IS STILL FOUND (review finding R1). When a successor
+// of the same key reached step 8 first, the older record was moved aside rather
+// than overwritten, and it is pruned — and cancelled on the same rule — here.
 func (m *Manager) EndResidency(key registry.Key, generation uint64, runtimeReleased bool) bool {
 	m.mu.Lock()
 	record, held := m.sessions[key]
-	if !held || record.generation != generation {
-		m.mu.Unlock()
-		return false
+	switch {
+	case held && record.generation == generation:
+		delete(m.sessions, key)
+	default:
+		aside := overtakenKey{key: key, generation: generation}
+		record, held = m.overtaken[aside]
+		if !held {
+			m.mu.Unlock()
+			return false
+		}
+		delete(m.overtaken, aside)
 	}
-	delete(m.sessions, key)
 	m.mu.Unlock()
 	if runtimeReleased {
 		record.cancel()
@@ -1580,6 +1606,16 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	}
 
 	m.mu.Lock()
+	// AN OLDER RECORD IS SET ASIDE, NOT OVERWRITTEN (review finding R1). Its
+	// residency has ended — its registry entry is gone, or this attach could
+	// not have installed one — but its own end may not have reached
+	// EndResidency yet, and overwriting it here left that late end matching
+	// nothing: the abandoned runtime's context was never cancelled. Whether it
+	// MAY be cancelled is still that end's to say (a runtime whose release
+	// failed keeps its context), so it is not cancelled here.
+	if older, held := m.sessions[key]; held && older.generation != entry.Generation {
+		m.overtaken[overtakenKey{key: key, generation: older.generation}] = older
+	}
 	m.sessions[key] = &sessionRecord{generation: entry.Generation, ctx: sessionCtx, cancel: cancelSession, ownership: handle}
 	m.mu.Unlock()
 

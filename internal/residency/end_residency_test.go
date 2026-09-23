@@ -99,3 +99,54 @@ func TestAStaleEndLeavesTheSuccessorsRecordAlone(t *testing.T) {
 		t.Fatalf("an attach of the resident successor = (%+v, %v), want the idempotent answer", again, err)
 	}
 }
+
+// TestAnOvertakenResidencysLateEndStillCancelsItsContext is review finding R1
+// at the Manager: a successor attach of the same key reaches step 8 BEFORE
+// the old residency's end reaches EndResidency. The old record must be set
+// aside rather than overwritten, so the late end still prunes it and cancels
+// its context on the end's own rule — and never touches the successor.
+func TestAnOvertakenResidencysLateEndStillCancelsItsContext(t *testing.T) {
+	for _, released := range []bool{true, false} {
+		t.Run(fmt.Sprintf("released=%v", released), func(t *testing.T) {
+			f := newFixture(t)
+			old, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+			if err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+			oldCtx, _ := f.manager.SessionContext(old.Key)
+			// The old residency's registry entry goes, as its release does,
+			// but its end has not reached the Manager yet.
+			if !f.registry.inner.RemoveByGeneration(old.Key, old.Generation) {
+				t.Fatal("the old residency was not in the registry")
+			}
+			f.publisher.ReleaseOwned(old.Key, old.Generation)
+			successor, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+			if err != nil {
+				t.Fatalf("successor Attach: %v", err)
+			}
+			if successor.Generation == old.Generation {
+				t.Fatal("the successor reused the old generation")
+			}
+			if got := f.manager.Records(); got != 2 {
+				t.Fatalf("Records() = %d with an overtaken residency not yet ended, want 2", got)
+			}
+
+			if !f.manager.EndResidency(old.Key, old.Generation, released) {
+				t.Fatal("the overtaken residency's late end pruned nothing")
+			}
+			if got := oldCtx.Err() != nil; got != released {
+				t.Fatalf("overtaken context cancelled = %v, want %v (runtime released = %v)", got, released, released)
+			}
+			successorCtx, ok := f.manager.SessionContext(successor.Key)
+			if !ok || successorCtx.Err() != nil {
+				t.Fatal("the overtaken residency's end reached its successor")
+			}
+			if got := f.manager.Records(); got != 1 {
+				t.Fatalf("Records() = %d after the overtaken end, want 1", got)
+			}
+			if f.manager.EndResidency(old.Key, old.Generation, released) {
+				t.Fatal("a second end of the overtaken residency pruned something")
+			}
+		})
+	}
+}

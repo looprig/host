@@ -197,3 +197,110 @@ func TestALostResidencysReleaseIsBounded(t *testing.T) {
 		t.Fatal("a runtime that did not release was not reported")
 	}
 }
+
+// TestALostResidencyOvertakenByASuccessorStillCancelsItsContext is review
+// finding R1 (host v0.9.0): the lost path releases its lease, a same-Host
+// successor attach of the same session completes, and only THEN does the old
+// path forget its residency. The successor's step 8 had overwritten the old
+// Manager record without cancelling it, and the old forget no longer matched
+// either map, so the abandoned runtime's session context stayed a live child
+// of the root for the life of the process.
+func TestALostResidencyOvertakenByASuccessorStillCancelsItsContext(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	first := f.attach(tenantA, sessionA)
+	oldCtx, ok := f.svc.manager.SessionContext(keyA)
+	if !ok {
+		t.Fatal("no session context for the first residency")
+	}
+
+	successorErr := make(chan error, 1)
+	f.store.leaseOf(keyA).onRelease = func() {
+		// The old path has released its grant and not yet forgotten the
+		// residency: the successor attaches entirely inside that window.
+		f.rig.Session = newControllableSession(testRigSessionID)
+		_, err := f.svc.Attach(context.Background(), residency.Request{
+			TenantID: tenantA, SessionID: sessionA, AgentID: testAgent, Mode: residency.ModeCreate,
+			Principal: residency.Principal{TenantID: tenantA, ActorID: "actor-a"},
+		})
+		successorErr <- err
+	}
+	f.store.loseLease(keyA)
+
+	select {
+	case err := <-successorErr:
+		if err != nil {
+			t.Fatalf("the successor attach inside the lost path's window: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lost path never released its lease")
+	}
+	awaitCondition(t, "the old residency's session context to be cancelled", func() bool { return oldCtx.Err() != nil })
+
+	successor := f.svc.residentFor(keyA)
+	if successor == nil || successor.generation == first.Generation {
+		t.Fatalf("the successor residency is not the one held: %+v", successor)
+	}
+	newCtx, ok := f.svc.manager.SessionContext(keyA)
+	if !ok || newCtx.Err() != nil {
+		t.Fatal("the successor's session context is gone or cancelled: the old path's end reached its successor")
+	}
+	if got := f.svc.manager.Records(); got != 1 {
+		t.Fatalf("Records() = %d with one residency held, want 1", got)
+	}
+}
+
+// TestALostResidencyWhoseRuntimeDidNotReleaseKeepsItsContext is review gap
+// M16: a lost runtime whose nonterminal release FAILED is still running on its
+// session context, and cancelling it would tear the runtime down behind the
+// release protocol's back. Its record is pruned; its context is left to Close.
+func TestALostResidencyWhoseRuntimeDidNotReleaseKeepsItsContext(t *testing.T) {
+	previous := lostReleaseBound
+	lostReleaseBound = 20 * time.Millisecond
+	t.Cleanup(func() { lostReleaseBound = previous })
+
+	f := newFixture(t)
+	f.rig.Session = busyReleaseSession{publishingSession: newPublishingSession()}
+	f.start()
+	f.attach(tenantA, sessionA)
+	ctx, ok := f.svc.manager.SessionContext(keyA)
+	if !ok {
+		t.Fatal("no session context for the residency")
+	}
+	baseline := f.svc.manager.Records()
+
+	f.store.loseLease(keyA)
+	awaitForgotten(t, f)
+	awaitCondition(t, "the lost residency's record to be pruned", func() bool { return f.svc.manager.Records() == baseline-1 })
+	if ctx.Err() != nil {
+		t.Fatal("the session context of a runtime whose release failed was cancelled: the runtime is still running on it")
+	}
+}
+
+// TestAWarmReleaseOvertakenByASuccessorStillCancelsItsContext is R1's warm
+// shape: a released warm outcome means the runtime released, so the ended
+// residency's context is cancelled even when a successor has been tracked
+// under the key before the outcome is recorded.
+func TestAWarmReleaseOvertakenByASuccessorStillCancelsItsContext(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	stale := f.svc.residentFor(keyA)
+	ctx, ok := f.svc.manager.SessionContext(keyA)
+	if !ok {
+		t.Fatal("no session context for the residency")
+	}
+	successor := &resident{key: stale.key, agent: stale.agent, generation: stale.generation + 1, runtime: stale.runtime, lease: stale.lease}
+	f.svc.mu.Lock()
+	f.svc.sessions[keyA] = successor
+	f.svc.mu.Unlock()
+
+	f.svc.WarmRelease(residency.WarmOutcome{Kind: residency.WarmOutcomeReleased, Key: keyA, Generation: stale.generation})
+
+	if ctx.Err() == nil {
+		t.Fatal("a warm-released residency's context was not cancelled because a successor was tracked first")
+	}
+	if f.svc.residentFor(keyA) != successor {
+		t.Fatal("the warm release's end removed the successor's handle")
+	}
+}

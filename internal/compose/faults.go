@@ -164,7 +164,7 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 		s.capacity.ReleaseOwned(held.key, held.generation)
 		s.warm.Forget(held.key)
 	}
-	s.forget(held.key, held.generation)
+	s.forgetResident(held)
 
 	if err := errors.Join(failures...); err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn,
