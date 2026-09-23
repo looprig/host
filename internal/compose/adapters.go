@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -512,20 +513,92 @@ func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 // ResidencyLost is handed a residency whose ownership is gone.
 //
 // THE RUNTIME ARRIVES UNRELEASED, by that seam's contract, and this is where
-// the composition stops offering it. It does NOT run the release protocol: the
-// grant is gone, so every fenced write in that protocol would be refused or,
-// worse, accepted under an epoch a successor has superseded. What is owed is
-// dropping the local machinery, which is what the runtime handle and the
-// consumer are.
+// the composition gives it up. It does NOT run the release protocol's durable
+// half: the grant is gone, so every fenced write in that protocol would be
+// refused or, worse, accepted under an epoch a successor has superseded. What
+// is owed is the LOCAL half, all of it — see releaseLost.
 func (s *Service) ResidencyLost(ctx context.Context, lost residency.LostResidency) {
 	s.mu.Lock()
 	held, present := s.sessions[lost.Key]
 	s.mu.Unlock()
-	if present && held.generation == lost.Generation {
-		held.stopWork()
+	if !present || held.generation != lost.Generation {
+		s.warm.Forget(lost.Key)
+		s.forget(lost.Key, lost.Generation)
+		return
 	}
-	s.warm.Forget(lost.Key)
-	s.forget(lost.Key, lost.Generation)
+	held.giveUpOnce.Do(func() {
+		s.releaseLost(context.WithoutCancel(ctx), held, lost.Reason)
+	})
+}
+
+// releaseLost is the crash-equivalent LOCAL release of a residency whose grant
+// is gone (finding F5).
+//
+// DROPPING THE COMPOSITION'S HANDLE WAS NOT ENOUGH, and the cost was a session
+// that stopped for good, silently. The heartbeat's surrender leaves the
+// registry entry in place — draining, not accepting, its teardown claimed by
+// this owner — and nothing else removes it. The Manager's idempotent attach
+// path then answered every later attach of the session with that dead
+// residency: Factory's pending sweep saw the route expire, attached again, was
+// told the session was resident here, and nothing consumed its inbox. One
+// failed lease renewal (a PostgreSQL restart seen through PgBouncer is enough)
+// wedged the command stream with no error anywhere.
+//
+// So every local step of a release runs, and none of the durable ones:
+//
+//   - the consumer is halted, bounded, and the session's work stops;
+//   - the runtime is ABANDONED when it can be — crash-equivalent, writing
+//     nothing and handing the journal lease back, so a successor's restore is
+//     not blocked by a runtime still renewing it — and otherwise released
+//     nonterminally, which the journal's own fence keeps from racing a
+//     successor;
+//   - FinishRelease removes the local registry entry (its tombstone is refused
+//     by the ended fence before any write), ends the heartbeat, hands the lost
+//     grant back and drops the local workspace;
+//   - the admission charge is credited and the handle forgotten, only while
+//     this residency is still the one held.
+//
+// It is logged at WARN because it is the only record an operator gets: the
+// heartbeat's surrender writes nothing, by design.
+func (s *Service) releaseLost(ctx context.Context, held *resident, reason residency.LossReason) {
+	logger := s.options.logger()
+	attrs := []slog.Attr{
+		slog.String("tenant_id", string(held.key.TenantID)),
+		slog.String("session_id", string(held.key.SessionID)),
+		slog.Uint64("generation", held.generation),
+	}
+	logger.LogAttrs(ctx, slog.LevelWarn,
+		"host: this Host's residency grant for the session is gone; giving the session up locally so it can be placed again",
+		append(attrs, slog.String("reason", string(reason)))...)
+
+	var failures []error
+	haltCtx, cancel := context.WithTimeout(ctx, giveUpHaltBound)
+	if err := s.Halt(haltCtx, held.key); err != nil {
+		failures = append(failures, fmt.Errorf("halt the consumer: %w", err))
+	}
+	cancel()
+	held.stopWork()
+	if faults, ok := persistenceFaultsFor(held.runtime); ok {
+		if err := held.residencyOnce.run(func() error { return faults.AbandonResidency(ctx) }); err != nil {
+			failures = append(failures, err)
+		}
+	} else if err := held.ReleaseResidency(ctx); err != nil {
+		failures = append(failures, err)
+	}
+	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
+		failures = append(failures, err)
+	}
+	if s.residentFor(held.key) == held {
+		s.capacity.Release(held.key)
+	}
+	s.warm.Forget(held.key)
+	s.forget(held.key, held.generation)
+
+	if err := errors.Join(failures...); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"host: the lost session's release wrote nothing durable (expected under a lost grant); its lease and registry row lapse on expiry",
+			append(attrs, slog.String("error", err.Error()))...)
+	}
 }
 
 // forget drops the composition's handle on one residency, fenced by generation
