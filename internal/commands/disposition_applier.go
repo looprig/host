@@ -568,12 +568,34 @@ func (a *DispositionApplier) settle(ctx context.Context, record DispositionRecor
 // settleOrRecover handles an applying record, which is one whose attempt is
 // already durable.
 //
-// THE DISCRIMINATOR IS THE JOURNAL GRANT AND NOT THE RESIDENCY. An attempt
-// naming the grant this runtime holds is THIS runtime's own and is settled: a
-// runtime closing its own attempt would tombstone work it may itself have done.
-// An attempt naming a STRICTLY EARLIER grant belongs to a runtime that is gone,
-// and only a successor may close one — which is the same comparison harness's
-// own closer makes on the other side.
+// SETTLE FROM EVIDENCE FIRST, ALWAYS — successor or not. THIS ORDER IS A FIX,
+// not the original design: see the "D1" defect in
+// CLAUDE_RESULT_I2.1.md's "Fix round" section. SettleDispositionCommand reads
+// evidence keyed by the ATTEMPT's own identity, which is author-agnostic: a
+// successor asking finds exactly what the predecessor's runtime already
+// committed, because the evidence is a fact about the journal and not about
+// who is asking. The OLD order called the recovery closure FIRST for any
+// attempt naming an earlier grant, which asks harness to certify "nothing
+// happened" over an attempt that may already have happened. On harness
+// v0.36.0 and earlier that always refused with EnduringEffectError once any
+// effect had committed — including one the predecessor had ALREADY durably
+// disposed — so the successor never reached the settle call the evidence
+// already supported, and the record wedged `applying` forever with
+// host_sessions_command_blocked stuck at 1 and every later command on the
+// session queued behind it. (harness v0.37.0's ClosureResult.AlreadyDisposed
+// makes the closure itself succeed on this shape too, so pairing with it may
+// have already closed the hole; settling first closes it independent of that
+// and skips an unneeded closure round trip whenever the evidence is already
+// there.)
+//
+// THE CLOSURE IS ONLY EVER A FALLBACK, tried when settling first found
+// nothing to settle from AND the attempt names a STRICTLY EARLIER grant than
+// this runtime holds — the same discriminator as before. An attempt naming
+// THIS runtime's own grant is never recovered: a runtime closing its own
+// attempt would tombstone work it may itself still be doing. When the
+// fallback closure succeeds — whether it wrote a fresh not_applied tombstone
+// or found the attempt already disposed — settle is tried once more, since
+// there is now evidence (old or new) to settle from.
 func (a *DispositionApplier) settleOrRecover(ctx context.Context, record DispositionRecord) (Outcome, error) {
 	if !record.hasAttempt() {
 		// An applying record with no attempt is a shape the store's own
@@ -593,10 +615,17 @@ func (a *DispositionApplier) settleOrRecover(ctx context.Context, record Disposi
 			Reason:    "this runtime holds no journal grant, so it can neither be the attempt's author nor close it",
 		}
 	}
-	if record.AttemptJournalEpoch < journalEpoch {
-		if problem := a.close(ctx, record); problem != nil {
-			return Outcome{State: StateApplying, PrefixOwned: true}, problem
-		}
+	outcome, err := a.settle(ctx, record, record.Revision)
+	if err == nil {
+		return outcome, nil
+	}
+	if record.AttemptJournalEpoch >= journalEpoch {
+		// Not a predecessor's attempt: nothing to recover, and this runtime
+		// must never close its own.
+		return outcome, err
+	}
+	if problem := a.close(ctx, record); problem != nil {
+		return Outcome{State: StateApplying, PrefixOwned: true}, problem
 	}
 	return a.settle(ctx, record, record.Revision)
 }

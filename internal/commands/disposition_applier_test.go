@@ -768,6 +768,94 @@ func TestDispositionClosesAPredecessorsStrandedAttempt(t *testing.T) {
 	}
 }
 
+// D1 (CLAUDE_RESULT_I2.1.md "Fix round"): A SUCCESSOR MUST SETTLE FROM A
+// PREDECESSOR'S ALREADY-COMMITTED DISPOSITION WITHOUT EVER NEEDING THE
+// CLOSURE TO SUCCEED, and once it has, the predecessor's own late settle
+// attempt — reaching the store after the fact, exactly as a paused write
+// resumed post-takeover does — must be refused rather than allowed to
+// overwrite the successor's outcome.
+//
+// THE SCENARIO: a predecessor's runtime committed the attempt's disposition
+// (durable "applied" evidence) and started the effect, but the predecessor
+// died or was paused before its own settle reached the store. A successor
+// takes over — its own claim already ratchets ClaimResidencyEpoch to its
+// higher residency — and is asked to apply the still-`applying` record. The
+// closer is wired to refuse with ErrEnduringEffect, exactly as harness <=
+// v0.36.0's AttemptCloser always did once ANY effect had committed under the
+// attempt: this is deliberately NOT relying on harness v0.37.0's
+// ClosureResult.AlreadyDisposed leniency, because the fix must hold
+// independent of that pairing.
+//
+// BEFORE THE FIX (close-before-settle): the successor called the closer
+// first, the closer refused (an effect is already committed), and Process
+// returned RefusalEnduringEffect with the record left `applying` forever —
+// host_sessions_command_blocked stuck at 1, every later command on the
+// session queued behind it, and the closer's refusal reached even though the
+// evidence needed no closure at all.
+//
+// AFTER THE FIX (settle-before-close): the successor settles straight from
+// the predecessor's already-durable evidence, the closer is never consulted,
+// and the command stream is unblocked.
+func TestASuccessorSettlesAPredecessorsAlreadyDisposedAttemptWithoutTheCloser(t *testing.T) {
+	f := newDispositionFixture(t, func(f *dispositionFixture) {
+		stored := f.put(KindInput, StateApplying)
+		stored.record.Revision = testRevision
+		// The successor's OWN claim already ratcheted the high-water mark to
+		// its residency: a real ClaimDisposition call did this before Process
+		// was ever asked to settle this record.
+		stored.record.ClaimResidencyEpoch = testEpoch
+		stored.record.ClaimExpiresAt = testClockAt.Add(time.Minute)
+		// The attempt is the PREDECESSOR's: an earlier journal grant, and a
+		// residency below the successor's own (its claim, at authorize time).
+		stored.record.AttemptID = "a-predecessors-attempt"
+		stored.record.AttemptJournalEpoch = testJournalEpoch - 1
+		stored.record.AttemptResidencyEpoch = testOtherEpoch
+		// THE CRUX OF D1: the predecessor's runtime already committed the
+		// disposition before this applier is ever asked about the command.
+		f.setEvidence(commandID(1), "applied")
+		// If the closure were called at all, it would refuse — modelling
+		// every harness release's behaviour once an effect has committed
+		// under the attempt (v0.37.0's AlreadyDisposed only changes what
+		// happens for the ATTEMPT'S OWN disposition on the closure path; this
+		// fixture proves the fix without depending on that leniency).
+		f.closer.err = ErrEnduringEffect
+	})
+
+	outcome, err := f.process()
+	if err != nil {
+		t.Fatalf("Process: %v, want the successor to settle from the predecessor's already-durable evidence without ever calling the closer", err)
+	}
+	if outcome.State != StateApplied {
+		t.Errorf("Outcome.State = %q, want %q", outcome.State, StateApplied)
+	}
+	if got := f.stored().record.State; got != StateApplied {
+		t.Errorf("the durable record is %q, want %q: the command stream must be unblocked", got, StateApplied)
+	}
+	if got := f.closer.closures(); len(got) != 0 {
+		t.Errorf("the closer was called %v; settling from already-durable evidence must never need it", got)
+	}
+	settledRevision := f.stored().record.Revision
+
+	// THE PREDECESSOR'S OWN LATE SETTLE NOW LANDS, exactly as a write paused
+	// before the takeover and resumed afterward does (CLAUDE_RESULT_I2.1.md's
+	// Pause/Resume fixture). It carries what the predecessor itself observed
+	// before it went stale: the pre-settlement revision, and its OWN
+	// (superseded) residency epoch — never the successor's.
+	_, err = f.store.SettleDisposition(context.Background(), testTenant, testSession, commandID(1), DispositionSettlement{
+		ExpectedRevision: testRevision,
+		ResidencyEpoch:   testOtherEpoch,
+	})
+	if err == nil {
+		t.Fatal("the predecessor's stale settle succeeded; it must be refused by the record's revision/residency mark now that the successor has already settled")
+	}
+	if got := f.stored().record.State; got != StateApplied {
+		t.Errorf("after the stale settle attempt the durable record is %q, want it to remain %q as the successor left it", got, StateApplied)
+	}
+	if got := f.stored().record.Revision; got != settledRevision {
+		t.Errorf("the stale settle attempt moved the revision from %d to %d; the successor's outcome must be the one that stands", settledRevision, got)
+	}
+}
+
 // A CLOSURE REFUSED FOR AN ENDURING EFFECT IS TERMINAL AND MUST NOT BE RETRIED
 // INTO A TOMBSTONE. The predecessor's effect committed and only its evidence is
 // missing; the pass blocks and an operator has to look. The control is that the
