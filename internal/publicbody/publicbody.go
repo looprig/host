@@ -142,13 +142,82 @@ func Projection(ids Identities) func(context.Context, json.RawMessage, uint64) (
 // replaceAll replaces every occurrence of a UUID's text with a string's JSON
 // content encoding. The input is returned as the same bytes when it does not
 // name the UUID.
+//
+// A MATCH THAT STARTS INSIDE A `\uXXXX` ESCAPE'S FOUR HEX DIGITS IS SKIPPED
+// (review R-S1). Canonical JSON never escapes a UUID's own hex digits or
+// hyphens, so an occurrence of the id's text is ordinarily always a literal
+// run of bytes safe to replace whole. But when the id happens to start with
+// the same four hex digits Go chose to `\u`-escape some other character
+// (`<`, `>`, `&`, U+2028/2029, or a control character), those four bytes are
+// the escape's payload, not literal text: replacing them would consume part
+// of the escape and leave `\u` followed by literal characters, which is not
+// valid JSON. Skipping that one match leaves the escape, and the bytes after
+// it, exactly as they were; an id occurring anywhere else in the body -
+// including right after a complete, non-overlapping escape - is replaced as
+// usual.
 func replaceAll(body json.RawMessage, uuidText, replacement string) json.RawMessage {
 	old := []byte(uuidText)
 	if !bytes.Contains(body, old) {
 		return body
 	}
 	quoted := mustString(replacement)
-	return bytes.ReplaceAll(body, old, quoted[1:len(quoted)-1])
+	newBytes := quoted[1 : len(quoted)-1]
+
+	var out bytes.Buffer
+	rest := body
+	base := 0
+	for {
+		idx := bytes.Index(rest, old)
+		if idx < 0 {
+			out.Write(rest)
+			break
+		}
+		matchStart := base + idx
+		if overlapsUnicodeEscape(body, matchStart) {
+			// Keep this one byte literally and resume the search right after
+			// it: the match starting here is not a real occurrence of the id.
+			out.Write(rest[:idx+1])
+			rest = rest[idx+1:]
+			base = matchStart + 1
+			continue
+		}
+		out.Write(rest[:idx])
+		out.Write(newBytes)
+		rest = rest[idx+len(old):]
+		base = matchStart + len(old)
+	}
+	return out.Bytes()
+}
+
+// overlapsUnicodeEscape reports whether a match starting at matchStart begins
+// inside a `\uXXXX` escape's four hex digits: within the 4 bytes before
+// matchStart there is a `u` that is itself an unescaped escape lead (an odd
+// run of backslashes immediately before it).
+func overlapsUnicodeEscape(body []byte, matchStart int) bool {
+	for offset := 1; offset <= 4; offset++ {
+		u := matchStart - offset
+		if u < 0 {
+			break
+		}
+		if body[u] == 'u' && isEscapeLead(body, u) {
+			return true
+		}
+	}
+	return false
+}
+
+// isEscapeLead reports whether the byte at u (a 'u') is the escape character
+// of a `\u` sequence rather than a literal 'u' following an escaped literal
+// backslash (`\\u`, two content bytes: a backslash, then 'u').
+func isEscapeLead(body []byte, u int) bool {
+	if u == 0 || body[u-1] != '\\' {
+		return false
+	}
+	count := 0
+	for j := u - 1; j >= 0 && body[j] == '\\'; j-- {
+		count++
+	}
+	return count%2 == 1
 }
 
 // projectCause maps or removes the header cause's command id.

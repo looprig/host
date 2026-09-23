@@ -196,6 +196,53 @@ func TestAPublicIdIsWrittenAsJSONStringContent(t *testing.T) {
 	}
 }
 
+// escapingRuntimeSession is review R-S1's probe: a runtime id that starts
+// with "001f", the same four hex digits Go's encoder chooses when it escapes
+// U+001F (a control character) as `\u001f`. So the escaped form of that one
+// character, followed by literal text, can spell the id's own 36 bytes
+// straddling the escape boundary.
+const escapingRuntimeSession = "001f0000-0000-4000-8000-000000000000"
+
+// TestAnIDMatchOverlappingAUnicodeEscapeIsNotCorrupted is review R-S1: a match
+// that starts inside a `\uXXXX` escape's hex digits is skipped rather than
+// replaced, so the escape — and the literal text after it — reach the wire
+// exactly as written, and the projection still produces canonical JSON
+// instead of refusing the record.
+func TestAnIDMatchOverlappingAUnicodeEscapeIsNotCorrupted(t *testing.T) {
+	body := json.RawMessage(`{"message":"\u001f0000-0000-4000-8000-000000000000"}`)
+	out, err := Project(context.Background(), body, Identities{
+		RuntimeSessionID: uuid.MustParse(escapingRuntimeSession),
+		SessionID:        publicSession,
+	}, 1)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("projected body is not valid JSON: %s", out)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("the escape was disturbed:\n got  %s\n want %s (unchanged)", out, body)
+	}
+}
+
+// TestAnIDMatchAfterACompleteEscapeIsReplaced is R-S1's companion case: the
+// same escape, but with a gap before the id's own text, so the match does not
+// start inside the escape's hex digits and is replaced as usual.
+func TestAnIDMatchAfterACompleteEscapeIsReplaced(t *testing.T) {
+	body := json.RawMessage(`{"message":"\u001f 001f0000-0000-4000-8000-000000000000"}`)
+	want := `{"message":"\u001f session-public-1"}`
+	out, err := Project(context.Background(), body, Identities{
+		RuntimeSessionID: uuid.MustParse(escapingRuntimeSession),
+		SessionID:        publicSession,
+	}, 1)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if string(out) != want {
+		t.Fatalf("projected\n got  %s\nwant %s", out, want)
+	}
+}
+
 type scriptedSource struct {
 	pages [][]Pair
 	reads int
