@@ -244,6 +244,11 @@ type Service struct {
 	drainer   *lifecycle.Drainer
 	links     *links
 
+	// The live tail's retry and restart bounds; zero means the defaults. Only
+	// a test in this package sets them. See publicbody.go.
+	projectionRetryBounds backoff
+	tailRestartBounds     backoff
+
 	mu          sync.Mutex
 	started     bool
 	starting    bool

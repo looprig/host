@@ -28,15 +28,8 @@ const (
 	supervisedCommand = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 )
 
-func fastRetries(t *testing.T) {
-	t.Helper()
-	floor, ceiling, restartFloor, restartCeiling := projectionRetryFloor, projectionRetryCeiling, tailRestartFloor, tailRestartCeiling
-	projectionRetryFloor, projectionRetryCeiling = time.Millisecond, 4*time.Millisecond
-	tailRestartFloor, tailRestartCeiling = time.Millisecond, 4*time.Millisecond
-	t.Cleanup(func() {
-		projectionRetryFloor, projectionRetryCeiling, tailRestartFloor, tailRestartCeiling = floor, ceiling, restartFloor, restartCeiling
-	})
-}
+// fast is the retry and restart bound every test here runs with.
+var fast = backoff{floor: time.Millisecond, ceiling: 4 * time.Millisecond}
 
 // flakyInbox fails its first `failures` reads, then serves one admission.
 type flakyInbox struct {
@@ -74,6 +67,7 @@ func (w *wirePublications) Publish(_ string, payload []byte) error {
 	return nil
 }
 
+// bodies returns the body of every publication put on the wire.
 func (w *wirePublications) bodies() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -141,7 +135,6 @@ func causedBody() string {
 // reading the command mapping is retried, the tail keeps running, and the
 // body is published projected once the read succeeds.
 func TestATransientMappingReadDoesNotEndTheLiveTail(t *testing.T) {
-	fastRetries(t)
 	handler := newCapturingHandler()
 	inbox := &flakyInbox{}
 	inbox.failures.Store(3)
@@ -156,7 +149,7 @@ func TestATransientMappingReadDoesNotEndTheLiveTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := newResubscribable()
-	tail, err := tails.PublishProjected(t.Context(), supervisedKey, runtime, retryingProjection(publicbody.Projection(ids), slog.New(handler), supervisedKey))
+	tail, err := tails.PublishProjected(t.Context(), supervisedKey, runtime, retryingProjection(publicbody.Projection(ids), slog.New(handler), supervisedKey, fast))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,12 +182,11 @@ func TestATransientMappingReadDoesNotEndTheLiveTail(t *testing.T) {
 // TestAProjectionNotAboutTheMappingIsNotRetried: a non-canonical body cannot
 // project on any retry.
 func TestAProjectionNotAboutTheMappingIsNotRetried(t *testing.T) {
-	fastRetries(t)
 	calls := 0
 	project := retryingProjection(func(context.Context, json.RawMessage, uint64) (json.RawMessage, error) {
 		calls++
 		return nil, publicbody.ErrNonCanonical
-	}, discardLogger, supervisedKey)
+	}, discardLogger, supervisedKey, fast)
 	if _, err := project(t.Context(), json.RawMessage(`{}`), 1); !errors.Is(err, publicbody.ErrNonCanonical) || calls != 1 {
 		t.Fatalf("= %v after %d calls, want ErrNonCanonical after 1", err, calls)
 	}
@@ -206,7 +198,7 @@ func TestAStopDuringAMappingRetryIsAStop(t *testing.T) {
 	project := retryingProjection(func(context.Context, json.RawMessage, uint64) (json.RawMessage, error) {
 		cancel()
 		return nil, &publicbody.MappingError{Cause: errors.New("down")}
-	}, discardLogger, supervisedKey)
+	}, discardLogger, supervisedKey, fast)
 	if _, err := project(ctx, json.RawMessage(`{}`), 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("= %v, want the context's error", err)
 	}
@@ -217,9 +209,8 @@ func TestAStopDuringAMappingRetryIsAStop(t *testing.T) {
 // logged at ERROR, and a new tail is subscribed so the reset viewers have a
 // stream to rejoin.
 func TestARefusedTailIsLoggedAndRestarted(t *testing.T) {
-	fastRetries(t)
 	handler := newCapturingHandler()
-	svc := &Service{options: Options{Logger: slog.New(handler)}}
+	svc := &Service{options: Options{Logger: slog.New(handler)}, tailRestartBounds: fast}
 	wire := &wirePublications{failNext: true}
 	routes := &countingRoutes{}
 	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: routes})

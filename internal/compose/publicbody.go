@@ -71,15 +71,34 @@ func (s *Service) publicProjector(ctx context.Context, request residency.Ownersh
 		SessionID:        request.Key.SessionID,
 		Commands:         publicbody.NewIndex(inboxCommands{inbox: s.options.Inbox, key: request.Key}),
 	}
-	return retryingProjection(publicbody.Projection(ids), s.options.logger(), request.Key)
+	return retryingProjection(publicbody.Projection(ids), s.options.logger(), request.Key, s.projectionRetry())
 }
 
-// The live projection's retry bounds (review F2). Variables so a test can
-// shorten them.
+// backoff is a doubling delay between a floor and a ceiling.
+type backoff struct{ floor, ceiling time.Duration }
+
+// The live projection's retry bounds and the refused-tail restart bounds
+// (review F2). A Service carries its own copy, so a test shortens them on the
+// Service it built rather than on a package variable other tests' goroutines
+// are still reading.
 var (
-	projectionRetryFloor   = 50 * time.Millisecond
-	projectionRetryCeiling = 5 * time.Second
+	defaultProjectionRetry = backoff{floor: 50 * time.Millisecond, ceiling: 5 * time.Second}
+	defaultTailRestart     = backoff{floor: 100 * time.Millisecond, ceiling: 5 * time.Second}
 )
+
+func (s *Service) projectionRetry() backoff {
+	if s.projectionRetryBounds != (backoff{}) {
+		return s.projectionRetryBounds
+	}
+	return defaultProjectionRetry
+}
+
+func (s *Service) tailRestart() backoff {
+	if s.tailRestartBounds != (backoff{}) {
+		return s.tailRestartBounds
+	}
+	return defaultTailRestart
+}
 
 // retryingProjection retries a projection whose command mapping could not be
 // READ, with bounded backoff, until the tail's context ends.
@@ -92,9 +111,9 @@ var (
 // returns the context's error, which the relay records as a stop. Every other
 // failure — a body that is not canonical — is returned at once: retrying it
 // cannot change the answer.
-func retryingProjection(project service.Projector, logger *slog.Logger, key registry.Key) service.Projector {
+func retryingProjection(project service.Projector, logger *slog.Logger, key registry.Key, bounds backoff) service.Projector {
 	return func(ctx context.Context, body json.RawMessage, seq uint64) (json.RawMessage, error) {
-		backoff := projectionRetryFloor
+		delay := bounds.floor
 		for attempt := 1; ; attempt++ {
 			projected, err := project(ctx, body, seq)
 			var mapping *publicbody.MappingError
@@ -111,23 +130,17 @@ func retryingProjection(project service.Projector, logger *slog.Logger, key regi
 				slog.Uint64("journal_seq", seq),
 				slog.Int("attempt", attempt),
 				slog.String("error", err.Error()))
-			timer := time.NewTimer(backoff)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return nil, ctx.Err()
 			case <-timer.C:
 			}
-			backoff = min(2*backoff, projectionRetryCeiling)
+			delay = min(2*delay, bounds.ceiling)
 		}
 	}
 }
-
-// The refused-tail restart bounds. Variables so a test can shorten them.
-var (
-	tailRestartFloor   = 100 * time.Millisecond
-	tailRestartCeiling = 5 * time.Second
-)
 
 // supervisedTail is one session's live tail, restarted when it refuses a
 // publication (review F2).
@@ -172,7 +185,8 @@ func (s *Service) superviseTail(ctx context.Context, key registry.Key, start fun
 func (s *Service) restartRefused(ctx context.Context, key registry.Key, supervised *supervisedTail, start func() (*service.Tail, error)) {
 	logger := s.options.logger()
 	attrs := []slog.Attr{slog.String("tenant_id", string(key.TenantID)), slog.String("session_id", string(key.SessionID))}
-	backoff := tailRestartFloor
+	bounds := s.tailRestart()
+	delay := bounds.floor
 	for {
 		supervised.mu.Lock()
 		current := supervised.current
@@ -190,14 +204,14 @@ func (s *Service) restartRefused(ctx context.Context, key registry.Key, supervis
 			"host: the session's live tail refused a publication; its routes were invalidated so viewers reset from the durable journal, and the tail is restarted",
 			append(attrs, slog.Any("error", cause))...)
 		for {
-			timer := time.NewTimer(backoff)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
 			}
-			backoff = min(2*backoff, tailRestartCeiling)
+			delay = min(2*delay, bounds.ceiling)
 			supervised.mu.Lock()
 			stopped := supervised.stopped
 			supervised.mu.Unlock()
