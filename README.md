@@ -19,6 +19,35 @@ Centrifuge is permitted in exactly one directory,
 and compared segment by segment, so a sibling package under
 `internal/realtime/` does not inherit it.
 
+## Install
+
+```sh
+go get github.com/looprig/host@latest
+```
+
+A Host is composed by a product: `cmd/host` is generic, registers no agents and
+refuses to start without product collaborators (launch targets, runtime
+adapter, credential verifier, storage). See "Deployment and operations".
+
+## Packages
+
+| Package | Purpose |
+|---|---|
+| `github.com/looprig/host` | `Options`/`New`, `Composition`/`Compose` (a running `Service`), `Run` (HostLink plus `/readyz`, `/healthz`, `/metrics` on one listener), `PublicJournal`/`NewPublicJournals` |
+| `github.com/looprig/host/department` | The immutable set of launch targets a Host serves and the runtime capabilities it consumes (`LeaseEpochReporter`, `AttemptCloser`, ...) |
+| `github.com/looprig/host/cmd/host` | The generic executable; reads `HOST_*` environment variables and needs a product bootstrap |
+| `examples/deploy` | A pooled Kubernetes example (`pooled-cloud.yaml`), checked by its test |
+
+Everything else is under `internal/`: residency, command consumption and
+settlement, gate projection, HostLink (`internal/realtime/hostlink`), and the
+SessionStore and harness adapters.
+
+## Where it sits
+
+Tier 5 (orchestration) of the Looprig workspace. Direct Looprig dependencies:
+`core`, `harness`, `inference`, `sessionstore` and `storage`. Factory consumes
+Host over HostLink; Host imports no Factory package.
+
 ## Status
 
 Department, residency, HostLink, warm release and drain are built.
@@ -46,11 +75,12 @@ controller's desire and the Pod all still name it, and no released Factory or
 controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` v0.12.0 store, and `internal/harnessadapter` to
-`github.com/looprig/harness` v0.39.0. Core is v0.11.0.
+`github.com/looprig/sessionstore` store (currently pinned at v0.13.1), and
+`internal/harnessadapter` to `github.com/looprig/harness` (currently v0.40.2).
+Core is v0.11.0. Check `go.mod` for the exact pins of a given release.
 
-**host v0.7.1 pairs with harness v0.37.1**, which is v0.37.0 plus one further
-fix, and both matter to a pooled fleet.
+**Since host v0.7.1 Host requires harness ≥ v0.37.1**, which is v0.37.0 plus one
+further fix, and both matter to a pooled fleet.
 
 v0.37.0 closes a crash window where an admitted input could settle `applied`
 with its effect lost, or a graceful shutdown could cancel an input the store
@@ -1021,11 +1051,15 @@ structurally. **Do not reinstate it.**
 
 ## Build and test
 
+The Go baseline is 1.26.8. Verify standalone, against the pinned dependencies:
+
 ```sh
-GOWORK=off go mod tidy
 GOWORK=off go test -race ./...
 GOWORK=off make check
 ```
+
+`make check` runs `fmt-check`, `vet`, `staticcheck`, `gosec`, `vuln`, `test`,
+`fuzz` and `build`; `make secure` runs the static and vulnerability gates only.
 
 ## License
 
