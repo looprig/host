@@ -47,28 +47,42 @@ var forbiddenLooprigModules = map[string]string{
 // concerned, which is the condition that produces a pseudo-version pin.
 var publishedLooprigVersions = map[string]string{
 	"core":         "v0.11.0",
-	"storage":      "v0.6.0",
-	"sessionstore": "v0.12.0",
-	"fsstore":      "v0.5.1",
-	"natsstore":    "v0.5.1",
-	// v0.40.0 is a pin-only bump for Host (I2.2): it adds harness's
-	// loop.ToolResultObjects seam, the session-scoped capture index with
-	// restore fold, and the read_tool_result binding surface. Host wires none
-	// of it yet — this is the dependency pin used for standalone
-	// verification, not a Host behaviour change.
-	"harness": "v0.40.0",
+	"storage":      "v0.7.0",
+	"sessionstore": "v0.13.1",
+	// fsstore is here only because HARNESS PULLS IT IN test-only (see the
+	// harness entry below); no Host file, production or test, imports it.
+	// fsstore v0.6.0 REFUSES any pre-v0.6.0 data root with ErrLegacyLayout —
+	// a migration concern for a module that opens fsstore roots, which Host
+	// does not.
+	"fsstore": "v0.6.0",
+	// natsstore names no Host dependency either; kept current for the same
+	// reason fsstore is: an indirect looprig requirement must still name a
+	// published version if it is ever pulled in.
+	"natsstore": "v0.5.3",
+	// harness v0.40.2 is a re-pin-only bump for Host (W5): it moves harness's
+	// own looprig requirements to core v0.11.0, inference v0.13.0,
+	// storage v0.7.0, sessionstore v0.13.1 and (test-only) fsstore v0.6.0,
+	// with no API change (apidiff vs v0.40.1 clean) and no Host behaviour
+	// change. It supersedes v0.40.1 (ListSessions no longer misreads a
+	// tool-result object key nested under a session's catalog key) and
+	// v0.40.0 (I2.2: loop.ToolResultObjects, the session-scoped capture
+	// index with restore fold, and the read_tool_result binding surface).
+	// Host wires none of the v0.40.0 capture surface yet — this is the
+	// dependency pin used for standalone verification, not a Host behaviour
+	// change.
+	"harness": "v0.40.2",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
 	// internal/harnesstest does, because harness's loop.WithInference takes an
 	// inference.Client and a real rig cannot run a turn without one. harness
-	// v0.40.0 still requires inference v0.12.0 (unchanged since v0.36.0), so
+	// v0.40.2 requires inference v0.13.0 (harness's own re-pin bump), so
 	// binding to harness names it in go.mod whether or not Host wanted a
 	// decision about it — which is exactly the indirect arrival the comment on
 	// requireViolations describes, and the reason that check consults this map
-	// rather than the import set. The version is the one harness v0.40.0
+	// rather than the import set. The version is the one harness v0.40.2
 	// pins and is published.
-	"inference": "v0.12.0",
+	"inference": "v0.13.0",
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +671,7 @@ func TestRequireViolations(t *testing.T) {
 	}{
 		{
 			name:   "published pins",
-			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.11.0\n\tgithub.com/looprig/sessionstore v0.12.0\n\tgithub.com/looprig/storage v0.6.0\n)\n",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.11.0\n\tgithub.com/looprig/sessionstore v0.13.1\n\tgithub.com/looprig/storage v0.7.0\n)\n",
 		},
 		{
 			name:   "non-looprig dependency is unconstrained",
@@ -671,7 +685,7 @@ func TestRequireViolations(t *testing.T) {
 		{
 			name:   "pseudo-version",
 			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/sessionstore v0.0.0-20260901060329-a34464c893e6\n",
-			want:   []string{`requires github.com/looprig/sessionstore at v0.0.0-20260901060329-a34464c893e6, which is not the published version v0.12.0`},
+			want:   []string{`requires github.com/looprig/sessionstore at v0.0.0-20260901060329-a34464c893e6, which is not the published version v0.13.1`},
 		},
 		{
 			name:   "unpublished version of a released module",
