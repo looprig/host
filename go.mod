@@ -5,10 +5,10 @@ go 1.26.8
 require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/looprig/core v0.11.0
-	github.com/looprig/harness v0.40.2
-	github.com/looprig/inference v0.13.0
-	github.com/looprig/sessionstore v0.13.1
+	github.com/looprig/core v0.12.0
+	github.com/looprig/harness v0.41.0
+	github.com/looprig/inference v0.14.0
+	github.com/looprig/sessionstore v0.14.0
 	github.com/looprig/storage v0.7.0
 	github.com/prometheus/client_golang v1.23.2
 	go.yaml.in/yaml/v2 v2.4.2
