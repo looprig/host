@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -81,5 +82,66 @@ func TestAnInputBodyANewerHostMayReadBlocksBeforeAttempt(t *testing.T) {
 	var refusal *ApplyError
 	if !errors.As(err, &refusal) || refusal.Refusal != RefusalUnreadableCommand || outcome.State != StateClaimed || len(f.store.begins) != 0 || len(f.store.rejects) != 0 {
 		t.Fatalf("Process = (%+v,%v)", outcome, err)
+	}
+}
+
+func TestPreAttemptBodyClassificationAcrossKinds(t *testing.T) {
+	largeBody, err := json.Marshal(sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: commandID(1)},
+		SessionID:       testSession,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"` + strings.Repeat("x", 65537) + `"}]`),
+	})
+	if err != nil || len(largeBody) <= 64*1024 {
+		t.Fatalf("oversized input fixture has %d bytes: %v", len(largeBody), err)
+	}
+	// Factory stores this oversized body by object reference. The applier has
+	// no object reader, so it must block before an attempt, not strand one.
+	ref := Payload{Ref: sessionwire.ObjectReference{ObjectID: "object-1"}}
+	for _, row := range []struct {
+		name    string
+		kind    Kind
+		payload Payload
+		reject  bool
+	}{
+		{"over-64-KiB input by reference", KindInput, ref, false},
+		{"interrupt by reference", KindInterrupt, ref, false},
+		{"restore by reference", KindRestore, ref, false},
+		{"malformed interrupt", KindInterrupt, Payload{Body: []byte("not-json")}, true},
+		{"malformed restore", KindRestore, Payload{Body: []byte(`{"version":1,"command_id":"v1:command-1","session_id":"session-inbox","principal":null}`)}, true},
+		{"future interrupt version", KindInterrupt, Payload{Body: []byte(`{"version":99,"command_id":"v1:command-1","session_id":"session-inbox"}`)}, false},
+		{"future restore version", KindRestore, Payload{Body: []byte(`{"version":99,"command_id":"v1:command-1","session_id":"session-inbox"}`)}, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newDispositionFixture(t, func(f *dispositionFixture) {
+				f.put(row.kind, StatePending)
+				f.store.payloads[commandID(1)] = row.payload
+			})
+			outcome, err := f.process()
+			if len(f.store.begins) != 0 || f.attempts.n != 0 || len(f.runtime.commands()) != 0 {
+				t.Fatalf("a pre-attempt body reached the attempt or runtime: %+v, %v", outcome, err)
+			}
+			if row.reject {
+				if err != nil || outcome.State != StateRejected || outcome.PrefixOwned || len(f.store.rejects) != 1 {
+					t.Fatalf("Process = (%+v,%v), rejects=%d", outcome, err, len(f.store.rejects))
+				}
+				return
+			}
+			var refusal *ApplyError
+			if !errors.As(err, &refusal) || refusal.Refusal != RefusalUnreadableCommand || outcome.State != StateClaimed || outcome.PrefixOwned || len(f.store.rejects) != 0 {
+				t.Fatalf("Process = (%+v,%v), rejects=%d", outcome, err, len(f.store.rejects))
+			}
+		})
+	}
+}
+
+func TestUnstampedCommandDispatchesWithoutInventedMembers(t *testing.T) {
+	f := newDispositionFixture(t)
+	outcome, err := f.process()
+	if err != nil || outcome.State != StateApplied {
+		t.Fatalf("Process = (%+v,%v)", outcome, err)
+	}
+	commands := f.runtime.commands()
+	if len(commands) != 1 || commands[0].Principal != nil || commands[0].Metadata != nil {
+		t.Fatalf("unstamped command gained members: %+v", commands)
 	}
 }

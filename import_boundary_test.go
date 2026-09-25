@@ -73,7 +73,7 @@ var publishedLooprigVersions = map[string]string{
 	// binding to harness names it in go.mod whether or not Host wanted a
 	// decision about it — which is exactly the indirect arrival the comment on
 	// requireViolations describes, and the reason that check consults this map
-	// rather than the import set. The version is the one harness v0.40.2
+	// rather than the import set. The version is the one harness v0.41.0
 	// pins and is published.
 	"inference": "v0.14.0",
 }
