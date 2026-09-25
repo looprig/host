@@ -8,9 +8,12 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/bodyclass"
+	"github.com/looprig/host/internal/controlbody"
 	"github.com/looprig/host/internal/createbody"
 	"github.com/looprig/host/internal/gateresponse"
 	hostconfig "github.com/looprig/host/internal/hostconfig"
+	"github.com/looprig/host/internal/inputbody"
 	"github.com/looprig/host/internal/registry"
 )
 
@@ -317,26 +320,13 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 			Cause:     err,
 		}
 	}
-	// A GATE RESPONSE IS CHECKED HERE, AFTER THE CLAIM AND BEFORE THE ATTEMPT,
-	// because this is the last point at which a rejection is still possible:
-	// once an attempt exists only the runtime's evidence settles the command.
-	if record.Kind == KindGateResponse {
-		rejected, problem := a.checkGateResponse(ctx, record, revision, payload)
-		if problem != nil {
-			return Outcome{State: StateClaimed}, problem
-		}
-		if rejected {
-			return Outcome{State: StateRejected}, nil
-		}
+	// Every body's strict reader runs after the claim, before BeginAttempt.
+	members, rejected, problem := a.checkBody(ctx, record, revision, payload)
+	if problem != nil {
+		return Outcome{State: StateClaimed}, problem
 	}
-	if record.Kind == KindCreate {
-		rejected, problem := a.checkCreate(ctx, record, revision, payload)
-		if problem != nil {
-			return Outcome{State: StateClaimed}, problem
-		}
-		if rejected {
-			return Outcome{State: StateRejected}, nil
-		}
+	if rejected {
+		return Outcome{State: StateRejected}, nil
 	}
 	// THE RUNTIME'S OWN GRANT, AND `held` IS WHAT IS BRANCHED ON. No pinned
 	// provider zeroes a released lease's epoch, so reading the number alone
@@ -382,7 +372,7 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 	// return below therefore reports PrefixOwned: the attempt is durable and
 	// recoverable by whoever holds the session next, which is exactly what that
 	// field means.
-	if problem := a.dispatch(ctx, record, payload, attempt); problem != nil {
+	if problem := a.dispatch(ctx, record, payload, attempt, members); problem != nil {
 		return a.afterFailedDispatch(ctx, record, applying, problem)
 	}
 	return a.settle(ctx, record, applying)
@@ -423,23 +413,53 @@ func (a *DispositionApplier) afterFailedDispatch(ctx context.Context, record Dis
 	return Outcome{State: StateApplying, PrefixOwned: true}, problem
 }
 
-// checkCreate distinguishes immutable malformed bytes from a version this Host
-// cannot read. Both answers are made after the claim and before any attempt.
-func (a *DispositionApplier) checkCreate(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bool, error) {
+// checkBody classifies every kind's private body while rejection is possible.
+func (a *DispositionApplier) checkBody(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bodyclass.Members, bool, error) {
+	switch record.Kind {
+	case KindGateResponse:
+		return a.checkGateResponse(ctx, record, revision, payload)
+	case KindCreate:
+		if payload.Ref != (sessionwire.ObjectReference{}) {
+			return bodyclass.Members{}, false, &ApplyError{Refusal: RefusalUnreadableCreate, CommandID: record.CommandID,
+				Reason: "this Host cannot dereference the create body, so a capable successor may need to read it"}
+		}
+		members, err := createbody.Check(payload.Body, a.key.SessionID, record.CommandID)
+		return a.classifyBody(ctx, record, revision, members, err, RefusalUnreadableCreate)
+	}
 	if payload.Ref != (sessionwire.ObjectReference{}) {
-		return false, &ApplyError{Refusal: RefusalUnreadableCreate, CommandID: record.CommandID,
-			Reason: "this Host cannot dereference the create body, so a capable successor may need to read it"}
+		return bodyclass.Members{}, false, &ApplyError{Refusal: RefusalUnreadableCommand, CommandID: record.CommandID,
+			Reason: "this Host cannot dereference the command body, so a capable successor may need to read it"}
 	}
-	err := createbody.Check(payload.Body, a.key.SessionID, record.CommandID)
+	var members bodyclass.Members
+	var err error
+	switch record.Kind {
+	case KindInput:
+		members, err = inputbody.Check(payload.Body, a.key.SessionID, record.CommandID)
+	case KindInterrupt:
+		members, err = controlbody.CheckInterrupt(payload.Body, a.key.SessionID, record.CommandID)
+	case KindRestore:
+		members, err = controlbody.CheckRestore(payload.Body, a.key.SessionID, record.CommandID)
+	default:
+		return bodyclass.Members{}, false, &ApplyError{Refusal: RefusalUnreadableCommand, CommandID: record.CommandID,
+			Reason: "this Host cannot read the unknown command kind"}
+	}
+	return a.classifyBody(ctx, record, revision, members, err, RefusalUnreadableCommand)
+}
+
+func (a *DispositionApplier) classifyBody(ctx context.Context, record DispositionRecord, revision uint64,
+	members bodyclass.Members, err error, blocked ApplyRefusal) (bodyclass.Members, bool, error) {
 	if err == nil {
-		return false, nil
+		return members, false, nil
 	}
-	var malformed *createbody.MalformedError
-	if errors.As(err, &malformed) {
-		return a.reject(ctx, record, revision)
+	var createMalformed *createbody.MalformedError
+	var inputMalformed *inputbody.MalformedError
+	var controlMalformed *controlbody.MalformedError
+	if errors.As(err, &createMalformed) || errors.As(err, &inputMalformed) || errors.As(err, &controlMalformed) {
+		rejected, problem := a.reject(ctx, record, revision)
+		return bodyclass.Members{}, rejected, problem
 	}
-	return false, &ApplyError{Refusal: RefusalUnreadableCreate, CommandID: record.CommandID,
-		Reason: "this Host cannot read the create body, so the claimed command stays available to a newer Host", Cause: err}
+	return bodyclass.Members{}, false, &ApplyError{Refusal: blocked, CommandID: record.CommandID,
+		Reason: "this Host cannot read the command body, so the claimed command stays available to a newer Host", Cause: err}
 }
 
 // checkGateResponse answers, before the attempt, every question Host can answer
@@ -466,7 +486,7 @@ func (a *DispositionApplier) checkCreate(ctx context.Context, record Disposition
 // OWNERSHIP IS DECIDED BY RESIDENCY EPOCH ONLY. The projection's mark is the
 // residency of the last Host to write a gate; it is compared with this Host's
 // residency grant and never with a journal epoch.
-func (a *DispositionApplier) checkGateResponse(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bool, error) {
+func (a *DispositionApplier) checkGateResponse(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bodyclass.Members, bool, error) {
 	// A BODY STORED BY REFERENCE IS REJECTED, NOT BLOCKED (spec gate C1,
 	// quality gate F5). This Host does not dereference a private object and
 	// harness's admitted command has no reference member, so no released Host
@@ -475,22 +495,29 @@ func (a *DispositionApplier) checkGateResponse(ctx context.Context, record Dispo
 	// anyway. factory v0.5.0 refuses such a body at admission; this is for
 	// every other path.
 	if len(payload.Body) == 0 && payload.Ref != (sessionwire.ObjectReference{}) {
-		return a.reject(ctx, record, revision)
+		rejected, err := a.reject(ctx, record, revision)
+		return bodyclass.Members{}, rejected, err
+	}
+	response, err := gateresponse.Decode(payload.Body, a.key.SessionID, record.CommandID)
+	var unsupported *gateresponse.UnsupportedError
+	if errors.As(err, &unsupported) {
+		return bodyclass.Members{}, false, &ApplyError{Refusal: RefusalUnreadableGateResponse, CommandID: record.CommandID,
+			Reason: "this Host cannot read the gate response body, so the claimed command stays available to a newer Host", Cause: err}
+	}
+	if err != nil {
+		rejected, problem := a.reject(ctx, record, revision)
+		return bodyclass.Members{}, rejected, problem
 	}
 	if a.gates == nil {
-		return false, &ApplyError{
+		return bodyclass.Members{}, false, &ApplyError{
 			Refusal:   RefusalNoGateReader,
 			CommandID: record.CommandID,
 			Reason:    "this composition supplied no durable gate reader, so the gate cannot be checked before the attempt",
 		}
 	}
-	response, err := gateresponse.Decode(payload.Body, a.key.SessionID, record.CommandID)
-	if err != nil {
-		return a.reject(ctx, record, revision)
-	}
 	gate, found, err := a.gates.LoadGate(ctx, a.key.TenantID, a.key.SessionID, response.Request.GateID)
 	if err != nil {
-		return false, &ApplyError{
+		return bodyclass.Members{}, false, &ApplyError{
 			Refusal:   RefusalStore,
 			CommandID: record.CommandID,
 			Reason:    "the durable gate could not be read, so the gate response could not be checked",
@@ -502,21 +529,22 @@ func (a *DispositionApplier) checkGateResponse(ctx context.Context, record Dispo
 	// projected, and a predecessor that skipped the check on that arm began an
 	// attempt its successor then closed as not_applied, losing the answer.
 	if gate.OwnerEpoch != a.residency {
-		return false, &ApplyError{
+		return bodyclass.Members{}, false, &ApplyError{
 			Refusal:   RefusalGateNotOwned,
 			CommandID: record.CommandID,
 			Reason:    "the durable gate's residency mark is not this Host's grant, so this Host cannot yet say it holds the gate",
 		}
 	}
 	if !found || !gate.Open {
-		return false, nil
+		return bodyclass.Members{Principal: response.Request.Principal}, false, nil
 	}
 	request := response.Request
 	if (request.ExpectedOpenEventID != "" && request.ExpectedOpenEventID != gate.OpenedEventID) ||
 		(request.ExpectedOpenJournalSeq != 0 && request.ExpectedOpenJournalSeq != gate.OpenedJournalSeq) {
-		return a.reject(ctx, record, revision)
+		rejected, problem := a.reject(ctx, record, revision)
+		return bodyclass.Members{}, rejected, problem
 	}
-	return false, nil
+	return bodyclass.Members{Principal: response.Request.Principal}, false, nil
 }
 
 // reject durably rejects a claimed command before any attempt.
@@ -539,7 +567,7 @@ func (a *DispositionApplier) reject(ctx context.Context, record DispositionRecor
 // nothing durable, so the command may be re-offered; a transport failure says
 // the opposite, and collapsing them either strands a re-offerable command or
 // re-drives a real effect.
-func (a *DispositionApplier) dispatch(ctx context.Context, record DispositionRecord, payload Payload, attempt AttemptID) error {
+func (a *DispositionApplier) dispatch(ctx context.Context, record DispositionRecord, payload Payload, attempt AttemptID, members bodyclass.Members) error {
 	err := a.runtime.ApplyCommand(ctx, department.RuntimeCommand{
 		CommandID:        record.CommandID,
 		RuntimeCommandID: record.RuntimeCommandID,
@@ -547,6 +575,8 @@ func (a *DispositionApplier) dispatch(ctx context.Context, record DispositionRec
 		Payload:          payload.Body,
 		PayloadRef:       payload.Ref,
 		AttemptID:        string(attempt),
+		Principal:        members.Principal,
+		Metadata:         members.Metadata,
 	})
 	switch {
 	case err == nil:

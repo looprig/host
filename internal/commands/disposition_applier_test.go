@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -464,8 +465,31 @@ func (f *dispositionFixture) put(kind Kind, state State) *storedDisposition {
 		},
 	}
 	f.store.commands[commandID(1)] = stored
-	f.store.payloads[commandID(1)] = Payload{Body: []byte(`{"blocks":[]}`)}
+	f.store.payloads[commandID(1)] = Payload{Body: coreBody(f.t, kind, commandID(1))}
 	return stored
+}
+
+func coreBody(t *testing.T, kind Kind, id sessionwire.CommandID) []byte {
+	t.Helper()
+	envelope := sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: id}
+	var request any
+	switch kind {
+	case KindInput:
+		request = sessionwire.InputRequest{CommandEnvelope: envelope, SessionID: testSession, Blocks: json.RawMessage(`[{"type":"text","text":"hello"}]`)}
+	case KindCreate:
+		request = sessionwire.CreateRequest{CommandEnvelope: envelope, SessionID: testSession, AgentID: "agent-a"}
+	case KindInterrupt:
+		request = sessionwire.InterruptRequest{CommandEnvelope: envelope, SessionID: testSession}
+	case KindRestore:
+		request = sessionwire.RestoreRequest{CommandEnvelope: envelope, SessionID: testSession}
+	default:
+		return []byte(`{"blocks":[]}`)
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 func (f *dispositionFixture) setEvidence(command sessionwire.CommandID, kind string) {

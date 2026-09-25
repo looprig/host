@@ -177,6 +177,35 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Command principal and message metadata (v0.11.0)
+
+Host unconditionally advertises `hostlink.attribution.principal`. Every
+command kind's stored Core body is strictly decoded after the claim and before
+the dispatch attempt. A permanently malformed body is rejected. An
+`unknown_field`, `unsupported_version`, or by-reference input, interrupt or
+restore body stays claimed without an attempt (`unreadable_command`) for a
+newer Host or Factory's deadline sweep. A by-reference create retains
+`unreadable_create`. A gate response with a future member now blocks as
+`unreadable_gate_response`; Hosts through v0.10.3 rejected it. A valid gate
+response on a composition without a gate reader still reports `no_gate_reader`.
+
+The strictly decoded principal crosses to `department.RuntimeCommand` on all
+five kinds, and metadata crosses on create and input. These are recorded
+assertions, not authorization evidence. A product runtime implementing
+`department.CommandApplier` should forward both to `runtimecommand.Admitted`.
+The reference harness adapter does this and hands input bytes unchanged to
+the product `BlockDecoder`; create's first message is re-presented in input
+shape with its members. A decoder using Core's strict `InputRequest` must use
+core v0.12.0 or later to accept stamped commands.
+
+This is a **one-way upgrade**. Once a journal holds a stamped or presented
+record, do not roll a Host back below v0.11.0 / harness v0.41.0: the older
+reader silently loses these members. Once a store holds a v3 inbox row, every
+Host must remain on sessionstore v0.14.0 or later. An input over 64 KiB is
+stored by reference; it previously stranded after an attempt and now blocks
+before one until Factory's deadline sweep rejects it. The referenced body is
+unapplied in either case.
+
 ## Upgrading to v0.10.0: no runtime identity reaches a client
 
 **Finding W1.** A harness public event body names the **runtime** session id

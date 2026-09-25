@@ -21,6 +21,7 @@ import (
 	"errors"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/host/internal/bodyclass"
 )
 
 // MalformedError reports a create body no Host can read as Core's create
@@ -90,6 +91,8 @@ func FirstMessage(body []byte) ([]byte, error) {
 		CommandEnvelope: request.CommandEnvelope,
 		SessionID:       request.SessionID,
 		Blocks:          request.Blocks,
+		Metadata:        request.Metadata,
+		Principal:       request.Principal,
 	})
 	if err != nil {
 		return nil, &MalformedError{Cause: err}
@@ -99,15 +102,15 @@ func FirstMessage(body []byte) ([]byte, error) {
 
 // Check validates the immutable create body against the durable command's
 // identities before an attempt can be written.
-func Check(body []byte, session sessionwire.SessionID, command sessionwire.CommandID) error {
+func Check(body []byte, session sessionwire.SessionID, command sessionwire.CommandID) (bodyclass.Members, error) {
 	request, err := decodeCreate(body)
 	if err != nil {
-		return err
+		return bodyclass.Members{}, err
 	}
 	if request.SessionID != session || request.CommandID != command {
-		return &MalformedError{Cause: errors.New("the create body names another session or command")}
+		return bodyclass.Members{}, &MalformedError{Cause: errors.New("the create body names another session or command")}
 	}
-	return nil
+	return bodyclass.Members{Principal: request.Principal, Metadata: request.Metadata}, nil
 }
 
 func decodeCreate(body []byte) (sessionwire.CreateRequest, error) {
@@ -122,21 +125,7 @@ func decodeCreate(body []byte) (sessionwire.CreateRequest, error) {
 }
 
 func classify(err error) error {
-	var validation *sessionwire.RequestValidationError
-	if errors.As(err, &validation) {
-		switch validation.Code {
-		case sessionwire.RequestValidationCodeUnknownField, sessionwire.RequestValidationCodeUnsupportedVersion:
-			return &UnsupportedError{Cause: err}
-		case sessionwire.RequestValidationCodeInvalidJSON, sessionwire.RequestValidationCodeDuplicateField,
-			sessionwire.RequestValidationCodeMissingField, sessionwire.RequestValidationCodeInvalidField:
-			return &MalformedError{Cause: err}
-		default:
-			return &UnsupportedError{Cause: err}
-		}
-	}
-	var syntax *json.SyntaxError
-	var typeError *json.UnmarshalTypeError
-	if errors.As(err, &syntax) || errors.As(err, &typeError) {
+	if bodyclass.Permanent(err) {
 		return &MalformedError{Cause: err}
 	}
 	return &UnsupportedError{Cause: err}

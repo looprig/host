@@ -30,6 +30,57 @@ func inputCommand() department.RuntimeCommand {
 	}
 }
 
+func TestAdmitCarriesDecodedMembersWithoutRewritingInputBytes(t *testing.T) {
+	principal := &sessionwire.Principal{Tenant: testTenant, Subject: "user-1", Kind: sessionwire.PrincipalKindActor}
+	metadata := sessionwire.MessageMetadata{"space": "family"}
+	var decoded []byte
+	bound := &boundSession{leaseEpoch: heldEpoch(3), tenant: testTenant, session: testSession,
+		decode: func(body []byte) ([]content.Block, error) {
+			decoded = append([]byte(nil), body...)
+			return []content.Block{&content.TextBlock{Text: "hello"}}, nil
+		}}
+	for _, kind := range []string{"input", "create", "interrupt", "restore"} {
+		t.Run(kind, func(t *testing.T) {
+			command := inputCommand()
+			command.Kind = kind
+			command.Principal = principal
+			if kind == "input" || kind == "create" {
+				command.Metadata = metadata
+			}
+			var request any
+			envelope := sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: command.CommandID}
+			switch kind {
+			case "input":
+				request = sessionwire.InputRequest{CommandEnvelope: envelope, SessionID: testSession, Blocks: json.RawMessage(`[{"type":"text","text":"hello"}]`), Principal: principal, Metadata: metadata}
+			case "create":
+				request = sessionwire.CreateRequest{CommandEnvelope: envelope, SessionID: testSession, AgentID: "agent-a", Blocks: json.RawMessage(`[{"type":"text","text":"hello"}]`), Principal: principal, Metadata: metadata}
+			case "interrupt":
+				request = sessionwire.InterruptRequest{CommandEnvelope: envelope, SessionID: testSession, Principal: principal}
+			case "restore":
+				request = sessionwire.RestoreRequest{CommandEnvelope: envelope, SessionID: testSession, Principal: principal}
+			}
+			body, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command.Payload = body
+			admitted, err := bound.admit(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if admitted.Principal == nil || *admitted.Principal != *principal {
+				t.Fatalf("Principal = %+v", admitted.Principal)
+			}
+			if want := kind == "input" || kind == "create"; (admitted.Metadata["space"] == "family") != want {
+				t.Fatalf("Metadata = %v", admitted.Metadata)
+			}
+			if kind == "input" && string(decoded) != string(body) {
+				t.Fatalf("decoder received rewritten input: %s", decoded)
+			}
+		})
+	}
+}
+
 // stubLeaseEpochReporter is a session.LeaseEpochReporter whose answer a test
 // chooses, including the legitimate "this session holds no lease that reports an
 // epoch" answer harness's two-result form exists to express.

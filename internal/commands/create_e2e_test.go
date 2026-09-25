@@ -451,6 +451,20 @@ func (w *liveWorld) consumer(lease residency.Lease, runtime *liveRuntime, dispat
 // binding, and an accepted order the store assigns.
 func (w *liveWorld) admit(id sessionwire.CommandID, kind sessionstore.CommandKind, request any) sessionwire.CommandID {
 	w.t.Helper()
+	var principal *sessionwire.Principal
+	var metadata sessionwire.MessageMetadata
+	switch command := request.(type) {
+	case sessionwire.CreateRequest:
+		principal, metadata = command.Principal, command.Metadata
+	case sessionwire.InputRequest:
+		principal, metadata = command.Principal, command.Metadata
+	case sessionwire.InterruptRequest:
+		principal = command.Principal
+	case sessionwire.RestoreRequest:
+		principal = command.Principal
+	case sessionwire.GateResponseRequest:
+		principal = command.Principal
+	}
 	payload, err := json.Marshal(request)
 	if err != nil {
 		w.t.Fatal(err)
@@ -464,11 +478,65 @@ func (w *liveWorld) admit(id sessionwire.CommandID, kind sessionstore.CommandKin
 		TenantID: liveTenant, SessionID: liveSession, CommandID: id, Binding: w.binding,
 		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeCommand.String()),
 		Kind:                     kind, Payload: payload,
+		Principal: principal, Metadata: metadata,
 		AcceptedAt: now, ApplyDeadline: now.Add(2 * time.Minute),
 	}); err != nil {
 		w.t.Fatalf("admit a %s: %v", kind, err)
 	}
 	return id
+}
+
+type recordingDispatch struct {
+	next department.CommandApplier
+	mu   sync.Mutex
+	seen []department.RuntimeCommand
+}
+
+func (d *recordingDispatch) ApplyCommand(ctx context.Context, command department.RuntimeCommand) error {
+	d.mu.Lock()
+	d.seen = append(d.seen, command)
+	d.mu.Unlock()
+	return d.next.ApplyCommand(ctx, command)
+}
+
+func TestStampedCreateAndInputCarryAttributionAcrossReleasedStores(t *testing.T) {
+	principal := &sessionwire.Principal{Tenant: liveTenant, Subject: "user-1", Kind: sessionwire.PrincipalKindActor}
+	metadata := sessionwire.MessageMetadata{"space": "family"}
+	w := newLiveWorld(t)
+	runtime := w.launch(false)
+	lease := w.hold()
+	dispatch := &recordingDispatch{next: runtime.applier}
+	consumer := w.consumer(lease, runtime, dispatch)
+	createID := w.nextID()
+	w.admit(createID, "create", sessionwire.CreateRequest{CommandEnvelope: envelope(createID), SessionID: liveSession, AgentID: liveAgent, Principal: principal})
+	inputID := w.nextID()
+	w.admit(inputID, "input", sessionwire.InputRequest{CommandEnvelope: envelope(inputID), SessionID: liveSession,
+		Blocks: blockArray("STAMPED-WORDS"), Principal: principal, Metadata: metadata})
+	interruptID := w.nextID()
+	w.admit(interruptID, "interrupt", sessionwire.InterruptRequest{CommandEnvelope: envelope(interruptID), SessionID: liveSession, Principal: principal})
+	if got := w.record(inputID).Record.Descriptor; got.Principal == nil || got.Principal.Subject != "user-1" || got.Metadata["space"] != "family" {
+		t.Fatalf("stored descriptor lost attribution: %+v", got)
+	}
+	drain(t, consumer)
+	for _, id := range []sessionwire.CommandID{createID, inputID} {
+		if state := w.record(id).Record.State; state != sessionstore.InboxStateApplied {
+			t.Fatalf("%s settled %q", id, state)
+		}
+	}
+	if state := w.record(interruptID).Record.State; state != sessionstore.InboxStateApplied {
+		t.Fatalf("interrupt settled %q", state)
+	}
+	eventually(t, "the stamped input to reach the model", func() bool { return w.llm.sawUserText("STAMPED-WORDS") })
+	dispatch.mu.Lock()
+	defer dispatch.mu.Unlock()
+	if len(dispatch.seen) != 3 {
+		t.Fatalf("dispatched %d commands", len(dispatch.seen))
+	}
+	for _, command := range dispatch.seen {
+		if command.Principal == nil || command.Principal.Subject != "user-1" {
+			t.Fatalf("%s lost principal", command.CommandID)
+		}
+	}
 }
 
 // envelope is the Core command envelope for one admitted id.

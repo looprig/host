@@ -171,3 +171,5 @@ terminal-drain-before-delete. Do not infer a disposition object store from
 SessionStore's legacy object-first `PutObject`. Gate responses require the
 advertised capability and the one-way Host upgrade rules in README; cold
 AskUser resume is unsupported.
+Command bodies are read before the attempt with `internal/bodyclass`'s one
+taxonomy; do not add a reader that classifies on its own.

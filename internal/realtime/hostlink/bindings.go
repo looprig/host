@@ -1018,13 +1018,18 @@ var advertisedMethods = []string{MethodBind, MethodUnbind, MethodAttach, MethodD
 // Host whose connect reply Supports it.
 const CapabilityGateResponse = sessionwire.HostLinkCapabilityGateResponse
 
+// CapabilityAttributionPrincipal is Core's token for a Host that strictly
+// reads command principal and message metadata before the dispatch attempt.
+// It is unconditional: the pinned harness runtime can carry both members.
+const CapabilityAttributionPrincipal = sessionwire.HostLinkCapabilityAttributionPrincipal
+
 // advertisedCapabilities is every capability token this package can
 // advertise. A token is NOT a method: dispatch has no case for it, and an RPC
 // naming one falls to the channel arm like any unknown name. It shares
 // hostlink_methods with the methods only because that is where Core puts it,
 // and it follows them in the wire order. Which tokens a server advertises is
 // its composition's choice (Config.Capabilities), and every one must be here.
-var advertisedCapabilities = []string{CapabilityGateResponse}
+var advertisedCapabilities = []string{CapabilityGateResponse, CapabilityAttributionPrincipal}
 
 // errUnroutableRPC is returned to Centrifuge when a refusal has no Core class,
 // which is the malformed-body case and nothing else.

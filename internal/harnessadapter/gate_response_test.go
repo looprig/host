@@ -44,6 +44,17 @@ func gateResponseCommand(t *testing.T, change func(*sessionwire.GateResponseRequ
 	}
 }
 
+func TestAdmitCarriesStampedGateResponsePrincipal(t *testing.T) {
+	principal := &sessionwire.Principal{Tenant: testTenant, Subject: "user-1", Kind: sessionwire.PrincipalKindActor}
+	command := gateResponseCommand(t, func(request *sessionwire.GateResponseRequest) { request.Principal = principal })
+	command.Principal = principal
+	bound := &boundSession{leaseEpoch: heldEpoch(3), tenant: testTenant, session: testSession}
+	admitted, err := bound.admit(command)
+	if err != nil || admitted.Principal == nil || *admitted.Principal != *principal || admitted.Metadata != nil {
+		t.Fatalf("admit = (%+v,%v)", admitted, err)
+	}
+}
+
 // TestAdmitBuildsAGateResponseFromTheStoredBody: the answer crosses as
 // harness's decoded GateResponse — the gate as harness's own identity, the
 // action and raw values verbatim, and the USER as its source (a classifier

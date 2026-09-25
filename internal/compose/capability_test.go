@@ -33,6 +33,10 @@ func (inertGateReads) LoadGate(context.Context, sessionwire.TenantID, sessionwir
 // advertisesGateResponse connects as tenant-a and reports whether the reply
 // Supports Core's gate-response token.
 func advertisesGateResponse(t *testing.T, f *fixture) bool {
+	return advertisesCapability(t, f, sessionwire.HostLinkCapabilityGateResponse)
+}
+
+func advertisesCapability(t *testing.T, f *fixture, capability string) bool {
 	t.Helper()
 	f.start()
 	link := dialFactoryLink(t, f.serve().URL, tenantA)
@@ -49,7 +53,29 @@ func advertisesGateResponse(t *testing.T, f *fixture) bool {
 	if !reply.Supports(sessionwire.HostLinkMethodAttach) {
 		t.Fatal("the reply does not advertise the methods, so the absence below proves nothing")
 	}
-	return reply.Supports(sessionwire.HostLinkCapabilityGateResponse)
+	return reply.Supports(capability)
+}
+
+func TestPrincipalCapabilityIsAdvertisedWithoutAnySeam(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		gates bool
+	}{
+		{"no gate seams", false},
+		{"gate seams wired", true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newFixture(t, func(options *Options, _ *hostconfig.Options) {
+				if row.gates {
+					options.Gates = inertGateSessions{}
+					options.GateReads = inertGateReads{}
+				}
+			})
+			if !advertisesCapability(t, f, sessionwire.HostLinkCapabilityAttributionPrincipal) {
+				t.Fatal("connect reply does not advertise principal attribution")
+			}
+		})
+	}
 }
 
 // TestTheGateResponseTokenIsAdvertisedOnlyWhenBothGateSeamsAreWired: a Host

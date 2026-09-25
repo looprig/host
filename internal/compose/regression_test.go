@@ -625,6 +625,33 @@ func newDurableCommands(key registry.Key) *durableCommands {
 // accept admits one command at the next acceptance order and returns its ID.
 func (d *durableCommands) accept(t *testing.T, id sessionwire.CommandID, payload string) sessionwire.CommandID {
 	t.Helper()
+	var legacy struct {
+		Blocks []struct {
+			Text string `json:"text"`
+		} `json:"blocks"`
+	}
+	if err := json.Unmarshal([]byte(payload), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	blocks := make([]map[string]string, 0, len(legacy.Blocks))
+	for _, block := range legacy.Blocks {
+		blocks = append(blocks, map[string]string{"type": "text", "text": block.Text})
+	}
+	if len(blocks) == 0 {
+		blocks = append(blocks, map[string]string{"type": "text", "text": "fixture"})
+	}
+	encodedBlocks, err := json.Marshal(blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: id},
+		SessionID:       d.key.SessionID,
+		Blocks:          encodedBlocks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	runtimeID, err := uuid.New()
 	if err != nil {
 		t.Fatalf("mint a runtime command id: %v", err)
@@ -643,7 +670,7 @@ func (d *durableCommands) accept(t *testing.T, id sessionwire.CommandID, payload
 		},
 		runtime:  runtimeID,
 		kind:     commands.KindInput,
-		payload:  []byte(payload),
+		payload:  body,
 		revision: 1,
 		state:    commands.StatePending,
 		// The deadline is far beyond the fixture's frozen instant, so no claim
@@ -1738,7 +1765,10 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse the hostlink capability constants: %v", err)
 	}
-	wantTokens := map[string]string{"CapabilityGateResponse": hostlink.CapabilityGateResponse}
+	wantTokens := map[string]string{
+		"CapabilityGateResponse":         hostlink.CapabilityGateResponse,
+		"CapabilityAttributionPrincipal": hostlink.CapabilityAttributionPrincipal,
+	}
 	if len(tokens) != len(wantTokens) {
 		t.Fatalf("hostlink declares capability tokens %v, want exactly %v; a new token is a new promise to Factory and must be reviewed as one", tokens, wantTokens)
 	}
@@ -1756,7 +1786,8 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 // capability constant may be declared from; it is coreFramingNames' role for
 // tokens, and a selector absent from it is reported, not skipped.
 var coreCapabilityNames = map[string]string{
-	"HostLinkCapabilityGateResponse": sessionwire.HostLinkCapabilityGateResponse,
+	"HostLinkCapabilityGateResponse":         sessionwire.HostLinkCapabilityGateResponse,
+	"HostLinkCapabilityAttributionPrincipal": sessionwire.HostLinkCapabilityAttributionPrincipal,
 }
 
 // hostLinkConstants is reservedHostLinkMethods' parse over another name

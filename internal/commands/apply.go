@@ -588,6 +588,10 @@ const (
 	// Host cannot read its body, while a newer Host may be able to.
 	RefusalUnreadableCreate ApplyRefusal = "unreadable_create"
 
+	// RefusalUnreadableCommand leaves an input, interrupt or restore claimed
+	// without an attempt because a newer Host may understand its body.
+	RefusalUnreadableCommand ApplyRefusal = "unreadable_command"
+
 	// RefusalUnreadableGateResponse reports a gate response whose private body
 	// this Host cannot read the gate identity out of, so §9.4's recheck cannot
 	// be run.
@@ -1091,6 +1095,8 @@ func (a *Applier) driveWithPayload(ctx context.Context, record Record, revision 
 	// inbox payload is private to Factory and Host: a runtime handed a bare
 	// public identity has no way to obtain what it is being asked to apply.
 	if err := a.runtime.ApplyCommand(ctx, department.RuntimeCommand{
+		// The legacy inbox has no disposition grant or Factory-stamped members;
+		// only the disposition path strictly decodes and carries those members.
 		CommandID:        record.CommandID,
 		RuntimeCommandID: record.RuntimeCommandID,
 		Kind:             string(record.Kind),

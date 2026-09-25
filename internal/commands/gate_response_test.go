@@ -92,6 +92,30 @@ func gateFixture(t *testing.T, gates *fakeGates, body func(*sessionwire.GateResp
 	})
 }
 
+func TestGateResponseCarriesStampedPrincipal(t *testing.T) {
+	f := gateFixture(t, ownedGate(testEpoch), func(answer *sessionwire.GateResponseRequest) {
+		answer.Principal = &sessionwire.Principal{Tenant: testTenant, Subject: "user-1", Kind: sessionwire.PrincipalKindActor}
+	})
+	outcome, err := f.process()
+	if err != nil || outcome.State != StateApplied {
+		t.Fatalf("Process = (%+v,%v)", outcome, err)
+	}
+	got := f.runtime.commands()[0]
+	if got.Principal == nil || got.Principal.Subject != "user-1" || got.Metadata != nil {
+		t.Fatalf("RuntimeCommand = %+v", got)
+	}
+}
+
+func TestFutureGateResponseBlocksEvenWithoutGateReader(t *testing.T) {
+	f := gateFixture(t, nil, nil)
+	f.store.payloads[commandID(1)] = Payload{Body: append(f.store.payloads[commandID(1)].Body[:len(f.store.payloads[commandID(1)].Body)-1], []byte(`,"future":true}`)...)}
+	outcome, err := f.process()
+	var refusal *ApplyError
+	if !errors.As(err, &refusal) || refusal.Refusal != RefusalUnreadableGateResponse || outcome.State != StateClaimed || len(f.store.begins) != 0 || len(f.store.rejects) != 0 {
+		t.Fatalf("Process = (%+v,%v)", outcome, err)
+	}
+}
+
 // TestAGateResponseToAGateThisHostOwnsIsDispatchedUnderItsAttempt is the
 // acceptance path: the gate is projected, its owner is this Host's residency,
 // the answer names the version the projection holds, and the command is claimed,

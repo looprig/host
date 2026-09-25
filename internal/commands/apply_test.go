@@ -906,7 +906,7 @@ func TestTheRuntimeCommandCarriesEverythingARuntimeNeeds(t *testing.T) {
 	// forever with a real effect behind it. THIS legacy Applier does not fill it
 	// — it is bound to the legacy family, which has no attempt — and
 	// TestTheLegacyApplierNamesNoAttempt below is the assertion that says so.
-	want := []string{"CommandID", "RuntimeCommandID", "Kind", "Payload", "PayloadRef", "AttemptID"}
+	want := []string{"CommandID", "RuntimeCommandID", "Kind", "Payload", "PayloadRef", "AttemptID", "Principal", "Metadata"}
 	if !reflect.DeepEqual(members, want) {
 		t.Errorf("department.RuntimeCommand carries %v, want %v", members, want)
 	}

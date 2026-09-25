@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -226,11 +227,19 @@ func (w *world) admit(id sessionwire.CommandID) {
 func (w *world) admitOne(id sessionwire.CommandID) {
 	w.t.Helper()
 	now := time.Now().UTC()
+	body, err := json.Marshal(sessionwire.InputRequest{
+		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: id},
+		SessionID:       settlementSession,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"hello"}]`),
+	})
+	if err != nil {
+		w.t.Fatal(err)
+	}
 	if _, _, err := w.orchestration.AdmitDispositionCommand(w.t.Context(), sessionstore.AdmitDispositionCommandRequest{
 		TenantID: settlementTenant, SessionID: settlementSession, CommandID: id, Binding: w.sessionBinding(),
 		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(w.runtimeID.String()),
 		Kind:                     sessionstore.CommandKind(commands.KindInput),
-		Payload:                  []byte(`{"blocks":[]}`),
+		Payload:                  body,
 		AcceptedAt:               now, ApplyDeadline: now.Add(time.Hour),
 	}); err != nil {
 		w.t.Fatalf("admit %q: %v", id, err)
@@ -358,6 +367,10 @@ func (r *conformingRuntime) ApplyCommand(ctx context.Context, command department
 		Kind:             runtimecommand.Kind(command.Kind),
 		LeaseEpoch:       r.lease.Epoch(),
 		AttemptID:        runtimecommand.AttemptID(command.AttemptID),
+		Principal:        command.Principal,
+	}
+	if admitted.Kind == runtimecommand.KindCreate || admitted.Kind == runtimecommand.KindInput {
+		admitted.Metadata = command.Metadata
 	}
 	// THE BLOCKS ARE DECODED HERE BECAUSE THEY ARE DECODED THERE. Host hands the
 	// private body across opaque — it is not the semantic validator of a command

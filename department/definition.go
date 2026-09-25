@@ -381,8 +381,8 @@ type PublicationSubscriber interface {
 // ever set; the runtime resolves the reference through its own object read
 // rather than having the bytes copied through Host's memory.
 //
-// WHAT STILL DOES NOT CROSS is anything Host decoded. Host is not the semantic
-// validator of a command body — Harness is — so the bytes travel opaque.
+// The optional principal and metadata are the only decoded values crossing
+// this seam. The private body still travels unchanged.
 type RuntimeCommand struct {
 	// CommandID is the public, retry-stable identity.
 	CommandID sessionwire.CommandID
@@ -422,6 +422,13 @@ type RuntimeCommand struct {
 	// sets it; a caller that does not is asking for the legacy behaviour and
 	// gets it.
 	AttemptID string
+
+	// Principal is the Factory-stamped sender read strictly before the attempt.
+	// It is a recorded assertion, never an authorization decision by Host.
+	Principal *sessionwire.Principal
+
+	// Metadata is the client's message field bag on create and input only.
+	Metadata sessionwire.MessageMetadata
 }
 
 // CommandApplier applies one admitted runtime command. This is Host's control

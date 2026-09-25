@@ -10,6 +10,8 @@
 // durable — and once an attempt exists nothing settles a command except the
 // runtime's own evidence, which a refused dispatch never writes. Sharing the
 // function is what makes that ordering safe.
+// Both readers use bodyclass.Permanent: a future member or version blocks
+// rather than destroying an answer a newer Host may apply.
 package gateresponse
 
 import (
@@ -19,6 +21,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/host/internal/bodyclass"
 )
 
 // Response is one decoded gate_response body.
@@ -51,6 +54,16 @@ func (e *MalformedError) Error() string {
 // Unwrap returns the lower-level failure, if any.
 func (e *MalformedError) Unwrap() error { return e.Cause }
 
+// UnsupportedError reports a body this Host cannot read but a newer one may.
+type UnsupportedError struct{ Cause error }
+
+func (e *UnsupportedError) Error() string {
+	return "gateresponse: this Host cannot read the gate response: " + e.Cause.Error()
+}
+
+// Unwrap returns the decode failure.
+func (e *UnsupportedError) Unwrap() error { return e.Cause }
+
 // ErrEmptyBody is the cause of a MalformedError for a command with no inline
 // body. A body stored behind an object reference is not this error: its bytes
 // exist, this Host does not dereference them, and that is the caller's to say.
@@ -69,6 +82,9 @@ func Decode(body []byte, session sessionwire.SessionID, command sessionwire.Comm
 	}
 	var request sessionwire.GateResponseRequest
 	if err := json.Unmarshal(body, &request); err != nil {
+		if !bodyclass.Permanent(err) {
+			return Response{}, &UnsupportedError{Cause: err}
+		}
 		return Response{}, &MalformedError{Reason: "it is not a Core gate-response request", Cause: err}
 	}
 	if err := request.Validate(); err != nil {

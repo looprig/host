@@ -61,9 +61,6 @@ func TestDecodeRefusesEveryBodyNoHostCouldApply(t *testing.T) {
 	}{
 		{"empty", func(*testing.T) []byte { return nil }, testSession, testCommand},
 		{"not JSON", func(*testing.T) []byte { return []byte("not json") }, testSession, testCommand},
-		{"an unknown member", func(*testing.T) []byte {
-			return []byte(`{"version":1,"command_id":"command-1","session_id":"core/session/opaque","gate_id":"` + testGate.String() + `","action":"a","values":{},"expected_open_journal_seq":7,"extra":1}`)
-		}, testSession, testCommand},
 		{"no expected-open version", func(t *testing.T) []byte {
 			r := request()
 			r.ExpectedOpenJournalSeq = 0
@@ -89,5 +86,27 @@ func TestDecodeRefusesEveryBodyNoHostCouldApply(t *testing.T) {
 				t.Fatalf("Decode = %v, want a MalformedError", err)
 			}
 		})
+	}
+}
+
+func TestDecodeBlocksWhatANewerHostMayRead(t *testing.T) {
+	for _, body := range []string{
+		`{"version":1,"command_id":"command-1","session_id":"core/session/opaque","gate_id":"` + testGate.String() + `","action":"a","values":{},"expected_open_journal_seq":7,"extra":1}`,
+		`{"version":99,"command_id":"command-1","session_id":"core/session/opaque","gate_id":"` + testGate.String() + `","action":"a","values":{},"expected_open_journal_seq":7}`,
+	} {
+		_, err := Decode([]byte(body), testSession, testCommand)
+		var unsupported *UnsupportedError
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("Decode = %v, want UnsupportedError", err)
+		}
+	}
+}
+
+func TestDecodeReturnsTheStampedPrincipal(t *testing.T) {
+	r := request()
+	r.Principal = &sessionwire.Principal{Tenant: "acme", Subject: "u", Kind: sessionwire.PrincipalKindActor}
+	response, err := Decode(encode(t, r), testSession, testCommand)
+	if err != nil || response.Request.Principal == nil || response.Request.Principal.Subject != "u" {
+		t.Fatalf("Decode = (%+v,%v)", response, err)
 	}
 }

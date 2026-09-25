@@ -131,11 +131,34 @@ func TestCreateBodyIdentityMismatchIsPermanent(t *testing.T) {
 	}{
 		{"session-other", testCommand}, {testSession, "command-other"},
 	} {
-		err := createbody.Check(stored(t, ""), row.session, row.command)
+		_, err := createbody.Check(stored(t, ""), row.session, row.command)
 		var malformed *createbody.MalformedError
 		if !errors.As(err, &malformed) {
 			t.Fatalf("Check identity = %v, want MalformedError", err)
 		}
+	}
+}
+
+func TestFirstMessageCarriesPrincipalAndMetadata(t *testing.T) {
+	body := []byte(`{"version":1,"command_id":"c-1","session_id":"s-1","agent_id":"a","blocks":[{"type":"text","text":"hi"}],"metadata":{"space":"family"},"principal":{"tenant":"acme","subject":"user-1","kind":"actor"}}`)
+	presented, err := createbody.FirstMessage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input sessionwire.InputRequest
+	if err := json.Unmarshal(presented, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Principal == nil || input.Principal.Subject != "user-1" || input.Metadata["space"] != "family" {
+		t.Fatalf("members lost: %+v", input)
+	}
+}
+
+func TestCheckReturnsTheMembers(t *testing.T) {
+	body := []byte(`{"version":1,"command_id":"c-1","session_id":"s-1","agent_id":"a","principal":{"tenant":"acme","subject":"svc","kind":"service"}}`)
+	members, err := createbody.Check(body, "s-1", "c-1")
+	if err != nil || members.Principal == nil || members.Principal.Kind != sessionwire.PrincipalKindService || members.Metadata != nil {
+		t.Fatalf("Check = (%+v,%v)", members, err)
 	}
 }
 

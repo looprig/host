@@ -181,11 +181,13 @@ type Options struct {
 // (commands.RefusalNoGateReader); GateReads alone would check answers against
 // a projection nothing publishes. Either half alone is a Host that cannot
 // apply a gate_response, and a Factory must not be told it can.
+// The principal-attribution token is unconditional: strict Core decoding and
+// the pinned harness runtime need no product seam.
 func (s *Service) capabilities() []string {
 	if s.options.Gates != nil && s.options.GateReads != nil {
-		return []string{hostlink.CapabilityGateResponse}
+		return []string{hostlink.CapabilityGateResponse, hostlink.CapabilityAttributionPrincipal}
 	}
-	return nil
+	return []string{hostlink.CapabilityAttributionPrincipal}
 }
 
 // DefaultGateRetry is the gate publisher's retry wait when GateRetry is zero.

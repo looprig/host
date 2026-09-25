@@ -384,6 +384,12 @@ func (s *boundSession) admit(command department.RuntimeCommand) (runtimecommand.
 		// an identity the released type refuses is refused BEFORE the applier.
 		AttemptID: runtimecommand.AttemptID(command.AttemptID),
 	}
+	// The disposition applier already decoded these members strictly before
+	// authorizing the attempt. Preserve them without changing decoder bytes.
+	admitted.Principal = command.Principal
+	if admitted.Kind == runtimecommand.KindCreate || admitted.Kind == runtimecommand.KindInput {
+		admitted.Metadata = command.Metadata
+	}
 	if !admitted.Kind.Valid() {
 		return runtimecommand.Admitted{}, &UnsupportedCommandError{
 			CommandID: command.CommandID,

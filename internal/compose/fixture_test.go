@@ -1494,7 +1494,15 @@ func (d *fakeDispositions) LoadDispositionPayload(
 	source := d.payloads
 	d.mu.Unlock()
 	if source == nil {
-		return commands.Payload{Body: []byte(`{"blocks":[]}`)}, nil
+		body, err := json.Marshal(sessionwire.InputRequest{
+			CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: command},
+			SessionID:       session,
+			Blocks:          json.RawMessage(`[{"type":"text","text":"fixture"}]`),
+		})
+		if err != nil {
+			return commands.Payload{}, err
+		}
+		return commands.Payload{Body: body}, nil
 	}
 	return source.LoadPayload(ctx, tenant, session, command)
 }

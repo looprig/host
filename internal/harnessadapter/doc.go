@@ -135,6 +135,9 @@
 // internal/createbody for why there is one encoding rather than two. A create
 // carrying a first message with no decoder bound is refused, exactly as an
 // input is by H7.
+// A product BlockDecoder that strictly decodes Core's InputRequest must use
+// core v0.12.0 or later: input bytes and re-presented create bytes may carry
+// principal and metadata, and the older strict decoder refuses them.
 //
 // A RESTORE CROSSES CARRYING NOTHING. Core's RestoreRequest has no blocks
 // member and Admitted.Validate refuses a restore that carries any. harness
