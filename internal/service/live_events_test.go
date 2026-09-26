@@ -95,8 +95,13 @@ func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {
 	}
 	t.Cleanup(tail.Stop)
 	stream <- liveFrame(key, "loop-a", "turn-a", "pending")
-	timer.fire()
-	waitFor(t, "first refusal", func() bool { return publications.tried() > 0 })
+	waitFor(t, "first refusal", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return publications.tried() > 0
+	})
 	stream <- liveFrame(key, "loop-b", "turn-b", "lost")
 	waitFor(t, "different-key drop", func() bool { return tail.EphemeralDrops() >= 1 })
 	publications.allowNext()
@@ -139,8 +144,13 @@ func TestPendingPreviewDroppedByEnduringFrameStaysGapped(t *testing.T) {
 	}
 	t.Cleanup(tail.Stop)
 	stream <- liveFrame(key, "loop-a", "turn-a", "pending")
-	timer.fire()
-	waitFor(t, "first refusal", func() bool { return publications.tried() > 0 })
+	waitFor(t, "first refusal", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return publications.tried() > 0
+	})
 	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "progress", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"ToolCallStarted","loop_id":"loop-b"}`)}}
 	waitFor(t, "pending drop", func() bool { return tail.Published() == 1 && tail.EphemeralDrops() >= 1 })
 	publications.allowNext()
