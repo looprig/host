@@ -1663,7 +1663,7 @@ func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 		// events.go, O5.3. Tails and Tail carry NO exported field on purpose:
 		// a Tail is a handle, and an exported field on one would be a second,
 		// unsynchronized way to read state its own accessors take a lock for.
-		"TailOptions":             {"FlushInterval", "Logger", "NewFlushTimer", "Publications", "Routes"},
+		"TailOptions":             {"FlushInterval", "IncludeReasoning", "Logger", "NewFlushTimer", "Publications", "Routes"},
 		"InvalidTailOptionsError": {"Field", "Reason"},
 		"Tails":                   nil,
 		"Tail":                    nil,

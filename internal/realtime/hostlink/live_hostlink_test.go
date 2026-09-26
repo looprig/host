@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -145,6 +146,14 @@ func (unusedCommandConsumers) ConsumerFor(registry.Key) (hostlink.CommandConsume
 }
 
 func TestHarnessLiveTextArrivesOnConcreteHostLinkInOrder(t *testing.T) {
+	for _, includeReasoning := range []bool{false, true} {
+		t.Run(strconv.FormatBool(includeReasoning), func(t *testing.T) {
+			testHarnessLiveTextOnHostLink(t, includeReasoning)
+		})
+	}
+}
+
+func testHarnessLiveTextOnHostLink(t *testing.T, includeReasoning bool) {
 	live := newLiveBridgeSession(t, "tenant-alpha")
 	const hostID = sessionwire.HostID("host-live-text")
 	const compatibility = "runtime-live-text"
@@ -233,7 +242,7 @@ func TestHarnessLiveTextArrivesOnConcreteHostLinkInOrder(t *testing.T) {
 
 	ids := publicbody.Identities{RuntimeSessionID: live.rigID, SessionID: live.key.SessionID}
 	rewrite := publicbody.Projection(ids)
-	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux})
+	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux, IncludeReasoning: includeReasoning})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,6 +256,19 @@ func TestHarnessLiveTextArrivesOnConcreteHostLinkInOrder(t *testing.T) {
 	}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := live.hub.PublishEventChecked(t.Context(), event.TokenDelta{Header: header, Chunk: &content.ThinkingChunk{Thinking: "visible reasoning"}}); err != nil {
+		t.Fatal(err)
+	}
+	if includeReasoning {
+		select {
+		case frame := <-publications:
+			if !bytes.Contains(frame, []byte(`"chunk_type":"thinking","thinking":"visible reasoning"`)) {
+				t.Fatalf("reasoning frame = %s", frame)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("Go Centrifuge client did not receive reasoning")
+		}
 	}
 	if err := live.hub.PublishEventChecked(t.Context(), event.TokenDelta{Header: header, Chunk: &content.TextChunk{Text: "visible preview"}}); err != nil {
 		t.Fatal(err)

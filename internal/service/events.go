@@ -54,9 +54,10 @@ type Routes interface {
 
 // TailOptions configures a Tails.
 type TailOptions struct {
-	Publications  Publications
-	Routes        Routes
-	FlushInterval time.Duration
+	Publications     Publications
+	Routes           Routes
+	FlushInterval    time.Duration
+	IncludeReasoning bool
 	// NewFlushTimer allows a controlled clock for interval tests.
 	NewFlushTimer func(time.Duration) FlushTimer
 	Logger        *slog.Logger
@@ -111,11 +112,12 @@ func (e *InvalidTailOptionsError) Error() string {
 // a deterministic function of the stored body that the durable read applies
 // too (host.PublicJournal), so live and durable bodies stay byte-identical.
 type Tails struct {
-	publications  Publications
-	routes        Routes
-	flushInterval time.Duration
-	newFlushTimer func(time.Duration) FlushTimer
-	logger        *slog.Logger
+	publications     Publications
+	routes           Routes
+	flushInterval    time.Duration
+	includeReasoning bool
+	newFlushTimer    func(time.Duration) FlushTimer
+	logger           *slog.Logger
 }
 
 // NewTails validates the options and returns a publisher.
@@ -144,7 +146,7 @@ func NewTails(options TailOptions) (*Tails, error) {
 	if options.Logger == nil {
 		options.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Tails{publications: options.Publications, routes: options.Routes, flushInterval: options.FlushInterval, newFlushTimer: options.NewFlushTimer, logger: options.Logger}, nil
+	return &Tails{publications: options.Publications, routes: options.Routes, flushInterval: options.FlushInterval, includeReasoning: options.IncludeReasoning, newFlushTimer: options.NewFlushTimer, logger: options.Logger}, nil
 }
 
 // TailEnd is why one tail stopped.
@@ -327,7 +329,11 @@ func (t *Tails) PublishProjected(
 		transient = ephemeralRewrite[0]
 	}
 	if source, ok := subscriber.(department.LivePublicationSubscriber); ok && transient != nil {
-		live, err = source.SubscribeLivePublic(runCtx)
+		if reasoning, ok := subscriber.(department.ReasoningPublicationSubscriber); ok && t.includeReasoning {
+			live, err = reasoning.SubscribeLivePublicWithReasoning(runCtx)
+		} else {
+			live, err = source.SubscribeLivePublic(runCtx)
+		}
 	} else {
 		published, err = subscriber.SubscribeCommitted(runCtx, "")
 	}
@@ -368,7 +374,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 	var pending *sessionwire.EphemeralPublication
 	var pendingText livetext.Delta
 	gapped := map[string]bool{}
-	textKey := func(d livetext.Delta) string { return d.LoopID + "\x00" + d.TurnID }
+	textKey := func(d livetext.Delta) string { return d.LoopID + "\x00" + d.TurnID + "\x00" + d.Chunk.Type }
 	var timer FlushTimer
 	var flushAt <-chan time.Time
 	var projected <-chan projectedLiveText
@@ -428,6 +434,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			}
 			value.Body = body
 			decoded, ok := livetext.Parse(body)
+			ok = ok && (t.includeReasoning || decoded.Chunk.Type == "text")
 			ok = ok && decoded.SessionID == string(tail.key.SessionID)
 			result <- projectedLiveText{publication: value, text: decoded, ok: ok}
 		}()

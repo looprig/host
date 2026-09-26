@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -78,6 +79,157 @@ func liveBody(key registry.Key, loop, turn, text string) json.RawMessage {
 }
 func liveFrame(key registry.Key, loop, turn, text string) department.LivePublication {
 	return department.LivePublication{Ephemeral: &sessionwire.EphemeralPublication{TenantID: key.TenantID, SessionID: key.SessionID, Body: liveBody(key, loop, turn, text)}}
+}
+
+func thinkingFrame(key registry.Key, loop, turn, thinking string) department.LivePublication {
+	return department.LivePublication{Ephemeral: &sessionwire.EphemeralPublication{TenantID: key.TenantID, SessionID: key.SessionID, Body: thinkingBody(key, loop, turn, thinking)}}
+}
+
+func thinkingBody(key registry.Key, loop, turn, thinking string) json.RawMessage {
+	body, _ := json.Marshal(map[string]any{"v": 1, "type": "TokenDelta", "session_id": string(key.SessionID), "loop_id": loop, "turn_id": turn, "chunk": map[string]any{"chunk_type": "thinking", "thinking": thinking}})
+	return body
+}
+
+func TestReasoningRequiresOptInAndKeepsTextEnduringOrder(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			stream := make(chan department.LivePublication, 4)
+			timer := &manualFlushTimer{ticks: make(chan time.Time, 4)}
+			wire := &livePublications{admit: true}
+			tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: &recordingRoutes{}, IncludeReasoning: enabled, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(tail.Stop)
+			stream <- thinkingFrame(key, "loop", "turn", "why")
+			if enabled {
+				waitFor(t, "reasoning frame", func() bool {
+					select {
+					case timer.ticks <- time.Now():
+					default:
+					}
+					return tail.EphemeralPublished() == 1
+				})
+			}
+			stream <- liveFrame(key, "loop", "turn", "answer")
+			previewCount := uint64(1)
+			if enabled {
+				previewCount = 2
+			}
+			waitFor(t, "text frame", func() bool {
+				select {
+				case timer.ticks <- time.Now():
+				default:
+				}
+				return tail.EphemeralPublished() == previewCount
+			})
+			stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"StepDone","loop_id":"loop"}`)}}
+			want := []string{`"text":"answer"`, `"event_id":"durable"`}
+			if enabled {
+				want = append([]string{`"thinking":"why"`}, want...)
+			}
+			waitFor(t, "ordered frames", func() bool { return len(wire.recorded()) == len(want) })
+			for i, frame := range wire.recorded() {
+				if !bytes.Contains(frame.payload, []byte(want[i])) {
+					t.Fatalf("frame %d = %s, want %s", i, frame.payload, want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPendingThinkingAndTextNeverMerge(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 2)
+	timer := &manualFlushTimer{ticks: make(chan time.Time, 2)}
+	wire := &livePublications{admit: true}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: &recordingRoutes{}, IncludeReasoning: true, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- thinkingFrame(key, "loop", "turn", "why")
+	stream <- liveFrame(key, "loop", "turn", "answer")
+	waitFor(t, "first kind flush", func() bool { return tail.EphemeralPublished() == 1 })
+	waitFor(t, "second kind flush", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 2
+	})
+	frames := wire.recorded()
+	if len(frames) != 2 || !bytes.Contains(frames[0].payload, []byte(`"thinking":"why"`)) || !bytes.Contains(frames[1].payload, []byte(`"text":"answer"`)) || tail.EphemeralDrops() != 0 {
+		t.Fatalf("distinct frames = %+v, drops %d", frames, tail.EphemeralDrops())
+	}
+}
+
+func TestThinkingCapGapAndBoundary(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 7)
+	timer := &manualFlushTimer{ticks: make(chan time.Time, 2)}
+	wire := &livePublications{admit: true}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: &recordingRoutes{}, IncludeReasoning: true, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- thinkingFrame(key, "loop", "turn", strings.Repeat("a", 1500))
+	stream <- thinkingFrame(key, "loop", "turn", strings.Repeat("b", 600))
+	stream <- thinkingFrame(key, "loop", "turn", "suppressed")
+	waitFor(t, "reasoning gap", func() bool { return tail.EphemeralDrops() >= 3 })
+	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "boundary", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"StepDone","loop_id":"loop"}`)}}
+	waitFor(t, "reasoning boundary", func() bool { return tail.Published() == 1 })
+	stream <- thinkingFrame(key, "loop", "turn", "resumed")
+	waitFor(t, "reasoning after boundary", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 1
+	})
+	frames := wire.recorded()
+	if len(frames) != 2 || !bytes.Contains(frames[1].payload, []byte(`"thinking":"resumed"`)) {
+		t.Fatalf("reasoning gap frames = %+v", frames)
+	}
+	for _, frame := range frames {
+		if len(frame.payload) > 4096 {
+			t.Fatalf("frame exceeds 4 KiB: %d", len(frame.payload))
+		}
+	}
+}
+
+func TestEscapedThinkingNeverExceedsTransportCap(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 2)
+	wire := &livePublications{admit: true}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: &recordingRoutes{}, IncludeReasoning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- thinkingFrame(key, "loop", "turn", strings.Repeat("\"", 2000))
+	waitFor(t, "escaped thinking suppressed", func() bool { return tail.EphemeralDrops() >= 1 })
+	if tail.EphemeralPublished() != 0 {
+		t.Fatal("oversized reasoning reached HostLink")
+	}
 }
 
 func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {

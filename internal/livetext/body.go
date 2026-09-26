@@ -1,12 +1,15 @@
-// Package livetext reads and joins the narrow transient text body Host emits.
+// Package livetext reads and joins bounded transient text and reasoning bodies.
 package livetext
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
 
-// MaxBytes caps one text preview frame before transport encoding.
+// MaxBytes caps one preview frame before transport encoding.
 const MaxBytes = 2048
 
-// Delta is the correlation and text content of one public TokenDelta body.
+// Delta is the correlation and visible content of one public TokenDelta body.
 type Delta struct {
 	Version   int    `json:"v"`
 	Type      string `json:"type"`
@@ -14,15 +17,22 @@ type Delta struct {
 	LoopID    string `json:"loop_id"`
 	TurnID    string `json:"turn_id"`
 	Chunk     struct {
-		Type string `json:"chunk_type"`
-		Text string `json:"text"`
+		Type     string `json:"chunk_type"`
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
 	} `json:"chunk"`
 }
 
-// Parse accepts only bounded text deltas with loop and turn identities.
+// Parse accepts only bounded text or reasoning deltas with loop and turn identities.
 func Parse(body json.RawMessage) (Delta, bool) {
 	var decoded Delta
-	if json.Unmarshal(body, &decoded) != nil || decoded.Version != 1 || decoded.Type != "TokenDelta" || decoded.LoopID == "" || decoded.TurnID == "" || decoded.Chunk.Type != "text" || decoded.Chunk.Text == "" || len(decoded.Chunk.Text) > MaxBytes {
+	if json.Unmarshal(body, &decoded) != nil || decoded.Version != 1 || decoded.Type != "TokenDelta" || decoded.LoopID == "" || decoded.TurnID == "" || decoded.Chunk.Type != "text" && decoded.Chunk.Type != "thinking" {
+		return Delta{}, false
+	}
+	if decoded.Chunk.Type == "thinking" {
+		decoded.Chunk.Text = decoded.Chunk.Thinking
+	}
+	if decoded.Chunk.Text == "" || len(decoded.Chunk.Text) > MaxBytes {
 		return Delta{}, false
 	}
 	return decoded, true
@@ -31,14 +41,27 @@ func Parse(body json.RawMessage) (Delta, bool) {
 // Join replaces the first body's text with the concatenation the caller
 // checked against MaxBytes. All other public fields stay present.
 func Join(first json.RawMessage, text string) (json.RawMessage, error) {
+	decoded, ok := Parse(first)
+	if !ok {
+		return nil, errors.New("livetext: unsupported live delta")
+	}
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(first, &body); err != nil {
 		return nil, err
 	}
-	chunk, err := json.Marshal(struct {
-		ChunkType string `json:"chunk_type"`
-		Text      string `json:"text"`
-	}{ChunkType: "text", Text: text})
+	var chunk []byte
+	var err error
+	if decoded.Chunk.Type == "thinking" {
+		chunk, err = json.Marshal(struct {
+			ChunkType string `json:"chunk_type"`
+			Thinking  string `json:"thinking"`
+		}{ChunkType: "thinking", Thinking: text})
+	} else {
+		chunk, err = json.Marshal(struct {
+			ChunkType string `json:"chunk_type"`
+			Text      string `json:"text"`
+		}{ChunkType: "text", Text: text})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -46,14 +69,14 @@ func Join(first json.RawMessage, text string) (json.RawMessage, error) {
 	return json.Marshal(body)
 }
 
-// Merge joins only adjacent text for the same loop and turn within the raw cap.
+// Merge joins only adjacent chunks of the same kind, loop and turn within the raw cap.
 func Merge(first, next json.RawMessage) (json.RawMessage, bool) {
 	a, ok := Parse(first)
 	if !ok {
 		return nil, false
 	}
 	b, ok := Parse(next)
-	if !ok || a.SessionID != b.SessionID || a.LoopID != b.LoopID || a.TurnID != b.TurnID || len(a.Chunk.Text)+len(b.Chunk.Text) > MaxBytes {
+	if !ok || a.SessionID != b.SessionID || a.LoopID != b.LoopID || a.TurnID != b.TurnID || a.Chunk.Type != b.Chunk.Type || len(a.Chunk.Text)+len(b.Chunk.Text) > MaxBytes {
 		return nil, false
 	}
 	joined, err := Join(first, a.Chunk.Text+b.Chunk.Text)

@@ -27,7 +27,7 @@ import (
 // restates a value host.New already checked: the Host is taken whole and every
 // identity, endpoint, placement, capacity and timing is read from it.
 type Options struct {
-	// LiveText enables transient text only when non-nil.
+	// LiveText enables transient text when non-nil, and visible reasoning when requested.
 	LiveText *LiveTextOptions
 	// Host is the validated Host this composition runs.
 	Host *hostconfig.Host
@@ -176,11 +176,12 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// LiveTextOptions configures the opt-in transient relay and transport budget.
+// LiveTextOptions configures the opt-in transient relay and shared transport budget.
 type LiveTextOptions struct {
 	RateBytesPerSecond int
 	BurstBytes         int
 	FlushInterval      time.Duration
+	IncludeReasoning   bool
 }
 
 // capabilities are the capability tokens this composition's links advertise.
@@ -964,7 +965,7 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 	if err != nil {
 		return nil, err
 	}
-	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux, FlushInterval: s.liveTextFlush(), Logger: s.options.logger()})
+	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux, FlushInterval: s.liveTextFlush(), IncludeReasoning: s.options.LiveText != nil && s.options.LiveText.IncludeReasoning, Logger: s.options.logger()})
 	if err != nil {
 		_ = server.Close(context.Background())
 		return nil, err

@@ -196,19 +196,23 @@ type DrainOptions struct {
 }
 
 // LiveTextOptions enables transient text previews. Zero fields use safe defaults.
+// IncludeReasoning also streams visible model reasoning when true. It defaults
+// to false; opaque/redacted provider state and signature-only chunks are never
+// published. Text and reasoning share the same transport budget and limits.
 // Enable only after Factory v0.12.1 or later is deployed; earlier Factory
 // mailboxes charge every frame, and WUI through v0.4.0 discards previews.
 type LiveTextOptions struct {
 	RateBytesPerSecond int
 	BurstBytes         int
 	FlushInterval      time.Duration
+	IncludeReasoning   bool
 }
 
 func composeLiveText(value *LiveTextOptions) *compose.LiveTextOptions {
 	if value == nil {
 		return nil
 	}
-	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval}
+	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval, IncludeReasoning: value.IncludeReasoning}
 }
 
 // Composition is one runnable Host, described.
@@ -228,7 +232,8 @@ type Composition struct {
 
 	Link  LinkOptions
 	Drain DrainOptions
-	// LiveText is opt-in. Nil keeps the v0.11.0 committed-only relay.
+	// LiveText is opt-in. Nil keeps the committed-only relay. Reasoning requires
+	// IncludeReasoning as well as a non-nil LiveText option.
 	LiveText *LiveTextOptions
 
 	// CompatibilityTimeout bounds the synchronous compatibility wait; WorkPoll
