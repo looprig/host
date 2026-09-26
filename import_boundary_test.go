@@ -63,7 +63,7 @@ var publishedLooprigVersions = map[string]string{
 	// Principal and Metadata, and the journal gains principal/metadata/presented
 	// members harness <= v0.40.2 cannot replay. Host sets both members from the
 	// body it decoded before the attempt (host v0.11.0).
-	"harness": "v0.41.0",
+	"harness": "v0.41.1",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
