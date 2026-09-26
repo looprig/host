@@ -254,8 +254,9 @@ func (s *dualSubscriber) SubscribeLivePublic(context.Context) (<-chan department
 func TestNilTransientProjectorUsesByteIdenticalCommittedRelay(t *testing.T) {
 	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
 	body := json.RawMessage(`{"type":"x"}`)
+	event := sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "event-1", JournalSeq: 1, CoveredThrough: 1, Body: body}
 	committed := make(chan sessionwire.EnduringPublication, 1)
-	committed <- sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "event-1", JournalSeq: 1, CoveredThrough: 1, Body: body}
+	committed <- event
 	subscriber := &dualSubscriber{committed: committed}
 	publications := &livePublications{admit: true}
 	tail, err := newTails(t, publications, &recordingRoutes{}).PublishProjected(t.Context(), key, subscriber, nil)
@@ -277,6 +278,18 @@ func TestNilTransientProjectorUsesByteIdenticalCommittedRelay(t *testing.T) {
 	}
 	if subscriber.liveCalls != 0 || tail.EphemeralPublished() != 0 || !bytes.Contains(publications.recorded()[0].payload, body) {
 		t.Fatalf("default relay changed: live calls %d, transient %d, frame %s", subscriber.liveCalls, tail.EphemeralPublished(), publications.recorded()[0].payload)
+	}
+	baselineStream := make(chan sessionwire.EnduringPublication, 1)
+	baselineStream <- event
+	baseline := &recordingPublications{}
+	baselineTail, err := newTails(t, baseline, &recordingRoutes{}).Publish(t.Context(), key, scriptedSubscriber{stream: baselineStream})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(baselineTail.Stop)
+	waitFor(t, "enduring-only baseline", func() bool { return len(baseline.recorded()) == 1 })
+	if !bytes.Equal(publications.recorded()[0].payload, baseline.recorded()[0].payload) {
+		t.Fatalf("default frame differs from enduring-only relay:\n%s\n%s", publications.recorded()[0].payload, baseline.recorded()[0].payload)
 	}
 }
 
