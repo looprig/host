@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/centrifugal/centrifuge"
@@ -27,9 +28,25 @@ const (
 	disconnectUnsupportedVersion uint32 = 4501
 )
 
+// Transient bytes queued behind a stalled consumer are bounded by burst +
+// rate × stall. At 8 KiB + 32 KiB/s × 30 s = 991,232 bytes, transient data
+// alone remains below the 1 MiB Centrifuge client queue limit. More than 30 s
+// of total stall is needed for transient bytes alone to reach that limit; a
+// client stalled that long is disconnected by enduring traffic and repairs by
+// replaying the durable journal. Keep the queue limit and admission constants
+// together when changing either side of this inequality.
+const (
+	ephemeralRateBytesPerSecond = 32 * 1024
+	ephemeralBurstBytes         = 8 * 1024
+	ephemeralMaxFrameBytes      = 4 * 1024
+	clientQueueMaxBytes         = 1024 * 1024
+)
+
 type centrifugeServer struct {
 	node    *centrifuge.Node
 	handler http.Handler
+	mu      sync.Mutex // serializes ephemeral admission with its broadcast
+	budget  *ephemeralBudget
 }
 
 // NewCentrifugeServer constructs and starts the embedded JSON/WebSocket
@@ -69,9 +86,10 @@ func NewCentrifugeServer(config Config) (Server, error) {
 	}
 	metrics := prometheus.NewRegistry()
 	nodeConfig := centrifuge.Config{
-		Name:    "looprig-hostlink",
-		Version: "v1",
-		Metrics: centrifuge.MetricsConfig{RegistererGatherer: metrics},
+		Name:               "looprig-hostlink",
+		Version:            "v1",
+		Metrics:            centrifuge.MetricsConfig{RegistererGatherer: metrics},
+		ClientQueueMaxSize: clientQueueMaxBytes,
 		// Centrifuge would otherwise default this to 255 and refuse a channel
 		// two maximum-length Core identifiers mint. MaxChannelBytes is derived
 		// from the encoding, so this ceiling moves with it rather than being a
@@ -156,7 +174,10 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		CheckOrigin: func(*http.Request) bool { return true },
 		Compression: false,
 	})
-	server := &centrifugeServer{node: node}
+	server := &centrifugeServer{
+		node:   node,
+		budget: newEphemeralBudget(ephemeralRateBytesPerSecond, ephemeralBurstBytes, time.Now),
+	}
 	server.handler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !selectsJSONProtocol(request) {
 			http.Error(writer, "HostLink requires the JSON protocol", http.StatusBadRequest)
@@ -181,11 +202,32 @@ func (s *centrifugeServer) Publish(channel string, payload []byte) error {
 	return err
 }
 
-// TryPublishEphemeral refuses transient frames because Centrifuge v0.38.0
-// exposes no trustworthy per-connection writer-queue headroom. Calling
-// Node.Publish here could make an additive text frame close a slow link before
-// its next enduring or control frame.
-func (s *centrifugeServer) TryPublishEphemeral(string, []byte) bool { return false }
+// TryPublishEphemeral publishes only when every currently subscribed physical
+// client has room in its own rate budget. A single client can subscribe to
+// several session channels, so a channel-scoped bucket would not bound that
+// client's queue. The caller counts false as a payload-free transient drop.
+func (s *centrifugeServer) TryPublishEphemeral(channel string, payload []byte) bool {
+	if len(payload) == 0 || len(payload) > ephemeralMaxFrameBytes {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	connections := s.node.Hub().Connections()
+	active := make(map[string]bool, len(connections))
+	subscribers := make([]string, 0, len(connections))
+	for id, client := range connections {
+		active[id] = true
+		if client.IsSubscribed(channel) {
+			subscribers = append(subscribers, id)
+		}
+	}
+	s.budget.forgetInactive(active)
+	if !s.budget.admit(subscribers, len(payload)) {
+		return false
+	}
+	_, err := s.node.Publish(channel, payload)
+	return err == nil
+}
 
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 

@@ -1,10 +1,17 @@
 package hostlink_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/internal/realtime/hostlink"
@@ -92,17 +99,140 @@ func TestAPublicationToAnUnsubscribedChannelIsNotAnError(t *testing.T) {
 	}
 }
 
-// The pinned Centrifuge writer does not expose per-connection queue headroom.
-// Until it does, transient publication must be refused before enqueue.
-func TestTransientPublishIsDisabledWithoutQueueHeadroom(t *testing.T) {
+// A bound, subscribed Centrifuge client must receive the admitted preview on
+// the same ordered channel as enduring publications.
+func TestTransientPublicationReachesSubscribedClientInOrder(t *testing.T) {
 	f := newFixture(t)
 	server, httpServer := startServer(t, &recordingAuthenticator{wantToken: testCredential}, hostlink.Config{Multiplexer: f.mux})
 	defer closeServers(t, server, httpServer)
+	connection := dial(t, httpServer.URL, "")
+	defer connection.Close()
+	if reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}}); reply.Connect == nil {
+		t.Fatalf("connect reply = %#v", reply)
+	}
+	acceptedRPC(t, rpc(t, connection, 2, hostlink.MethodBind, bindRequest(testSession)))
+	channel := hostlink.ChannelFor(residencyKey(testSession))
+	if reply := sendCommand(t, connection, 3, map[string]any{"id": 3, "subscribe": map[string]any{"channel": channel}}); reply.Error != nil {
+		t.Fatalf("subscribe: %#v", *reply.Error)
+	}
 	admitter, ok := server.(interface{ TryPublishEphemeral(string, []byte) bool })
 	if !ok {
 		t.Fatal("HostLink has no transient admission seam")
 	}
-	if admitter.TryPublishEphemeral(hostlink.ChannelFor(residencyKey(testSession)), []byte(`{"type":"ephemeral_publication"}`)) {
-		t.Fatal("Centrifuge admitted a transient frame without trustworthy queue headroom")
+	frames := [][]byte{[]byte(`{"event_id":"before"}`), []byte(`{"type":"ephemeral_publication"}`), []byte(`{"event_id":"after"}`)}
+	if err := server.Publish(channel, frames[0]); err != nil {
+		t.Fatal(err)
+	}
+	if !admitter.TryPublishEphemeral(channel, frames[1]) {
+		t.Fatal("first transient frame was refused despite an empty bucket")
+	}
+	if err := server.Publish(channel, frames[2]); err != nil {
+		t.Fatal(err)
+	}
+	var received []push
+	for len(received) < len(frames) {
+		connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, raw, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("read frame %d: %v", len(received), err)
+		}
+		for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte{'\n'}) {
+			var got push
+			if err := json.Unmarshal(line, &got); err != nil || got.Push == nil || got.Push.Pub == nil {
+				t.Fatalf("frame %d = %s, decode error %v", len(received), line, err)
+			}
+			received = append(received, got)
+		}
+	}
+	if len(received) != len(frames) {
+		t.Fatalf("received %d frames, want %d", len(received), len(frames))
+	}
+	for i, want := range frames {
+		got := received[i]
+		if got.Push.Channel != channel || string(got.Push.Pub.Data) != string(want) {
+			t.Fatalf("frame %d = %s on %q, want %s on %q", i, got.Push.Pub.Data, got.Push.Channel, want, channel)
+		}
+	}
+}
+
+// A stalled replica may be disconnected when its own Centrifuge queue fills;
+// another replica must continue to receive every enduring frame in order.
+func TestSlowSubscriberDoesNotLoseOrReorderEnduringForHealthySubscriber(t *testing.T) {
+	f := newFixture(t)
+	server, httpServer := startServer(t, &recordingAuthenticator{wantToken: testCredential}, hostlink.Config{Multiplexer: f.mux})
+	defer closeServers(t, server, httpServer)
+	channel := hostlink.ChannelFor(residencyKey(testSession))
+	openSubscriber := func() *websocket.Conn {
+		connection := dial(t, httpServer.URL, "")
+		if reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}}); reply.Connect == nil {
+			t.Fatalf("connect reply = %#v", reply)
+		}
+		acceptedRPC(t, rpc(t, connection, 2, hostlink.MethodBind, bindRequest(testSession)))
+		if reply := sendCommand(t, connection, 3, map[string]any{"id": 3, "subscribe": map[string]any{"channel": channel}}); reply.Error != nil {
+			t.Fatalf("subscribe: %#v", *reply.Error)
+		}
+		return connection
+	}
+	slow := openSubscriber()
+	defer slow.Close()
+	healthy := openSubscriber()
+	defer healthy.Close()
+	const count = 320 // More than a 1 MiB queue at 4 KiB per publication.
+	for i := 0; i < count; i++ {
+		prefix := fmt.Sprintf(`{"seq":%d,"padding":"`, i)
+		payload := []byte(prefix + strings.Repeat("x", 4096-len(prefix)-2) + `"}`)
+		if err := server.Publish(channel, payload); err != nil {
+			t.Fatalf("Publish enduring %d: %v", i, err)
+		}
+		healthy.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, raw, err := healthy.ReadMessage()
+		if err != nil {
+			t.Fatalf("healthy read %d: %v", i, err)
+		}
+		var received struct {
+			Push struct {
+				Pub struct {
+					Data struct {
+						Seq int `json:"seq"`
+					} `json:"data"`
+				} `json:"pub"`
+			} `json:"push"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(raw), &received); err != nil || received.Push.Pub.Data.Seq != i {
+			t.Fatalf("healthy frame %d = %s, decode error %v", i, raw, err)
+		}
+	}
+	// The stalled link either catches up in the same order or is disconnected
+	// with an ordered prefix. Its queue never silently skips an enduring frame.
+	seen := 0
+	for seen < count {
+		slow.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, raw, err := slow.ReadMessage()
+		if err != nil {
+			var timeout net.Error
+			if seen == 0 || errors.As(err, &timeout) && timeout.Timeout() {
+				t.Fatalf("slow subscriber received %d enduring frames before error: %v", seen, err)
+			}
+			var closeError *websocket.CloseError
+			if !errors.As(err, &closeError) && !errors.Is(err, io.EOF) {
+				t.Fatalf("slow subscriber error after %d frames: %v", seen, err)
+			}
+			break
+		}
+		for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte{'\n'}) {
+			var frame struct {
+				Push struct {
+					Pub struct {
+						Data struct {
+							Seq int `json:"seq"`
+						} `json:"data"`
+					} `json:"pub"`
+				} `json:"push"`
+			}
+			if err := json.Unmarshal(line, &frame); err != nil || frame.Push.Pub.Data.Seq != seen {
+				t.Fatalf("slow frame %d = %s, decode error %v", seen, line, err)
+			}
+			seen++
+		}
 	}
 }
