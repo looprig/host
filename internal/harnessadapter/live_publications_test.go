@@ -2,6 +2,8 @@ package harnessadapter
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -81,8 +83,12 @@ func TestLivePublicationsDropOtherChunksAndFailUncommittedEnduring(t *testing.T)
 	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, JournalSeq: 3}
 	select {
 	case got, open := <-publications:
-		if open {
-			t.Fatalf("unexpected publication after uncommitted enduring: %+v", got)
+		var missing *MissingCommittedFieldError
+		if !open || !errors.As(got.Terminal, &missing) {
+			t.Fatalf("terminal cause = %+v (open %v), want typed missing commit", got, open)
+		}
+		if _, open := <-publications; open {
+			t.Fatal("live stream did not close after terminal cause")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("uncommitted enduring did not close the live tail")
@@ -97,21 +103,39 @@ func TestLiveEphemeralPressureDoesNotSpendEnduringBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < committedEgressBuffer; i++ {
+		subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: fmt.Sprintf("event-%d", i), JournalSeq: uint64(i + 1), CoveredThrough: uint64(i + 1), PublicBody: []byte(`{"type":"SessionActive"}`)}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(subscription.deliveries) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("pump did not consume 256 enduring frames")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	for i := 0; i < 64; i++ {
 		subscription.deliveries <- liveDelta(&content.TextChunk{Text: "x"})
 	}
-	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "after-pressure", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
-	deadline := time.After(5 * time.Second)
+	for len(subscription.deliveries) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("pump stopped consuming ephemerals")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if drops := runtime.(interface{ EphemeralDrops() uint64 }).EphemeralDrops(); drops == 0 {
+		t.Fatal("extra ephemerals did not drop")
+	}
+	timeout := time.After(5 * time.Second)
 	for {
 		select {
 		case got, open := <-publications:
 			if !open {
 				t.Fatal("ephemeral pressure closed the pump")
 			}
-			if got.Enduring != nil && got.Enduring.EventID == "after-pressure" {
+			if got.Enduring != nil && got.Enduring.EventID == "event-255" {
 				return
 			}
-		case <-deadline:
+		case <-timeout:
 			t.Fatal("enduring publication was delayed by ephemeral pressure")
 		}
 	}

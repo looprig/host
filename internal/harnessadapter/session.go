@@ -3,6 +3,7 @@ package harnessadapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/looprig/core/content"
@@ -132,6 +133,17 @@ const committedEgressBuffer = 256
 
 const liveEphemeralBuffer = 16
 
+// MissingCommittedFieldError ends a mixed subscription when an enduring
+// delivery lacks the durable fields required for journal repair.
+type MissingCommittedFieldError struct {
+	EventID    string
+	JournalSeq uint64
+}
+
+func (e *MissingCommittedFieldError) Error() string {
+	return fmt.Sprintf("harnessadapter: enduring delivery %q at sequence %d lacks committed fields", e.EventID, e.JournalSeq)
+}
+
 // SubscribeLivePublic opens one ordered Harness subscription for both public
 // classes. Every enduring delivery must carry committed bytes.
 func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
@@ -168,6 +180,9 @@ func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscrip
 		case <-ctx.Done():
 			return
 		case send <- first:
+			if first.Terminal != nil {
+				return
+			}
 			if first.Enduring != nil {
 				enduring--
 			} else {
@@ -183,7 +198,12 @@ func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscrip
 				return
 			}
 			if delivery.Event.Class() == event.Enduring {
-				if !delivery.Committed() || enduring == committedEgressBuffer {
+				if !delivery.Committed() {
+					pending = append(pending, department.LivePublication{Terminal: &MissingCommittedFieldError{EventID: delivery.EventID, JournalSeq: delivery.JournalSeq}})
+					deliveries = nil
+					continue
+				}
+				if enduring == committedEgressBuffer {
 					return
 				}
 				publication := sessionwire.EnduringPublication{

@@ -363,10 +363,11 @@ type PublicationSubscriber interface {
 }
 
 // LivePublication is one member of a runtime's ordered public event stream.
-// Exactly one publication is set.
+// Exactly one publication or terminal cause is set.
 type LivePublication struct {
 	Enduring  *sessionwire.EnduringPublication
 	Ephemeral *sessionwire.EphemeralPublication
+	Terminal  error
 }
 
 // LivePublicationSubscriber is optional. Older runtimes retain the committed
