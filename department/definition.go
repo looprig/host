@@ -377,6 +377,13 @@ type LivePublicationSubscriber interface {
 	SubscribeLivePublic(context.Context) (<-chan LivePublication, error)
 }
 
+// ReasoningPublicationSubscriber optionally supplies the same ordered stream
+// with visible reasoning deltas included. The ordinary live subscription keeps
+// its text-only behavior.
+type ReasoningPublicationSubscriber interface {
+	SubscribeLivePublicWithReasoning(context.Context) (<-chan LivePublication, error)
+}
+
 // RuntimeCommand is one admitted command as Host hands it to a runtime.
 //
 // IT IS NOT sessionwire.CommandEnvelope, AND THAT WAS A DEFECT RATHER THAN A

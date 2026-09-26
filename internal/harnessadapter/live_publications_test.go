@@ -2,6 +2,7 @@ package harnessadapter
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -158,5 +159,64 @@ func TestOversizedTextChunkIsDroppedBeforeTheEnduringEvent(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("enduring publication was delayed")
+	}
+}
+
+func TestReasoningSubscriptionProjectsOnlyVisibleThinkingInOrder(t *testing.T) {
+	subscription := newFakeSubscription(nil)
+	var filters []event.EventFilter
+	runtime := boundFor(t, liveController{fullController: newFullController(newFakeSubscription(nil), nil, nil), subscription: subscription, filters: &filters})
+	live, ok := runtime.(interface {
+		SubscribeLivePublicWithReasoning(context.Context) (<-chan department.LivePublication, error)
+	})
+	if !ok {
+		t.Fatal("bound runtime has no reasoning subscription")
+	}
+	publications, err := live.SubscribeLivePublicWithReasoning(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: "why"})
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Signature: "signature-only"})
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: "redacted", ProviderState: []byte(`{"redacted":true}`)})
+	subscription.deliveries <- liveDelta(&content.ToolUseChunk{InputJSON: `{"secret":"tool"}`})
+	subscription.deliveries <- liveDelta(&content.ImageChunk{})
+	subscription.deliveries <- liveDelta(&content.RefusalChunk{Text: "refused"})
+	subscription.deliveries <- liveDelta(&content.TextChunk{Text: "answer"})
+	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
+	for i, want := range []string{`"chunk_type":"thinking","thinking":"why"`, `"chunk_type":"text","text":"answer"`, "durable"} {
+		select {
+		case got := <-publications:
+			if want == "durable" {
+				if got.Enduring == nil || got.Enduring.EventID != "durable" {
+					t.Fatalf("publication %d = %+v", i, got)
+				}
+			} else if got.Ephemeral == nil || !bytes.Contains(got.Ephemeral.Body, []byte(want)) {
+				t.Fatalf("publication %d = %+v, want %s", i, got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("publication %d did not arrive", i)
+		}
+	}
+}
+
+func TestOversizedThinkingChunkIsDroppedBeforeEnduring(t *testing.T) {
+	subscription := newFakeSubscription(nil)
+	var filters []event.EventFilter
+	runtime := boundFor(t, liveController{fullController: newFullController(newFakeSubscription(nil), nil, nil), subscription: subscription, filters: &filters})
+	live := runtime.(department.ReasoningPublicationSubscriber)
+	publications, err := live.SubscribeLivePublicWithReasoning(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: strings.Repeat("x", 2049)})
+	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
+	select {
+	case got := <-publications:
+		if got.Enduring == nil || got.Enduring.EventID != "durable" {
+			t.Fatalf("first publication = %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("enduring event was delayed by oversized reasoning")
 	}
 }

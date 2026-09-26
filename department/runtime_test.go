@@ -1142,6 +1142,31 @@ func TestRigRuntimeForwardsOptionalLivePublicationCapability(t *testing.T) {
 	}
 }
 
+type reasoningRigSession struct{ liveRigSession }
+
+func (s reasoningRigSession) SubscribeLivePublicWithReasoning(context.Context) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+
+func TestRigRuntimeForwardsOptionalReasoningSubscription(t *testing.T) {
+	stream := make(chan department.LivePublication)
+	target := rigTarget(t, &testkit.FakeRig{Session: reasoningRigSession{liveRigSession: liveRigSession{FullSession: testkit.NewFullSession(rigSessionUUID), stream: stream}}})
+	runtime, err := target.Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := runtime.(interface {
+		SubscribeLivePublicWithReasoning(context.Context) (<-chan department.LivePublication, error)
+	})
+	if !ok {
+		t.Fatal("adapted runtime lost reasoning subscription")
+	}
+	got, err := reasoning.SubscribeLivePublicWithReasoning(t.Context())
+	if err != nil || got != stream {
+		t.Fatalf("reasoning stream = %v, %v", got, err)
+	}
+}
+
 // forwardingWrapper is the decorator shape O2 will actually build.
 type forwardingWrapper struct{ department.Runtime }
 

@@ -315,7 +315,11 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
 	if live, ok := session.(LivePublicationSubscriber); ok {
-		return &liveRigRuntime{rigRuntime: adapted, LivePublicationSubscriber: live}, nil
+		wrapped := &liveRigRuntime{rigRuntime: adapted, LivePublicationSubscriber: live}
+		if reasoning, ok := session.(ReasoningPublicationSubscriber); ok {
+			return &reasoningRigRuntime{liveRigRuntime: wrapped, ReasoningPublicationSubscriber: reasoning}, nil
+		}
+		return wrapped, nil
 	}
 	return adapted, nil
 }
@@ -326,6 +330,11 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 type liveRigRuntime struct {
 	*rigRuntime
 	LivePublicationSubscriber
+}
+
+type reasoningRigRuntime struct {
+	*liveRigRuntime
+	ReasoningPublicationSubscriber
 }
 
 // rigRuntime is the adapter O1.1 said would be mandatory.

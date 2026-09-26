@@ -147,6 +147,16 @@ func (e *MissingCommittedFieldError) Error() string {
 // SubscribeLivePublic opens one ordered Harness subscription for both public
 // classes. Every enduring delivery must carry committed bytes.
 func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
+	return s.subscribeLivePublic(ctx, false)
+}
+
+// SubscribeLivePublicWithReasoning adds visible reasoning deltas to the same
+// ordered subscription. Opaque provider state and signature-only deltas stay private.
+func (s *boundSession) SubscribeLivePublicWithReasoning(ctx context.Context) (<-chan department.LivePublication, error) {
+	return s.subscribeLivePublic(ctx, true)
+}
+
+func (s *boundSession) subscribeLivePublic(ctx context.Context, includeReasoning bool) (<-chan department.LivePublication, error) {
 	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
 	})
@@ -154,7 +164,7 @@ func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan departme
 		return nil, err
 	}
 	published := make(chan department.LivePublication)
-	go s.pumpLive(ctx, subscription, published)
+	go s.pumpLive(ctx, subscription, published, includeReasoning)
 	return published, nil
 }
 
@@ -164,7 +174,7 @@ func (s *boundSession) EphemeralDrops() uint64 { return s.ephDrops.Load() }
 
 // pumpLive keeps producer order in a bounded queue. Ephemeral entries have
 // their own limit, so they cannot consume the 256 enduring slots.
-func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscription, out chan<- department.LivePublication) {
+func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscription, out chan<- department.LivePublication, includeReasoning bool) {
 	defer close(out)
 	defer func() { _ = subscription.Close() }()
 	pending := make([]department.LivePublication, 0, committedEgressBuffer+liveEphemeralBuffer)
@@ -220,8 +230,18 @@ func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscrip
 				s.ephDrops.Add(1)
 				continue
 			}
-			chunk, ok := delta.Chunk.(*content.TextChunk)
-			if !ok || chunk == nil || chunk.Text == "" || len(chunk.Text) > livetext.MaxBytes || ephemeral == liveEphemeralBuffer {
+			var preview string
+			switch chunk := delta.Chunk.(type) {
+			case *content.TextChunk:
+				if chunk != nil {
+					preview = chunk.Text
+				}
+			case *content.ThinkingChunk:
+				if includeReasoning && chunk != nil && len(chunk.ProviderState) == 0 {
+					preview = chunk.Thinking
+				}
+			}
+			if preview == "" || len(preview) > livetext.MaxBytes || ephemeral == liveEphemeralBuffer {
 				s.ephDrops.Add(1)
 				continue
 			}
