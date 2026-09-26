@@ -497,9 +497,10 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 				if !merged {
 					flush()
 					if pending != nil {
-						gapped[key] = true
+						gapped[textKey(pendingText)] = true
+						pending = nil
+						stopTimer()
 						tail.dropEphemeral()
-						goto projectionDone
 					}
 					pending = &value
 					pendingText = decoded

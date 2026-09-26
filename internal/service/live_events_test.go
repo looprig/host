@@ -173,6 +173,37 @@ func TestPendingThinkingAndTextNeverMerge(t *testing.T) {
 	}
 }
 
+func TestRefusedThinkingFlushKeepsLaterTextInSameStep(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 3)
+	timer := &manualFlushTimer{ticks: make(chan time.Time, 3)}
+	publications := &refusingPublications{refuse: 1}
+	tails, err := service.NewTails(service.TailOptions{Publications: publications, Routes: &recordingRoutes{}, IncludeReasoning: true, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, body json.RawMessage, _ uint64) (json.RawMessage, error) { return body, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- thinkingFrame(key, "loop", "turn", "why")
+	stream <- liveFrame(key, "loop", "turn", "hello ")
+	waitFor(t, "refused thinking flush", func() bool { return publications.tried() == 1 })
+	stream <- liveFrame(key, "loop", "turn", "world")
+	waitFor(t, "later same-step text", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 1
+	})
+	frames := publications.recorded()
+	if len(frames) != 1 || !bytes.Contains(frames[0].payload, []byte(`"text":"hello world"`)) || tail.EphemeralDrops() != 1 {
+		t.Fatalf("published frames = %+v, drops = %d; want joined text and one dropped thinking frame", frames, tail.EphemeralDrops())
+	}
+}
+
 func TestThinkingCapGapAndBoundary(t *testing.T) {
 	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
 	stream := make(chan department.LivePublication, 7)
@@ -232,7 +263,7 @@ func TestEscapedThinkingNeverExceedsTransportCap(t *testing.T) {
 	}
 }
 
-func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {
+func TestDifferentKeyReplacesRefusedOlderPreview(t *testing.T) {
 	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
 	stream := make(chan department.LivePublication, 6)
 	timer := &manualFlushTimer{ticks: make(chan time.Time, 4)}
@@ -254,18 +285,24 @@ func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {
 		}
 		return publications.tried() > 0
 	})
-	stream <- liveFrame(key, "loop-b", "turn-b", "lost")
-	waitFor(t, "different-key drop", func() bool { return tail.EphemeralDrops() >= 1 })
+	stream <- liveFrame(key, "loop-b", "turn-b", "kept")
+	waitFor(t, "older-key drop", func() bool { return tail.EphemeralDrops() >= 1 })
 	publications.allowNext()
-	waitFor(t, "older pending preview", func() bool {
+	waitFor(t, "new pending preview", func() bool {
 		select {
 		case timer.ticks <- time.Now():
 		default:
 		}
 		return tail.EphemeralPublished() == 1
 	})
-	stream <- liveFrame(key, "loop-b", "turn-b", "must stay suppressed")
-	waitFor(t, "gapped continuation", func() bool { return tail.EphemeralDrops() >= 2 })
+	stream <- liveFrame(key, "loop-b", "turn-b", "continues")
+	waitFor(t, "same-key continuation", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 2
+	})
 	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "boundary", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"StepDone","loop_id":"loop-b"}`)}}
 	waitFor(t, "boundary", func() bool { return tail.Published() == 1 })
 	stream <- liveFrame(key, "loop-b", "turn-b", "resumed")
@@ -274,9 +311,9 @@ func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {
 		case timer.ticks <- time.Now():
 		default:
 		}
-		return tail.EphemeralPublished() == 2
+		return tail.EphemeralPublished() == 3
 	})
-	if frames := publications.recorded(); len(frames) != 3 || !bytes.Contains(frames[2].payload, []byte(`"text":"resumed"`)) {
+	if frames := publications.recorded(); len(frames) != 4 || !bytes.Contains(frames[0].payload, []byte(`"text":"kept"`)) || !bytes.Contains(frames[1].payload, []byte(`"text":"continues"`)) || !bytes.Contains(frames[3].payload, []byte(`"text":"resumed"`)) {
 		t.Fatalf("frames after gap: %+v", frames)
 	}
 }
