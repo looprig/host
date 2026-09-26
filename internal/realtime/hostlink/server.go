@@ -22,6 +22,9 @@ type Authenticator interface {
 type Config struct {
 	TenantID      sessionwire.TenantID
 	Authenticator Authenticator
+	// TransientRateBytesPerSecond and TransientBurstBytes default to 32 KiB/s and 8 KiB.
+	TransientRateBytesPerSecond int
+	TransientBurstBytes         int
 
 	// PingInterval and PongTimeout are optional but must be supplied together:
 	// setting one without the other is rejected. When both are zero HostLink

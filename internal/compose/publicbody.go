@@ -74,7 +74,11 @@ func (s *Service) publicProjectors(ctx context.Context, request residency.Owners
 	}
 	transientIDs := enduringIDs
 	transientIDs.Commands = publicbody.NewIndex(source)
-	return tailProjectors(enduringIDs, transientIDs, s.options.logger(), request.Key, s.projectionRetry())
+	enduring, transient := tailProjectors(enduringIDs, transientIDs, s.options.logger(), request.Key, s.projectionRetry())
+	if s.options.LiveText == nil {
+		transient = nil
+	}
+	return enduring, transient
 }
 
 // tailProjectors gives the enduring path its mapping-read retry and the

@@ -333,6 +333,25 @@ func TestComposeRefusesWhatItCannotRun(t *testing.T) {
 	}
 }
 
+func TestComposeRejectsNegativeLiveTextLimits(t *testing.T) {
+	for _, choice := range []struct {
+		name    string
+		options host.LiveTextOptions
+	}{
+		{"rate", host.LiveTextOptions{RateBytesPerSecond: -1}},
+		{"burst", host.LiveTextOptions{BurstBytes: -1}},
+		{"flush", host.LiveTextOptions{FlushInterval: -time.Millisecond}},
+	} {
+		t.Run(choice.name, func(t *testing.T) {
+			blueprint := newComposeFixture(t).blueprint(t)
+			blueprint.LiveText = &choice.options
+			if _, err := host.Compose(t.Context(), blueprint); err == nil {
+				t.Fatal("negative live-text limit was accepted")
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The whole path, in process and over the link
 // ---------------------------------------------------------------------------

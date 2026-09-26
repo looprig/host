@@ -194,6 +194,22 @@ type DrainOptions struct {
 	PublishBound time.Duration
 }
 
+// LiveTextOptions enables transient text previews. Zero fields use safe defaults.
+// Enable only after Factory v0.12.1 or later is deployed; earlier Factory
+// mailboxes charge every frame, and WUI through v0.4.0 discards previews.
+type LiveTextOptions struct {
+	RateBytesPerSecond int
+	BurstBytes         int
+	FlushInterval      time.Duration
+}
+
+func composeLiveText(value *LiveTextOptions) *compose.LiveTextOptions {
+	if value == nil {
+		return nil
+	}
+	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval}
+}
+
 // Composition is one runnable Host, described.
 type Composition struct {
 	// Options is the Host's configuration. ITS COLLABORATOR FIELDS MUST BE
@@ -211,6 +227,8 @@ type Composition struct {
 
 	Link  LinkOptions
 	Drain DrainOptions
+	// LiveText is opt-in. Nil keeps the v0.11.0 committed-only relay.
+	LiveText *LiveTextOptions
 
 	// CompatibilityTimeout bounds the synchronous compatibility wait; WorkPoll
 	// is how often resident sessions are asked what they are doing. Both are
@@ -372,6 +390,7 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 
 	inner, err := compose.New(compose.Options{
 		Host:                 resolved,
+		LiveText:             composeLiveText(blueprint.LiveText),
 		HostGeneration:       blueprint.Generation,
 		Clock:                clock,
 		Leases:               adapted,
@@ -424,6 +443,20 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 
 // validate holds every rule Compose applies before it opens anything.
 func (c Composition) validate() error {
+	if c.LiveText != nil {
+		for _, value := range []struct {
+			field   string
+			invalid bool
+		}{
+			{"LiveText.RateBytesPerSecond", c.LiveText.RateBytesPerSecond < 0},
+			{"LiveText.BurstBytes", c.LiveText.BurstBytes < 0},
+			{"LiveText.FlushInterval", c.LiveText.FlushInterval < 0},
+		} {
+			if value.invalid {
+				return &InvalidCompositionError{Field: value.field, Reason: "must not be negative"}
+			}
+		}
+	}
 	for _, supplied := range []struct {
 		field string
 		set   bool

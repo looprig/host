@@ -27,6 +27,8 @@ import (
 // restates a value host.New already checked: the Host is taken whole and every
 // identity, endpoint, placement, capacity and timing is read from it.
 type Options struct {
+	// LiveText enables transient text only when non-nil.
+	LiveText *LiveTextOptions
 	// Host is the validated Host this composition runs.
 	Host *hostconfig.Host
 
@@ -172,6 +174,13 @@ type Options struct {
 	// discards: logging is never a precondition of running. What it says is
 	// stated where each record is written; see logAttach.
 	Logger *slog.Logger
+}
+
+// LiveTextOptions configures the opt-in transient relay and transport budget.
+type LiveTextOptions struct {
+	RateBytesPerSecond int
+	BurstBytes         int
+	FlushInterval      time.Duration
 }
 
 // capabilities are the capability tokens this composition's links advertise.
@@ -943,22 +952,43 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 		return nil, err
 	}
 	server, err := hostlink.NewCentrifugeServer(hostlink.Config{
-		TenantID:      tenant,
-		Authenticator: s.options.Auth,
-		PingInterval:  s.options.PingInterval,
-		PongTimeout:   s.options.PongTimeout,
-		Multiplexer:   mux,
-		Capabilities:  s.capabilities(),
+		TenantID:                    tenant,
+		Authenticator:               s.options.Auth,
+		PingInterval:                s.options.PingInterval,
+		PongTimeout:                 s.options.PongTimeout,
+		Multiplexer:                 mux,
+		Capabilities:                s.capabilities(),
+		TransientRateBytesPerSecond: s.liveTextRate(),
+		TransientBurstBytes:         s.liveTextBurst(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux})
+	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux, FlushInterval: s.liveTextFlush(), Logger: s.options.logger()})
 	if err != nil {
 		_ = server.Close(context.Background())
 		return nil, err
 	}
 	return &tenantLink{tenant: tenant, mux: mux, server: server, tails: tails}, nil
+}
+
+func (s *Service) liveTextRate() int {
+	if s.options.LiveText != nil {
+		return s.options.LiveText.RateBytesPerSecond
+	}
+	return 0
+}
+func (s *Service) liveTextBurst() int {
+	if s.options.LiveText != nil {
+		return s.options.LiveText.BurstBytes
+	}
+	return 0
+}
+func (s *Service) liveTextFlush() time.Duration {
+	if s.options.LiveText != nil {
+		return s.options.LiveText.FlushInterval
+	}
+	return 0
 }
 
 // Department is the immutable set of launch targets this Host serves.

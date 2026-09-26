@@ -166,9 +166,19 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		}
 		return reply, nil
 	})
+	rate, burst := config.TransientRateBytesPerSecond, config.TransientBurstBytes
+	if rate == 0 {
+		rate = ephemeralRateBytesPerSecond
+	}
+	if burst == 0 {
+		burst = ephemeralBurstBytes
+	}
+	if rate < 0 || burst < 0 {
+		return nil, errors.New("hostlink: transient rate and burst must be positive")
+	}
 	server := &centrifugeServer{
 		node:       node,
-		budget:     newEphemeralBudget(ephemeralRateBytesPerSecond, ephemeralBurstBytes, time.Now),
+		budget:     newEphemeralBudget(rate, burst, time.Now),
 		subscribed: make(map[string]map[string]uint64),
 	}
 	if config.Multiplexer != nil {

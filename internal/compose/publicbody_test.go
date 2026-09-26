@@ -13,10 +13,77 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/publicbody"
 	"github.com/looprig/host/internal/registry"
+	"github.com/looprig/host/internal/residency"
+	"github.com/looprig/host/internal/service"
 )
+
+type runtimeWithoutRigID struct{ department.Runtime }
+type composeDualSource struct {
+	committed <-chan sessionwire.EnduringPublication
+	liveCalls int
+}
+
+func (s *composeDualSource) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
+	return s.committed, nil
+}
+func (s *composeDualSource) SubscribeLivePublic(context.Context) (<-chan department.LivePublication, error) {
+	s.liveCalls++
+	return nil, errors.New("mixed stream requested")
+}
+
+type composeTransientWire struct {
+	wirePublications
+	transient atomic.Int32
+}
+
+func (w *composeTransientWire) TryPublishEphemeral(string, []byte) bool {
+	w.transient.Add(1)
+	return true
+}
+
+type runtimeWithRigID struct{ department.Runtime }
+
+func (runtimeWithRigID) RigSessionID() uuid.UUID { return uuid.MustParse(supervisedRuntime) }
+
+func TestLiveTextDefaultsOffWithRigRuntime(t *testing.T) {
+	s := &Service{options: Options{}}
+	enduring, transient := s.publicProjectors(t.Context(), residency.OwnershipRequest{Key: supervisedKey, Runtime: runtimeWithRigID{}})
+	if enduring == nil || transient != nil {
+		t.Fatal("default composition did not retain only the enduring projector")
+	}
+}
+
+func TestLiveTextOptInStillSuppressesRuntimeWithoutRigID(t *testing.T) {
+	s := &Service{options: Options{LiveText: &LiveTextOptions{}}}
+	enduring, transient := s.publicProjectors(t.Context(), residency.OwnershipRequest{Key: supervisedKey, Runtime: runtimeWithoutRigID{}})
+	if enduring != nil || transient != nil {
+		t.Fatal("runtime without rig ID received a transient projector")
+	}
+	committed := make(chan sessionwire.EnduringPublication, 1)
+	committed <- sessionwire.EnduringPublication{TenantID: supervisedKey.TenantID, SessionID: supervisedKey.SessionID, EventID: "event-1", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"x"}`)}
+	source := &composeDualSource{committed: committed}
+	wire := &composeTransientWire{}
+	tails, err := service.NewTails(service.TailOptions{Publications: wire, Routes: &countingRoutes{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), supervisedKey, source, enduring, transient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	deadline := time.Now().Add(time.Second)
+	for tail.Published() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tail.Published() != 1 || tail.EphemeralPublished() != 0 || wire.transient.Load() != 0 || source.liveCalls != 0 {
+		t.Fatalf("no-ID runtime emitted transient frames: enduring %d, transient %d, attempts %d, mixed subscriptions %d", tail.Published(), tail.EphemeralPublished(), wire.transient.Load(), source.liveCalls)
+	}
+}
 
 // pagedInbox serves a session's acceptance records in pages, as the store does.
 type pagedInbox struct{ records []commands.Command }
