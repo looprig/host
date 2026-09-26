@@ -352,6 +352,27 @@ func TestComposeRejectsNegativeLiveTextLimits(t *testing.T) {
 	}
 }
 
+func TestComposeRejectsUnsafeLiveTextLimits(t *testing.T) {
+	for _, choice := range []struct {
+		name, field string
+		options     host.LiveTextOptions
+	}{
+		{"burst below frame cap", "LiveText.BurstBytes", host.LiveTextOptions{BurstBytes: 4095}},
+		{"rate exceeds queue bound", "LiveText.RateBytesPerSecond", host.LiveTextOptions{RateBytesPerSecond: 35_000}},
+		{"burst reaches queue bound", "LiveText.BurstBytes", host.LiveTextOptions{BurstBytes: 65_536}},
+	} {
+		t.Run(choice.name, func(t *testing.T) {
+			blueprint := newComposeFixture(t).blueprint(t)
+			blueprint.LiveText = &choice.options
+			_, err := host.Compose(t.Context(), blueprint)
+			var invalid *host.InvalidCompositionError
+			if !errors.As(err, &invalid) || invalid.Field != choice.field {
+				t.Fatalf("error = %v, want InvalidCompositionError for %s", err, choice.field)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The whole path, in process and over the link
 // ---------------------------------------------------------------------------

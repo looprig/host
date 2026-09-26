@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/compose"
 	hostconfig "github.com/looprig/host/internal/hostconfig"
+	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/residency"
 	"github.com/looprig/host/internal/sessionstoreadapter"
 )
@@ -455,6 +456,23 @@ func (c Composition) validate() error {
 			if value.invalid {
 				return &InvalidCompositionError{Field: value.field, Reason: "must not be negative"}
 			}
+		}
+		rate, burst := c.LiveText.RateBytesPerSecond, c.LiveText.BurstBytes
+		if rate == 0 {
+			rate = hostlink.DefaultTransientRateBytesPerSecond
+		}
+		if burst == 0 {
+			burst = hostlink.DefaultTransientBurstBytes
+		}
+		if burst < hostlink.MaxTransientFrameBytes {
+			return &InvalidCompositionError{Field: "LiveText.BurstBytes", Reason: "must admit a maximum 4 KiB encoded frame"}
+		}
+		if burst >= hostlink.ClientQueueMaxBytes || rate > (hostlink.ClientQueueMaxBytes-1-burst)/30 {
+			field := "LiveText.RateBytesPerSecond"
+			if c.LiveText.RateBytesPerSecond == 0 {
+				field = "LiveText.BurstBytes"
+			}
+			return &InvalidCompositionError{Field: field, Reason: "burst + rate × 30 seconds must stay below the 1 MiB client queue limit"}
 		}
 	}
 	for _, supplied := range []struct {

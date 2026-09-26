@@ -43,6 +43,14 @@ const (
 	clientQueueMaxBytes         = 1024 * 1024
 )
 
+// Transient admission limits are shared with public Composition validation.
+const (
+	DefaultTransientRateBytesPerSecond = ephemeralRateBytesPerSecond
+	DefaultTransientBurstBytes         = ephemeralBurstBytes
+	MaxTransientFrameBytes             = ephemeralMaxFrameBytes
+	ClientQueueMaxBytes                = clientQueueMaxBytes
+)
+
 type centrifugeServer struct {
 	node             *centrifuge.Node
 	handler          http.Handler
@@ -86,6 +94,9 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		if !slices.Contains(advertisedCapabilities, capability) || slices.Contains(config.Capabilities[:index], capability) {
 			return nil, errors.New("hostlink: " + strconv.Quote(capability) + " is not a capability this package can advertise, or is named twice")
 		}
+	}
+	if config.TransientRateBytesPerSecond < 0 || config.TransientBurstBytes < 0 {
+		return nil, errors.New("hostlink: transient rate and burst must be positive")
 	}
 	metrics := prometheus.NewRegistry()
 	nodeConfig := centrifuge.Config{
@@ -172,9 +183,6 @@ func NewCentrifugeServer(config Config) (Server, error) {
 	}
 	if burst == 0 {
 		burst = ephemeralBurstBytes
-	}
-	if rate < 0 || burst < 0 {
-		return nil, errors.New("hostlink: transient rate and burst must be positive")
 	}
 	server := &centrifugeServer{
 		node:       node,
