@@ -362,6 +362,20 @@ type PublicationSubscriber interface {
 	SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error)
 }
 
+// LivePublication is one member of a runtime's ordered public event stream.
+// Exactly one publication is set.
+type LivePublication struct {
+	Enduring  *sessionwire.EnduringPublication
+	Ephemeral *sessionwire.EphemeralPublication
+}
+
+// LivePublicationSubscriber is optional. Older runtimes retain the committed
+// subscription above; a runtime implementing this capability supplies both
+// classes from one producer subscription.
+type LivePublicationSubscriber interface {
+	SubscribeLivePublic(context.Context) (<-chan LivePublication, error)
+}
+
 // RuntimeCommand is one admitted command as Host hands it to a runtime.
 //
 // IT IS NOT sessionwire.CommandEnvelope, AND THAT WAS A DEFECT RATHER THAN A

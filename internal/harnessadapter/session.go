@@ -3,17 +3,21 @@ package harnessadapter
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
+	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
+	harnesswire "github.com/looprig/harness/pkg/sessionwire"
 
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/createbody"
 	"github.com/looprig/host/internal/gateresponse"
+	"github.com/looprig/host/internal/livetext"
 )
 
 // boundSession is one launched harness session, expressed as the capabilities
@@ -41,7 +45,8 @@ type boundSession struct {
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
 
-	decode BlockDecoder
+	decode   BlockDecoder
+	ephDrops atomic.Uint64
 }
 
 // ID is Harness's identity for the session.
@@ -124,6 +129,93 @@ func (s *boundSession) SubscribeCommitted(
 // subscriber". Matching it means Host adds one buffer of the same depth rather
 // than a second, differently-sized answer to the same question.
 const committedEgressBuffer = 256
+
+const liveEphemeralBuffer = 16
+
+// SubscribeLivePublic opens one ordered Harness subscription for both public
+// classes. Every enduring delivery must carry committed bytes.
+func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
+	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
+		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	published := make(chan department.LivePublication)
+	go s.pumpLive(ctx, subscription, published)
+	return published, nil
+}
+
+// EphemeralDrops counts rejected and pressure-dropped preview publications.
+// It never includes payload text.
+func (s *boundSession) EphemeralDrops() uint64 { return s.ephDrops.Load() }
+
+// pumpLive keeps producer order in a bounded queue. Ephemeral entries have
+// their own limit, so they cannot consume the 256 enduring slots.
+func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscription, out chan<- department.LivePublication) {
+	defer close(out)
+	defer func() { _ = subscription.Close() }()
+	pending := make([]department.LivePublication, 0, committedEgressBuffer+liveEphemeralBuffer)
+	enduring, ephemeral := 0, 0
+	deliveries := subscription.Events()
+	for {
+		var send chan<- department.LivePublication
+		var first department.LivePublication
+		if len(pending) != 0 {
+			send, first = out, pending[0]
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case send <- first:
+			if first.Enduring != nil {
+				enduring--
+			} else {
+				ephemeral--
+			}
+			pending[0] = department.LivePublication{}
+			pending = pending[1:]
+		case delivery, open := <-deliveries:
+			if !open {
+				return
+			}
+			if delivery.Event == nil {
+				return
+			}
+			if delivery.Event.Class() == event.Enduring {
+				if !delivery.Committed() || enduring == committedEgressBuffer {
+					return
+				}
+				publication := sessionwire.EnduringPublication{
+					TenantID: s.tenant, SessionID: s.session,
+					EventID: sessionwire.EventID(delivery.EventID), JournalSeq: delivery.JournalSeq,
+					CoveredThrough: delivery.CoveredThrough, Body: delivery.PublicBody,
+				}
+				pending = append(pending, department.LivePublication{Enduring: &publication})
+				enduring++
+				continue
+			}
+			delta, ok := delivery.Event.(event.TokenDelta)
+			if !ok {
+				s.ephDrops.Add(1)
+				continue
+			}
+			chunk, ok := delta.Chunk.(*content.TextChunk)
+			if !ok || chunk == nil || chunk.Text == "" || len(chunk.Text) > livetext.MaxBytes || ephemeral == liveEphemeralBuffer {
+				s.ephDrops.Add(1)
+				continue
+			}
+			projection, err := harnesswire.Project(s.tenant, s.session, delta)
+			if err != nil || projection.Class != harnesswire.PublicEphemeral {
+				s.ephDrops.Add(1)
+				continue
+			}
+			publication := sessionwire.EphemeralPublication{TenantID: s.tenant, SessionID: s.session, Body: projection.Body}
+			pending = append(pending, department.LivePublication{Ephemeral: &publication})
+			ephemeral++
+		}
+	}
+}
 
 // pump translates deliveries into publications until the subscription or the
 // caller's context ends.

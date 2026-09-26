@@ -314,7 +314,18 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
+	if live, ok := session.(LivePublicationSubscriber); ok {
+		return &liveRigRuntime{rigRuntime: adapted, LivePublicationSubscriber: live}, nil
+	}
 	return adapted, nil
+}
+
+// liveRigRuntime exposes the optional mixed subscription only when the rig
+// session actually supplies it. A nil embedded interface would falsely
+// advertise the capability on older runtimes.
+type liveRigRuntime struct {
+	*rigRuntime
+	LivePublicationSubscriber
 }
 
 // rigRuntime is the adapter O1.1 said would be mandatory.

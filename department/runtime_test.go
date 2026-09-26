@@ -1109,6 +1109,39 @@ func TestRigSessionIDSurvivesAWrapperAndRefusesAStranger(t *testing.T) {
 	}
 }
 
+type liveRigSession struct {
+	*testkit.FullSession
+	stream <-chan department.LivePublication
+}
+
+func (s liveRigSession) SubscribeLivePublic(context.Context) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+
+func TestRigRuntimeForwardsOptionalLivePublicationCapability(t *testing.T) {
+	stream := make(chan department.LivePublication)
+	target := rigTarget(t, &testkit.FakeRig{Session: liveRigSession{FullSession: testkit.NewFullSession(rigSessionUUID), stream: stream}})
+	runtime, err := target.Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, ok := runtime.(department.LivePublicationSubscriber)
+	if !ok {
+		t.Fatal("adapted runtime lost the live-public capability")
+	}
+	got, err := live.SubscribeLivePublic(t.Context())
+	if err != nil || got != stream {
+		t.Fatalf("forwarded subscription = (%v, %v), want the rig's channel", got, err)
+	}
+	legacy, err := rigTarget(t, &testkit.FakeRig{Session: testkit.NewFullSession(rigSessionUUID)}).Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := legacy.(department.LivePublicationSubscriber); ok {
+		t.Fatal("legacy runtime falsely advertises live-public delivery")
+	}
+}
+
 // forwardingWrapper is the decorator shape O2 will actually build.
 type forwardingWrapper struct{ department.Runtime }
 
