@@ -151,7 +151,8 @@ func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan departme
 }
 
 // SubscribeLivePublicWithReasoning adds visible reasoning deltas to the same
-// ordered subscription. Opaque provider state and signature-only deltas stay private.
+// ordered subscription. Only visible text is projected; provider state and
+// signatures stay private even when they accompany that text.
 func (s *boundSession) SubscribeLivePublicWithReasoning(ctx context.Context) (<-chan department.LivePublication, error) {
 	return s.subscribeLivePublic(ctx, true)
 }
@@ -237,7 +238,7 @@ func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscrip
 					preview = chunk.Text
 				}
 			case *content.ThinkingChunk:
-				if includeReasoning && chunk != nil && len(chunk.ProviderState) == 0 {
+				if includeReasoning && chunk != nil {
 					preview = chunk.Thinking
 				}
 			}

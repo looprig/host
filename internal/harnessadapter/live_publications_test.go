@@ -178,20 +178,21 @@ func TestReasoningSubscriptionProjectsOnlyVisibleThinkingInOrder(t *testing.T) {
 	}
 	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: "why"})
 	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Signature: "signature-only"})
-	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: "redacted", ProviderState: []byte(`{"redacted":true}`)})
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{ProviderState: []byte(`{"thoughtSignature":"opaque-only"}`)})
+	subscription.deliveries <- liveDelta(&content.ThinkingChunk{Thinking: "Gemini thought", ProviderState: []byte(`{"thoughtSignature":"opaque-with-text"}`)})
 	subscription.deliveries <- liveDelta(&content.ToolUseChunk{InputJSON: `{"secret":"tool"}`})
 	subscription.deliveries <- liveDelta(&content.ImageChunk{})
 	subscription.deliveries <- liveDelta(&content.RefusalChunk{Text: "refused"})
 	subscription.deliveries <- liveDelta(&content.TextChunk{Text: "answer"})
 	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
-	for i, want := range []string{`"chunk_type":"thinking","thinking":"why"`, `"chunk_type":"text","text":"answer"`, "durable"} {
+	for i, want := range []string{`"chunk_type":"thinking","thinking":"why"`, `"chunk_type":"thinking","thinking":"Gemini thought"`, `"chunk_type":"text","text":"answer"`, "durable"} {
 		select {
 		case got := <-publications:
 			if want == "durable" {
 				if got.Enduring == nil || got.Enduring.EventID != "durable" {
 					t.Fatalf("publication %d = %+v", i, got)
 				}
-			} else if got.Ephemeral == nil || !bytes.Contains(got.Ephemeral.Body, []byte(want)) {
+			} else if got.Ephemeral == nil || !bytes.Contains(got.Ephemeral.Body, []byte(want)) || bytes.Contains(got.Ephemeral.Body, []byte("thoughtSignature")) {
 				t.Fatalf("publication %d = %+v, want %s", i, got, want)
 			}
 		case <-time.After(5 * time.Second):
