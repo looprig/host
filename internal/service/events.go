@@ -373,7 +373,13 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 	var flushAt <-chan time.Time
 	var projected <-chan projectedLiveText
 	var cancelProjection context.CancelFunc
+	var projectingBody json.RawMessage
 	queued := make([]sessionwire.EphemeralPublication, 0, liveProjectionQueue)
+	markGap := func(body json.RawMessage) {
+		if decoded, ok := livetext.Parse(body); ok {
+			gapped[textKey(decoded)] = true
+		}
+	}
 	stopTimer := func() {
 		if timer != nil {
 			timer.Stop()
@@ -408,6 +414,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 		}
 	}
 	startProjection := func(value sessionwire.EphemeralPublication) {
+		projectingBody = value.Body
 		workerCtx, cancel := context.WithCancel(ctx)
 		cancelProjection = cancel
 		result := make(chan projectedLiveText, 1)
@@ -436,6 +443,8 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			return
 		case <-flushAt:
 			if projected != nil || len(queued) != 0 {
+				// Wait for earlier projections to preserve text order. Memory is
+				// bounded by one pending frame and the fixed projection queue.
 				timer.Reset(t.flushInterval)
 				flushAt = timer.C()
 				continue
@@ -445,6 +454,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			cancelProjection()
 			projected = nil
 			cancelProjection = nil
+			projectingBody = nil
 			if !result.ok {
 				tail.dropEphemeral()
 			} else {
@@ -480,6 +490,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 				if !merged {
 					flush()
 					if pending != nil {
+						gapped[key] = true
 						tail.dropEphemeral()
 						goto projectionDone
 					}
@@ -521,17 +532,21 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			}
 			if publication.Enduring != nil {
 				if cancelProjection != nil {
+					markGap(projectingBody)
 					cancelProjection()
 					cancelProjection = nil
 					projected = nil
+					projectingBody = nil
 					tail.dropEphemeral()
 				}
-				for range queued {
+				for _, value := range queued {
+					markGap(value.Body)
 					tail.dropEphemeral()
 				}
 				queued = queued[:0]
 				flush()
 				if pending != nil {
+					gapped[textKey(pendingText)] = true
 					pending = nil
 					stopTimer()
 					tail.dropEphemeral()

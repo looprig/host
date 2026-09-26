@@ -59,6 +59,11 @@ func (p *refusingPublications) TryPublishEphemeral(channel string, payload []byt
 	return p.Publish(channel, payload) == nil
 }
 func (p *refusingPublications) tried() int { p.mu.Lock(); defer p.mu.Unlock(); return p.attempts }
+func (p *refusingPublications) allowNext() {
+	p.mu.Lock()
+	p.refuse = p.attempts
+	p.mu.Unlock()
+}
 
 type manualFlushTimer struct{ ticks chan time.Time }
 
@@ -73,6 +78,115 @@ func liveBody(key registry.Key, loop, turn, text string) json.RawMessage {
 }
 func liveFrame(key registry.Key, loop, turn, text string) department.LivePublication {
 	return department.LivePublication{Ephemeral: &sessionwire.EphemeralPublication{TenantID: key.TenantID, SessionID: key.SessionID, Body: liveBody(key, loop, turn, text)}}
+}
+
+func TestDifferentKeyDroppedBehindRefusedPreviewStaysGapped(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 6)
+	timer := &manualFlushTimer{ticks: make(chan time.Time, 4)}
+	publications := &refusingPublications{refuse: 100}
+	tails, err := service.NewTails(service.TailOptions{Publications: publications, Routes: &recordingRoutes{}, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- liveFrame(key, "loop-a", "turn-a", "pending")
+	timer.fire()
+	waitFor(t, "first refusal", func() bool { return publications.tried() > 0 })
+	stream <- liveFrame(key, "loop-b", "turn-b", "lost")
+	waitFor(t, "different-key drop", func() bool { return tail.EphemeralDrops() >= 1 })
+	publications.allowNext()
+	waitFor(t, "older pending preview", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 1
+	})
+	stream <- liveFrame(key, "loop-b", "turn-b", "must stay suppressed")
+	waitFor(t, "gapped continuation", func() bool { return tail.EphemeralDrops() >= 2 })
+	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "boundary", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"StepDone","loop_id":"loop-b"}`)}}
+	waitFor(t, "boundary", func() bool { return tail.Published() == 1 })
+	stream <- liveFrame(key, "loop-b", "turn-b", "resumed")
+	waitFor(t, "preview after boundary", func() bool {
+		select {
+		case timer.ticks <- time.Now():
+		default:
+		}
+		return tail.EphemeralPublished() == 2
+	})
+	if frames := publications.recorded(); len(frames) != 3 || !bytes.Contains(frames[2].payload, []byte(`"text":"resumed"`)) {
+		t.Fatalf("frames after gap: %+v", frames)
+	}
+}
+
+func TestPendingPreviewDroppedByEnduringFrameStaysGapped(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 6)
+	timer := &manualFlushTimer{ticks: make(chan time.Time, 4)}
+	publications := &refusingPublications{refuse: 100}
+	tails, err := service.NewTails(service.TailOptions{Publications: publications, Routes: &recordingRoutes{}, NewFlushTimer: func(time.Duration) service.FlushTimer { return timer }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) { return b, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- liveFrame(key, "loop-a", "turn-a", "pending")
+	timer.fire()
+	waitFor(t, "first refusal", func() bool { return publications.tried() > 0 })
+	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "progress", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"ToolCallStarted","loop_id":"loop-b"}`)}}
+	waitFor(t, "pending drop", func() bool { return tail.Published() == 1 && tail.EphemeralDrops() >= 1 })
+	publications.allowNext()
+	stream <- liveFrame(key, "loop-a", "turn-a", "must stay suppressed")
+	waitFor(t, "gapped continuation", func() bool { return tail.EphemeralDrops() >= 2 })
+	if tail.EphemeralPublished() != 0 {
+		t.Fatal("published text after pending was lost")
+	}
+}
+
+func TestInFlightAndQueuedPreviewsDroppedByEnduringFrameStayGapped(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	stream := make(chan department.LivePublication, 8)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	var mu sync.Mutex
+	project := func(_ context.Context, b json.RawMessage, _ uint64) (json.RawMessage, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			close(entered)
+			<-release
+		}
+		return b, nil
+	}
+	publications := &livePublications{admit: true}
+	tail, err := newTails(t, publications, &recordingRoutes{}).PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tail.Stop)
+	stream <- liveFrame(key, "loop-a", "turn-a", "in flight")
+	<-entered
+	stream <- liveFrame(key, "loop-b", "turn-b", "queued")
+	stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: key.TenantID, SessionID: key.SessionID, EventID: "progress", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"ToolCallStarted","loop_id":"loop-c"}`)}}
+	waitFor(t, "projection drops", func() bool { return tail.Published() == 1 && tail.EphemeralDrops() >= 2 })
+	close(release)
+	stream <- liveFrame(key, "loop-a", "turn-a", "suppressed a")
+	stream <- liveFrame(key, "loop-b", "turn-b", "suppressed b")
+	waitFor(t, "both gaps", func() bool { return tail.EphemeralDrops() >= 4 })
+	if tail.EphemeralPublished() != 0 {
+		t.Fatal("published text from dropped projections")
+	}
 }
 
 func TestRefusedFlushRetriesWithContiguousText(t *testing.T) {
