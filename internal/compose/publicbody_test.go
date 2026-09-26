@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,6 +39,81 @@ func (s *composeDualSource) SubscribeLivePublic(context.Context) (<-chan departm
 type composeTransientWire struct {
 	wirePublications
 	transient atomic.Int32
+}
+
+type composeReasoningSource struct {
+	stream <-chan department.LivePublication
+}
+
+func (s composeReasoningSource) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
+	return nil, errors.New("committed fallback used")
+}
+func (s composeReasoningSource) SubscribeLivePublic(context.Context) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+func (s composeReasoningSource) SubscribeLivePublicWithReasoning(context.Context) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+
+type composeCaptureWire struct{ frames chan []byte }
+
+func (w composeCaptureWire) Publish(_ string, frame []byte) error {
+	w.frames <- append([]byte(nil), frame...)
+	return nil
+}
+func (w composeCaptureWire) TryPublishEphemeral(_ string, frame []byte) bool {
+	w.frames <- append([]byte(nil), frame...)
+	return true
+}
+
+func TestTenantTailOptionsPropagateReasoning(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		live    *LiveTextOptions
+		enabled bool
+	}{
+		{name: "enabled", live: &LiveTextOptions{IncludeReasoning: true}, enabled: true},
+		{name: "disabled", live: &LiveTextOptions{}},
+		{name: "nil"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wire := composeCaptureWire{frames: make(chan []byte, 2)}
+			s := &Service{options: Options{LiveText: test.live}}
+			options := s.tailOptions(wire, &countingRoutes{})
+			if options.IncludeReasoning != test.enabled {
+				t.Fatalf("TailOptions.IncludeReasoning = %t, want %t", options.IncludeReasoning, test.enabled)
+			}
+			tails, err := service.NewTails(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := make(chan department.LivePublication, 2)
+			tail, err := tails.PublishProjected(t.Context(), supervisedKey, composeReasoningSource{stream}, nil, func(_ context.Context, body json.RawMessage, _ uint64) (json.RawMessage, error) { return body, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(tail.Stop)
+			body, err := json.Marshal(map[string]any{"v": 1, "type": "TokenDelta", "session_id": supervisedKey.SessionID, "loop_id": "loop", "turn_id": "turn", "chunk": map[string]any{"chunk_type": "thinking", "thinking": "why"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream <- department.LivePublication{Ephemeral: &sessionwire.EphemeralPublication{TenantID: supervisedKey.TenantID, SessionID: supervisedKey.SessionID, Body: body}}
+			if !test.enabled {
+				stream <- department.LivePublication{Enduring: &sessionwire.EnduringPublication{TenantID: supervisedKey.TenantID, SessionID: supervisedKey.SessionID, EventID: "boundary", JournalSeq: 1, CoveredThrough: 1, Body: json.RawMessage(`{"type":"StepDone","loop_id":"loop"}`)}}
+			}
+			select {
+			case frame := <-wire.frames:
+				if test.enabled && !bytes.Contains(frame, []byte(`"chunk_type":"thinking"`)) {
+					t.Fatalf("first frame = %s, want thinking", frame)
+				}
+				if !test.enabled && bytes.Contains(frame, []byte(`"chunk_type":"thinking"`)) {
+					t.Fatalf("reasoning disabled but first frame = %s", frame)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("no publication")
+			}
+		})
+	}
 }
 
 func (w *composeTransientWire) TryPublishEphemeral(string, []byte) bool {

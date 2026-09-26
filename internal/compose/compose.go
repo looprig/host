@@ -965,12 +965,20 @@ func (s *Service) buildTenantLink(tenant sessionwire.TenantID) (*tenantLink, err
 	if err != nil {
 		return nil, err
 	}
-	tails, err := service.NewTails(service.TailOptions{Publications: server, Routes: mux, FlushInterval: s.liveTextFlush(), IncludeReasoning: s.options.LiveText != nil && s.options.LiveText.IncludeReasoning, Logger: s.options.logger()})
+	tails, err := service.NewTails(s.tailOptions(server, mux))
 	if err != nil {
 		_ = server.Close(context.Background())
 		return nil, err
 	}
 	return &tenantLink{tenant: tenant, mux: mux, server: server, tails: tails}, nil
+}
+
+func (s *Service) tailOptions(publications service.Publications, routes service.Routes) service.TailOptions {
+	return service.TailOptions{
+		Publications: publications, Routes: routes, FlushInterval: s.liveTextFlush(),
+		IncludeReasoning: s.options.LiveText != nil && s.options.LiveText.IncludeReasoning,
+		Logger:           s.options.logger(),
+	}
 }
 
 func (s *Service) liveTextRate() int {
