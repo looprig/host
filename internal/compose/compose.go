@@ -177,6 +177,9 @@ type Options struct {
 }
 
 // LiveTextOptions configures the opt-in transient relay and shared transport budget.
+// Reasoning requires a runtime implementing both department.LivePublicationSubscriber
+// and department.ReasoningPublicationSubscriber. Separate reasoning blocks within
+// a turn are concatenated without a separator in live previews.
 type LiveTextOptions struct {
 	RateBytesPerSecond int
 	BurstBytes         int

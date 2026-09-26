@@ -112,12 +112,13 @@ func (e *InvalidTailOptionsError) Error() string {
 // a deterministic function of the stored body that the durable read applies
 // too (host.PublicJournal), so live and durable bodies stay byte-identical.
 type Tails struct {
-	publications     Publications
-	routes           Routes
-	flushInterval    time.Duration
-	includeReasoning bool
-	newFlushTimer    func(time.Duration) FlushTimer
-	logger           *slog.Logger
+	publications         Publications
+	routes               Routes
+	flushInterval        time.Duration
+	includeReasoning     bool
+	newFlushTimer        func(time.Duration) FlushTimer
+	logger               *slog.Logger
+	reasoningUnavailable sync.Once
 }
 
 // NewTails validates the options and returns a publisher.
@@ -328,8 +329,16 @@ func (t *Tails) PublishProjected(
 	if len(ephemeralRewrite) > 0 {
 		transient = ephemeralRewrite[0]
 	}
-	if source, ok := subscriber.(department.LivePublicationSubscriber); ok && transient != nil {
-		if reasoning, ok := subscriber.(department.ReasoningPublicationSubscriber); ok && t.includeReasoning {
+	source, liveOK := subscriber.(department.LivePublicationSubscriber)
+	reasoning, reasoningOK := subscriber.(department.ReasoningPublicationSubscriber)
+	if t.includeReasoning && (!liveOK || !reasoningOK) {
+		t.reasoningUnavailable.Do(func() {
+			t.logger.LogAttrs(ctx, slog.LevelInfo, "host: reasoning previews unavailable",
+				slog.String("tenant_id", string(key.TenantID)), slog.String("session_id", string(key.SessionID)))
+		})
+	}
+	if liveOK && transient != nil {
+		if reasoningOK && t.includeReasoning {
 			live, err = reasoning.SubscribeLivePublicWithReasoning(runCtx)
 		} else {
 			live, err = source.SubscribeLivePublic(runCtx)

@@ -379,7 +379,8 @@ type LivePublicationSubscriber interface {
 
 // ReasoningPublicationSubscriber optionally supplies the same ordered stream
 // with visible reasoning deltas included. The ordinary live subscription keeps
-// its text-only behavior.
+// its text-only behavior. A runtime must implement both this interface and
+// LivePublicationSubscriber to stream reasoning from Host.
 type ReasoningPublicationSubscriber interface {
 	SubscribeLivePublicWithReasoning(context.Context) (<-chan LivePublication, error)
 }

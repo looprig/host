@@ -143,6 +143,29 @@ func TestReasoningRequiresOptInAndKeepsTextEnduringOrder(t *testing.T) {
 	}
 }
 
+func TestRequestedReasoningWithoutRuntimeSupportLogsOnce(t *testing.T) {
+	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
+	var logs bytes.Buffer
+	tails, err := service.NewTails(service.TailOptions{
+		Publications: &livePublications{admit: true}, Routes: &recordingRoutes{}, IncludeReasoning: true,
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		stream := make(chan department.LivePublication)
+		tail, err := tails.PublishProjected(t.Context(), key, liveSubscriber{stream}, nil, func(_ context.Context, body json.RawMessage, _ uint64) (json.RawMessage, error) { return body, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		tail.Stop()
+	}
+	if got := strings.Count(logs.String(), `"msg":"host: reasoning previews unavailable"`); got != 1 || !strings.Contains(logs.String(), `"level":"INFO"`) {
+		t.Fatalf("missing-runtime log = %s, want one INFO record", logs.String())
+	}
+}
+
 func TestPendingThinkingAndTextNeverMerge(t *testing.T) {
 	key := registry.Key{TenantID: "tenant-alpha", SessionID: "session-a"}
 	stream := make(chan department.LivePublication, 2)
