@@ -4,6 +4,7 @@ go 1.26.8
 
 require (
 	github.com/centrifugal/centrifuge v0.38.0
+	github.com/centrifugal/centrifuge-go v0.10.12
 	github.com/gorilla/websocket v1.5.3
 	github.com/looprig/core v0.12.0
 	github.com/looprig/harness v0.41.0
@@ -24,6 +25,7 @@ require (
 	github.com/gammazero/deque v0.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
+	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/maypok86/otter v1.2.4 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
