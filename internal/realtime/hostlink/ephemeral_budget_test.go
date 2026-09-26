@@ -1,6 +1,7 @@
 package hostlink
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -28,12 +29,21 @@ func TestEphemeralAdmissionRefillsAfterBurst(t *testing.T) {
 func TestEphemeralFloodAcrossChannelsStaysBelowClientQueueLimit(t *testing.T) {
 	now := time.Unix(100, 0)
 	budget := newEphemeralBudget(ephemeralRateBytesPerSecond, ephemeralBurstBytes, func() time.Time { return now })
+	channel := strings.Repeat("x", MaxChannelBytes)
+	payload := []byte(`"` + strings.Repeat("x", ephemeralMaxFrameBytes-2) + `"`)
+	queuedBytes, err := queuedTransientBytes(channel, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queuedBytes <= len(payload)+len(channel) {
+		t.Fatalf("queue charge %d omitted Centrifuge framing", queuedBytes)
+	}
 	admitted := 0
 	for millisecond := 0; millisecond < 30_000; millisecond++ {
 		// Alternating channels on the same connection must spend one budget.
 		for range 4 {
-			if budget.admit([]string{"client-a"}, 4*1024) {
-				admitted += 4 * 1024
+			if budget.admit([]string{"client-a"}, queuedBytes) {
+				admitted += queuedBytes
 			}
 		}
 		now = now.Add(time.Millisecond)

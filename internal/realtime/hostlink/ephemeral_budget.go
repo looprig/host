@@ -54,12 +54,8 @@ func (b *ephemeralBudget) admit(clients []string, size int) bool {
 	return true
 }
 
-func (b *ephemeralBudget) forgetInactive(active map[string]bool) {
+func (b *ephemeralBudget) forget(clientID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for id := range b.client {
-		if _, found := active[id]; !found {
-			delete(b.client, id)
-		}
-	}
+	delete(b.client, clientID)
 }

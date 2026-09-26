@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/centrifugal/centrifuge"
+	"github.com/centrifugal/protocol"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -43,10 +44,12 @@ const (
 )
 
 type centrifugeServer struct {
-	node    *centrifuge.Node
-	handler http.Handler
-	mu      sync.Mutex // serializes ephemeral admission with its broadcast
-	budget  *ephemeralBudget
+	node             *centrifuge.Node
+	handler          http.Handler
+	mu               sync.Mutex // serializes ephemeral admission with its broadcast
+	budget           *ephemeralBudget
+	subscribed       map[string]map[string]uint64 // channel -> physical client ID -> subscribe attempt
+	nextSubscription uint64
 }
 
 // NewCentrifugeServer constructs and starts the embedded JSON/WebSocket
@@ -163,8 +166,13 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		}
 		return reply, nil
 	})
+	server := &centrifugeServer{
+		node:       node,
+		budget:     newEphemeralBudget(ephemeralRateBytesPerSecond, ephemeralBurstBytes, time.Now),
+		subscribed: make(map[string]map[string]uint64),
+	}
 	if config.Multiplexer != nil {
-		node.OnConnect(config.Multiplexer.install)
+		node.OnConnect(func(client *centrifuge.Client) { config.Multiplexer.install(client, server) })
 	}
 	if err := node.Run(); err != nil {
 		return nil, err
@@ -174,10 +182,6 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		CheckOrigin: func(*http.Request) bool { return true },
 		Compression: false,
 	})
-	server := &centrifugeServer{
-		node:   node,
-		budget: newEphemeralBudget(ephemeralRateBytesPerSecond, ephemeralBurstBytes, time.Now),
-	}
 	server.handler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !selectsJSONProtocol(request) {
 			http.Error(writer, "HostLink requires the JSON protocol", http.StatusBadRequest)
@@ -202,31 +206,109 @@ func (s *centrifugeServer) Publish(channel string, payload []byte) error {
 	return err
 }
 
-// TryPublishEphemeral publishes only when every currently subscribed physical
-// client has room in its own rate budget. A single client can subscribe to
-// several session channels, so a channel-scoped bucket would not bound that
-// client's queue. The caller counts false as a payload-free transient drop.
+// TryPublishEphemeral publishes only when every subscribed physical client has
+// room in its own rate budget. A single client can subscribe to several session
+// channels, so a channel-scoped bucket would not bound that client's queue.
+// The caller counts false as a payload-free transient drop.
 func (s *centrifugeServer) TryPublishEphemeral(channel string, payload []byte) bool {
 	if len(payload) == 0 || len(payload) > ephemeralMaxFrameBytes {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	connections := s.node.Hub().Connections()
-	active := make(map[string]bool, len(connections))
-	subscribers := make([]string, 0, len(connections))
-	for id, client := range connections {
-		active[id] = true
-		if client.IsSubscribed(channel) {
-			subscribers = append(subscribers, id)
-		}
-	}
-	s.budget.forgetInactive(active)
-	if !s.budget.admit(subscribers, len(payload)) {
+	queuedBytes, err := queuedTransientBytes(channel, payload)
+	if err != nil {
 		return false
 	}
-	_, err := s.node.Publish(channel, payload)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.admitSubscribed(channel, s.node.Hub().Connections(), queuedBytes) {
+		return false
+	}
+	_, err = s.node.Publish(channel, payload)
 	return err == nil
+}
+
+// queuedTransientBytes uses the same JSON publication envelope Centrifuge's
+// pinned in-process broker enqueues for a client-protocol subscriber. Counting
+// the encoded queue item includes the channel and framing, not just the data.
+func queuedTransientBytes(channel string, payload []byte) (int, error) {
+	frame, err := protocol.DefaultJsonReplyEncoder.Encode(&protocol.Reply{Push: &protocol.Push{
+		Channel: channel, Pub: &protocol.Publication{Data: payload},
+	}})
+	return len(frame), err
+}
+
+// noteSubscribed runs before Multiplexer tells Centrifuge to register the
+// subscription. Holding the same gate as TryPublish means a newly subscribed
+// client is charged before any broadcast can include it.
+func (s *centrifugeServer) noteSubscribed(clientID, channel string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subscribed == nil {
+		s.subscribed = make(map[string]map[string]uint64)
+	}
+	if s.subscribed[channel] == nil {
+		s.subscribed[channel] = make(map[string]uint64)
+	}
+	s.nextSubscription++
+	s.subscribed[channel][clientID] = s.nextSubscription
+	return s.nextSubscription
+}
+
+// subscriptionFinished removes a rejected attempt once Centrifuge has
+// completed its reply. A later attempt may already exist for the same channel;
+// its generation must survive an older completion callback.
+func (s *centrifugeServer) subscriptionFinished(clientID, channel string, attempt uint64, accepted bool) {
+	if accepted {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subscribed[channel][clientID] != attempt {
+		return
+	}
+	delete(s.subscribed[channel], clientID)
+	if len(s.subscribed[channel]) == 0 {
+		delete(s.subscribed, channel)
+	}
+}
+
+func (s *centrifugeServer) noteUnsubscribed(clientID, channel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.subscribed[channel], clientID)
+	if len(s.subscribed[channel]) == 0 {
+		delete(s.subscribed, channel)
+	}
+}
+
+func (s *centrifugeServer) forgetClient(clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for channel, clients := range s.subscribed {
+		delete(clients, clientID)
+		if len(clients) == 0 {
+			delete(s.subscribed, channel)
+		}
+	}
+	s.budget.forget(clientID)
+}
+
+// admitSubscribed is called while s.mu is held. The active snapshot omits
+// clients already removed from the Hub; a pending accepted subscription is
+// present in s.subscribed even before Client.IsSubscribed becomes true.
+func (s *centrifugeServer) admitSubscribed(channel string, active map[string]*centrifuge.Client, size int) bool {
+	ids := make([]string, 0, len(s.subscribed[channel]))
+	for id := range s.subscribed[channel] {
+		if _, found := active[id]; found {
+			ids = append(ids, id)
+		} else {
+			delete(s.subscribed[channel], id)
+		}
+	}
+	if len(s.subscribed[channel]) == 0 {
+		delete(s.subscribed, channel)
+	}
+	return s.budget.admit(ids, size)
 }
 
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }

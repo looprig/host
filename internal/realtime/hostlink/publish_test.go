@@ -155,6 +155,30 @@ func TestTransientPublicationReachesSubscribedClientInOrder(t *testing.T) {
 	}
 }
 
+func TestConcreteTransientAdmissionChargesEncodedQueueBytes(t *testing.T) {
+	f := newFixture(t)
+	server, httpServer := startServer(t, &recordingAuthenticator{wantToken: testCredential}, hostlink.Config{Multiplexer: f.mux})
+	defer closeServers(t, server, httpServer)
+	connection := dial(t, httpServer.URL, "")
+	defer connection.Close()
+	if reply := connect(t, connection, testCredential, sessionwire.VersionNegotiationRequest{SupportedVersions: []sessionwire.WireVersion{1}}); reply.Connect == nil {
+		t.Fatalf("connect reply = %#v", reply)
+	}
+	acceptedRPC(t, rpc(t, connection, 2, hostlink.MethodBind, bindRequest(testSession)))
+	channel := hostlink.ChannelFor(residencyKey(testSession))
+	if reply := sendCommand(t, connection, 3, map[string]any{"id": 3, "subscribe": map[string]any{"channel": channel}}); reply.Error != nil {
+		t.Fatalf("subscribe: %#v", *reply.Error)
+	}
+	admitter := server.(interface{ TryPublishEphemeral(string, []byte) bool })
+	payload := []byte(`"` + strings.Repeat("x", 4094) + `"`)
+	if !admitter.TryPublishEphemeral(channel, payload) {
+		t.Fatal("first 4 KiB payload was refused")
+	}
+	if admitter.TryPublishEphemeral(channel, payload) {
+		t.Fatal("second 4 KiB payload was admitted; encoded queue bytes exceed the 8 KiB burst")
+	}
+}
+
 // A stalled replica may be disconnected when its own Centrifuge queue fills;
 // another replica must continue to receive every enduring frame in order.
 func TestSlowSubscriberDoesNotLoseOrReorderEnduringForHealthySubscriber(t *testing.T) {

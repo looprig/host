@@ -1117,7 +1117,7 @@ func (m *Multiplexer) dispatch(ctx context.Context, link LinkID, method string, 
 // attach is the client's, which Centrifuge cancels when the connection closes;
 // the residency manager keeps a request context out of its sequence by design,
 // so a link that drops mid-attach neither cancels the launch nor leaks it.
-func (m *Multiplexer) install(client *centrifuge.Client) {
+func (m *Multiplexer) install(client *centrifuge.Client, server *centrifugeServer) {
 	link := LinkID(client.ID())
 	client.OnRPC(func(event centrifuge.RPCEvent, callback centrifuge.RPCCallback) {
 		answer := func() {
@@ -1142,9 +1142,23 @@ func (m *Multiplexer) install(client *centrifuge.Client) {
 			callback(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
 			return
 		}
-		callback(centrifuge.SubscribeReply{}, nil)
+		attempt := server.noteSubscribed(client.ID(), event.Channel)
+		ready := make(chan struct{})
+		callback(centrifuge.SubscribeReply{SubscriptionReady: ready}, nil)
+		// Centrifuge can reject the request after our callback (for example,
+		// an unsupported tag filter). It closes ready after processing the
+		// subscribe reply, including the error path. A rejected attempt never
+		// gets OnUnsubscribe, so remove its provisional admission here.
+		go func() {
+			<-ready
+			server.subscriptionFinished(client.ID(), event.Channel, attempt, client.IsSubscribed(event.Channel))
+		}()
+	})
+	client.OnUnsubscribe(func(event centrifuge.UnsubscribeEvent) {
+		server.noteUnsubscribed(client.ID(), event.Channel)
 	})
 	client.OnDisconnect(func(centrifuge.DisconnectEvent) {
 		m.CloseLink(link)
+		server.forgetClient(client.ID())
 	})
 }
