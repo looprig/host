@@ -53,25 +53,36 @@ func (s inboxCommands) Read(ctx context.Context, after, _ uint64) ([]publicbody.
 // body is published under the public session id and the public command ids
 // the client admitted, never the runtime's.
 //
-// A RUNTIME THAT REPORTS NO RUNTIME SESSION ID IS RELAYED VERBATIM, and said
-// so. Only a runtime launched through department's rig adapter reports one;
-// any other runtime's bodies are its own format, which this projection has no
-// rule for, and inventing an identity to replace would be worse than none.
-func (s *Service) publicProjector(ctx context.Context, request residency.OwnershipRequest) service.Projector {
+// A RUNTIME THAT REPORTS NO RUNTIME SESSION ID has enduring bodies relayed
+// verbatim and transient bodies suppressed. Only a runtime launched through
+// department's rig adapter reports one; any other runtime's bodies are its own
+// format, which this projection has no rule for.
+func (s *Service) publicProjectors(ctx context.Context, request residency.OwnershipRequest) (service.Projector, service.Projector) {
 	runtimeID, ok := department.RigSessionID(request.Runtime)
 	if !ok || runtimeID.IsZero() {
 		s.options.logger().LogAttrs(ctx, slog.LevelWarn,
 			"host: the runtime reports no runtime session id, so its public bodies are relayed without the public-identity projection",
 			slog.String("tenant_id", string(request.Key.TenantID)),
 			slog.String("session_id", string(request.Key.SessionID)))
-		return nil
+		return nil, nil
 	}
-	ids := publicbody.Identities{
+	source := inboxCommands{inbox: s.options.Inbox, key: request.Key}
+	enduringIDs := publicbody.Identities{
 		RuntimeSessionID: runtimeID,
 		SessionID:        request.Key.SessionID,
-		Commands:         publicbody.NewIndex(inboxCommands{inbox: s.options.Inbox, key: request.Key}),
+		Commands:         publicbody.NewIndex(source),
 	}
-	return retryingProjection(publicbody.Projection(ids), s.options.logger(), request.Key, s.projectionRetry())
+	transientIDs := enduringIDs
+	transientIDs.Commands = publicbody.NewIndex(source)
+	return tailProjectors(enduringIDs, transientIDs, s.options.logger(), request.Key, s.projectionRetry())
+}
+
+// tailProjectors gives the enduring path its mapping-read retry and the
+// transient path one prompt attempt. A transient mapping outage loses only a
+// preview; it never stalls the session's enduring relay.
+func tailProjectors(enduringIDs, transientIDs publicbody.Identities, logger *slog.Logger, key registry.Key, bounds backoff) (service.Projector, service.Projector) {
+	enduring := publicbody.Projection(enduringIDs)
+	return retryingProjection(enduring, logger, key, bounds), publicbody.Projection(transientIDs)
 }
 
 // backoff is a doubling delay between a floor and a ceiling.

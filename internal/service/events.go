@@ -6,10 +6,12 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/internal/livetext"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 )
@@ -65,7 +67,8 @@ func (e *InvalidTailOptionsError) Error() string {
 	return "service: invalid option " + strconv.Quote(e.Field) + ": " + e.Reason
 }
 
-// Tails publishes committed session tails onto HostLink channels.
+// Tails publishes committed session tails and admitted transient text onto
+// HostLink channels.
 //
 // WHAT IT DOES NOT DO IS THE SUBSTANCE. It does not read a journal, does not
 // project an event, does not re-encode a body, and does not decide what a
@@ -164,6 +167,7 @@ type Tail struct {
 	end       TailEnd
 	cause     error
 	published uint64
+	ephDrops  uint64
 }
 
 // Key is the session this tail publishes.
@@ -193,6 +197,14 @@ func (t *Tail) Published() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.published
+}
+
+// EphemeralDrops reports transient frames discarded at the relay. The counter
+// carries no body or text.
+func (t *Tail) EphemeralDrops() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ephDrops
 }
 
 // ErrTargetGenerationSuperseded reports a target-directory write refused
@@ -255,6 +267,7 @@ func (t *Tails) PublishProjected(
 	key registry.Key,
 	subscriber department.PublicationSubscriber,
 	rewrite Projector,
+	ephemeralRewrite ...Projector,
 ) (*Tail, error) {
 	if subscriber == nil {
 		return nil, &InvalidTailOptionsError{
@@ -270,7 +283,14 @@ func (t *Tails) PublishProjected(
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	published, err := subscriber.SubscribeCommitted(runCtx, "")
+	var published <-chan sessionwire.EnduringPublication
+	var live <-chan department.LivePublication
+	var err error
+	if source, ok := subscriber.(department.LivePublicationSubscriber); ok {
+		live, err = source.SubscribeLivePublic(runCtx)
+	} else {
+		published, err = subscriber.SubscribeCommitted(runCtx, "")
+	}
 	if err != nil {
 		cancel()
 		return nil, err
@@ -283,8 +303,194 @@ func (t *Tails) PublishProjected(
 		end:     TailEndRunning,
 		rewrite: rewrite,
 	}
-	go t.relay(runCtx, tail, published)
+	if live != nil {
+		var transient Projector
+		if len(ephemeralRewrite) > 0 {
+			transient = ephemeralRewrite[0]
+		}
+		go t.relayLive(runCtx, tail, live, transient)
+	} else {
+		go t.relay(runCtx, tail, published)
+	}
 	return tail, nil
+}
+
+const (
+	liveTextFlush       = 15 * time.Millisecond
+	liveProjectionQueue = 16
+)
+
+type projectedLiveText struct {
+	publication sessionwire.EphemeralPublication
+	text        livetext.Delta
+	ok          bool
+}
+
+// relayLive preserves one producer order. Its only pending transient frame is
+// flushed before the next enduring frame and after a short idle interval.
+func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan department.LivePublication, transient Projector) {
+	defer close(tail.done)
+	var pending *sessionwire.EphemeralPublication
+	var pendingText livetext.Delta
+	var timer *time.Timer
+	var flushAt <-chan time.Time
+	var projected <-chan projectedLiveText
+	var cancelProjection context.CancelFunc
+	queued := make([]sessionwire.EphemeralPublication, 0, liveProjectionQueue)
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		flushAt = nil
+	}
+	flush := func() {
+		if pending == nil {
+			return
+		}
+		stopTimer()
+		t.publishEphemeral(tail, *pending)
+		pending = nil
+	}
+	startProjection := func(value sessionwire.EphemeralPublication) {
+		workerCtx, cancel := context.WithCancel(ctx)
+		cancelProjection = cancel
+		result := make(chan projectedLiveText, 1)
+		projected = result
+		go func() {
+			defer cancel()
+			body, err := transient(workerCtx, value.Body, 0)
+			if err != nil || workerCtx.Err() != nil {
+				result <- projectedLiveText{}
+				return
+			}
+			value.Body = body
+			decoded, ok := livetext.Parse(body)
+			ok = ok && decoded.SessionID == string(tail.key.SessionID)
+			result <- projectedLiveText{publication: value, text: decoded, ok: ok}
+		}()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			stopTimer()
+			if cancelProjection != nil {
+				cancelProjection()
+			}
+			tail.finish(TailEndStopped, ctx.Err())
+			return
+		case <-flushAt:
+			flush()
+		case result := <-projected:
+			cancelProjection()
+			projected = nil
+			cancelProjection = nil
+			if !result.ok {
+				tail.dropEphemeral()
+			} else {
+				value, decoded := result.publication, result.text
+				merged := false
+				if pending != nil && pendingText.LoopID == decoded.LoopID && pendingText.TurnID == decoded.TurnID && len(pendingText.Chunk.Text)+len(decoded.Chunk.Text) <= livetext.MaxBytes {
+					body, err := livetext.Join(pending.Body, pendingText.Chunk.Text+decoded.Chunk.Text)
+					if err == nil {
+						pending.Body = body
+						pendingText.Chunk.Text += decoded.Chunk.Text
+						merged = true
+					}
+				}
+				if !merged {
+					flush()
+					pending = &value
+					pendingText = decoded
+					if timer == nil {
+						timer = time.NewTimer(liveTextFlush)
+					} else {
+						timer.Reset(liveTextFlush)
+					}
+					flushAt = timer.C
+				}
+			}
+			if len(queued) != 0 {
+				value := queued[0]
+				queued = queued[1:]
+				startProjection(value)
+			}
+		case publication, open := <-stream:
+			if !open {
+				stopTimer()
+				if cancelProjection != nil {
+					cancelProjection()
+				}
+				if ctx.Err() != nil {
+					tail.finish(TailEndStopped, ctx.Err())
+				} else {
+					tail.finish(TailEndLost, nil)
+					t.invalidate(tail)
+				}
+				return
+			}
+			if publication.Enduring != nil {
+				if cancelProjection != nil {
+					cancelProjection()
+					cancelProjection = nil
+					projected = nil
+					tail.dropEphemeral()
+				}
+				for range queued {
+					tail.dropEphemeral()
+				}
+				queued = queued[:0]
+				flush()
+				if err := t.publish(ctx, tail, *publication.Enduring); err != nil {
+					if ctx.Err() != nil {
+						tail.finish(TailEndStopped, ctx.Err())
+					} else {
+						tail.finish(TailEndRefused, err)
+						t.invalidate(tail)
+					}
+					return
+				}
+				continue
+			}
+			if publication.Ephemeral == nil || transient == nil {
+				tail.dropEphemeral()
+				continue
+			}
+			value := *publication.Ephemeral
+			if value.TenantID != tail.key.TenantID || value.SessionID != tail.key.SessionID {
+				tail.dropEphemeral()
+				continue
+			}
+			if projected != nil {
+				if len(queued) == liveProjectionQueue {
+					tail.dropEphemeral()
+				} else {
+					queued = append(queued, value)
+				}
+				continue
+			}
+			startProjection(value)
+		}
+	}
+}
+
+// TryPublishEphemeral must return promptly and reserve transport headroom for
+// enduring/control frames. A transport without this admission is disabled.
+type ephemeralPublisher interface {
+	TryPublishEphemeral(channel string, payload []byte) bool
+}
+
+func (t *Tails) publishEphemeral(tail *Tail, publication sessionwire.EphemeralPublication) {
+	transport, ok := t.publications.(ephemeralPublisher)
+	if !ok {
+		tail.dropEphemeral()
+		return
+	}
+	payload, err := json.Marshal(publication)
+	if err != nil || !transport.TryPublishEphemeral(tail.channel, payload) {
+		tail.dropEphemeral()
+		return
+	}
+	tail.count()
 }
 
 // relay is one session's publishing goroutine.
@@ -387,4 +593,10 @@ func (t *Tail) count() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.published++
+}
+
+func (t *Tail) dropEphemeral() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ephDrops++
 }

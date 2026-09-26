@@ -91,3 +91,18 @@ func TestAPublicationToAnUnsubscribedChannelIsNotAnError(t *testing.T) {
 		t.Fatalf("Publish to a channel nobody subscribes = %v, want nil", err)
 	}
 }
+
+// The pinned Centrifuge writer does not expose per-connection queue headroom.
+// Until it does, transient publication must be refused before enqueue.
+func TestTransientPublishIsDisabledWithoutQueueHeadroom(t *testing.T) {
+	f := newFixture(t)
+	server, httpServer := startServer(t, &recordingAuthenticator{wantToken: testCredential}, hostlink.Config{Multiplexer: f.mux})
+	defer closeServers(t, server, httpServer)
+	admitter, ok := server.(interface{ TryPublishEphemeral(string, []byte) bool })
+	if !ok {
+		t.Fatal("HostLink has no transient admission seam")
+	}
+	if admitter.TryPublishEphemeral(hostlink.ChannelFor(residencyKey(testSession)), []byte(`{"type":"ephemeral_publication"}`)) {
+		t.Fatal("Centrifuge admitted a transient frame without trustworthy queue headroom")
+	}
+}

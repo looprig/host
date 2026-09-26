@@ -194,9 +194,9 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 	if err != nil {
 		return nil, err
 	}
-	projector := s.publicProjector(ctx, request)
+	projector, transientProjector := s.publicProjectors(ctx, request)
 	tail, err := s.superviseTail(ctx, request.Key, func() (*service.Tail, error) {
-		return link.tails.PublishProjected(ctx, request.Key, request.Runtime, projector)
+		return link.tails.PublishProjected(ctx, request.Key, request.Runtime, projector, transientProjector)
 	})
 	if err != nil {
 		return nil, err

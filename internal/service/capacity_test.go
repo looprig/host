@@ -1442,6 +1442,7 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"Tail.Stop":                     true,
 		"Tail.End":                      true,
 		"Tail.Published":                true,
+		"Tail.EphemeralDrops":           true,
 		"ErrForeignPublication":         true,
 
 		// v0.10.0, finding W1. The same live tail with each body's private
@@ -2464,10 +2465,11 @@ func TestFilesSleepOrPollExactlyWhereTheyAreAllowedTo(t *testing.T) {
 		"time.NewTicker": true, "time.AfterFunc": true, "runtime.Gosched": true,
 	}
 	policies := map[string]waitPolicy{
-		"capacity.go":      banEverything,
-		"capacity_test.go": banEverything,
-		"events.go":        banRealTimeOnly,
-		"events_test.go":   noBan,
+		"capacity.go":         banEverything,
+		"capacity_test.go":    banEverything,
+		"events.go":           banRealTimeOnly,
+		"events_test.go":      noBan,
+		"live_events_test.go": noBan,
 	}
 	files := packageFiles(t, true)
 	if !slices.Equal(files, slices.Sorted(maps.Keys(policies))) {

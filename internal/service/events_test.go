@@ -977,7 +977,7 @@ func (c *liveController) CompactToLoop(ctx context.Context, id uuid.UUID) (uuid.
 }
 
 func (c *liveController) SubscribeEvents(filter event.EventFilter) (event.Subscription, error) {
-	return c.base.SubscribeEvents(filter)
+	return c.hub.SubscribeEvents(filter)
 }
 
 func (c *liveController) RespondGate(ctx context.Context, response gate.GateResponse) error {

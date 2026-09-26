@@ -181,6 +181,12 @@ func (s *centrifugeServer) Publish(channel string, payload []byte) error {
 	return err
 }
 
+// TryPublishEphemeral refuses transient frames because Centrifuge v0.38.0
+// exposes no trustworthy per-connection writer-queue headroom. Calling
+// Node.Publish here could make an additive text frame close a slow link before
+// its next enduring or control frame.
+func (s *centrifugeServer) TryPublishEphemeral(string, []byte) bool { return false }
+
 func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shutdown(ctx) }
 
 // selectsJSONProtocol reports whether the request explicitly selects the JSON
