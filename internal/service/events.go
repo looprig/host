@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -53,9 +54,24 @@ type Routes interface {
 
 // TailOptions configures a Tails.
 type TailOptions struct {
-	Publications Publications
-	Routes       Routes
+	Publications  Publications
+	Routes        Routes
+	FlushInterval time.Duration
+	// NewFlushTimer allows a controlled clock for interval tests.
+	NewFlushTimer func(time.Duration) FlushTimer
+	Logger        *slog.Logger
 }
+
+// FlushTimer is the small timer contract used by the live-text relay.
+type FlushTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(time.Duration) bool
+}
+
+type wallFlushTimer struct{ *time.Timer }
+
+func (t wallFlushTimer) C() <-chan time.Time { return t.Timer.C }
 
 // InvalidTailOptionsError reports an option a Tails may not run with.
 type InvalidTailOptionsError struct {
@@ -95,8 +111,11 @@ func (e *InvalidTailOptionsError) Error() string {
 // a deterministic function of the stored body that the durable read applies
 // too (host.PublicJournal), so live and durable bodies stay byte-identical.
 type Tails struct {
-	publications Publications
-	routes       Routes
+	publications  Publications
+	routes        Routes
+	flushInterval time.Duration
+	newFlushTimer func(time.Duration) FlushTimer
+	logger        *slog.Logger
 }
 
 // NewTails validates the options and returns a publisher.
@@ -113,7 +132,19 @@ func NewTails(options TailOptions) (*Tails, error) {
 			Reason: "is required; a lost tail must invalidate its routes so Factory resets durably",
 		}
 	}
-	return &Tails{publications: options.Publications, routes: options.Routes}, nil
+	if options.FlushInterval < 0 {
+		return nil, &InvalidTailOptionsError{Field: "FlushInterval", Reason: "must not be negative"}
+	}
+	if options.FlushInterval == 0 {
+		options.FlushInterval = 50 * time.Millisecond
+	}
+	if options.NewFlushTimer == nil {
+		options.NewFlushTimer = func(d time.Duration) FlushTimer { return wallFlushTimer{time.NewTimer(d)} }
+	}
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.DiscardHandler)
+	}
+	return &Tails{publications: options.Publications, routes: options.Routes, flushInterval: options.FlushInterval, newFlushTimer: options.NewFlushTimer, logger: options.Logger}, nil
 }
 
 // TailEnd is why one tail stopped.
@@ -163,11 +194,12 @@ type Tail struct {
 	// rewrite is the tail's public-body projection, or nil for none.
 	rewrite Projector
 
-	mu        sync.Mutex
-	end       TailEnd
-	cause     error
-	published uint64
-	ephDrops  uint64
+	mu           sync.Mutex
+	end          TailEnd
+	cause        error
+	published    uint64
+	ephPublished uint64
+	ephDrops     uint64
 }
 
 // Key is the session this tail publishes.
@@ -192,11 +224,18 @@ func (t *Tail) End() (TailEnd, error) {
 	return t.end, t.cause
 }
 
-// Published reports how many publications this tail put on the wire.
+// Published reports how many enduring publications this tail put on the wire.
 func (t *Tail) Published() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.published
+}
+
+// EphemeralPublished reports admitted transient frames separately from the durable count.
+func (t *Tail) EphemeralPublished() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ephPublished
 }
 
 // EphemeralDrops reports transient frames discarded at the relay. The counter
@@ -286,7 +325,11 @@ func (t *Tails) PublishProjected(
 	var published <-chan sessionwire.EnduringPublication
 	var live <-chan department.LivePublication
 	var err error
-	if source, ok := subscriber.(department.LivePublicationSubscriber); ok {
+	var transient Projector
+	if len(ephemeralRewrite) > 0 {
+		transient = ephemeralRewrite[0]
+	}
+	if source, ok := subscriber.(department.LivePublicationSubscriber); ok && transient != nil {
 		live, err = source.SubscribeLivePublic(runCtx)
 	} else {
 		published, err = subscriber.SubscribeCommitted(runCtx, "")
@@ -304,10 +347,6 @@ func (t *Tails) PublishProjected(
 		rewrite: rewrite,
 	}
 	if live != nil {
-		var transient Projector
-		if len(ephemeralRewrite) > 0 {
-			transient = ephemeralRewrite[0]
-		}
 		go t.relayLive(runCtx, tail, live, transient)
 	} else {
 		go t.relay(runCtx, tail, published)
@@ -316,7 +355,6 @@ func (t *Tails) PublishProjected(
 }
 
 const (
-	liveTextFlush       = 15 * time.Millisecond
 	liveProjectionQueue = 16
 )
 
@@ -332,7 +370,9 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 	defer close(tail.done)
 	var pending *sessionwire.EphemeralPublication
 	var pendingText livetext.Delta
-	var timer *time.Timer
+	gapped := map[string]bool{}
+	textKey := func(d livetext.Delta) string { return d.LoopID + "\x00" + d.TurnID }
+	var timer FlushTimer
 	var flushAt <-chan time.Time
 	var projected <-chan projectedLiveText
 	var cancelProjection context.CancelFunc
@@ -348,8 +388,27 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			return
 		}
 		stopTimer()
-		t.publishEphemeral(tail, *pending)
+		if !t.publishEphemeral(tail, *pending) {
+			if timer == nil {
+				timer = t.newFlushTimer(t.flushInterval)
+			} else {
+				timer.Reset(t.flushInterval)
+			}
+			flushAt = timer.C()
+			return
+		}
 		pending = nil
+	}
+	clearBoundary := func(body json.RawMessage) {
+		loopID, ok := livetext.BoundaryLoop(body)
+		if !ok {
+			return
+		}
+		for key := range gapped {
+			if loopID == "" || len(key) > len(loopID) && key[:len(loopID)+1] == loopID+"\x00" {
+				delete(gapped, key)
+			}
+		}
 	}
 	startProjection := func(value sessionwire.EphemeralPublication) {
 		workerCtx, cancel := context.WithCancel(ctx)
@@ -379,6 +438,11 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			tail.finish(TailEndStopped, ctx.Err())
 			return
 		case <-flushAt:
+			if projected != nil || len(queued) != 0 {
+				timer.Reset(t.flushInterval)
+				flushAt = timer.C()
+				continue
+			}
 			flush()
 		case result := <-projected:
 			cancelProjection()
@@ -388,27 +452,51 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 				tail.dropEphemeral()
 			} else {
 				value, decoded := result.publication, result.text
+				key := textKey(decoded)
+				if gapped[key] {
+					tail.dropEphemeral()
+					goto projectionDone
+				}
+				if !fitsEphemeralFrame(value) {
+					gapped[key] = true
+					tail.dropEphemeral()
+					goto projectionDone
+				}
 				merged := false
-				if pending != nil && pendingText.LoopID == decoded.LoopID && pendingText.TurnID == decoded.TurnID && len(pendingText.Chunk.Text)+len(decoded.Chunk.Text) <= livetext.MaxBytes {
-					body, err := livetext.Join(pending.Body, pendingText.Chunk.Text+decoded.Chunk.Text)
-					if err == nil {
+				if pending != nil && textKey(pendingText) == key {
+					body, ok := livetext.Merge(pending.Body, value.Body)
+					candidate := *pending
+					candidate.Body = body
+					if ok && fitsEphemeralFrame(candidate) {
 						pending.Body = body
 						pendingText.Chunk.Text += decoded.Chunk.Text
 						merged = true
+					} else {
+						gapped[key] = true
+						pending = nil
+						stopTimer()
+						tail.dropEphemeral()
+						tail.dropEphemeral()
+						goto projectionDone
 					}
 				}
 				if !merged {
 					flush()
+					if pending != nil {
+						tail.dropEphemeral()
+						goto projectionDone
+					}
 					pending = &value
 					pendingText = decoded
 					if timer == nil {
-						timer = time.NewTimer(liveTextFlush)
+						timer = t.newFlushTimer(t.flushInterval)
 					} else {
-						timer.Reset(liveTextFlush)
+						timer.Reset(t.flushInterval)
 					}
-					flushAt = timer.C
+					flushAt = timer.C()
 				}
 			}
+		projectionDone:
 			if len(queued) != 0 {
 				value := queued[0]
 				queued = queued[1:]
@@ -428,6 +516,12 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 				}
 				return
 			}
+			if publication.Terminal != nil {
+				t.logger.LogAttrs(ctx, slog.LevelError, "host: live publication stream ended on a runtime invariant breach", slog.String("tenant_id", string(tail.key.TenantID)), slog.String("session_id", string(tail.key.SessionID)), slog.String("error", publication.Terminal.Error()))
+				tail.finish(TailEndLost, publication.Terminal)
+				t.invalidate(tail)
+				return
+			}
 			if publication.Enduring != nil {
 				if cancelProjection != nil {
 					cancelProjection()
@@ -440,6 +534,11 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 				}
 				queued = queued[:0]
 				flush()
+				if pending != nil {
+					pending = nil
+					stopTimer()
+					tail.dropEphemeral()
+				}
 				if err := t.publish(ctx, tail, *publication.Enduring); err != nil {
 					if ctx.Err() != nil {
 						tail.finish(TailEndStopped, ctx.Err())
@@ -449,6 +548,7 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 					}
 					return
 				}
+				clearBoundary(publication.Enduring.Body)
 				continue
 			}
 			if publication.Ephemeral == nil || transient == nil {
@@ -479,18 +579,24 @@ type ephemeralPublisher interface {
 	TryPublishEphemeral(channel string, payload []byte) bool
 }
 
-func (t *Tails) publishEphemeral(tail *Tail, publication sessionwire.EphemeralPublication) {
+func fitsEphemeralFrame(publication sessionwire.EphemeralPublication) bool {
+	payload, err := json.Marshal(publication)
+	return err == nil && len(payload) <= 4096
+}
+
+func (t *Tails) publishEphemeral(tail *Tail, publication sessionwire.EphemeralPublication) bool {
 	transport, ok := t.publications.(ephemeralPublisher)
 	if !ok {
-		tail.dropEphemeral()
-		return
+		return false
 	}
 	payload, err := json.Marshal(publication)
-	if err != nil || !transport.TryPublishEphemeral(tail.channel, payload) {
-		tail.dropEphemeral()
-		return
+	if err != nil || len(payload) > 4096 || !transport.TryPublishEphemeral(tail.channel, payload) {
+		return false
 	}
-	tail.count()
+	tail.mu.Lock()
+	tail.ephPublished++
+	tail.mu.Unlock()
+	return true
 }
 
 // relay is one session's publishing goroutine.

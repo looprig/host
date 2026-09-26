@@ -1442,6 +1442,9 @@ func TestPublishIsTheOnlyPublishingSurface(t *testing.T) {
 		"Tail.Stop":                     true,
 		"Tail.End":                      true,
 		"Tail.Published":                true,
+		"Tail.EphemeralPublished":       true,
+		"FlushTimer":                    true,
+		"wallFlushTimer.C":              true,
 		"Tail.EphemeralDrops":           true,
 		"ErrForeignPublication":         true,
 
@@ -1660,7 +1663,7 @@ func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 		// events.go, O5.3. Tails and Tail carry NO exported field on purpose:
 		// a Tail is a handle, and an exported field on one would be a second,
 		// unsynchronized way to read state its own accessors take a lock for.
-		"TailOptions":             {"Publications", "Routes"},
+		"TailOptions":             {"FlushInterval", "Logger", "NewFlushTimer", "Publications", "Routes"},
 		"InvalidTailOptionsError": {"Field", "Reason"},
 		"Tails":                   nil,
 		"Tail":                    nil,
