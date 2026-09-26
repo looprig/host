@@ -165,14 +165,11 @@ const (
 	// Host's own egress overflowed. Every one of them means this Host can no
 	// longer feed the live stream, so the routes are invalidated.
 	//
-	// THE CAUSES ARE NOT DISTINGUISHED, and that is a limit of the seam rather
-	// than a decision taken here. department.PublicationSubscriber hands back a
-	// channel and no termination cause, so Host sees a closed channel and
-	// cannot tell egress overflow — which harness documents as retryable by
-	// resubscribing — from hub.ErrCommittedBodyMissing or
-	// hub.ErrCommitEventMismatch, which are broken invariants a resubscribe
-	// loops forever against. Host therefore takes the safe intersection of the
-	// two policies: invalidate, and never resubscribe on its own.
+	// A mixed subscription carries a typed cause when its adapter sees an
+	// enduring delivery without committed fields; Tail.End surfaces that cause.
+	// A bare channel close still carries no cause, so Host cannot distinguish
+	// hub backpressure from all upstream invariant failures. It invalidates
+	// routes in either case and never resubscribes on its own.
 	TailEndLost TailEnd = "lost"
 
 	// TailEndRefused reports a publication this Host would not put on the wire:
