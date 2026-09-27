@@ -20,7 +20,9 @@
 package commands_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -418,6 +420,7 @@ func (w *liveWorld) consumer(lease residency.Lease, runtime *liveRuntime, dispat
 		ResidencyEpoch: uint64(lease.Epoch()),
 		Records:        w.adapted,
 		Writes:         writer,
+		Objects:        w.released,
 		Runtime:        dispatch,
 		JournalEpochs:  runtime.epochs,
 		Attempts:       commands.UUIDAttemptIDs{},
@@ -484,6 +487,57 @@ func (w *liveWorld) admit(id sessionwire.CommandID, kind sessionstore.CommandKin
 		w.t.Fatalf("admit a %s: %v", kind, err)
 	}
 	return id
+}
+
+// TestFactoryShapedReferencedInputCrossesTheRealStoreAndRuntime uses the
+// orchestration store's upload and inbox APIs, then the ordinary consumer and
+// harness adapter. A referenced body must arrive as bytes at the runtime.
+func TestFactoryShapedReferencedInputCrossesTheRealStoreAndRuntime(t *testing.T) {
+	w := newLiveWorld(t)
+	runtime := w.launch(false)
+	lease := w.hold()
+	dispatch := &recordingDispatch{next: runtime.applier}
+	consumer := w.consumer(lease, runtime, dispatch)
+	createID := w.nextID()
+	w.admit(createID, "create", sessionwire.CreateRequest{CommandEnvelope: envelope(createID), SessionID: liveSession, AgentID: liveAgent})
+	drain(t, consumer)
+
+	inputID := w.nextID()
+	words := strings.Repeat("REFERENCE-BODY-", 5000)
+	body, err := json.Marshal(sessionwire.InputRequest{CommandEnvelope: envelope(inputID), SessionID: liveSession, Blocks: blockArray(words)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= sessionstore.MaxInboxPayloadBytes {
+		t.Fatalf("body has %d bytes, want above inline limit", len(body))
+	}
+	metadata, err := w.released.PutCommandPayload(t.Context(), sessionstore.PutCommandPayloadRequest{
+		TenantID: liveTenant, SessionID: liveSession, SizeBytes: uint64(len(body)), SHA256: sha256.Sum256(body), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("PutCommandPayload: %v", err)
+	}
+	runtimeID, err := uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, err := w.released.AdmitDispositionCommand(t.Context(), sessionstore.AdmitDispositionCommandRequest{
+		TenantID: liveTenant, SessionID: liveSession, CommandID: inputID, Binding: w.binding,
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeID.String()), Kind: "input", PayloadObject: &metadata,
+		AcceptedAt: now, ApplyDeadline: now.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("AdmitDispositionCommand: %v", err)
+	}
+	drain(t, consumer)
+	if state := w.record(inputID).Record.State; state != sessionstore.InboxStateApplied {
+		t.Fatalf("referenced input settled %q", state)
+	}
+	dispatch.mu.Lock()
+	defer dispatch.mu.Unlock()
+	if len(dispatch.seen) != 2 || !bytes.Equal(dispatch.seen[1].Payload, body) || dispatch.seen[1].PayloadRef != (sessionwire.ObjectReference{}) {
+		t.Fatalf("runtime saw %d commands, referenced body was not delivered as verified bytes", len(dispatch.seen))
+	}
 }
 
 type recordingDispatch struct {

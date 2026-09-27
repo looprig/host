@@ -1,11 +1,18 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
+	"strings"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/bodyclass"
@@ -35,6 +42,10 @@ type DispositionApplierOptions struct {
 
 	Records DispositionRecords
 	Writes  DispositionWrites
+	// Objects reads private command bodies from this session's control SessionStore.
+	Objects CommandPayloadObjects
+	// MaxCommandBodyBytes bounds a referenced body held in memory. Zero uses 8 MiB.
+	MaxCommandBodyBytes int64
 
 	// Runtime is Host's control path into the resident runtime.
 	Runtime department.CommandApplier
@@ -73,6 +84,18 @@ type DispositionApplierOptions struct {
 	Stranded func(command sessionwire.CommandID, cause error)
 }
 
+// CommandPayloadObjects is the scoped immutable-object reader needed by the applier.
+type CommandPayloadObjects interface {
+	GetObjectMetadata(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error)
+	GetObject(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error)
+}
+
+// DefaultMaxCommandBodyBytes is the composition's zero-value read bound.
+const DefaultMaxCommandBodyBytes int64 = 8 << 20
+
+// MaxCommandBodyBytesLimit matches Harness pkg/sessionstore's maxRuntimeBodyBytes.
+const MaxCommandBodyBytesLimit int64 = 16 << 20
+
 // DispositionApplier claims, authorizes, dispatches and settles one command at a
 // time in the disposition family. It is the Processor a composed Host runs, and
 // it replaced the commands.NoDispatch refusal, deleted in the same change,
@@ -88,6 +111,8 @@ type DispositionApplier struct {
 	attempts  AttemptIDs
 	closer    AttemptClosers
 	gates     Gates
+	objects   CommandPayloadObjects
+	maxBody   int64
 	fence     Fence
 	stranded  func(sessionwire.CommandID, error)
 }
@@ -97,6 +122,12 @@ var _ Processor = (*DispositionApplier)(nil)
 
 // NewDispositionApplier validates options and returns a DispositionApplier.
 func NewDispositionApplier(options DispositionApplierOptions) (*DispositionApplier, error) {
+	if options.MaxCommandBodyBytes == 0 {
+		options.MaxCommandBodyBytes = DefaultMaxCommandBodyBytes
+	}
+	if options.MaxCommandBodyBytes <= sessionstore.MaxInboxPayloadBytes || options.MaxCommandBodyBytes > MaxCommandBodyBytesLimit {
+		return nil, &InvalidConsumerOptionsError{Field: "MaxCommandBodyBytes", Reason: "must exceed the 64 KiB inbox bound and not exceed Harness's 16 MiB runtime body limit"}
+	}
 	if options.Host == nil {
 		return nil, &InvalidConsumerOptionsError{Field: "Host", Reason: "must be set; the clock, the claim TTL and this Host's identity all come from it"}
 	}
@@ -152,6 +183,8 @@ func NewDispositionApplier(options DispositionApplierOptions) (*DispositionAppli
 		attempts:  options.Attempts,
 		closer:    options.Closer,
 		gates:     options.Gates,
+		objects:   options.Objects,
+		maxBody:   options.MaxCommandBodyBytes,
 		fence:     options.Fence,
 		stranded:  options.Stranded,
 	}, nil
@@ -321,6 +354,25 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 		}
 	}
 	// Every body's strict reader runs after the claim, before BeginAttempt.
+	if !payload.wellFormed() {
+		rejected, problem := a.reject(ctx, record, revision)
+		if problem != nil {
+			return Outcome{State: StateClaimed}, problem
+		}
+		if rejected {
+			return Outcome{State: StateRejected}, nil
+		}
+	}
+	if payload.Ref != (sessionwire.ObjectReference{}) {
+		var rejected bool
+		payload, rejected, err = a.dereference(ctx, record, revision, payload)
+		if err != nil {
+			return Outcome{State: StateClaimed}, err
+		}
+		if rejected {
+			return Outcome{State: StateRejected}, nil
+		}
+	}
 	members, rejected, problem := a.checkBody(ctx, record, revision, payload)
 	if problem != nil {
 		return Outcome{State: StateClaimed}, problem
@@ -376,6 +428,117 @@ func (a *DispositionApplier) authorizeAndDispatch(ctx context.Context, record Di
 		return a.afterFailedDispatch(ctx, record, applying, problem)
 	}
 	return a.settle(ctx, record, applying)
+}
+
+// dereference reads only the command's own scoped object. Invalid immutable
+// references are rejected before an attempt; store faults leave the claim for retry.
+func (a *DispositionApplier) dereference(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (Payload, bool, error) {
+	if a.objects == nil {
+		return payload, false, nil
+	}
+	bad := func() (Payload, bool, error) {
+		rejected, problem := a.reject(ctx, record, revision)
+		return Payload{}, rejected, problem
+	}
+	fault := func(err error) (Payload, bool, error) {
+		return Payload{}, false, &ApplyError{Refusal: RefusalStore, CommandID: record.CommandID, Reason: "the referenced command body could not be read", Cause: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return fault(err)
+	}
+	metadata, err := a.objects.GetObjectMetadata(ctx, sessionstore.GetObjectMetadataRequest{
+		TenantID: a.key.TenantID, SessionID: a.key.SessionID,
+		ExpectedKind: sessionstore.ObjectKindCommandPayload, Reference: payload.Ref,
+	})
+	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return fault(canceled)
+		}
+		if permanentObjectFailure(err) {
+			return bad()
+		}
+		return fault(err)
+	}
+	// #nosec G115 -- construction validates maxBody as positive and at most 16 MiB.
+	if metadata.Reference != payload.Ref || metadata.SizeBytes > uint64(a.maxBody) || metadata.Digest == "" ||
+		!strings.HasPrefix(payload.Ref.ObjectID, "v1:command-payload:") ||
+		!strings.HasSuffix(payload.Ref.ObjectID, ":"+strings.TrimPrefix(metadata.Digest, "sha256:")) {
+		return bad()
+	}
+	reader, err := a.objects.GetObject(ctx, sessionstore.GetObjectRequest{
+		TenantID: a.key.TenantID, SessionID: a.key.SessionID,
+		ExpectedKind: sessionstore.ObjectKindCommandPayload, Metadata: metadata,
+	})
+	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return fault(canceled)
+		}
+		if permanentObjectFailure(err) {
+			return bad()
+		}
+		return fault(err)
+	}
+	// Read one byte beyond the bound to detect a lying provider. Both this
+	// stream and SessionStore's own reader verify the declared digest at EOF.
+	var body bytes.Buffer
+	hash := sha256.New()
+	n, readErr := io.Copy(io.MultiWriter(&body, hash), io.LimitReader(reader, a.maxBody+1))
+	closeErr := reader.Close()
+	if readErr != nil {
+		if err := ctx.Err(); err != nil {
+			return fault(err)
+		}
+		if permanentObjectFailure(readErr) {
+			return bad()
+		}
+		return fault(readErr)
+	}
+	if closeErr != nil {
+		if err := ctx.Err(); err != nil {
+			return fault(err)
+		}
+		if permanentObjectFailure(closeErr) {
+			return bad()
+		}
+		return fault(closeErr)
+	}
+	if ctx.Err() != nil {
+		return fault(ctx.Err())
+	}
+	// #nosec G115 -- n is bounded above by the positive 16 MiB maxBody + 1.
+	if n > a.maxBody || uint64(n) != metadata.SizeBytes {
+		return bad()
+	}
+	if metadata.Digest != "sha256:"+hex.EncodeToString(hash.Sum(nil)) {
+		return bad()
+	}
+	return Payload{Body: body.Bytes()}, false, nil
+}
+
+func permanentObjectFailure(err error) bool {
+	var keyspace *sessionstore.KeyspaceError
+	if errors.As(err, &keyspace) {
+		switch keyspace.Code {
+		case sessionstore.KeyspaceBindingNotFound, sessionstore.KeyspaceScopeInvalid,
+			sessionstore.KeyspaceHashCollision, sessionstore.KeyspaceLegacyTenant,
+			sessionstore.KeyspaceLegacySession:
+			return true
+		}
+	}
+	var identity *sessionstore.InvalidIdentityError
+	if errors.As(err, &identity) {
+		return true
+	}
+	var object *sessionstore.ObjectError
+	if errors.As(err, &object) {
+		switch object.Code {
+		case sessionstore.ObjectErrorInvalid, sessionstore.ObjectErrorSize, sessionstore.ObjectErrorDigest,
+			sessionstore.ObjectErrorIntegrity, sessionstore.ObjectErrorMetadataUnavailable:
+			return true
+		}
+	}
+	var missing *storage.BlobNotFoundError
+	return errors.As(err, &missing)
 }
 
 // afterFailedDispatch handles a runtime that failed a command after its attempt
@@ -467,8 +630,8 @@ func (a *DispositionApplier) classifyBody(ctx context.Context, record Dispositio
 //
 // THREE ANSWERS, AND THEY ARE DIFFERENT KINDS OF ANSWER:
 //
-//   - A BODY NO HOST COULD EVER APPLY is rejected: stored by reference,
-//     malformed, naming another session or command, a gate identity harness
+//   - A BODY NO HOST COULD EVER APPLY is rejected: malformed, naming another
+//     session or command, a gate identity harness
 //     never mints, or — for a gate
 //     the projection holds and this Host owns — an expected-open version that
 //     is not the projected one. The body is immutable and every Host reads the
@@ -487,13 +650,10 @@ func (a *DispositionApplier) classifyBody(ctx context.Context, record Dispositio
 // residency of the last Host to write a gate; it is compared with this Host's
 // residency grant and never with a journal epoch.
 func (a *DispositionApplier) checkGateResponse(ctx context.Context, record DispositionRecord, revision uint64, payload Payload) (bodyclass.Members, bool, error) {
-	// A BODY STORED BY REFERENCE IS REJECTED, NOT BLOCKED (spec gate C1,
-	// quality gate F5). This Host does not dereference a private object and
-	// harness's admitted command has no reference member, so no released Host
-	// can apply it — and a block holds the session's WHOLE command stream,
-	// interrupts included, until Factory's deadline sweep rejects the answer
-	// anyway. factory v0.5.0 refuses such a body at admission; this is for
-	// every other path.
+	// A reference reaching this point means this applier was constructed
+	// without an object reader. The composed Host supplies one and resolves
+	// references before classification. A bare applier preserves its earlier
+	// refusal, since the adapter cannot read an object itself.
 	if len(payload.Body) == 0 && payload.Ref != (sessionwire.ObjectReference{}) {
 		rejected, err := a.reject(ctx, record, revision)
 		return bodyclass.Members{}, rejected, err

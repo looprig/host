@@ -155,12 +155,14 @@ func (s *Service) beginWork(ctx context.Context, request residency.OwnershipRequ
 			slog.String("session_id", string(request.Key.SessionID)))
 	}
 	applier, err := commands.NewDispositionApplier(commands.DispositionApplierOptions{
-		Host:           s.options.Host,
-		Key:            request.Key,
-		ResidencyEpoch: uint64(request.LeaseEpoch),
-		Records:        s.options.Records,
-		Writes:         writer,
-		Runtime:        request.Runtime,
+		Host:                s.options.Host,
+		Key:                 request.Key,
+		ResidencyEpoch:      uint64(request.LeaseEpoch),
+		Records:             s.options.Records,
+		Writes:              writer,
+		Objects:             s.options.Objects,
+		MaxCommandBodyBytes: s.options.MaxCommandBodyBytes,
+		Runtime:             request.Runtime,
 		// THE JOURNAL EPOCH COMES FROM THE RUNTIME AND NEVER FROM request.LeaseEpoch,
 		// which is this Host's RESIDENCY. The two are different authorities over
 		// different stores; an attempt stamped with the wrong one names a grant no

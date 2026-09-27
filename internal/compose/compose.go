@@ -79,6 +79,10 @@ type Options struct {
 	// bound per session, to the grant this Host holds for it.
 	Records commands.DispositionRecords
 	Writers DispositionWriters
+	// Objects is the control SessionStore's scoped command-payload reader.
+	Objects commands.CommandPayloadObjects
+	// MaxCommandBodyBytes bounds a referenced runtime body; zero uses 8 MiB.
+	MaxCommandBodyBytes int64
 
 	// Checkpointer is the product's release checkpoint. It is REQUIRED; see
 	// host.Checkpointer for why an absent one may not become a no-op.
@@ -195,12 +199,17 @@ type LiveTextOptions struct {
 // a projection nothing publishes. Either half alone is a Host that cannot
 // apply a gate_response, and a Factory must not be told it can.
 // The principal-attribution token is unconditional: strict Core decoding and
-// the pinned harness runtime need no product seam.
+// the pinned harness runtime need no product seam. The payload-reference token
+// requires the control SessionStore object reader; host.Compose always wires it.
 func (s *Service) capabilities() []string {
-	if s.options.Gates != nil && s.options.GateReads != nil {
-		return []string{hostlink.CapabilityGateResponse, hostlink.CapabilityAttributionPrincipal}
+	capabilities := []string{hostlink.CapabilityAttributionPrincipal}
+	if s.options.Objects != nil {
+		capabilities = append(capabilities, sessionwire.HostLinkCapabilityPayloadReference)
 	}
-	return []string{hostlink.CapabilityAttributionPrincipal}
+	if s.options.Gates != nil && s.options.GateReads != nil {
+		return append([]string{hostlink.CapabilityGateResponse}, capabilities...)
+	}
+	return capabilities
 }
 
 // DefaultGateRetry is the gate publisher's retry wait when GateRetry is zero.
@@ -429,6 +438,9 @@ func New(options Options) (*Service, error) {
 
 // validate holds every composition rule, in one place.
 func (o Options) validate() error {
+	if o.MaxCommandBodyBytes != 0 && (o.MaxCommandBodyBytes <= 64<<10 || o.MaxCommandBodyBytes > commands.MaxCommandBodyBytesLimit) {
+		return &InvalidOptionsError{Field: "MaxCommandBodyBytes", Reason: "must exceed 64 KiB and not exceed Harness's 16 MiB runtime body limit"}
+	}
 	if o.Host == nil {
 		return &InvalidOptionsError{Field: "Host", Reason: "must be set"}
 	}

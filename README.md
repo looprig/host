@@ -77,7 +77,7 @@ controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` store (currently pinned at v0.14.0), and
 `internal/harnessadapter` to `github.com/looprig/harness` (currently v0.41.0).
-Core is v0.12.0. Check `go.mod` for the exact pins of a given release.
+Core is v0.13.0. Check `go.mod` for the exact pins of a given release.
 
 **Since host v0.7.1 Host requires harness ≥ v0.37.1**, which is v0.37.0 plus one
 further fix, and both matter to a pooled fleet.
@@ -182,10 +182,8 @@ v0.5.0. A cold AskUser answer/resume remains unsupported.
 Host unconditionally advertises `hostlink.attribution.principal`. Every
 command kind's stored Core body is strictly decoded after the claim and before
 the dispatch attempt. A permanently malformed body is rejected. An
-`unknown_field`, `unsupported_version`, or by-reference input, interrupt or
-restore body stays claimed without an attempt (`unreadable_command`) for a
-newer Host or Factory's deadline sweep. A by-reference create retains
-`unreadable_create`. A gate response with a future member now blocks as
+`unknown_field` or `unsupported_version` stays claimed without an attempt
+(`unreadable_command`) for a newer Host or Factory's deadline sweep. A gate response with a future member now blocks as
 `unreadable_gate_response`; Hosts through v0.10.3 rejected it. A valid gate
 response on a composition without a gate reader still reports `no_gate_reader`.
 
@@ -201,10 +199,9 @@ core v0.12.0 or later to accept stamped commands.
 This is a **one-way upgrade**. Once a journal holds a stamped or presented
 record, do not roll a Host back below v0.11.0 / harness v0.41.0: the older
 reader silently loses these members. Once a store holds a v3 inbox row, every
-Host must remain on sessionstore v0.14.0 or later. An input over 64 KiB is
-stored by reference; it previously stranded after an attempt and now blocks
-before one until Factory's deadline sweep rejects it. The referenced body is
-unapplied in either case.
+Host must remain on sessionstore v0.14.0 or later. A body over 64 KiB is
+stored by reference; a Host advertising `hostlink.payload.reference` reads and
+verifies it before applying the command.
 
 ## Upgrading to v0.10.0: no runtime identity reaches a client
 
@@ -557,8 +554,9 @@ command is rejected while the command has no attempt, freeing the session's
 command stream. A body this Host may be too old to understand (`unknown_field`
 or `unsupported_version`) stays claimed and unattempted; a newer Host can
 take the claim, and Factory's apply deadline still bounds it. A body stored
-only by object reference also blocks conservatively because this Host cannot
-read it. Once an attempt exists, only runtime evidence settles the command.
+only by object reference is read from the command's scoped control store and
+checked by the same classifier. Once an attempt exists, only runtime evidence
+settles the command.
 
 The precheck validates the generic create envelope and block-array shape. A
 product's block decoder can still refuse a block after the attempt; that
@@ -598,8 +596,7 @@ successor closes the attempt or an operator repairs the decoder.
 - **Applying an answer.** A `gate_response` is checked after the claim and
   before the attempt — the last point a rejection is possible:
   - **rejected** (`RejectDispositionCommand`, no durable reason) when no Host
-    could ever apply it: stored by object reference (no released Host
-    dereferences one), not Core's strict `GateResponseRequest`, naming another
+    could ever apply it: a missing or corrupt referenced object, not Core's strict `GateResponseRequest`, naming another
     session or command, a gate id that is not a non-zero UUID, or — for a gate
     the projection holds under this Host's mark — an `ExpectedOpen*` that is not
     the projected version;
@@ -666,6 +663,20 @@ reply `Supports` it**; no earlier Host advertises it. A token is not a method:
 nothing dispatches on it, and sent as an RPC it is answered from the channel arm
 like any unknown name. Host advertises it only when its composition wires both
 gate seams (publication and the pre-attempt check); `host.Compose` always does.
+
+### Referenced command bodies
+
+The composed Host advertises Core v0.13.0's `hostlink.payload.reference`
+(`sessionwire.HostLinkCapabilityPayloadReference`). For a create, input, or
+gate response above SessionStore's 64 KiB inline limit, the applier resolves
+`PayloadRef` through the session's control SessionStore, using the command's
+tenant and session and the `command-payload` kind. It checks size and SHA-256
+while reading, then runs the same body checks as an inline command. The runtime
+and Harness adapter receive verified bytes and never dereference the object.
+Missing, foreign, wrong-kind, corrupt, or oversized objects are rejected before
+an attempt. Transient store faults block the pass for retry. The memory limit
+defaults to 8 MiB; `Composition.MaxCommandBodyBytes` may be set above 64 KiB
+through 16 MiB, Harness's object-backed runtime body ceiling.
 
 The projection's residency mark equalling this Host's grant is **not** a
 capability signal. It is the applier's **ownership** check (an answer to a gate

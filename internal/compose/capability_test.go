@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/sessionstore"
 
 	"github.com/looprig/host/internal/commands"
 	"github.com/looprig/host/internal/gates"
@@ -25,6 +27,43 @@ func (inertGateSessions) GateSessionFor(residency.Lease, sessionwire.TenantID, s
 
 // inertGateReads is a commands.Gates that holds no gate.
 type inertGateReads struct{}
+
+type inertCommandPayloadObjects struct{}
+
+func (inertCommandPayloadObjects) GetObjectMetadata(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error) {
+	return sessionwire.ObjectMetadata{}, errors.New("unused")
+}
+func (inertCommandPayloadObjects) GetObject(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) {
+	return nil, errors.New("unused")
+}
+
+func TestPayloadReferenceCapabilityRequiresControlObjectReader(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		reader bool
+	}{{"absent", false}, {"wired", true}} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newFixture(t, func(options *Options, _ *hostconfig.Options) {
+				if row.reader {
+					options.Objects = inertCommandPayloadObjects{}
+				}
+			})
+			if got := advertisesCapability(t, f, sessionwire.HostLinkCapabilityPayloadReference); got != row.reader {
+				t.Fatalf("payload reference capability = %v, want %v", got, row.reader)
+			}
+		})
+	}
+}
+
+func TestCommandBodyLimitIsValidatedAtComposition(t *testing.T) {
+	for _, bound := range []int64{1, 64 << 10, (16 << 20) + 1} {
+		err := (Options{MaxCommandBodyBytes: bound}).validate()
+		var invalid *InvalidOptionsError
+		if !errors.As(err, &invalid) || invalid.Field != "MaxCommandBodyBytes" {
+			t.Fatalf("limit %d: validate = %v, want MaxCommandBodyBytes refusal", bound, err)
+		}
+	}
+}
 
 func (inertGateReads) LoadGate(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.GateID) (commands.Gate, bool, error) {
 	return commands.Gate{}, false, nil

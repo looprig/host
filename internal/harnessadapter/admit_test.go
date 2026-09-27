@@ -317,10 +317,9 @@ func TestAdmitRefusesAnInputThatDecodesToNothing(t *testing.T) {
 	}
 }
 
-// H8. RuntimeCommand.PayloadRef exists so a large private body is dereferenced
-// by the runtime instead of travelling through Host's memory. Admitted has no
-// reference member and no object reader, so a referenced payload cannot cross.
-// The fake accepts one and records it.
+// H8. The applier dereferences a stored body before calling this adapter.
+// Admitted has no reference member or object reader, so a caller that bypasses
+// the applier and passes PayloadRef directly is refused here.
 func TestAdmitRefusesAnObjectReferencedPayload(t *testing.T) {
 	bound := &boundSession{
 		leaseEpoch: heldEpoch(3),

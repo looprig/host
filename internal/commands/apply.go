@@ -17,7 +17,7 @@
 // reader trying to work out why apply does not work in disposition mode.
 //
 // sessionstore v0.7.0 has all of them for a LEGACY session — GetCommand, the
-// inbox record's private Payload/PayloadRef with GetObject behind a reference,
+// inbox record's private Payload/PayloadRef with the applier's scoped object reader,
 // FindCommandApplication, ReadGates, ClaimCommand, BeginApplyingCommand,
 // CompleteCommand, RejectCommand, and the journal's application-prefix envelope
 // — and the shapes below are modelled on those rather than invented beside them.
@@ -188,9 +188,8 @@ type Record struct {
 // a test can see.
 //
 // AT MOST ONE OF THE TWO IS SET. §10.1 gives a private body an independent
-// immutable object reference once it exceeds its inline threshold; Host passes
-// the reference on rather than dereferencing it, so a large body never travels
-// through Host's memory.
+// immutable object reference once it exceeds its inline threshold. The
+// disposition applier resolves the reference before dispatch.
 type Payload struct {
 	// Body is the inline private request body.
 	Body []byte

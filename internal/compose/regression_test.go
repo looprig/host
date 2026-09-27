@@ -1768,6 +1768,7 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 	wantTokens := map[string]string{
 		"CapabilityGateResponse":         hostlink.CapabilityGateResponse,
 		"CapabilityAttributionPrincipal": hostlink.CapabilityAttributionPrincipal,
+		"CapabilityPayloadReference":     hostlink.CapabilityPayloadReference,
 	}
 	if len(tokens) != len(wantTokens) {
 		t.Fatalf("hostlink declares capability tokens %v, want exactly %v; a new token is a new promise to Factory and must be reviewed as one", tokens, wantTokens)
@@ -1788,6 +1789,7 @@ func TestHostServesNoReadOrListPlaneAndTheProbeCanSayOtherwise(t *testing.T) {
 var coreCapabilityNames = map[string]string{
 	"HostLinkCapabilityGateResponse":         sessionwire.HostLinkCapabilityGateResponse,
 	"HostLinkCapabilityAttributionPrincipal": sessionwire.HostLinkCapabilityAttributionPrincipal,
+	"HostLinkCapabilityPayloadReference":     sessionwire.HostLinkCapabilityPayloadReference,
 }
 
 // hostLinkConstants is reservedHostLinkMethods' parse over another name

@@ -217,6 +217,10 @@ func composeLiveText(value *LiveTextOptions) *compose.LiveTextOptions {
 
 // Composition is one runnable Host, described.
 type Composition struct {
+	// MaxCommandBodyBytes bounds a referenced command body. Zero defaults to
+	// 8 MiB; explicit values must exceed SessionStore's 64 KiB inline limit
+	// and stay within Harness's 16 MiB object-backed runtime body limit.
+	MaxCommandBodyBytes int64
 	// Options is the Host's configuration. ITS COLLABORATOR FIELDS MUST BE
 	// NIL — Department, SessionStore, Workspaces, Clock and Auth — because
 	// Compose supplies every one of them from Collaborators: the Department
@@ -407,6 +411,8 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		Cursors:              adapted,
 		Records:              adapted,
 		Writers:              adapted,
+		Objects:              store,
+		MaxCommandBodyBytes:  blueprint.MaxCommandBodyBytes,
 		Targets:              adapted,
 		Gates:                adapted,
 		GateReads:            adapted,
@@ -449,6 +455,9 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 
 // validate holds every rule Compose applies before it opens anything.
 func (c Composition) validate() error {
+	if c.MaxCommandBodyBytes != 0 && (c.MaxCommandBodyBytes <= sessionstore.MaxInboxPayloadBytes || c.MaxCommandBodyBytes > 16<<20) {
+		return &InvalidCompositionError{Field: "MaxCommandBodyBytes", Reason: "must exceed SessionStore's 64 KiB inbox limit and not exceed Harness's 16 MiB runtime body limit"}
+	}
 	if c.LiveText != nil {
 		for _, value := range []struct {
 			field   string

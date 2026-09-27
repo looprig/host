@@ -163,11 +163,11 @@
 // with none, so somebody must decode. This adapter takes a decoder rather than
 // guessing an encoding, and refuses when it has none.
 //
-// H8. AN OBJECT-REFERENCED PAYLOAD CANNOT CROSS AT ALL. RuntimeCommand.PayloadRef
-// exists so a large private body is dereferenced by the runtime instead of
-// travelling through Host's memory. Admitted has no reference member and no
-// object reader, so a referenced payload is refused. The fake accepts one and
-// records it.
+// H8. AN OBJECT-REFERENCED PAYLOAD IS DEREFERENCED BY THE APPLIER, NEVER BY
+// THE ADAPTER. The applier reads and verifies the private body in the command's
+// tenant/session scope and passes bytes to RuntimeCommand.Payload. Admitted has
+// no reference member and the adapter never reads objects. A caller bypassing
+// the applier and passing PayloadRef directly is still refused.
 //
 // H9. HARNESS WRITES THE APPLICATION PREFIX ITSELF, AND BY DEFAULT WRITES IT
 // UNDER ITS OWN SESSION SCOPE. harness/pkg/sessionstore opens the released store
