@@ -46,7 +46,7 @@ var forbiddenLooprigModules = map[string]string{
 // name. A module absent from this map is unreleased as far as Host is
 // concerned, which is the condition that produces a pseudo-version pin.
 var publishedLooprigVersions = map[string]string{
-	"core":         "v0.13.0",
+	"core":         "v0.13.1",
 	"storage":      "v0.7.0",
 	"sessionstore": "v0.14.0",
 	// fsstore is here only because HARNESS PULLS IT IN test-only (see the
@@ -62,20 +62,22 @@ var publishedLooprigVersions = map[string]string{
 	// harness v0.41.0 (principal/metadata/presenter, one-way): Admitted gains
 	// Principal and Metadata, and the journal gains principal/metadata/presented
 	// members harness <= v0.40.2 cannot replay. Host sets both members from the
-	// body it decoded before the attempt (host v0.11.0).
-	"harness": "v0.41.1",
+	// body it decoded before the attempt (host v0.11.0). harness v0.42.0 adds
+	// tool_use_id/tool_name/elapsed_ms to the ephemeral tool-call events Host's
+	// live tool steps forward; ephemeral, so no journal impact.
+	"harness": "v0.42.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
 	// internal/harnesstest does, because harness's loop.WithInference takes an
 	// inference.Client and a real rig cannot run a turn without one. harness
-	// v0.41.0 requires inference v0.14.0, so
+	// v0.42.0 requires inference v0.14.0, so
 	// binding to harness names it in go.mod whether or not Host wanted a
 	// decision about it — which is exactly the indirect arrival the comment on
 	// requireViolations describes, and the reason that check consults this map
-	// rather than the import set. The version is the one harness v0.41.0
-	// pins and is published.
-	"inference": "v0.14.0",
+	// rather than the import set. Host names the newest published patch,
+	// v0.14.1, one above the version harness v0.42.0 pins.
+	"inference": "v0.14.1",
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +613,7 @@ func TestReplaceViolations(t *testing.T) {
 		{
 			name:   "versioned replacement onto an unpublished version",
 			source: "module m\n\ngo 1.26.6\n\nreplace github.com/looprig/core => github.com/looprig/core v0.9.9\n",
-			want:   []string{`replaces github.com/looprig/core with github.com/looprig/core at v0.9.9, which is not the published version v0.13.0`},
+			want:   []string{`replaces github.com/looprig/core with github.com/looprig/core at v0.9.9, which is not the published version v0.13.1`},
 		},
 		{
 			name:   "versioned replacement onto an unreleased module",
@@ -664,7 +666,7 @@ func TestRequireViolations(t *testing.T) {
 	}{
 		{
 			name:   "published pins",
-			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.13.0\n\tgithub.com/looprig/sessionstore v0.14.0\n\tgithub.com/looprig/storage v0.7.0\n)\n",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.13.1\n\tgithub.com/looprig/sessionstore v0.14.0\n\tgithub.com/looprig/storage v0.7.0\n)\n",
 		},
 		{
 			name:   "non-looprig dependency is unconstrained",
@@ -683,7 +685,7 @@ func TestRequireViolations(t *testing.T) {
 		{
 			name:   "unpublished version of a released module",
 			source: "module m\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.12.0\n",
-			want:   []string{`requires github.com/looprig/core at v0.12.0, which is not the published version v0.13.0`},
+			want:   []string{`requires github.com/looprig/core at v0.12.0, which is not the published version v0.13.1`},
 		},
 		{
 			// A forbidden module must be rejected FOR BEING FORBIDDEN. Today it
@@ -702,7 +704,7 @@ func TestRequireViolations(t *testing.T) {
 		},
 		{
 			name:   "several at once, in file order",
-			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.13.0\n\tgithub.com/looprig/factory v0.1.0\n\tgithub.com/looprig/drain v0.1.0\n)\n",
+			source: "module m\n\ngo 1.26.6\n\nrequire (\n\tgithub.com/looprig/core v0.13.1\n\tgithub.com/looprig/factory v0.1.0\n\tgithub.com/looprig/drain v0.1.0\n)\n",
 			want: []string{
 				`github.com/looprig/factory at v0.1.0; Host is consumed by Factory`,
 				`github.com/looprig/drain at v0.1.0; Host has no released version`,
@@ -1079,7 +1081,7 @@ func TestDeclaredNestedModuleInheritsTheWholeGuard(t *testing.T) {
 		root := t.TempDir()
 		writeFixture(t, root, "go.mod", "module github.com/looprig/host\n")
 		writeFixture(t, root, "host.go", "package host\n\nimport _ \"context\"\n")
-		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.13.0\n")
+		writeFixture(t, root, "tools/checkout/go.mod", "module github.com/looprig/host/tools/checkout\n\ngo 1.26.6\n\nrequire github.com/looprig/core v0.13.1\n")
 		writeFixture(t, root, "tools/checkout/ok.go", "package checkout\n\nimport _ \"context\"\n")
 
 		scan, err := scanNestedModules(root, []string{"tools/checkout"})

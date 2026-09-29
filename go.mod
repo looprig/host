@@ -7,9 +7,9 @@ require (
 	github.com/centrifugal/centrifuge-go v0.10.12
 	github.com/centrifugal/protocol v0.17.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/looprig/core v0.13.0
-	github.com/looprig/harness v0.41.1
-	github.com/looprig/inference v0.14.0
+	github.com/looprig/core v0.13.1
+	github.com/looprig/harness v0.42.0
+	github.com/looprig/inference v0.14.1
 	github.com/looprig/sessionstore v0.14.0
 	github.com/looprig/storage v0.7.0
 	github.com/prometheus/client_golang v1.23.2
