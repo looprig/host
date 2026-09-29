@@ -410,6 +410,10 @@ type fakeOwnership struct {
 	// how a test reaches the attach's own fence — the object a real heartbeat
 	// starting here would go on to write through.
 	withRequest func(OwnershipRequest)
+
+	// honourCommit makes BeginOwnership refuse an attach whose Commit answers
+	// false, as the composition's ownership does at its commit point.
+	honourCommit bool
 }
 
 func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipRequest) (OwnershipHandle, error) {
@@ -436,6 +440,9 @@ func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipReq
 		withRequest(request)
 		o.mu.Lock()
 	}
+	if o.honourCommit && request.Commit != nil && !request.Commit() {
+		return nil, errCommitRefused
+	}
 	if o.err != nil {
 		return nil, o.err
 	}
@@ -448,6 +455,10 @@ func (o *fakeOwnership) BeginOwnership(ctx context.Context, request OwnershipReq
 	o.handles = append(o.handles, handle)
 	return handle, nil
 }
+
+// errCommitRefused is fakeOwnership's refusal of an attach cancelled before it
+// committed.
+var errCommitRefused = errors.New("fakeOwnership: the attach was cancelled before it committed")
 
 func (o *fakeOwnership) startedRequests() []OwnershipRequest {
 	o.mu.Lock()

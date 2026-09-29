@@ -2,6 +2,7 @@ package residency
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -13,14 +14,24 @@ import (
 func TestCancelAttachesReachesOnlyAnUncommittedAttach(t *testing.T) {
 	t.Run("cancelled before commit", func(t *testing.T) {
 		f := newFixture(t)
-		committed := true
-		f.ownership.withRequest = func(request OwnershipRequest) {
-			f.manager.CancelAttaches()
-			committed = request.Commit()
+		f.ownership.honourCommit = true
+		f.ownership.withRequest = func(OwnershipRequest) { f.manager.CancelAttaches() }
+		_, err := f.manager.Attach(context.Background(), f.request(ModeCreate))
+		if !errors.Is(err, errCommitRefused) {
+			t.Fatalf("Attach = %v, want the ownership's refusal of an attach cancelled before it committed", err)
 		}
-		_, _ = f.manager.Attach(context.Background(), f.request(ModeCreate))
-		if committed {
-			t.Fatal("Commit answered true for an attach CancelAttaches had already cancelled")
+		// AND IT ROLLED BACK: nothing it took is still held.
+		if held := f.leases.heldCount(); held != 0 {
+			t.Fatalf("%d session leases still held after the cancelled attach", held)
+		}
+		if _, resident := f.registry.Get(f.key()); resident {
+			t.Fatal("the cancelled attach left a registry entry")
+		}
+		if records := f.manager.Records(); records != 0 {
+			t.Fatalf("manager.Records() = %d after the cancelled attach, want 0", records)
+		}
+		if _, releases := f.admissions.counts(); releases == 0 {
+			t.Fatal("the cancelled attach's admission charge was never released")
 		}
 	})
 	t.Run("committed before cancel", func(t *testing.T) {
