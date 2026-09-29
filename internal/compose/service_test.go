@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -86,13 +87,27 @@ func TestStartPublishesEveryTargetBeforeItReturns(t *testing.T) {
 func TestNewBuildsAndDoesNotStart(t *testing.T) {
 	f := newFixture(t)
 
-	before := runtime.NumGoroutine()
-	built, err := New(f.svc.options)
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	// THE PROBE IS REPEATED, and passes on the first attempt whose count did
+	// not rise. A goroutine left over from an earlier test can itself START one
+	// while New runs (measured once in 30 package runs under -race, with ~190k
+	// leftovers), which one sample cannot tell from New starting it. A New that
+	// starts a goroutine raises the count on EVERY attempt, so it still fails.
+	var built *Service
+	var rises []string
+	for attempt := 0; attempt < 5 && built == nil; attempt++ {
+		before := runtime.NumGoroutine()
+		candidate, err := New(f.svc.options)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if after := runtime.NumGoroutine(); after > before {
+			rises = append(rises, fmt.Sprintf("%d -> %d", before, after))
+			continue
+		}
+		built = candidate
 	}
-	if after := runtime.NumGoroutine(); after > before {
-		t.Errorf("New left %d more goroutines running (%d -> %d); it must build and not start", after-before, before, after)
+	if built == nil {
+		t.Fatalf("New left more goroutines running on every attempt (%v); it must build and not start", rises)
 	}
 
 	beforeStart := runtime.NumGoroutine()
