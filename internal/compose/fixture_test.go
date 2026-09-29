@@ -361,6 +361,9 @@ type fakeStore struct {
 
 	// leaseReleaseErr makes the grant minted for a session refuse its release.
 	leaseReleaseErr map[sessionwire.SessionID]error
+
+	// onLeaseRelease runs inside the Release of the grant minted for a session.
+	onLeaseRelease map[sessionwire.SessionID]func()
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -439,6 +442,7 @@ func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.Te
 	lease := &fakeLease{trace: s.trace, epoch: 9, lost: make(chan struct{})}
 	s.mu.Lock()
 	lease.releaseErr = s.leaseReleaseErr[session]
+	lease.onRelease = s.onLeaseRelease[session]
 	s.mu.Unlock()
 	s.mu.Lock()
 	s.leases[key] = lease

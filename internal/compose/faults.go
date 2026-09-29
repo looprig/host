@@ -152,6 +152,8 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	}
 	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
 		failures = append(failures, err)
+		s.recordUnreleased(fmt.Errorf("compose: the release of the unusable session %s/%s did not finish: %w",
+			held.key.TenantID, held.key.SessionID, err))
 	}
 	// The admission credit AFTER the lease release, for the warm release's
 	// reason: crediting capacity while still holding the grant would admit a

@@ -186,10 +186,8 @@ type Residents interface {
 type Attaches interface {
 	// AwaitAttaches blocks until every attach in flight at the moment of the
 	// call has finished — resident or rolled back — or the context ends, and
-	// then reports the context's error, naming what is still in flight. Once
-	// they have finished it reports, as an error, any attach rollback that
-	// could not give back what it took (other than one Ender reports), so a
-	// drain never counts a leaked grant as settled.
+	// then reports the context's error, naming what is still in flight. How a
+	// rollback went is the ReleaseLedger's to report.
 	AwaitAttaches(context.Context) error
 
 	// AwaitSessionAttaches is AwaitAttaches for ONE session. The drain calls it
@@ -209,17 +207,25 @@ type Attaches interface {
 
 // Ender is the optional Session method that reports a residency whose ATTACH
 // ROLLED BACK after it had committed into the drain's snapshot — while the
-// drain waited for it — and with what outcome. The rollback gave back what it
-// could, so the drain does not release the residency again; a rollback that
-// could NOT give everything back is returned as the error, and it withholds
-// `drained` exactly as a refused FinishRelease does.
+// drain waited for it. That rollback went through the residency's one release
+// authority, so there is nothing left for the drain to release; what it could
+// not give back is on the Host's ReleaseLedger, not here.
 //
 // IT IS NOT "the residency is gone". A residency another path removed — a warm
-// release, a teardown — is not ended in this sense, and must answer false: that
-// path may have retained a failure (a refused tombstone) that only the drain's
-// own FinishRelease on its snapshot will surface.
+// release, a teardown — is not ended in this sense and answers false, so the
+// drain's own release steps run and share that path's outcome.
 type Ender interface {
-	Ended() (bool, error)
+	Ended() bool
+}
+
+// ReleaseLedger is the optional Residents capability that reports every release on
+// this Host — an attach rollback, a warm release, a give-up — that ended with
+// resources still held, whether or not the drain's snapshot ever named its
+// session. The drain reads it after its own releases and withholds `drained`
+// while it reports anything: a grant this Host still holds is a release that did
+// not finish, whichever path left it.
+type ReleaseLedger interface {
+	Unreleased() error
 }
 
 // THIS PACKAGE OWNS NO TRANSPORT SHUTDOWN, and the absence is load-bearing
@@ -337,6 +343,11 @@ const (
 	// has not finished may still hold a lease and a runtime, or still publish
 	// over the drain's tombstone.
 	StepSettleAttaches Step = "settle_attaches"
+
+	// StepUnreleased is the Host's ReleaseLedger reporting a release — by any path —
+	// that ended with resources still held. It carries no session key (the
+	// error names them) and it WITHHOLDS `drained`.
+	StepUnreleased Step = "unreleased"
 
 	// StepCloseLink is the transport shutdown, and THIS PACKAGE NEVER RECORDS
 	// IT. The drain does not close a transport at all; the process-lifecycle
@@ -734,6 +745,15 @@ func (d *Drainer) run(sessions []Session) {
 	wait.Wait()
 	endGrace()
 
+	// THE LEDGER IS READ LAST, after every release this drain ran or waited
+	// for, so a rollback or warm release that finished while the drain ran is
+	// in it. See ReleaseLedger.
+	if ledger, ok := d.options.Residents.(ReleaseLedger); ok {
+		if err := ledger.Unreleased(); err != nil {
+			d.record(Failure{Step: StepUnreleased, Err: err})
+		}
+	}
+
 	d.mu.Lock()
 	d.drainState = d.settledState()
 	done := d.done
@@ -759,9 +779,10 @@ func (d *Drainer) run(sessions []Session) {
 // `draining`, so a Factory waits and eventually escalates instead of deleting.
 // A leaked workload is visible to an operator; deleted work is not.
 //
-// ONLY FinishRelease AND AN UNSETTLED ATTACH WITHHOLD IT. An attach that did
-// not finish rolling back within its bound may still hold a residency grant and
-// a runtime's journal lease, which is the same "release did not finish".
+// ONLY FinishRelease, AN UNSETTLED ATTACH AND THE RELEASE LEDGER WITHHOLD IT. An attach
+// that did not finish within its bound may still hold a residency grant and a
+// runtime's journal lease, and the ReleaseLedger reports a release by any other path
+// that left one held; each is the same "release did not finish".
 //
 // Nothing else does. A failed checkpoint, a missed idle boundary
 // and a refused ReleaseResidency are all recorded and none of them means
@@ -771,7 +792,7 @@ func (d *Drainer) run(sessions []Session) {
 // failure after this state was already settled.
 func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
 	for _, failure := range d.failures {
-		if failure.Step == StepFinishRelease || failure.Step == StepSettleAttaches {
+		if failure.Step == StepFinishRelease || failure.Step == StepSettleAttaches || failure.Step == StepUnreleased {
 			return sessionwire.HostLinkDrainStateDraining
 		}
 	}
@@ -820,13 +841,8 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 			return
 		}
 	}
-	if ender, ok := session.(Ender); ok {
-		if ended, err := ender.Ended(); ended {
-			if err != nil {
-				record(StepFinishRelease, err)
-			}
-			return
-		}
+	if ender, ok := session.(Ender); ok && ender.Ended() {
+		return
 	}
 
 	// STEP 0, as the warm release's: stop applying commands before anything
@@ -887,22 +903,12 @@ func (d *Drainer) settleAttaches(graceCtx context.Context, attaches Attaches) {
 		case <-patience.Done():
 		}
 	}()
-	err := attaches.AwaitAttaches(patience)
-	switch {
-	case err == nil:
-		return
-	case patience.Err() == nil:
-		// SETTLED, BUT NOT CLEANLY: an attach's rollback could not give back
-		// everything it took. Nothing is left to wait for or cancel.
-		d.record(Failure{Step: StepSettleAttaches, Err: err})
+	if err := attaches.AwaitAttaches(patience); err == nil {
 		return
 	}
 	attaches.CancelAttaches()
 	if err := attaches.AwaitAttaches(graceCtx); err != nil {
-		if graceCtx.Err() != nil {
-			err = errors.Join(ErrWaitAbandoned, err)
-		}
-		d.record(Failure{Step: StepSettleAttaches, Err: err})
+		d.record(Failure{Step: StepSettleAttaches, Err: errors.Join(ErrWaitAbandoned, err)})
 	}
 }
 

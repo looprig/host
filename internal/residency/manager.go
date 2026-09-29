@@ -355,6 +355,22 @@ type OwnershipRequest struct {
 	Commit func() bool
 }
 
+// ReleaseAuthority is the optional OwnershipHandle capability that takes over an
+// attach's rollback of the resources a RESIDENCY owns once ownership has begun.
+//
+// FROM STEP 7 THE RESIDENCY IS VISIBLE TO OTHER RELEASE PATHS — the drain, a
+// lost or faulted residency's give-up — and each releases the runtime, the
+// grant and the local workspace through the owner's once-only guards. A rollback
+// that released them directly would bypass those guards and release a second
+// time (review finding P2/3). So once a handle offering this exists, the
+// attach's compensations for those three go through it, and every path shares
+// one completion and one first error for each.
+type ReleaseAuthority interface {
+	ReleaseRuntime(context.Context) error
+	ReleaseLease(context.Context) error
+	ReleaseWorkspace(context.Context) error
+}
+
 // Ownership begins the durable inbox consumption, event fan-out and heartbeat
 // a resident session owns. O3.2 and O4.1 implement it; this package only
 // sequences it, and sequences it LAST, because every one of those three writes
@@ -1296,7 +1312,15 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	case lease == nil:
 		return fail(StepLease, "", "the lease store reported success and granted nothing", nil)
 	}
-	unwound.own("session lease", lease.Release)
+	// Declared here so that every compensation below, registered before
+	// ownership exists, still reads it when it runs. See ReleaseAuthority.
+	var authority ReleaseAuthority
+	unwound.own("session lease", func(ctx context.Context) error {
+		if authority != nil {
+			return authority.ReleaseLease(ctx)
+		}
+		return lease.Release(ctx)
+	})
 
 	// THE ONE MECHANISM, for this attach's three fenced writes. All of them
 	// were unclassified: a step 8 publish refused for a later epoch was seen
@@ -1414,6 +1438,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 			return fail(StepHydrate, "", "the session workspace could not be materialized", err)
 		}
 		unwound.shared("workspace", func(ctx context.Context) error {
+			if authority != nil {
+				return authority.ReleaseWorkspace(ctx)
+			}
 			return m.workspaces.ReleaseWorkspace(ctx, key.TenantID, key.SessionID)
 		})
 	}
@@ -1457,7 +1484,12 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	case runtime == nil:
 		return fail(StepHydrate, "", "the launch target reported success and produced no runtime", nil)
 	}
-	unwound.own("runtime residency", runtime.ReleaseResidency)
+	unwound.own("runtime residency", func(ctx context.Context) error {
+		if authority != nil {
+			return authority.ReleaseRuntime(ctx)
+		}
+		return runtime.ReleaseResidency(ctx)
+	})
 
 	// -- 4. the required runtime capabilities --------------------------------
 	//
@@ -1638,6 +1670,9 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		return fail(StepOwnership, "", "ownership reported success and returned no handle, so nothing it started could ever be stopped", nil)
 	}
 	unwound.own("ownership", handle.Stop)
+	if delegate, ok := handle.(ReleaseAuthority); ok {
+		authority = delegate
+	}
 
 	// -- 8. only then, attached ----------------------------------------------
 	//

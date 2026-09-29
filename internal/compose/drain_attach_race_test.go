@@ -676,9 +676,8 @@ func TestAResidencyRemovedByAnotherPathIsNotReportedEnded(t *testing.T) {
 	}
 	held := f.svc.residentFor(keyA)
 	f.svc.forgetResident(held) // what a finished warm release does
-	ended, err := snapshot[0].(lifecycle.Ender).Ended()
-	if ended || err != nil {
-		t.Fatalf("Ended() = (%v, %v) for a residency another path removed; the drain would skip it and lose that path's failures", ended, err)
+	if snapshot[0].(lifecycle.Ender).Ended() {
+		t.Fatal("Ended() = true for a residency another path removed; the drain would skip it and lose that path's failures")
 	}
 }
 
@@ -727,5 +726,139 @@ func TestACommittedAttachParkedPastTheGraceIsLeftHeldAndReleasedOnce(t *testing.
 	}
 	if lease := f.store.leaseOf(keyB); lease == nil || lease.releases.Load() != 1 {
 		t.Fatalf("the grant (%v) was not released exactly once", lease)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One release authority per residency, and the Host's release ledger
+// ---------------------------------------------------------------------------
+
+// TestAnIncompleteRollbackTheDrainNeverSawWithholdsDrained is re-review P1(1).
+// A committed attach fails at step 8; its rollback removes the residency and
+// then cannot release the grant. Whether that happens wholly before the drain
+// began, or while the drain was taking its snapshot, the snapshot never names
+// the session — and the drain reported `drained` with the grant still held.
+// The release ledger records it independently of any snapshot.
+func TestAnIncompleteRollbackTheDrainNeverSawWithholdsDrained(t *testing.T) {
+	for _, when := range []string{"before the drain", "during the drain's snapshot"} {
+		t.Run(when, func(t *testing.T) {
+			f := newFixture(t)
+			f.start()
+			refuseLeaseReleaseOf(f)
+			refuseResidentRowOf(f, false)
+			if when == "during the drain's snapshot" {
+				// The drain begins from inside the rollback's grant release —
+				// after the residency was removed, before the release fails.
+				f.store.mu.Lock()
+				f.store.onLeaseRelease = map[sessionwire.SessionID]func(){sessionB: func() {
+					if _, err := f.svc.StartDrain(hostlink.DrainScope{}); err != nil {
+						t.Errorf("StartDrain: %v", err)
+					}
+					if resident := f.svc.ResidentSessions(); len(resident) != 0 {
+						t.Errorf("the drain's snapshot holds %d sessions, want none: this row is about a snapshot that missed the session", len(resident))
+					}
+				}}
+				f.store.mu.Unlock()
+			}
+
+			_, attached := attachLate(t, f)
+			var refused *residency.AttachError
+			if err := await(t, "the attach to answer", attached); !errors.As(err, &refused) || len(refused.Unreleased) == 0 {
+				t.Fatalf("the attach answered %v, want a refusal whose rollback could not release everything", err)
+			}
+			report, err := f.svc.Stop(context.Background())
+			if err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			if !withheldFor(report, sessionB) {
+				t.Fatalf("Stop reported %+v, want draining with a failure naming %s: its grant is still held", report, sessionB)
+			}
+		})
+	}
+}
+
+// TestADrainRacingAWarmReleaseSharesItsGrantRelease is re-review P1(2). A warm
+// release is inside the grant's release when the drain reaches the same step.
+// The drain used to see the step latched and answer nil at once — `drained`
+// before the grant was released — and never saw the warm release's error. It
+// now waits for that one release and reports its outcome.
+func TestADrainRacingAWarmReleaseSharesItsGrantRelease(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	inRelease := make(chan struct{})
+	proceed := make(chan struct{})
+	f.store.mu.Lock()
+	f.store.leaseReleaseErr = map[sessionwire.SessionID]error{sessionA: errors.New("injected: the grant could not be released")}
+	f.store.onLeaseRelease = map[sessionwire.SessionID]func(){sessionA: func() {
+		close(inRelease)
+		<-proceed
+	}}
+	f.store.mu.Unlock()
+	f.attach(tenantA, sessionA)
+	held := f.svc.residentFor(keyA)
+
+	warmDone := make(chan error, 1)
+	go func() { warmDone <- (warmSession{resident: held}).ReleaseLease(context.Background()) }()
+	await(t, "the warm release to enter the grant's release", inRelease)
+
+	if _, err := f.svc.StartDrain(hostlink.DrainScope{}); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+	close(proceed)
+
+	if err := await(t, "the warm release to answer", warmDone); err == nil {
+		t.Fatal("the warm release's grant release reported success")
+	}
+	report := await(t, "the drain to finish", waited)
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		t.Fatalf("the drain reported %q, want draining: the grant it shared with the warm release was never released", report.State)
+	}
+	if lease := f.store.leaseOf(keyA); lease.releases.Load() != 1 {
+		t.Fatalf("the grant was released %d times, want once", lease.releases.Load())
+	}
+}
+
+// TestNoOtherPathReleasesAnUnsettledAttachTwice is re-review P2(3). An attach
+// has committed and is still publishing its `resident` row. A warm release may
+// not begin on it (its attach has not returned), and any other path that does
+// release it — here a give-up running concurrently — shares the rollback's one
+// release of the runtime and the grant, so each is released exactly once.
+func TestNoOtherPathReleasesAnUnsettledAttachTwice(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	f.work.setState(keyA, residency.WorkStateIdle)
+	f.work.setState(keyB, residency.WorkStateIdle)
+	if !f.svc.ConfirmIdle(keyA) {
+		t.Fatal("an idle, settled residency is not confirmed idle, so the refusal below would mean nothing")
+	}
+
+	parked, release := refuseResidentRowOf(f, true)
+	t.Cleanup(release)
+	late, attached := attachLate(t, f)
+	await(t, "the committed attach to reach its resident publication", parked)
+	if f.svc.ConfirmIdle(keyB) {
+		t.Fatal("a warm release may begin on a residency whose attach has not returned")
+	}
+
+	held := f.svc.residentFor(keyB)
+	if err := held.ReleaseResidency(context.Background()); err != nil {
+		t.Fatalf("concurrent runtime release: %v", err)
+	}
+	if err := held.releaseLease(context.Background()); err != nil {
+		t.Fatalf("concurrent grant release: %v", err)
+	}
+
+	release()
+	if err := await(t, "the attach to answer", attached); err == nil {
+		t.Fatal("the attach whose resident row was refused reported success")
+	}
+	if released := late.Released(); released != 1 {
+		t.Fatalf("the runtime was released %d times, want exactly once", released)
+	}
+	if lease := f.store.leaseOf(keyB); lease.releases.Load() != 1 {
+		t.Fatalf("the grant was released %d times, want exactly once", lease.releases.Load())
 	}
 }

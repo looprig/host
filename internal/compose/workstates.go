@@ -166,6 +166,14 @@ func (s *Service) pruneActivity(seen map[registry.Key]bool) {
 // movement, so "unchanged since the last sample" is "unchanged since the
 // countdown was armed". Anything this cannot establish is false.
 func (s *Service) ConfirmIdle(key registry.Key) bool {
+	// A RESIDENCY WHOSE ATTACH HAS NOT RETURNED IS NEVER WARM-RELEASED. Its
+	// attach may still fail and roll it back, and a warm release that had
+	// begun would then be releasing the same runtime and grant as that
+	// rollback. The watch is armed at the commit point (trackResident), before
+	// the attach returns, so this is the gate that keeps the two apart.
+	if held := s.residentFor(key); held == nil || !held.settled.Load() {
+		return false
+	}
 	if s.options.WorkStates == nil {
 		return false
 	}

@@ -59,21 +59,41 @@ type resident struct {
 	workspaces residency.Workspaces
 
 	once struct {
-		mu        sync.Mutex
-		workDone  bool
-		stopped   bool
-		leaseGone bool
-		dropped   bool
+		mu       sync.Mutex
+		workDone bool
 	}
 
-	// The four steps above these are guarded ON ATTEMPT; these four are guarded
-	// ON SUCCESS, and the split is a decision rather than an oversight.
+	// THE RELEASE AUTHORITY for the three destructive steps that hand something
+	// back and must never run twice (review finding: ONE authority per
+	// residency). Each runs ONCE, and every caller — the drain, a warm release,
+	// an attach's rollback (residency.ReleaseAuthority), a lost or faulted
+	// give-up — WAITS for that one run and receives ITS error. An earlier
+	// version latched a flag on attempt and returned nil to every later caller,
+	// so a drain racing a warm release blocked in the grant's release reported
+	// the grant released — `drained` — before it was, and never saw the warm
+	// release's error.
+	ownershipStop sharedOnce
+	leaseRelease  sharedOnce
+	stateDrop     sharedOnce
+
+	// settled records that the attach which installed this residency RETURNED
+	// SUCCESSFULLY; rolledBack that it failed after committing and rolled the
+	// residency back through this authority. Exactly one of them becomes true.
+	// A warm release may not begin on a residency that is not settled (see
+	// Service.ConfirmIdle), so it can never overlap that attach's rollback.
+	settled    atomic.Bool
+	rolledBack atomic.Bool
+
+	// The destructive steps above these run ONCE; these four are guarded ON
+	// SUCCESS, and the split is a decision rather than an oversight.
 	//
-	// A DESTRUCTIVE STEP LATCHES ON ATTEMPT. stopWork, stopOwnership,
-	// releaseLease and dropState hand something back, and a step that errored
-	// may have handed it back anyway; retrying one of those is a release of
-	// somebody else's grant if the session has since been re-acquired, which is
-	// worse than a release that never retries.
+	// A DESTRUCTIVE STEP RUNS ONCE AND SHARES ITS OUTCOME. stopWork,
+	// stopOwnership, releaseLease and dropState hand something back, and a step
+	// that errored may have handed it back anyway; retrying one of those is a
+	// release of somebody else's grant if the session has since been
+	// re-acquired, which is worse than a release that never retries. But a
+	// later caller WAITS for the one run and gets its error (sharedOnce): it
+	// must never be told a release it did not see finish succeeded.
 	//
 	// A DURABLE OR IDEMPOTENT STEP LATCHES ON SUCCESS, so that this layer never
 	// turns a failed step into a nil return of its own. That matters most for
@@ -113,14 +133,6 @@ type resident struct {
 	// never cleared: no drain path returns a session to resident, so a warm
 	// release racing the drain must not Resume what the drain halted.
 	drainHalted atomic.Bool
-
-	// rollback is the outcome of the attach that installed this residency,
-	// recorded only when that attach failed after committing (see
-	// committedOwnership): rolledBack says it did, rollbackErr what its rollback
-	// could not give back.
-	rollbackMu  sync.Mutex
-	rolledBack  bool
-	rollbackErr error
 
 	checkpointOnce onceOnSuccess
 	beginOnce      onceOnSuccess
@@ -207,19 +219,19 @@ func (r *resident) ReleaseResidency(ctx context.Context) error {
 	return r.residencyOnce.run(func() error { return r.runtime.ReleaseResidency(ctx) })
 }
 
-// endRollback records the outcome of this residency's failed attach.
-func (r *resident) endRollback(err error) {
-	r.rollbackMu.Lock()
-	defer r.rollbackMu.Unlock()
-	r.rolledBack, r.rollbackErr = true, err
+// sharedOnce runs one action once and hands every caller its completion and its
+// error. A caller arriving while it runs waits for it (sync.Once blocks
+// concurrent callers until the first returns); a caller arriving after gets the
+// same result. It never retries and never answers a false nil.
+type sharedOnce struct {
+	once sync.Once
+	err  error
 }
 
-// rollbackOutcome reports whether this residency's attach rolled it back, and
-// what that rollback could not give back.
-func (r *resident) rollbackOutcome() (bool, error) {
-	r.rollbackMu.Lock()
-	defer r.rollbackMu.Unlock()
-	return r.rolledBack, r.rollbackErr
+// run performs the action, or waits for and returns the one that ran.
+func (o *sharedOnce) run(action func() error) error {
+	o.once.Do(func() { o.err = action() })
+	return o.err
 }
 
 // runtimeReleased reports whether the runtime was released or abandoned, so
@@ -252,19 +264,13 @@ func (r *resident) finishRelease(ctx context.Context) error {
 	return r.finishOnce.run(func() error { return r.halves.FinishRelease(ctx) })
 }
 
-// stopOwnership ends the heartbeat, once.
+// stopOwnership ends the heartbeat, once, for every caller.
 func (r *resident) stopOwnership(ctx context.Context) error {
-	r.once.mu.Lock()
-	stop := !r.once.stopped
-	r.once.stopped = true
-	r.once.mu.Unlock()
-	if !stop {
-		return nil
-	}
-	return r.halves.Stop(ctx)
+	return r.ownershipStop.run(func() error { return r.halves.Stop(ctx) })
 }
 
-// releaseLease hands back the residency grant, once.
+// releaseLease hands back the residency grant, once, and every caller shares
+// that one release's outcome.
 //
 // IT USED TO HAND BACK TWO. A session held Host's residency lease and, from the
 // attach-time opening fence, the runtime's journal grant; this released both,
@@ -273,27 +279,16 @@ func (r *resident) stopOwnership(ctx context.Context) error {
 // internal/residency — so there is one grant, and a second release here would be
 // a release of something this Host never took.
 func (r *resident) releaseLease(ctx context.Context) error {
-	r.once.mu.Lock()
-	release := !r.once.leaseGone
-	r.once.leaseGone = true
-	r.once.mu.Unlock()
-	if !release {
-		return nil
-	}
-	return r.lease.Release(ctx)
+	return r.leaseRelease.run(func() error { return r.lease.Release(ctx) })
 }
 
-// dropState drops the local workspace materialization, once. It never deletes
-// durable state: ReleaseWorkspace is the local half by that seam's contract.
+// dropState drops the local workspace materialization, once, for every caller.
+// It never deletes durable state: ReleaseWorkspace is the local half by that
+// seam's contract.
 func (r *resident) dropState(ctx context.Context) error {
-	r.once.mu.Lock()
-	drop := !r.once.dropped
-	r.once.dropped = true
-	r.once.mu.Unlock()
-	if !drop {
-		return nil
-	}
-	return r.workspaces.ReleaseWorkspace(ctx, r.key.TenantID, r.key.SessionID)
+	return r.stateDrop.run(func() error {
+		return r.workspaces.ReleaseWorkspace(ctx, r.key.TenantID, r.key.SessionID)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -331,9 +326,9 @@ var (
 )
 
 // Ended reports that the attach which installed this residency failed AFTER
-// committing it, and how its rollback went. See lifecycle.Ender: a residency
-// removed by any other path is not "ended" and answers false.
-func (r releaseSession) Ended() (bool, error) { return r.resident.rollbackOutcome() }
+// committing it and rolled it back. See lifecycle.Ender: a residency removed by
+// any other path is not "ended" and answers false.
+func (r releaseSession) Ended() bool { return r.rolledBack.Load() }
 
 // HaltConsumption stops this session's command consumer claiming or applying
 // anything more, waiting — bounded by ctx — for a pass already in flight.

@@ -123,6 +123,13 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 // committedOwnership is the handle the Manager holds for a residency that has
 // COMMITTED into this composition's resident set.
 //
+// IT IS THE RESIDENCY'S RELEASE AUTHORITY toward the attach's rollback
+// (residency.ReleaseAuthority): from here the Manager releases the runtime, the
+// grant and the local workspace THROUGH the resident's once-only steps, which
+// the drain and every give-up path share, instead of directly — so a rollback
+// racing any of them releases each once and every one of them sees the same
+// outcome.
+//
 // ITS Stop IS THE ATTACH'S ROLLBACK, AND ONLY THAT. The Manager calls an
 // ownership handle's Stop from one place — the unwinder of an attach that fails
 // after step 7 (review finding F1) — and never on a residency that reached step
@@ -130,28 +137,38 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 // because a resident session is released through releaseHalves, by the drain,
 // the warm release or a teardown. So when Stop is called the attach that
 // installed `held` has failed, and stopping only the heartbeat left `held`
-// resident here with its consumer, tail and warm watch running — a zombie, and
-// for a drain waiting on the attach a session it would then release a second
-// time over a heartbeat that was already gone.
+// resident here with its consumer, tail and warm watch running.
 type committedOwnership struct {
 	residency.OwnershipHandle
 	service *Service
 	held    *resident
 }
 
+var _ residency.ReleaseAuthority = (*committedOwnership)(nil)
+
 // Stop ends the composition's hold on the failed residency, then the heartbeat.
-// The Manager's rollback gives back the rest — the tombstone, the registry
-// entry, the runtime and the grant — so this releases none of those.
+// The Manager's rollback gives back the rest, through this same authority.
 func (c *committedOwnership) Stop(ctx context.Context) error {
-	// The rollback's outcome is known only when the Manager returns; the
-	// attach entry point records it on the residency (see Service.Attach).
-	c.service.mu.Lock()
-	c.service.rolledBack[c.held.key] = c.held
-	c.service.mu.Unlock()
+	c.held.rolledBack.Store(true)
 	c.held.stopWork()
 	c.service.warm.Forget(c.held.key)
 	c.service.forgetResident(c.held)
-	return c.OwnershipHandle.Stop(ctx)
+	return c.held.stopOwnership(ctx)
+}
+
+// ReleaseRuntime releases the runtime through the residency's guard.
+func (c *committedOwnership) ReleaseRuntime(ctx context.Context) error {
+	return c.held.ReleaseResidency(ctx)
+}
+
+// ReleaseLease releases the grant through the residency's guard.
+func (c *committedOwnership) ReleaseLease(ctx context.Context) error {
+	return c.held.releaseLease(ctx)
+}
+
+// ReleaseWorkspace drops the local workspace through the residency's guard.
+func (c *committedOwnership) ReleaseWorkspace(ctx context.Context) error {
+	return c.held.dropState(ctx)
 }
 
 // beginWork starts one session's durable command consumer, its applier and the
@@ -564,6 +581,13 @@ func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 	s.metrics.WarmRelease(outcome)
 	switch outcome.Kind {
 	case residency.WarmOutcomeReleased:
+		// A RELEASE THAT LEFT SOMETHING HELD GOES ON THE LEDGER FIRST, before
+		// the handle is dropped: once it is gone no drain's snapshot can name
+		// the session, and the ledger is the only place the grant still held
+		// is recorded.
+		if err := unfinishedWarmRelease(outcome); err != nil {
+			s.recordUnreleased(err)
+		}
 		// A RELEASED OUTCOME MEANS THE RUNTIME RELEASED (the warm protocol stops
 		// at step 4 otherwise), so its context may be cancelled whether or not a
 		// successor has been tracked under the key since (review finding R1).
@@ -592,6 +616,25 @@ func (s *Service) WarmRelease(outcome residency.WarmOutcome) {
 		s.options.logger().LogAttrs(context.Background(), slog.LevelWarn,
 			"host: a warm release stopped because the runtime did not release; the session stays resident and not admitting until the drain", attrs...)
 	}
+}
+
+// unfinishedWarmRelease reports the steps of a released warm outcome that left
+// something held — the tombstone, the grant or the local state. A failed
+// checkpoint or `releasing` mark is recorded by the warm path and does not mean
+// the release did not finish, exactly as for the drain (lifecycle.settledState).
+func unfinishedWarmRelease(outcome residency.WarmOutcome) error {
+	var failures []error
+	for _, failure := range outcome.Failures {
+		switch failure.Step {
+		case residency.WarmStepFinishRelease, residency.WarmStepReleaseLease, residency.WarmStepDropState:
+			failures = append(failures, fmt.Errorf("%s: %w", failure.Step, failure.Err))
+		}
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("compose: the warm release of %s/%s did not finish: %w",
+		outcome.Key.TenantID, outcome.Key.SessionID, errors.Join(failures...))
 }
 
 // ResidencyLost is handed a residency whose ownership is gone.
@@ -686,6 +729,8 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 	}
 	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil && !onlyLostGrant(err) {
 		failures = append(failures, err)
+		s.recordUnreleased(fmt.Errorf("compose: the give-up of the lost session %s/%s did not finish: %w",
+			held.key.TenantID, held.key.SessionID, err))
 	}
 	if s.residentFor(held.key) == held {
 		s.capacity.ReleaseOwned(held.key, held.generation)
