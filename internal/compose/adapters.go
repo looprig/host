@@ -345,7 +345,24 @@ func (s *Service) trackResident(request residency.OwnershipRequest, halves relea
 		checkpoint: s.options.Checkpointer.Checkpoint,
 		workspaces: s.options.Workspaces,
 	}
+	// THE COMMIT POINT, AND IT IS ATOMIC WITH THE DRAIN'S SNAPSHOT. StartDrain
+	// sets `draining` under this mutex before the drain reads ResidentSessions
+	// under it, so an attach inserted here is in that snapshot, and one arriving
+	// after is refused and rolls back. Without it an attach that passed
+	// admission before the drain began and reached here after the snapshot
+	// became resident on a draining Host that never released it — the tests
+	// lane's C1 wedge: its runtime's journal lease was held until the process
+	// exited. Commit is the same critical section's other half: an attach the
+	// drain has already cancelled is refused rather than installed.
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return drainingAttachRefusal(request.AgentID)
+	}
+	if request.Commit != nil && !request.Commit() {
+		s.mu.Unlock()
+		return drainingAttachRefusal(request.AgentID)
+	}
 	s.sessions[request.Key] = held
 	s.mu.Unlock()
 	if err := s.warm.Watch(warmSession{resident: held}); err != nil && !errors.Is(err, residency.ErrWarmReleaserStopped) {
@@ -353,6 +370,18 @@ func (s *Service) trackResident(request residency.OwnershipRequest, halves relea
 		return err
 	}
 	return nil
+}
+
+// drainingAttachRefusal refuses an attach that reached its commit point after
+// this Host began draining. It is service's not_admitting — the refusal step 1
+// gives an attach that arrives after the drain — because that is what it is: the
+// session belongs on another Host, and a Factory re-places it.
+func drainingAttachRefusal(agent sessionwire.AgentID) error {
+	return &service.AdmissionRefusedError{
+		Code:    sessionwire.HostLinkErrorNotAdmitting,
+		AgentID: agent,
+		Reason:  "this Host began draining while the attach was in flight, so the session was not made resident",
+	}
 }
 
 // ---------------------------------------------------------------------------

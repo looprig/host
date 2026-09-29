@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -299,12 +300,17 @@ type fakeLease struct {
 	// onRelease, when set, runs inside Release before it returns, so a test can
 	// stand between a lost residency's lease release and the rest of its path.
 	onRelease func()
+
+	// released records that this grant was handed back, per grant rather than
+	// per trace, so a test can ask about ONE session's lease.
+	released atomic.Bool
 }
 
 func (l *fakeLease) Epoch() residency.ResidencyEpoch { return l.epoch }
 func (l *fakeLease) Lost() <-chan struct{}           { return l.lost }
 func (l *fakeLease) Release(context.Context) error {
 	l.trace.record("lease.release")
+	l.released.Store(true)
 	if l.onRelease != nil {
 		l.onRelease()
 	}
@@ -333,6 +339,12 @@ type fakeStore struct {
 	heldElsewhere  map[registry.Key]error
 	acquireEntered chan struct{}
 	acquireRelease chan struct{}
+
+	// loadHold, when set, runs inside LoadSessionState — AFTER the lease is
+	// granted, so an attach parked here holds a lease and an admission charge —
+	// and its error is the read's. It receives the attach's session context,
+	// so a hold may honour or ignore cancellation.
+	loadHold func(ctx context.Context, session sessionwire.SessionID) error
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -415,10 +427,15 @@ func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.Te
 	return lease, nil
 }
 
-func (s *fakeStore) LoadSessionState(context.Context, sessionwire.TenantID, sessionwire.SessionID) (residency.SessionState, error) {
+func (s *fakeStore) LoadSessionState(ctx context.Context, _ sessionwire.TenantID, session sessionwire.SessionID) (residency.SessionState, error) {
 	s.mu.Lock()
-	stateErr := s.stateErr
+	stateErr, hold := s.stateErr, s.loadHold
 	s.mu.Unlock()
+	if hold != nil {
+		if err := hold(ctx, session); err != nil {
+			return residency.SessionState{}, err
+		}
+	}
 	if stateErr != nil {
 		return residency.SessionState{}, stateErr
 	}

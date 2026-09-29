@@ -343,6 +343,16 @@ type OwnershipRequest struct {
 	// calls that the worst case in the file, because a tombstone is a route
 	// removal and the route may be the successor's.
 	Fence *epochFence
+
+	// Commit is the attach's point of no return, for an Ownership that keeps a
+	// resident set a drain reads. It reports whether the attach may still become
+	// resident — false once CancelAttaches has cancelled it — and, having
+	// answered true, takes the attach out of CancelAttaches' reach: from then on
+	// it is a residency the drain releases, and cancelling its session context
+	// would tear a live runtime down beneath that release. An implementation
+	// calls it inside the same critical section that inserts the session into
+	// its resident set. Nil means there is nothing to commit.
+	Commit func() bool
 }
 
 // Ownership begins the durable inbox consumption, event fan-out and heartbeat
@@ -720,6 +730,12 @@ type Manager struct {
 	// attaching serializes attaches of one key. See Manager.acquireKey.
 	attaching map[registry.Key]chan struct{}
 
+	// pending holds the session-context cancellation of every attach that has
+	// a session context and has not yet COMMITTED (OwnershipRequest.Commit) or
+	// returned. It is keyed by session because attaches of one key are
+	// serialized. See CancelAttaches.
+	pending map[registry.Key]*pendingAttach
+
 	// parked, when set, is called immediately before an attach parks on a busy
 	// key slot. It exists so that PARKING IS OBSERVABLE, which is what turns
 	// "a second attach must not return from inside the install window" from a
@@ -769,6 +785,7 @@ func NewManager(options Options) (*Manager, error) {
 		sessions:   map[registry.Key]*sessionRecord{},
 		overtaken:  map[overtakenKey]*sessionRecord{},
 		attaching:  map[registry.Key]chan struct{}{},
+		pending:    map[registry.Key]*pendingAttach{},
 	}, nil
 }
 
@@ -790,6 +807,31 @@ func (m *Manager) Records() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.sessions) + len(m.overtaken)
+}
+
+// pendingAttach is one uncommitted attach's cancellation.
+type pendingAttach struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// CancelAttaches cancels the session context of every attach that has not yet
+// committed, so each stops waiting on its collaborators and rolls back. It is
+// the drain's last resort for an attach that did not finish within the grace.
+//
+// A COMMITTED ATTACH IS NOT CANCELLED. Commit and this run under the same mutex,
+// so an attach is either cancelled before it commits — and its Commit then
+// answers false — or committed and out of reach: a residency already in the
+// drain's resident set is the drain's to release, and cancelling its context
+// would cancel a live runtime beneath that release. The rollback itself runs on
+// a context this cannot cancel; see attach.
+func (m *Manager) CancelAttaches() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, pending := range m.pending {
+		pending.cancel()
+		delete(m.pending, key)
+	}
 }
 
 // Close cancels this Manager's root session context, which cancels every
@@ -1188,6 +1230,23 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	sessionCtx, cancelSession := m.newSessionContext(request.Principal)
 	unwound.own("session context", func(context.Context) error { cancelSession(); return nil })
 
+	// UNCOMMITTED, THIS ATTACH IS CANCELLABLE BY A DRAIN. See CancelAttaches and
+	// OwnershipRequest.Commit; it leaves the set when it commits or returns.
+	pending := &pendingAttach{ctx: sessionCtx, cancel: cancelSession}
+	m.mu.Lock()
+	m.pending[key] = pending
+	m.mu.Unlock()
+	defer m.forgetPending(key, pending)
+	commit := func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.pending[key] != pending || pending.ctx.Err() != nil {
+			return false
+		}
+		delete(m.pending, key)
+		return true
+	}
+
 	// THE ROLLBACK CONTEXT IS NOT THE MANAGER ROOT, and the reason is §8.3's,
 	// one level up. Compensations ran on m.root, which Close cancels — so a
 	// Close arriving during an in-flight attach disabled the entire rollback
@@ -1554,10 +1613,14 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		Generation:      entry.Generation,
 		Runtime:         runtime,
 		Fence:           fence,
+		Commit:          commit,
 	})
 	switch {
 	case err != nil:
-		return fail(StepOwnership, "", "inbox, event and heartbeat ownership could not be started", err)
+		// A REFUSAL CARRIES ITS OWN CLASS THROUGH: an Ownership that refuses
+		// because this Host began draining while the attach was in flight
+		// answers service's not_admitting, exactly as step 1 would have.
+		return fail(StepOwnership, admissionCode(err), "inbox, event and heartbeat ownership could not be started", err)
 	case handle == nil:
 		// The SAME RULE the lease and the runtime get, applied in the third
 		// place it belongs. An accepted nil handle attaches the session with
@@ -1818,6 +1881,15 @@ func (p Principal) validate(tenant sessionwire.TenantID) error {
 		}
 	}
 	return nil
+}
+
+// forgetPending removes an attach from the cancellable set if it is still there.
+func (m *Manager) forgetPending(key registry.Key, pending *pendingAttach) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending[key] == pending {
+		delete(m.pending, key)
+	}
 }
 
 // newSessionContext derives a session from THIS MANAGER'S ROOT and installs the

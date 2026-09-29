@@ -3,9 +3,11 @@ package compose
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -284,10 +286,13 @@ type Service struct {
 	disposed    bool
 	disposeDone chan struct{}
 	disposeErr  error
-	attaching   int
-	sessions    map[registry.Key]*resident
-	consumers   map[registry.Key]*commands.Consumer
-	leases      map[registry.Key]residency.Lease
+	// attaching holds every attach in flight, so a drain can wait for the ones
+	// its resident snapshot could not see. See AwaitAttaches.
+	attaching map[uint64]inflightAttach
+	attachSeq uint64
+	sessions  map[registry.Key]*resident
+	consumers map[registry.Key]*commands.Consumer
+	leases    map[registry.Key]residency.Lease
 
 	// activityMu guards activity: the journal position each resident session's
 	// gate fold had reached at the sampler's last reading. The sampler writes
@@ -701,9 +706,19 @@ func (s *Service) Attach(ctx context.Context, request residency.Request) (reside
 		s.mu.Unlock()
 		return residency.Residency{}, ErrServiceNotStarted
 	}
-	s.attaching++
+	s.attachSeq++
+	id, done := s.attachSeq, make(chan struct{})
+	if s.attaching == nil {
+		s.attaching = map[uint64]inflightAttach{}
+	}
+	s.attaching[id] = inflightAttach{key: registry.Key{TenantID: request.TenantID, SessionID: request.SessionID}, done: done}
 	s.mu.Unlock()
-	defer func() { s.mu.Lock(); s.attaching--; s.mu.Unlock() }()
+	defer func() {
+		s.mu.Lock()
+		delete(s.attaching, id)
+		s.mu.Unlock()
+		close(done)
+	}()
 	held, err := s.manager.Attach(ctx, request)
 	if err != nil {
 		s.logAttach(ctx, request, err)
@@ -844,7 +859,7 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 func (s *Service) CloseUnstarted(ctx context.Context, closeOwnedStore func() error) error {
 	s.mu.Lock()
 	if !s.disposed {
-		if s.starting || s.draining || s.started || s.stopped || s.attaching != 0 || len(s.sessions) != 0 || len(s.registry.Snapshot()) != 0 {
+		if s.starting || s.draining || s.started || s.stopped || len(s.attaching) != 0 || len(s.sessions) != 0 || len(s.registry.Snapshot()) != 0 {
 			s.mu.Unlock()
 			return ErrServiceActive
 		}
@@ -933,6 +948,55 @@ func releaseRefused(report lifecycle.Report) bool {
 	}
 	return false
 }
+
+// inflightAttach is one attach this Host has entered and not yet answered.
+type inflightAttach struct {
+	key  registry.Key
+	done chan struct{}
+}
+
+// AwaitAttaches waits for every attach in flight at the moment of the call, as
+// the drain's lifecycle.Attaches seam.
+//
+// IT IS WHAT MAKES `drained` TRUE OF AN ATTACH THE SNAPSHOT MISSED. Such an
+// attach cannot become resident — trackResident refuses it once this Host is
+// draining — but until its rollback has run it still holds a residency grant
+// and, past hydration, a runtime holding its journal lease. A drain that
+// reported `drained` before then let Stop return, and let a Factory delete the
+// workload, with that lease still held.
+func (s *Service) AwaitAttaches(ctx context.Context) error {
+	s.mu.Lock()
+	inflight := make([]inflightAttach, 0, len(s.attaching))
+	for _, attach := range s.attaching {
+		inflight = append(inflight, attach)
+	}
+	s.mu.Unlock()
+	for i, attach := range inflight {
+		select {
+		case <-attach.done:
+		case <-ctx.Done():
+			var still []string
+			for _, left := range inflight[i:] {
+				select {
+				case <-left.done:
+				default:
+					still = append(still, string(left.key.TenantID)+"/"+string(left.key.SessionID))
+				}
+			}
+			if len(still) == 0 {
+				return nil
+			}
+			return fmt.Errorf("compose: %d attach(es) still in flight (%s): %w", len(still), strings.Join(still, ", "), ctx.Err())
+		}
+	}
+	return nil
+}
+
+// CancelAttaches cancels every uncommitted attach, as the drain's last resort.
+// See residency.Manager.CancelAttaches.
+func (s *Service) CancelAttaches() { s.manager.CancelAttaches() }
+
+var _ lifecycle.Attaches = (*Service)(nil)
 
 // ResidentSessions returns the sessions this Host holds, as the drain's seam.
 func (s *Service) ResidentSessions() []lifecycle.Session {

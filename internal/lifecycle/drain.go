@@ -167,6 +167,35 @@ type Residents interface {
 	ResidentSessions() []Session
 }
 
+// Attaches is the optional Residents capability that accounts for the attaches
+// IN FLIGHT when the drain began.
+//
+// THE RESIDENT SNAPSHOT DOES NOT COVER THEM, and that gap was a real wedge (the
+// tests lane's C1). An attach that passed admission before Admissions.BeginDrain
+// and was still hydrating when ResidentSessions was read is in neither set the
+// drain acts on: the ledger admitted it, and the snapshot missed it. If it then
+// became resident it was never released, the drain reported `drained`, and its
+// runtime kept its journal lease for the life of the process — so every
+// successor's hydrate was refused.
+//
+// THE CONTRACT THAT CLOSES IT IS SPLIT between this seam and its implementer.
+// The implementer refuses, atomically with the snapshot, any attach that would
+// become resident once the drain has begun, so an attach in flight can only roll
+// back; the drain waits for those rollbacks before it reports `drained`, because
+// until one has finished its lease and runtime are still held.
+type Attaches interface {
+	// AwaitAttaches blocks until every attach in flight at the moment of the
+	// call has finished — resident or rolled back — or the context ends, and
+	// then reports the context's error, naming what is still in flight.
+	AwaitAttaches(context.Context) error
+
+	// CancelAttaches cancels every attach that has not yet become resident, so
+	// it stops waiting on its collaborators and rolls back. It must never
+	// cancel a residency that is already in the resident set: that one is the
+	// drain's to release.
+	CancelAttaches()
+}
+
 // THIS PACKAGE OWNS NO TRANSPORT SHUTDOWN, and the absence is load-bearing
 // rather than an omission. It used to hold a Link seam and close it as the
 // drain's last step. That was wrong for a HostLink-INITIATED drain, and wrong
@@ -269,6 +298,12 @@ const (
 	StepCheckpoint       Step = "checkpoint"
 	StepReleaseResidency Step = "release_residency"
 	StepFinishRelease    Step = "finish_release"
+
+	// StepSettleAttaches is the wait for the attaches in flight when the drain
+	// began (see Attaches). Its failure carries no session key — it names the
+	// attaches in its error — and it WITHHOLDS `drained`: an attach that has not
+	// finished rolling back may still hold a lease and a runtime.
+	StepSettleAttaches Step = "settle_attaches"
 
 	// StepCloseLink is the transport shutdown, and THIS PACKAGE NEVER RECORDS
 	// IT. The drain does not close a transport at all; the process-lifecycle
@@ -624,9 +659,15 @@ func (d *Drainer) Wait() Report {
 // closes the link and reports drained.
 //
 // THE SESSION SET IS TAKEN ONCE, by StartDrain, and is not re-read. A session
-// that becomes resident after the drain began is refused by the ledger that is
+// that begins its attach after the drain began is refused by the ledger that is
 // already flipped; chasing it here would be a machine that can be kept working
 // by a caller it has already told to stop.
+//
+// AN ATTACH THE LEDGER ADMITTED BEFORE THE FLIP IS NOT IN THAT SET, and "the
+// ledger refuses it" was once the whole of this comment. It is not refused by
+// the ledger — it passed the ledger — so when Residents offers Attaches the
+// drain also waits for those, concurrently with the releases. See Attaches and
+// settleAttaches.
 func (d *Drainer) run(sessions []Session) {
 	// The platform grace bounds the whole drain. Cancelling this context is
 	// what ends an idle wait that will not end on its own; the cleanup that
@@ -643,6 +684,13 @@ func (d *Drainer) run(sessions []Session) {
 	}()
 
 	var wait sync.WaitGroup
+	if attaches, ok := d.options.Residents.(Attaches); ok {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			d.settleAttaches(graceCtx, attaches)
+		}()
+	}
 	for _, session := range sessions {
 		wait.Add(1)
 		go func() {
@@ -678,7 +726,11 @@ func (d *Drainer) run(sessions []Session) {
 // `draining`, so a Factory waits and eventually escalates instead of deleting.
 // A leaked workload is visible to an operator; deleted work is not.
 //
-// ONLY FinishRelease WITHHOLDS IT. A failed checkpoint, a missed idle boundary
+// ONLY FinishRelease AND AN UNSETTLED ATTACH WITHHOLD IT. An attach that did
+// not finish rolling back within its bound may still hold a residency grant and
+// a runtime's journal lease, which is the same "release did not finish".
+//
+// Nothing else does. A failed checkpoint, a missed idle boundary
 // and a refused ReleaseResidency are all recorded and none of them means
 // release did not finish — the tombstone is written and the lease is released
 // in every one of those. A transport that would not close is not in this list
@@ -686,7 +738,7 @@ func (d *Drainer) run(sessions []Session) {
 // failure after this state was already settled.
 func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
 	for _, failure := range d.failures {
-		if failure.Step == StepFinishRelease {
+		if failure.Step == StepFinishRelease || failure.Step == StepSettleAttaches {
 			return sessionwire.HostLinkDrainStateDraining
 		}
 	}
@@ -740,6 +792,40 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 		record(StepReleaseResidency, err)
 	}
 	run(StepFinishRelease, session.FinishRelease)
+}
+
+// settleAttaches waits for the attaches in flight when this drain began, under
+// the platform grace, and cancels what is left when the grace expires.
+//
+// THE WAIT COMES FIRST AND THE CANCELLATION ONLY AT THE GRACE, deliberately. An
+// in-flight attach cannot become resident once the drain has begun (the
+// implementer refuses it at its commit point), so its rollback through the
+// ordinary path — a live runtime's nonterminal release, then the lease — is the
+// well-trodden way to give everything back. Cancelling at once would instead
+// cancel a runtime launched moments ago on the session context, which is the
+// crash-equivalent path.
+//
+// AFTER THE CANCELLATION THE WAIT IS BOUNDED AGAIN, by the idle boundary,
+// because an attach whose collaborator ignores cancellation must not hold the
+// termination this drain is racing. What is still in flight then is recorded,
+// and it withholds `drained` (settledState).
+func (d *Drainer) settleAttaches(graceCtx context.Context, attaches Attaches) {
+	if err := attaches.AwaitAttaches(graceCtx); err == nil {
+		return
+	}
+	attaches.CancelAttaches()
+	boundCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-d.options.Clock.After(d.options.IdleBoundary):
+			cancel()
+		case <-boundCtx.Done():
+		}
+	}()
+	if err := attaches.AwaitAttaches(boundCtx); err != nil {
+		d.record(Failure{Step: StepSettleAttaches, Err: errors.Join(ErrWaitAbandoned, err)})
+	}
 }
 
 // bounded runs one cancellable step under the idle boundary and the platform
