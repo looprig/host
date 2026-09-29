@@ -39,6 +39,7 @@ package residency
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -365,10 +366,23 @@ type OwnershipRequest struct {
 // time (review finding P2/3). So once a handle offering this exists, the
 // attach's compensations for those three go through it, and every path shares
 // one completion and one first error for each.
+//
+// IT COVERS EVERY COMPENSATION FROM STEP 7 ON, the location and the admission
+// charge as well: a give-up that completed first has already written the
+// tombstone, removed the local entry and credited the charge, and a direct
+// compensation would then report "nothing was removed" and "not charged" for a
+// release that in fact finished (round-3 review). Through the authority it
+// receives that release's own verdict — and still a genuine failure, such as an
+// entry replaced under a generation nothing here released.
 type ReleaseAuthority interface {
 	ReleaseRuntime(context.Context) error
 	ReleaseLease(context.Context) error
 	ReleaseWorkspace(context.Context) error
+	// ReleaseLocation writes the epoch-fenced tombstone and removes the local
+	// registry entry, as one step with one verdict.
+	ReleaseLocation(context.Context) error
+	// ReleaseAdmission credits the residency's admission charge back.
+	ReleaseAdmission(context.Context) error
 }
 
 // Ownership begins the durable inbox consumption, event fan-out and heartbeat
@@ -629,6 +643,12 @@ type AttachError struct {
 	// route with no owner, a lease nobody will renew — and it must not be
 	// indistinguishable from the first.
 	Unreleased []string
+
+	// UnreleasedCauses are the errors behind Unreleased, one per compensation
+	// that itself failed, for a caller that must classify them (an expected
+	// lost-grant refusal is not a leak). A resource Unreleased names only
+	// because a registry loser leaves it to the winner has no cause here.
+	UnreleasedCauses []error
 }
 
 func (e *AttachError) Error() string {
@@ -1183,17 +1203,19 @@ func (u *unwinder) sharedHeld() []string {
 // It CONTINUES past a failure rather than stopping. The compensations are
 // independent, and abandoning the rest because one failed would turn one leaked
 // resource into five.
-func (u *unwinder) unwind(ctx context.Context, includeShared bool) []string {
+func (u *unwinder) unwind(ctx context.Context, includeShared bool) ([]string, []error) {
 	var unreleased []string
+	var causes []error
 	for i := len(u.actions) - 1; i >= 0; i-- {
 		if u.actions[i].shared && !includeShared {
 			continue
 		}
 		if err := u.actions[i].run(ctx); err != nil {
 			unreleased = append(unreleased, u.actions[i].name+": "+err.Error())
+			causes = append(causes, fmt.Errorf("%s: %w", u.actions[i].name, err))
 		}
 	}
-	return unreleased
+	return unreleased, causes
 }
 
 // attach is the nine-step sequence. It is one function on purpose: the ORDER is
@@ -1230,7 +1252,13 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		}
 	}
 	unwound := &unwinder{}
-	unwound.shared("admission", func(context.Context) error {
+	// Declared here so that every compensation below, registered before
+	// ownership exists, still reads it when it runs. See ReleaseAuthority.
+	var authority ReleaseAuthority
+	unwound.shared("admission", func(ctx context.Context) error {
+		if authority != nil {
+			return authority.ReleaseAdmission(ctx)
+		}
 		// The bool is CONSUMED. This attach charged the ledger, so a release
 		// reporting that nothing was charged means something else credited it
 		// back first — which is the double-credit that lets a Host admit past
@@ -1280,8 +1308,8 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	rollbackCtx := context.Background()
 
 	fail := func(step Step, code sessionwire.HostLinkErrorCode, reason string, cause error) (Residency, error) {
-		unreleased := unwound.unwind(rollbackCtx, true)
-		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased, RuntimeCompatibilityID: mismatchBuild(code, target.compatibility)}
+		unreleased, causes := unwound.unwind(rollbackCtx, true)
+		return Residency{}, &AttachError{Step: step, Code: code, Key: key, Reason: reason, Cause: cause, Unreleased: unreleased, UnreleasedCauses: causes, RuntimeCompatibilityID: mismatchBuild(code, target.compatibility)}
 	}
 
 	// -- 2. the SessionStore lease and its new epoch -------------------------
@@ -1312,9 +1340,6 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 	case lease == nil:
 		return fail(StepLease, "", "the lease store reported success and granted nothing", nil)
 	}
-	// Declared here so that every compensation below, registered before
-	// ownership exists, still reads it when it runs. See ReleaseAuthority.
-	var authority ReleaseAuthority
 	unwound.own("session lease", func(ctx context.Context) error {
 		if authority != nil {
 			return authority.ReleaseLease(ctx)
@@ -1558,7 +1583,7 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// (see Admissions.Own), and a charge nobody owns is one no release
 		// would ever credit.
 		m.admissions.Own(key, entry.Generation)
-		unreleased := unwound.unwind(rollbackCtx, false)
+		unreleased, causes := unwound.unwind(rollbackCtx, false)
 		residency, mismatch := existingResidency(entry, key, request)
 		if mismatch != nil {
 			// THE THIRD EXIT, and it is a FAILING one. The residency that won
@@ -1578,12 +1603,13 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 				code, build = refusal.Code, refusal.RuntimeCompatibilityID
 			}
 			return Residency{}, &AttachError{
-				Step:       StepInstall,
-				Code:       code,
-				Key:        key,
-				Reason:     "the session is resident under an attach this request does not describe",
-				Cause:      mismatch,
-				Unreleased: append(unreleased, unwound.sharedHeld()...),
+				Step:             StepInstall,
+				Code:             code,
+				Key:              key,
+				Reason:           "the session is resident under an attach this request does not describe",
+				Cause:            mismatch,
+				Unreleased:       append(unreleased, unwound.sharedHeld()...),
+				UnreleasedCauses: causes,
 				// The WINNER's build, which existingResidency named: it is what
 				// this Host now runs for the session.
 				RuntimeCompatibilityID: build,
@@ -1597,15 +1623,21 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 			// operator nothing at all. This is the rule fail() applies, applied
 			// on the path beside it.
 			return Residency{}, &AttachError{
-				Step:       StepInstall,
-				Key:        key,
-				Reason:     "the session is resident under another attach and this one could not release what it took",
-				Unreleased: unreleased,
+				Step:             StepInstall,
+				Key:              key,
+				Reason:           "the session is resident under another attach and this one could not release what it took",
+				Unreleased:       unreleased,
+				UnreleasedCauses: causes,
 			}
 		}
 		return residency, nil
 	}
 	unwound.own("registry entry", func(context.Context) error {
+		// From step 7 the local entry is removed by the location release,
+		// which the authority runs once for every path; see ReleaseAuthority.
+		if authority != nil {
+			return nil
+		}
 		// Consumed for the same reason: false means the generation this attach
 		// installed is no longer the one held, so the residency was replaced
 		// under it and this rollback removed nothing.
@@ -1640,6 +1672,12 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		// removals less strictly than publishes it takes the SUCCESSOR's route
 		// away. Refusing leaves this Host's own record to expire, which §18.2
 		// assigns to registry expiry and Factory's due reconciler.
+		//
+		// From step 7 it goes through the authority, which writes it through
+		// the same fence once for every path and hands back that one verdict.
+		if authority != nil {
+			return authority.ReleaseLocation(ctx)
+		}
 		return fence.write(func() error {
 			return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, uint64(epoch))
 		})

@@ -163,7 +163,7 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	// finding B2), because a successor can claim the charge BEFORE it is the
 	// one held: a late give-up must not uncharge its successor.
 	if s.residentFor(held.key) == held {
-		s.capacity.ReleaseOwned(held.key, held.generation)
+		_ = held.creditAdmission()
 		s.warm.Forget(held.key)
 	}
 	s.forgetResident(held)

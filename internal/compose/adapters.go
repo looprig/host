@@ -171,6 +171,18 @@ func (c *committedOwnership) ReleaseWorkspace(ctx context.Context) error {
 	return c.held.dropState(ctx)
 }
 
+// ReleaseLocation writes the tombstone and removes the local entry through the
+// residency's guard — the heartbeat's own FinishRelease, whose first verdict
+// every path shares.
+func (c *committedOwnership) ReleaseLocation(ctx context.Context) error {
+	return c.held.finishRelease(ctx)
+}
+
+// ReleaseAdmission credits the charge back through the residency's guard.
+func (c *committedOwnership) ReleaseAdmission(context.Context) error {
+	return c.held.creditAdmission()
+}
+
 // beginWork starts one session's durable command consumer, its applier and the
 // live event relay.
 //
@@ -407,6 +419,7 @@ func (s *Service) trackResident(request residency.OwnershipRequest, halves relea
 		work:       work,
 		checkpoint: s.options.Checkpointer.Checkpoint,
 		workspaces: s.options.Workspaces,
+		admissions: s.capacity,
 	}
 	// THE COMMIT POINT, AND IT IS ATOMIC WITH THE DRAIN'S SNAPSHOT. StartDrain
 	// sets `draining` under this mutex before the drain reads ResidentSessions
@@ -627,7 +640,9 @@ func unfinishedWarmRelease(outcome residency.WarmOutcome) error {
 	for _, failure := range outcome.Failures {
 		switch failure.Step {
 		case residency.WarmStepFinishRelease, residency.WarmStepReleaseLease, residency.WarmStepDropState:
-			failures = append(failures, fmt.Errorf("%s: %w", failure.Step, failure.Err))
+			if err := withoutLostGrant(failure.Err); err != nil {
+				failures = append(failures, fmt.Errorf("%s: %w", failure.Step, err))
+			}
 		}
 	}
 	if len(failures) == 0 {
@@ -727,13 +742,13 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 		}
 		cancel()
 	}
-	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil && !onlyLostGrant(err) {
+	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
 		failures = append(failures, err)
 		s.recordUnreleased(fmt.Errorf("compose: the give-up of the lost session %s/%s did not finish: %w",
 			held.key.TenantID, held.key.SessionID, err))
 	}
 	if s.residentFor(held.key) == held {
-		s.capacity.ReleaseOwned(held.key, held.generation)
+		_ = held.creditAdmission()
 		s.warm.Forget(held.key)
 	}
 	s.forgetResident(held)
@@ -752,21 +767,31 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 // shorten it.
 var lostReleaseBound = giveUpHaltBound
 
-// onlyLostGrant reports whether FinishRelease failed ONLY in the ways a lost
-// grant makes certain: the tombstone refused by the ended fence (nothing
-// durable is written under a lost epoch, by design) and the provider refusing
-// to release a lease it already declared lost. Those are the expected shape of
-// this path, not failures of it, and reporting them would make the WARN fire on
-// every loss.
-func onlyLostGrant(err error) bool {
+// withoutLostGrant is the ONE classification of an expected lost-grant refusal,
+// applied on every path that reports a release's outcome — the drain's
+// FinishRelease, a give-up, a warm release, an attach rollback — and it returns
+// only what is left.
+//
+// What it removes is what a lost grant makes certain: the tombstone refused by
+// the ended fence (nothing durable is written under a lost epoch, by design) and
+// the provider refusing to release a lease it already declared lost. The grant
+// is gone, so this Host holds nothing those steps could have given back, and
+// reporting them would put a permanent entry on the release ledger for a
+// release that in fact finished — a Host that could never drain again. A
+// genuine heartbeat, grant or workspace failure is kept.
+func withoutLostGrant(err error) error {
+	if err == nil {
+		return nil
+	}
+	var kept []error
 	var release *residency.ReleaseError
 	for _, part := range flatten(err) {
 		if errors.As(part, &release) && errors.Is(part, residency.ErrLeaseNotHeld) {
 			continue
 		}
-		return false
+		kept = append(kept, part)
 	}
-	return true
+	return errors.Join(kept...)
 }
 
 // flatten returns the leaves of an errors.Join tree, one level at a time.

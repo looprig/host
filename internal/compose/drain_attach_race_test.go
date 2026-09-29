@@ -862,3 +862,132 @@ func TestNoOtherPathReleasesAnUnsettledAttachTwice(t *testing.T) {
 		t.Fatalf("the grant was released %d times, want exactly once", lease.releases.Load())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A benign race must never poison the release ledger
+// ---------------------------------------------------------------------------
+
+// TestARollbackAfterACompleteGiveUpLeavesTheHostDrainable is round-3 finding 1.
+// A committed attach is still publishing its `resident` row when its runtime
+// faults, and the give-up releases the session COMPLETELY — runtime abandoned,
+// tombstone written, local entry removed, grant and workspace released, charge
+// credited. The attach's publication then fails and it rolls back. Every
+// compensation must receive that give-up's verdict through the residency's
+// release authority: compensations run directly reported "nothing was
+// removed" and "not charged", which went on the permanent release ledger, and
+// the Host could never drain again.
+func TestARollbackAfterACompleteGiveUpLeavesTheHostDrainable(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	parked, release := refuseResidentRowOf(f, true)
+	t.Cleanup(release)
+	late, attached := attachLate(t, f)
+	await(t, "the committed attach to reach its resident publication", parked)
+
+	late.Fault(errors.New("injected journal append failure"))
+	awaitCondition(t, "the give-up to finish", func() bool {
+		lease := f.store.leaseOf(keyB)
+		return f.svc.residentFor(keyB) == nil && lease != nil && lease.releases.Load() == 1
+	})
+	if _, held := f.svc.registry.Get(keyB); held {
+		t.Fatal("the give-up left the registry entry, so it did not complete and this row measures a different race")
+	}
+	if late.Abandoned() != 1 {
+		t.Fatalf("the runtime was abandoned %d times by the give-up, want once", late.Abandoned())
+	}
+
+	release()
+	var refused *residency.AttachError
+	if err := await(t, "the attach to answer", attached); !errors.As(err, &refused) {
+		t.Fatalf("the attach answered %v, want a refusal", err)
+	} else if len(refused.UnreleasedCauses) != 0 {
+		t.Fatalf("the rollback reported %v unreleased after a complete give-up had released everything", refused.UnreleasedCauses)
+	}
+	if err := f.svc.Unreleased(); err != nil {
+		t.Fatalf("the release ledger holds %v after a benign race", err)
+	}
+	// THE TOMBSTONE TOO: the rollback's must be the give-up's, not a second
+	// write around the heartbeat's first-verdict guard.
+	if tombstones := f.trace.count("locations.tombstone"); tombstones != 1 {
+		t.Fatalf("%d tombstones were written, want the give-up's one", tombstones)
+	}
+	if lease := f.store.leaseOf(keyB); lease.releases.Load() != 1 {
+		t.Fatalf("the grant was released %d times, want once", lease.releases.Load())
+	}
+	if late.Released() != 0 || late.Abandoned() != 1 {
+		t.Fatalf("the runtime was released %d / abandoned %d times, want 0 / 1", late.Released(), late.Abandoned())
+	}
+	if consumed := f.svc.capacity.ConsumedWeight(); consumed != 0 {
+		t.Fatalf("ConsumedWeight = %d, want 0: the charge was credited more or less than once", consumed)
+	}
+	report, err := f.svc.Stop(context.Background())
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if report.State != sessionwire.HostLinkDrainStateDrained || len(report.Failures) != 0 {
+		t.Fatalf("a later drain reported %+v, want drained with no failures", report)
+	}
+}
+
+// TestAGrantLostMidWarmReleaseLeavesTheHostDrainable is round-3 finding 2. A
+// warm release has released the runtime and not yet finished; the grant is
+// lost; the lost-residency give-up finishes locally with the tombstone refused
+// by the ended fence — the expected shape of a lost grant. The warm release
+// then resumes, receives that same verdict and reports itself released. That
+// refusal is not a leak and must not reach the release ledger.
+func TestAGrantLostMidWarmReleaseLeavesTheHostDrainable(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	held := f.svc.residentFor(keyA)
+	warm := warmSession{resident: held}
+	ctx := context.Background()
+	if err := warm.BeginRelease(ctx); err != nil {
+		t.Fatalf("warm BeginRelease: %v", err)
+	}
+	if err := warm.ReleaseResidency(ctx); err != nil {
+		t.Fatalf("warm ReleaseResidency: %v", err)
+	}
+
+	f.store.loseLease(keyA)
+	awaitCondition(t, "the lost-residency give-up to finish", func() bool { return f.svc.residentFor(keyA) == nil })
+
+	finishErr := warm.FinishRelease(ctx)
+	if finishErr == nil || withoutLostGrant(finishErr) != nil {
+		t.Fatalf("the resumed warm FinishRelease answered %v, want only the expected lost-grant refusal, or this row measures nothing", finishErr)
+	}
+	f.svc.WarmRelease(residency.WarmOutcome{
+		Key: keyA, Generation: held.generation, Kind: residency.WarmOutcomeReleased,
+		Failures: []residency.WarmFailure{{Step: residency.WarmStepFinishRelease, Err: finishErr}},
+	})
+	if err := f.svc.Unreleased(); err != nil {
+		t.Fatalf("the release ledger holds %v after a lost grant mid-warm-release", err)
+	}
+	report, err := f.svc.Stop(ctx)
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if report.State != sessionwire.HostLinkDrainStateDrained || len(report.Failures) != 0 {
+		t.Fatalf("a later drain reported %+v, want drained with no failures", report)
+	}
+}
+
+// TestAGenuineWarmReleaseFailureStillWithholdsDrained is the classification's
+// other side: a warm release whose grant release genuinely fails is on the
+// ledger, and a later drain may not report drained.
+func TestAGenuineWarmReleaseFailureStillWithholdsDrained(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	f.svc.WarmRelease(residency.WarmOutcome{
+		Key: keyA, Generation: f.svc.residentFor(keyA).generation, Kind: residency.WarmOutcomeReleased,
+		Failures: []residency.WarmFailure{{Step: residency.WarmStepReleaseLease, Err: errors.New("injected: the provider refused the release")}},
+	})
+	report, err := f.svc.Stop(context.Background())
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		t.Fatalf("a drain after a genuinely failed warm release reported %q, want draining", report.State)
+	}
+}

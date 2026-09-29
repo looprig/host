@@ -973,9 +973,16 @@ func (s *Service) settleAttach(key registry.Key, held residency.Residency, err e
 		return
 	}
 	var refused *residency.AttachError
-	if errors.As(err, &refused) && len(refused.Unreleased) != 0 {
-		s.recordUnreleased(fmt.Errorf("compose: the rollback of the attach of %s/%s could not release: %s",
-			key.TenantID, key.SessionID, strings.Join(refused.Unreleased, "; ")))
+	if !errors.As(err, &refused) {
+		return
+	}
+	// ONLY WHAT A COMPENSATION FAILED TO GIVE BACK, and not an expected
+	// lost-grant refusal (withoutLostGrant). A resource a registry loser leaves
+	// to the resident winner is named in Unreleased with no cause: it is held,
+	// but by that residency, and it is not a leak.
+	if unreleased := withoutLostGrant(errors.Join(refused.UnreleasedCauses...)); unreleased != nil {
+		s.recordUnreleased(fmt.Errorf("compose: the rollback of the attach of %s/%s could not release: %w",
+			key.TenantID, key.SessionID, unreleased))
 	}
 }
 

@@ -72,9 +72,16 @@ type resident struct {
 	// so a drain racing a warm release blocked in the grant's release reported
 	// the grant released — `drained` — before it was, and never saw the warm
 	// release's error.
-	ownershipStop sharedOnce
-	leaseRelease  sharedOnce
-	stateDrop     sharedOnce
+	ownershipStop   sharedOnce
+	leaseRelease    sharedOnce
+	stateDrop       sharedOnce
+	admissionCredit sharedOnce
+
+	// admissions is the ledger this residency's admission charge is held in,
+	// credited back once through creditAdmission.
+	admissions interface {
+		ReleaseOwned(registry.Key, uint64) bool
+	}
 
 	// settled records that the attach which installed this residency RETURNED
 	// SUCCESSFULLY; rolledBack that it failed after committing and rolled the
@@ -291,6 +298,21 @@ func (r *resident) dropState(ctx context.Context) error {
 	})
 }
 
+// creditAdmission credits this residency's admission charge back, once, and
+// every caller shares that one credit's outcome. The ledger fences the credit
+// by generation, so it can never uncharge a successor.
+func (r *resident) creditAdmission() error {
+	return r.admissionCredit.run(func() error {
+		if r.admissions == nil {
+			return nil
+		}
+		if !r.admissions.ReleaseOwned(r.key, r.generation) {
+			return errors.New("compose: the admission ledger holds no charge for this residency's generation")
+		}
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // The two release seams, and where they disagree
 // ---------------------------------------------------------------------------
@@ -378,6 +400,11 @@ func (s releaseSession) FinishRelease(ctx context.Context) error {
 	}
 	if err := s.dropState(ctx); err != nil {
 		failures = append(failures, err)
+	}
+	// AN EXPECTED LOST-GRANT REFUSAL IS NOT A FAILURE HERE, on any path that
+	// reaches this (drain, give-up): see withoutLostGrant.
+	if len(failures) != 0 {
+		failures = []error{withoutLostGrant(errors.Join(failures...))}
 	}
 	// THE DRAIN'S END OF THE RESIDENCY (booked finding B1): the Manager's
 	// record is pruned here, and its context cancelled only if the runtime
