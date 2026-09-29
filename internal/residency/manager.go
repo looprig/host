@@ -1418,6 +1418,15 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		})
 	}
 
+	// AN EARLY REFUSAL BEFORE THE LAUNCH, the most expensive step and the one
+	// whose rollback is a runtime release. An attach admitted before a drain
+	// began would be refused at its commit point anyway (the composition's
+	// Ownership holds that check, atomic with the drain's snapshot); refusing
+	// here merely avoids launching a runtime only to release it.
+	if m.admissions.Draining() {
+		return fail(StepValidate, sessionwire.HostLinkErrorNotAdmitting, "this Host began draining while the attach was in flight, so no runtime was launched", nil)
+	}
+
 	storage := department.StorageContext{Namespace: state.Namespace}
 	var runtime department.Runtime
 	if launch == ModeCreate {

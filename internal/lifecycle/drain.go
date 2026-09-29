@@ -189,11 +189,28 @@ type Attaches interface {
 	// then reports the context's error, naming what is still in flight.
 	AwaitAttaches(context.Context) error
 
+	// AwaitSessionAttaches is AwaitAttaches for ONE session. The drain calls it
+	// before it releases a session from its snapshot, because an attach that
+	// had already COMMITTED when the snapshot was read is in the snapshot and
+	// still running its last steps: released beneath it, its final
+	// `resident` publication landed AFTER the drain's tombstone, and it
+	// reported the session attached on a Host that had just released it.
+	AwaitSessionAttaches(context.Context, registry.Key) error
+
 	// CancelAttaches cancels every attach that has not yet become resident, so
 	// it stops waiting on its collaborators and rolls back. It must never
 	// cancel a residency that is already in the resident set: that one is the
 	// drain's to release.
 	CancelAttaches()
+}
+
+// Ender is the optional Session method that reports a residency which ENDED ON
+// ITS OWN while the drain waited for its attach — the attach committed and then
+// failed and rolled itself back. There is nothing left for the drain to
+// release, and releasing it again would book failures against a generation
+// that no longer exists.
+type Ender interface {
+	Ended() bool
 }
 
 // THIS PACKAGE OWNS NO TRANSPORT SHUTDOWN, and the absence is load-bearing
@@ -245,6 +262,11 @@ type Options struct {
 	// The abandonment is the part that makes this a bound. Cancelling a context
 	// only asks; a session that ignores it would otherwise hold this drain past
 	// any grace at all.
+	//
+	// An attach still in flight when the drain began (see Attaches) is waited
+	// for until one IdleBoundary before the grace — floored at half the grace —
+	// then cancelled, and abandoned at the grace itself. So the whole drain,
+	// attaches included, stays inside Grace.
 	Grace time.Duration
 
 	// IdleBoundary is one session's bound on reaching idle. It must not exceed
@@ -300,9 +322,11 @@ const (
 	StepFinishRelease    Step = "finish_release"
 
 	// StepSettleAttaches is the wait for the attaches in flight when the drain
-	// began (see Attaches). Its failure carries no session key — it names the
-	// attaches in its error — and it WITHHOLDS `drained`: an attach that has not
-	// finished rolling back may still hold a lease and a runtime.
+	// began (see Attaches). The Host-wide wait's failure carries no session key
+	// — it names the attaches in its error — while a wait for one session's own
+	// attach carries that session's. Either WITHHOLDS `drained`: an attach that
+	// has not finished may still hold a lease and a runtime, or still publish
+	// over the drain's tombstone.
 	StepSettleAttaches Step = "settle_attaches"
 
 	// StepCloseLink is the transport shutdown, and THIS PACKAGE NEVER RECORDS
@@ -769,6 +793,20 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 		}
 	}
 
+	// FIRST, THE SESSION'S OWN ATTACH, if one is still finishing. See
+	// Attaches.AwaitSessionAttaches: a session committed into the snapshot may
+	// still be in its attach's last steps, and releasing it concurrently let
+	// that attach's `resident` publication land after the tombstone. Bounded by
+	// the grace; if it expires the release goes ahead and the failure withholds
+	// `drained`, because the two may still interleave.
+	if attaches, ok := d.options.Residents.(Attaches); ok {
+		if err := attaches.AwaitSessionAttaches(graceCtx, key); err != nil {
+			record(StepSettleAttaches, errors.Join(ErrWaitAbandoned, err))
+		} else if ender, ok := session.(Ender); ok && ender.Ended() {
+			return
+		}
+	}
+
 	// STEP 0, as the warm release's: stop applying commands before anything
 	// is marked, waited on or checkpointed. See ConsumptionHalter.
 	if halter, ok := session.(ConsumptionHalter); ok {
@@ -794,36 +832,44 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	run(StepFinishRelease, session.FinishRelease)
 }
 
-// settleAttaches waits for the attaches in flight when this drain began, under
-// the platform grace, and cancels what is left when the grace expires.
+// settleAttaches waits for the attaches in flight when this drain began,
+// cancels what is left before the platform grace, and waits for that to finish
+// within the grace.
 //
-// THE WAIT COMES FIRST AND THE CANCELLATION ONLY AT THE GRACE, deliberately. An
-// in-flight attach cannot become resident once the drain has begun (the
-// implementer refuses it at its commit point), so its rollback through the
-// ordinary path — a live runtime's nonterminal release, then the lease — is the
-// well-trodden way to give everything back. Cancelling at once would instead
-// cancel a runtime launched moments ago on the session context, which is the
-// crash-equivalent path.
+// THE WAIT COMES FIRST AND THE CANCELLATION LATER, deliberately. An in-flight
+// attach cannot become resident once the drain has begun (the implementer
+// refuses it at its commit point), so its rollback through the ordinary path —
+// a live runtime's nonterminal release, then the lease — is the well-trodden way
+// to give everything back. Cancelling at once would instead cancel a runtime
+// launched moments ago on the session context, which is the crash-equivalent
+// path.
 //
-// AFTER THE CANCELLATION THE WAIT IS BOUNDED AGAIN, by the idle boundary,
-// because an attach whose collaborator ignores cancellation must not hold the
-// termination this drain is racing. What is still in flight then is recorded,
-// and it withholds `drained` (settledState).
+// THE CANCELLATION IS ONE IDLE BOUNDARY BEFORE THE GRACE, so the attach has
+// that long to roll back and the whole settle stays INSIDE the grace: the grace
+// is the platform's termination bound, and a drain that overran it would be
+// killed with the lease still held. When IdleBoundary is most of the grace the
+// cancellation is floored at half the grace, so an attach still gets a real
+// chance to finish on its own. What is still in flight when the grace expires
+// is recorded, and it withholds `drained` (settledState).
 func (d *Drainer) settleAttaches(graceCtx context.Context, attaches Attaches) {
-	if err := attaches.AwaitAttaches(graceCtx); err == nil {
+	cancelAt := d.options.Grace - d.options.IdleBoundary
+	if floor := d.options.Grace / 2; cancelAt < floor {
+		cancelAt = floor
+	}
+	patience, endPatience := context.WithCancel(graceCtx)
+	defer endPatience()
+	go func() {
+		select {
+		case <-d.options.Clock.After(cancelAt):
+			endPatience()
+		case <-patience.Done():
+		}
+	}()
+	if err := attaches.AwaitAttaches(patience); err == nil {
 		return
 	}
 	attaches.CancelAttaches()
-	boundCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-d.options.Clock.After(d.options.IdleBoundary):
-			cancel()
-		case <-boundCtx.Done():
-		}
-	}()
-	if err := attaches.AwaitAttaches(boundCtx); err != nil {
+	if err := attaches.AwaitAttaches(graceCtx); err != nil {
 		d.record(Failure{Step: StepSettleAttaches, Err: errors.Join(ErrWaitAbandoned, err)})
 	}
 }

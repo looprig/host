@@ -36,13 +36,21 @@ type FakeRig struct {
 	NewErr     error
 	RestoreErr error
 
+	// LaunchHook, when set, runs at the start of both operations — outside the
+	// rig's lock, with the launch's context — and its error is the launch's.
+	// It is how a test parks a launch, cooperatively or not.
+	LaunchHook func(context.Context) error
+
 	creates  []department.RigCreateRequest
 	restores []department.RigRestoreRequest
 	restored []uuid.UUID
 }
 
 // NewSession records the request and returns the configured session.
-func (f *FakeRig) NewSession(_ context.Context, request department.RigCreateRequest) (department.RigSession, error) {
+func (f *FakeRig) NewSession(ctx context.Context, request department.RigCreateRequest) (department.RigSession, error) {
+	if err := f.launchHook(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.creates = append(f.creates, request)
@@ -53,7 +61,10 @@ func (f *FakeRig) NewSession(_ context.Context, request department.RigCreateRequ
 }
 
 // RestoreSession records the request and returns the configured session.
-func (f *FakeRig) RestoreSession(_ context.Context, id uuid.UUID, request department.RigRestoreRequest) (department.RigSession, error) {
+func (f *FakeRig) RestoreSession(ctx context.Context, id uuid.UUID, request department.RigRestoreRequest) (department.RigSession, error) {
+	if err := f.launchHook(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.restores = append(f.restores, request)
@@ -62,6 +73,17 @@ func (f *FakeRig) RestoreSession(_ context.Context, id uuid.UUID, request depart
 		return nil, f.RestoreErr
 	}
 	return f.Session, nil
+}
+
+// launchHook runs LaunchHook, if one is set.
+func (f *FakeRig) launchHook(ctx context.Context) error {
+	f.mu.Lock()
+	hook := f.LaunchHook
+	f.mu.Unlock()
+	if hook == nil {
+		return nil
+	}
+	return hook(ctx)
 }
 
 // Creates returns every create request this rig received, in order.

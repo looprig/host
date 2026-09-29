@@ -304,7 +304,17 @@ var (
 	_ lifecycle.Session           = releaseSession{}
 	_ lifecycle.ConsumptionHalter = releaseSession{}
 	_ lifecycle.EpochReporter     = releaseSession{}
+	_ lifecycle.Ender             = releaseSession{}
 )
+
+// Ended reports that this residency is no longer the one this Host holds for
+// its key: its attach committed, then failed and rolled itself back while the
+// drain waited for it. The drain then has nothing of its own to release.
+func (r releaseSession) Ended() bool {
+	r.service.mu.Lock()
+	defer r.service.mu.Unlock()
+	return r.service.sessions[r.key] != r.resident
+}
 
 // HaltConsumption stops this session's command consumer claiming or applying
 // anything more, waiting — bounded by ctx — for a pass already in flight.

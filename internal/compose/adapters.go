@@ -83,6 +83,17 @@ var _ residency.Ownership = (*sessionOwnership)(nil)
 // consumer running with no relay — silently drops the events its own
 // applications produce.
 func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency.OwnershipRequest) (residency.OwnershipHandle, error) {
+	// AN EARLY REFUSAL, and only that: trackResident's check is the
+	// authoritative one, atomic with the drain's snapshot. This one keeps an
+	// attach the drain has already doomed from starting a consumer that could
+	// claim a command and begin an attempt before trackResident refuses it —
+	// an attempt its rollback would then strand, crash-equivalently.
+	o.service.mu.Lock()
+	draining := o.service.draining
+	o.service.mu.Unlock()
+	if draining {
+		return nil, drainingAttachRefusal(request.AgentID)
+	}
 	handle, err := o.inner.BeginOwnership(ctx, request)
 	if err != nil {
 		return nil, err

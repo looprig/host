@@ -345,6 +345,10 @@ type fakeStore struct {
 	// and its error is the read's. It receives the attach's session context,
 	// so a hold may honour or ignore cancellation.
 	loadHold func(ctx context.Context, session sessionwire.SessionID) error
+
+	// publishHold, when set, runs inside PublishResidency before the row is
+	// stored, with the writer's context.
+	publishHold func(ctx context.Context, observation sessionwire.HostLinkRegistryObservation)
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -442,10 +446,13 @@ func (s *fakeStore) LoadSessionState(ctx context.Context, _ sessionwire.TenantID
 	return residency.SessionState{Namespace: "tenant/session", CompatibilityID: testCompat, RigSessionID: testRigSessionID, RuntimeJournal: residency.RuntimeJournalAbsent}, nil
 }
 
-func (s *fakeStore) PublishResidency(_ context.Context, observation sessionwire.HostLinkRegistryObservation) error {
+func (s *fakeStore) PublishResidency(ctx context.Context, observation sessionwire.HostLinkRegistryObservation) error {
 	s.mu.Lock()
-	hold := s.hold
+	hold, publishHold := s.hold, s.publishHold
 	s.mu.Unlock()
+	if publishHold != nil {
+		publishHold(ctx, observation)
+	}
 	if hold != nil && observation.Residency == sessionwire.SessionResidencyReleasing {
 		<-hold
 	}
@@ -1664,9 +1671,23 @@ func (w *fakeDispositionWriter) RejectDisposition(
 type fakeDispositionWriters struct {
 	store  *fakeDispositions
 	refuse error
+
+	// hook, when set, runs once, inside the next attach's ownership start —
+	// after its early drain check and before its commit point.
+	mu    sync.Mutex
+	hook  func()
+	calls int
 }
 
 func (w *fakeDispositionWriters) DispositionWriterFor(lease residency.Lease) (commands.DispositionWrites, error) {
+	w.mu.Lock()
+	hook := w.hook
+	w.hook = nil
+	w.calls++
+	w.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if w.refuse != nil {
 		return nil, w.refuse
 	}

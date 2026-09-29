@@ -965,10 +965,26 @@ type inflightAttach struct {
 // reported `drained` before then let Stop return, and let a Factory delete the
 // workload, with that lease still held.
 func (s *Service) AwaitAttaches(ctx context.Context) error {
+	return s.awaitAttaches(ctx, func(registry.Key) bool { return true })
+}
+
+// AwaitSessionAttaches waits for the attaches of one session in flight at the
+// moment of the call. The drain calls it before releasing that session: an
+// attach that committed into the drain's snapshot may still be publishing its
+// `resident` row, and a release run beneath it let that row land after the
+// tombstone and the attach report the session attached.
+func (s *Service) AwaitSessionAttaches(ctx context.Context, key registry.Key) error {
+	return s.awaitAttaches(ctx, func(attaching registry.Key) bool { return attaching == key })
+}
+
+// awaitAttaches waits for the in-flight attaches a filter selects.
+func (s *Service) awaitAttaches(ctx context.Context, selected func(registry.Key) bool) error {
 	s.mu.Lock()
 	inflight := make([]inflightAttach, 0, len(s.attaching))
 	for _, attach := range s.attaching {
-		inflight = append(inflight, attach)
+		if selected(attach.key) {
+			inflight = append(inflight, attach)
+		}
 	}
 	s.mu.Unlock()
 	for i, attach := range inflight {
