@@ -571,6 +571,19 @@ func (m *Multiplexer) Bind(link LinkID, request sessionwire.HostLinkBindRequest)
 			wire:    sessionwire.HostLinkErrorRuntimeUnavailable,
 		}
 	}
+	// THE OWNERSHIP READS AND THE ROUTE WRITE SHARE ONE CRITICAL SECTION, and
+	// that is what makes a bind unable to outlive the release it races. Every
+	// path that ends a residency here first stops admission — the drain flips
+	// the ledger, a warm release marks the entry releasing, a teardown claims
+	// it — and only then calls InvalidateSession, which takes this same mutex.
+	// Validated outside it, a bind that read "resident and admitting" just
+	// before a drain began could record its route just AFTER the drain's
+	// InvalidateSession had run: a route to a session this Host no longer
+	// held, which nothing would ever drop while the Host stayed up answering.
+	// Under it, a bind either records before the invalidation (and is dropped
+	// by it) or reads after the stop (and is refused).
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.admission.Draining() {
 		return Binding{}, &BindError{
 			Refusal: RefusalHostNotAdmitting,
@@ -652,11 +665,10 @@ func (m *Multiplexer) Bind(link LinkID, request sessionwire.HostLinkBindRequest)
 //
 // The capacity check is here rather than in Bind because it must be the LAST
 // thing a bind does: refusing an invalid request for want of capacity would
-// tell a Factory to retry elsewhere a bind that is wrong everywhere.
+// tell a Factory to retry elsewhere a bind that is wrong everywhere. The caller
+// holds m.mu; see Bind.
 func (m *Multiplexer) record(link LinkID, key registry.Key, epoch uint64, idempotencyKey string) (Binding, error) {
 	channel := ChannelFor(key)
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	bindings := m.links[link]
 	if _, bound := bindings[channel]; !bound {
 		if len(bindings) >= m.perLink {
