@@ -991,3 +991,51 @@ func TestAGenuineWarmReleaseFailureStillWithholdsDrained(t *testing.T) {
 		t.Fatalf("a drain after a genuinely failed warm release reported %q, want draining", report.State)
 	}
 }
+
+// TestARollbackBeforeCommitUnderALostGrantLeavesTheHostDrainable is round-4's
+// finding. The attach has published its `attaching` row (step 6) and is
+// starting ownership when the grant is lost and a drain begins; the commit is
+// then refused and the attach rolls back BEFORE any release authority exists.
+// Its tombstone is refused by the ended fence — the expected shape of a lost
+// grant — and every other compensation succeeds. That refusal is not a leak:
+// the release ledger stays empty and the drain reports drained. It is also the
+// row that pins the lost-grant classification on the attach-rollback path.
+func TestARollbackBeforeCommitUnderALostGrantLeavesTheHostDrainable(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	parked, release := parkAt(f, parkOwnership, false)
+	t.Cleanup(release)
+	late, attached := attachLate(t, f)
+	await(t, "the attach to park in its ownership start", parked)
+
+	f.store.loseLease(keyB)
+	if _, err := f.svc.StartDrain(hostlink.DrainScope{}); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+
+	release()
+	var refused *residency.AttachError
+	if err := await(t, "the attach to answer", attached); !errors.As(err, &refused) {
+		t.Fatalf("the attach answered %v, want a refusal", err)
+	}
+	if len(refused.UnreleasedCauses) == 0 {
+		t.Fatal("the rollback reported nothing unreleased, so the lost-grant refusal this row is about never happened")
+	}
+	for _, cause := range refused.UnreleasedCauses {
+		if withoutLostGrant(cause) != nil {
+			t.Fatalf("the rollback reported %v, which is not the expected lost-grant refusal: this row needs every other compensation to succeed", cause)
+		}
+	}
+	if err := f.svc.Unreleased(); err != nil {
+		t.Fatalf("the release ledger holds %v after a lost grant before commit", err)
+	}
+	if late.Released() != 1 {
+		t.Fatalf("the runtime was released %d times, want once", late.Released())
+	}
+	report := await(t, "the drain to finish", waited)
+	if report.State != sessionwire.HostLinkDrainStateDrained || len(report.Failures) != 0 {
+		t.Fatalf("the drain reported %+v, want drained with no failures", report)
+	}
+}

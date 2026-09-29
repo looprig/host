@@ -1678,9 +1678,19 @@ func (m *Manager) attach(key registry.Key, request Request, target snapshotTarge
 		if authority != nil {
 			return authority.ReleaseLocation(ctx)
 		}
-		return fence.write(func() error {
+		err := fence.write(func() error {
 			return m.locations.TombstoneResidency(ctx, key.TenantID, key.SessionID, uint64(epoch))
 		})
+		// A LOST GRANT IS TYPED HERE AS THE HEARTBEAT TYPES IT: a refusal by
+		// the ended fence is a *ReleaseError whose cause is ErrLeaseNotHeld,
+		// the one shape callers classify as the expected outcome of a lost
+		// grant rather than a leak. Bare, it read as a tombstone this Host
+		// failed to write and still owed — and a Host that recorded it could
+		// never report drained again (round-4 review).
+		if errors.Is(err, ErrLeaseNotHeld) {
+			return &ReleaseError{Key: key, Unwritten: []string{"residency tombstone: " + err.Error()}, Cause: err}
+		}
+		return err
 	})
 
 	// -- 7. inbox, event and heartbeat ownership -----------------------------
