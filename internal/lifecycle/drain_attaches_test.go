@@ -21,6 +21,9 @@ type fakeAttaches struct {
 	cancels        int
 	finishOnCancel bool
 	sessionWaits   []registry.Key
+	// failure is what AwaitAttaches reports once nothing is in flight: an
+	// incomplete rollback.
+	failure error
 }
 
 func newAttaches(keys ...registry.Key) *fakeAttaches {
@@ -51,7 +54,12 @@ func (a *fakeAttaches) await(ctx context.Context, selected func(registry.Key) bo
 }
 
 func (a *fakeAttaches) AwaitAttaches(ctx context.Context) error {
-	return a.await(ctx, func(registry.Key) bool { return true })
+	if err := a.await(ctx, func(registry.Key) bool { return true }); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.failure
 }
 
 func (a *fakeAttaches) AwaitSessionAttaches(ctx context.Context, key registry.Key) error {
@@ -106,9 +114,10 @@ type attachingResidents struct {
 // endedSession is a fakeSession whose residency ended on its own.
 type endedSession struct {
 	*fakeSession
+	err error
 }
 
-func (endedSession) Ended() bool { return true }
+func (e endedSession) Ended() (bool, error) { return true, e.err }
 
 func newAttachDrainer(t *testing.T, idle time.Duration, attaches *fakeAttaches, sessions ...lifecycle.Session) (*lifecycle.Drainer, *fakeClock) {
 	t.Helper()
@@ -266,7 +275,7 @@ func TestASessionWhoseAttachRolledBackIsNotReleasedAgain(t *testing.T) {
 	shared := &journal{}
 	session := newSession("rolled-back", shared)
 	attaches := newAttaches(session.Key())
-	drainer, _ := newAttachDrainer(t, testIdleGrace, attaches, endedSession{session})
+	drainer, _ := newAttachDrainer(t, testIdleGrace, attaches, endedSession{fakeSession: session})
 	mustStart(t, drainer)
 	reported := waitReport(drainer)
 
@@ -279,4 +288,62 @@ func TestASessionWhoseAttachRolledBackIsNotReleasedAgain(t *testing.T) {
 	if steps := session.stepsTaken(); len(steps) != 0 {
 		t.Fatalf("the drain ran %v on a residency that had already ended", steps)
 	}
+}
+
+// TestAnIncompleteRollbackReportedBySettlementWithholdsDrained: the attaches
+// all finished, but one rollback could not give back what it took. The drain
+// records it at once — there is nothing to cancel — and may not report drained.
+func TestAnIncompleteRollbackReportedBySettlementWithholdsDrained(t *testing.T) {
+	attaches := newAttaches()
+	attaches.failure = errors.New("a grant could not be released")
+	drainer, _ := newAttachDrainer(t, testIdleGrace, attaches)
+	mustStart(t, drainer)
+	report := drainer.Wait()
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		t.Fatalf("state = %q after an incomplete rollback, want draining", report.State)
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepSettleAttaches || errors.Is(report.Failures[0].Err, lifecycle.ErrWaitAbandoned) {
+		t.Fatalf("failures = %v, want one settle_attaches that is not an abandonment", report.Failures)
+	}
+	if cancels := attaches.cancelCount(); cancels != 0 {
+		t.Fatalf("CancelAttaches ran %d times with nothing in flight", cancels)
+	}
+}
+
+// TestAnEndedResidencyWhoseRollbackFailedWithholdsDrained: the drain does not
+// release it again, but its rollback's failure is the drain's failure.
+func TestAnEndedResidencyWhoseRollbackFailedWithholdsDrained(t *testing.T) {
+	session := newSession("rolled-back-badly", &journal{})
+	drainer, _ := newAttachDrainer(t, testIdleGrace, newAttaches(), endedSession{fakeSession: session, err: errors.New("the grant could not be released")})
+	mustStart(t, drainer)
+	report := drainer.Wait()
+	if report.State != sessionwire.HostLinkDrainStateDraining || len(report.Failures) != 1 || report.Failures[0].Step != lifecycle.StepFinishRelease {
+		t.Fatalf("report = %+v, want draining with the rollback's failure as finish_release", report)
+	}
+	if steps := session.stepsTaken(); len(steps) != 0 {
+		t.Fatalf("the drain ran %v on an ended residency", steps)
+	}
+}
+
+// TestASessionWhoseAttachOutlivesTheGraceIsNotReleased is review finding P2 at
+// this layer: the drain leaves the residency held rather than release it
+// concurrently with an attach that may still unwind it.
+func TestASessionWhoseAttachOutlivesTheGraceIsNotReleased(t *testing.T) {
+	session := newSession("still-attaching", &journal{})
+	attaches := newAttaches(session.Key())
+	drainer, clock := newAttachDrainer(t, testIdleGrace, attaches, session)
+	mustStart(t, drainer)
+	reported := waitReport(drainer)
+
+	waitFor(t, "the drain to wait for the session's attach", func() bool { return attaches.sessionWaitCount() == 1 })
+	waitFor(t, "the drain to arm its grace", func() bool { return clock.pendingFor(testGrace) == 1 })
+	clock.fireFor(testGrace)
+	report := <-reported
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		t.Fatalf("state = %q, want draining", report.State)
+	}
+	if steps := session.stepsTaken(); len(steps) != 0 {
+		t.Fatalf("the drain ran %v on a residency whose attach was still in flight", steps)
+	}
+	attaches.finishAll()
 }

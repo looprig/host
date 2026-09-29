@@ -290,9 +290,17 @@ type Service struct {
 	// its resident snapshot could not see. See AwaitAttaches.
 	attaching map[uint64]inflightAttach
 	attachSeq uint64
-	sessions  map[registry.Key]*resident
-	consumers map[registry.Key]*commands.Consumer
-	leases    map[registry.Key]residency.Lease
+	// rolledBack holds a residency whose committed attach is rolling back,
+	// between committedOwnership.Stop and the attach's return, so the return
+	// can record the rollback's outcome on it.
+	rolledBack map[registry.Key]*resident
+	// rollbackFailures are the incomplete rollbacks of attaches that never
+	// committed. They are retained for the life of the Host: each is a grant,
+	// runtime or charge this Host may still hold, and the drain reports them.
+	rollbackFailures []error
+	sessions         map[registry.Key]*resident
+	consumers        map[registry.Key]*commands.Consumer
+	leases           map[registry.Key]residency.Lease
 
 	// activityMu guards activity: the journal position each resident session's
 	// gate fold had reached at the sampler's last reading. The sampler writes
@@ -337,14 +345,15 @@ func New(options Options) (*Service, error) {
 	}
 
 	composed := &Service{
-		options:   options,
-		registry:  index,
-		capacity:  capacity,
-		advertise: advertise,
-		sessions:  map[registry.Key]*resident{},
-		consumers: map[registry.Key]*commands.Consumer{},
-		leases:    map[registry.Key]residency.Lease{},
-		stopping:  make(chan struct{}),
+		options:    options,
+		registry:   index,
+		capacity:   capacity,
+		advertise:  advertise,
+		sessions:   map[registry.Key]*resident{},
+		consumers:  map[registry.Key]*commands.Consumer{},
+		rolledBack: map[registry.Key]*resident{},
+		leases:     map[registry.Key]residency.Lease{},
+		stopping:   make(chan struct{}),
 	}
 
 	if options.DeriveWorkStates {
@@ -723,6 +732,7 @@ func (s *Service) Attach(ctx context.Context, request residency.Request) (reside
 	if err != nil {
 		s.logAttach(ctx, request, err)
 	}
+	s.recordRollback(registry.Key{TenantID: request.TenantID, SessionID: request.SessionID}, err)
 	return held, err
 }
 
@@ -949,6 +959,42 @@ func releaseRefused(report lifecycle.Report) bool {
 	return false
 }
 
+// recordRollback keeps the outcome of an attach that failed, BEFORE the attach
+// is taken out of the in-flight set, so a drain that waited for it reads the
+// outcome and never a gap (review finding P1-a).
+//
+// A committed attach's outcome goes on its residency, where the drain reads it
+// through its own view of that residency (releaseSession.Ended) — clean or
+// not. An uncommitted
+// attach whose rollback could not give everything back is retained Host-wide,
+// and the drain's settle reports it. A refusal whose rollback fully succeeded
+// leaves nothing to report.
+func (s *Service) recordRollback(key registry.Key, err error) {
+	var unreleased error
+	var refused *residency.AttachError
+	if errors.As(err, &refused) && len(refused.Unreleased) != 0 {
+		unreleased = fmt.Errorf("compose: the rollback of the attach of %s/%s could not release: %s",
+			key.TenantID, key.SessionID, strings.Join(refused.Unreleased, "; "))
+	}
+	s.mu.Lock()
+	held := s.rolledBack[key]
+	delete(s.rolledBack, key)
+	if held == nil && unreleased != nil {
+		s.rollbackFailures = append(s.rollbackFailures, unreleased)
+	}
+	s.mu.Unlock()
+	if held != nil {
+		if err == nil {
+			// Not reachable through the Manager — its ownership handle is
+			// stopped only by a failing attach's rollback — but a residency
+			// marked rolled back by an attach that then succeeded would be
+			// skipped by the drain, so it is reported rather than assumed.
+			unreleased = errors.New("compose: an attach reported success after rolling its residency back")
+		}
+		held.endRollback(unreleased)
+	}
+}
+
 // inflightAttach is one attach this Host has entered and not yet answered.
 type inflightAttach struct {
 	key  registry.Key
@@ -965,7 +1011,13 @@ type inflightAttach struct {
 // reported `drained` before then let Stop return, and let a Factory delete the
 // workload, with that lease still held.
 func (s *Service) AwaitAttaches(ctx context.Context) error {
-	return s.awaitAttaches(ctx, func(registry.Key) bool { return true })
+	if err := s.awaitAttaches(ctx, func(registry.Key) bool { return true }); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	failures := append([]error(nil), s.rollbackFailures...)
+	s.mu.Unlock()
+	return errors.Join(failures...)
 }
 
 // AwaitSessionAttaches waits for the attaches of one session in flight at the

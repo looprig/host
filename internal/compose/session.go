@@ -114,6 +114,14 @@ type resident struct {
 	// release racing the drain must not Resume what the drain halted.
 	drainHalted atomic.Bool
 
+	// rollback is the outcome of the attach that installed this residency,
+	// recorded only when that attach failed after committing (see
+	// committedOwnership): rolledBack says it did, rollbackErr what its rollback
+	// could not give back.
+	rollbackMu  sync.Mutex
+	rolledBack  bool
+	rollbackErr error
+
 	checkpointOnce onceOnSuccess
 	beginOnce      onceOnSuccess
 	finishOnce     onceOnSuccess
@@ -197,6 +205,21 @@ func (r *resident) Checkpoint(ctx context.Context) error {
 func (r *resident) ReleaseResidency(ctx context.Context) error {
 	r.stopWork()
 	return r.residencyOnce.run(func() error { return r.runtime.ReleaseResidency(ctx) })
+}
+
+// endRollback records the outcome of this residency's failed attach.
+func (r *resident) endRollback(err error) {
+	r.rollbackMu.Lock()
+	defer r.rollbackMu.Unlock()
+	r.rolledBack, r.rollbackErr = true, err
+}
+
+// rollbackOutcome reports whether this residency's attach rolled it back, and
+// what that rollback could not give back.
+func (r *resident) rollbackOutcome() (bool, error) {
+	r.rollbackMu.Lock()
+	defer r.rollbackMu.Unlock()
+	return r.rolledBack, r.rollbackErr
 }
 
 // runtimeReleased reports whether the runtime was released or abandoned, so
@@ -307,14 +330,10 @@ var (
 	_ lifecycle.Ender             = releaseSession{}
 )
 
-// Ended reports that this residency is no longer the one this Host holds for
-// its key: its attach committed, then failed and rolled itself back while the
-// drain waited for it. The drain then has nothing of its own to release.
-func (r releaseSession) Ended() bool {
-	r.service.mu.Lock()
-	defer r.service.mu.Unlock()
-	return r.service.sessions[r.key] != r.resident
-}
+// Ended reports that the attach which installed this residency failed AFTER
+// committing it, and how its rollback went. See lifecycle.Ender: a residency
+// removed by any other path is not "ended" and answers false.
+func (r releaseSession) Ended() (bool, error) { return r.resident.rollbackOutcome() }
 
 // HaltConsumption stops this session's command consumer claiming or applying
 // anything more, waiting — bounded by ctx — for a pass already in flight.

@@ -143,6 +143,11 @@ type committedOwnership struct {
 // The Manager's rollback gives back the rest — the tombstone, the registry
 // entry, the runtime and the grant — so this releases none of those.
 func (c *committedOwnership) Stop(ctx context.Context) error {
+	// The rollback's outcome is known only when the Manager returns; the
+	// attach entry point records it on the residency (see Service.Attach).
+	c.service.mu.Lock()
+	c.service.rolledBack[c.held.key] = c.held
+	c.service.mu.Unlock()
 	c.held.stopWork()
 	c.service.warm.Forget(c.held.key)
 	c.service.forgetResident(c.held)

@@ -575,3 +575,157 @@ func TestADrainWaitingOnACommittedAttachThatRollsBackReportsDrained(t *testing.T
 	}
 	assertCommittedAttachRolledBackOnce(t, f, late)
 }
+
+// refuseLeaseReleaseOf makes sessionB's grant refuse its release, so an
+// attach's rollback of it cannot complete.
+func refuseLeaseReleaseOf(f *fixture) {
+	f.store.mu.Lock()
+	f.store.leaseReleaseErr = map[sessionwire.SessionID]error{sessionB: errors.New("injected: the grant could not be released")}
+	f.store.mu.Unlock()
+}
+
+// failureNaming reports whether a drain report carries a failure that
+// withholds `drained` and names sessionB.
+func withheldFor(report lifecycle.Report, session sessionwire.SessionID) bool {
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		return false
+	}
+	for _, failure := range report.Failures {
+		if failure.Key.SessionID == session || strings.Contains(failure.Err.Error(), string(session)) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAnIncompleteRollbackOfACommittedAttachWithholdsDrained is review finding
+// P1-a for an attach the drain was waiting on. Its step 8 fails and its
+// rollback cannot release the grant. The drain skipped the ended residency and
+// reported `drained` — with a grant this Host still holds.
+func TestAnIncompleteRollbackOfACommittedAttachWithholdsDrained(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	refuseLeaseReleaseOf(f)
+	parked, release := refuseResidentRowOf(f, true)
+	t.Cleanup(release)
+
+	_, attached := attachLate(t, f)
+	await(t, "the committed attach to reach its resident publication", parked)
+	started := make(chan error, 1)
+	go func() {
+		_, err := f.svc.StartDrain(hostlink.DrainScope{})
+		started <- err
+	}()
+	if err := await(t, "the drain to begin", started); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+
+	release()
+	var refused *residency.AttachError
+	if err := await(t, "the attach to answer", attached); !errors.As(err, &refused) || len(refused.Unreleased) == 0 {
+		t.Fatalf("the attach answered %v, want a refusal reporting what its rollback could not release", err)
+	}
+	if report := await(t, "the drain to finish", waited); !withheldFor(report, sessionB) {
+		t.Fatalf("the drain reported %+v, want draining with a failure naming %s: its rollback left a grant held", report, sessionB)
+	}
+}
+
+// TestAnIncompleteRollbackOfAnUncommittedAttachWithholdsDrained is P1-a for an
+// attach that never entered the resident set: the drain's Host-wide settle
+// must carry its rollback's failure rather than count it settled.
+func TestAnIncompleteRollbackOfAnUncommittedAttachWithholdsDrained(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	refuseLeaseReleaseOf(f)
+	parked, release := parkAt(f, parkHydrate, false)
+	t.Cleanup(release)
+
+	_, attached := attachLate(t, f)
+	await(t, "the late attach to park past admission", parked)
+	if _, err := f.svc.StartDrain(hostlink.DrainScope{}); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+
+	release()
+	var refused *residency.AttachError
+	if err := await(t, "the attach to answer", attached); !errors.As(err, &refused) || len(refused.Unreleased) == 0 {
+		t.Fatalf("the attach answered %v, want a refusal reporting what its rollback could not release", err)
+	}
+	if report := await(t, "the drain to finish", waited); !withheldFor(report, sessionB) {
+		t.Fatalf("the drain reported %+v, want draining with a failure naming %s", report, sessionB)
+	}
+}
+
+// TestAResidencyRemovedByAnotherPathIsNotReportedEnded is review finding P1-b.
+// A warm release that finished — even one whose tombstone failed — removes the
+// resident, and the drain's snapshot of it must NOT read that removal as
+// "ended cleanly": only the drain's own FinishRelease on the snapshot surfaces
+// the failure the release retained. Ended answers true only for the attach
+// rollback that recorded its outcome.
+func TestAResidencyRemovedByAnotherPathIsNotReportedEnded(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.attach(tenantA, sessionA)
+	snapshot := f.svc.ResidentSessions()
+	if len(snapshot) != 1 {
+		t.Fatalf("snapshot holds %d sessions, want 1", len(snapshot))
+	}
+	held := f.svc.residentFor(keyA)
+	f.svc.forgetResident(held) // what a finished warm release does
+	ended, err := snapshot[0].(lifecycle.Ender).Ended()
+	if ended || err != nil {
+		t.Fatalf("Ended() = (%v, %v) for a residency another path removed; the drain would skip it and lose that path's failures", ended, err)
+	}
+}
+
+// TestACommittedAttachParkedPastTheGraceIsLeftHeldAndReleasedOnce is review
+// finding P2. The drain's wait for a committed attach expires at the grace. It
+// must NOT release that residency: the attach may still fail and unwind its own
+// runtime and grant, and the two releases would bypass each other's guards.
+// The drain stays `draining`, and the grant is released exactly once — by the
+// attach's own rollback when its publication finally fails.
+func TestACommittedAttachParkedPastTheGraceIsLeftHeldAndReleasedOnce(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	parked, release := refuseResidentRowOf(f, true)
+	t.Cleanup(release)
+
+	late, attached := attachLate(t, f)
+	await(t, "the committed attach to reach its resident publication", parked)
+	started := make(chan error, 1)
+	go func() {
+		_, err := f.svc.StartDrain(hostlink.DrainScope{})
+		started <- err
+	}()
+	if err := await(t, "the drain to begin", started); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+
+	f.clock.fireWhenWaiting(t, cancelAt(f))
+	f.clock.awaitWaiters(t, f.svc.options.Grace, 1)
+	f.clock.fire(f.svc.options.Grace)
+	report := await(t, "the drain to finish", waited)
+	if report.State != sessionwire.HostLinkDrainStateDraining {
+		t.Fatalf("the drain reported %q with a committed attach still in flight, want draining", report.State)
+	}
+	if f.trace.indexOf("checkpoint") != -1 || late.Released() != 0 {
+		t.Fatal("the drain released a residency whose attach was still in flight")
+	}
+
+	release()
+	if err := await(t, "the attach to answer", attached); err == nil {
+		t.Fatal("the attach whose resident row was refused reported success")
+	}
+	if released := late.Released(); released != 1 {
+		t.Fatalf("the runtime was released %d times, want exactly once", released)
+	}
+	if lease := f.store.leaseOf(keyB); lease == nil || lease.releases.Load() != 1 {
+		t.Fatalf("the grant (%v) was not released exactly once", lease)
+	}
+}

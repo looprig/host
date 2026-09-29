@@ -186,7 +186,10 @@ type Residents interface {
 type Attaches interface {
 	// AwaitAttaches blocks until every attach in flight at the moment of the
 	// call has finished — resident or rolled back — or the context ends, and
-	// then reports the context's error, naming what is still in flight.
+	// then reports the context's error, naming what is still in flight. Once
+	// they have finished it reports, as an error, any attach rollback that
+	// could not give back what it took (other than one Ender reports), so a
+	// drain never counts a leaked grant as settled.
 	AwaitAttaches(context.Context) error
 
 	// AwaitSessionAttaches is AwaitAttaches for ONE session. The drain calls it
@@ -204,13 +207,19 @@ type Attaches interface {
 	CancelAttaches()
 }
 
-// Ender is the optional Session method that reports a residency which ENDED ON
-// ITS OWN while the drain waited for its attach — the attach committed and then
-// failed and rolled itself back. There is nothing left for the drain to
-// release, and releasing it again would book failures against a generation
-// that no longer exists.
+// Ender is the optional Session method that reports a residency whose ATTACH
+// ROLLED BACK after it had committed into the drain's snapshot — while the
+// drain waited for it — and with what outcome. The rollback gave back what it
+// could, so the drain does not release the residency again; a rollback that
+// could NOT give everything back is returned as the error, and it withholds
+// `drained` exactly as a refused FinishRelease does.
+//
+// IT IS NOT "the residency is gone". A residency another path removed — a warm
+// release, a teardown — is not ended in this sense, and must answer false: that
+// path may have retained a failure (a refused tombstone) that only the drain's
+// own FinishRelease on its snapshot will surface.
 type Ender interface {
-	Ended() bool
+	Ended() (bool, error)
 }
 
 // THIS PACKAGE OWNS NO TRANSPORT SHUTDOWN, and the absence is load-bearing
@@ -799,10 +808,23 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	// that attach's `resident` publication land after the tombstone. Bounded by
 	// the grace; if it expires the release goes ahead and the failure withholds
 	// `drained`, because the two may still interleave.
+	//
+	// A WAIT CUT SHORT BY THE GRACE LEAVES THE RESIDENCY HELD, deliberately.
+	// The attach may yet fail and unwind its own runtime and grant, and a drain
+	// release run concurrently would release them a second time through guards
+	// neither shares. So nothing is released, and the recorded failure keeps the
+	// drain `draining`: the attach's own rollback, or the process exit, ends it.
 	if attaches, ok := d.options.Residents.(Attaches); ok {
 		if err := attaches.AwaitSessionAttaches(graceCtx, key); err != nil {
 			record(StepSettleAttaches, errors.Join(ErrWaitAbandoned, err))
-		} else if ender, ok := session.(Ender); ok && ender.Ended() {
+			return
+		}
+	}
+	if ender, ok := session.(Ender); ok {
+		if ended, err := ender.Ended(); ended {
+			if err != nil {
+				record(StepFinishRelease, err)
+			}
 			return
 		}
 	}
@@ -865,12 +887,22 @@ func (d *Drainer) settleAttaches(graceCtx context.Context, attaches Attaches) {
 		case <-patience.Done():
 		}
 	}()
-	if err := attaches.AwaitAttaches(patience); err == nil {
+	err := attaches.AwaitAttaches(patience)
+	switch {
+	case err == nil:
+		return
+	case patience.Err() == nil:
+		// SETTLED, BUT NOT CLEANLY: an attach's rollback could not give back
+		// everything it took. Nothing is left to wait for or cancel.
+		d.record(Failure{Step: StepSettleAttaches, Err: err})
 		return
 	}
 	attaches.CancelAttaches()
 	if err := attaches.AwaitAttaches(graceCtx); err != nil {
-		d.record(Failure{Step: StepSettleAttaches, Err: errors.Join(ErrWaitAbandoned, err)})
+		if graceCtx.Err() != nil {
+			err = errors.Join(ErrWaitAbandoned, err)
+		}
+		d.record(Failure{Step: StepSettleAttaches, Err: err})
 	}
 }
 

@@ -305,6 +305,9 @@ type fakeLease struct {
 	// per trace, so a test can ask about ONE session's lease.
 	released atomic.Bool
 	releases atomic.Int32
+
+	// releaseErr, when set, is what Release answers (it is still counted).
+	releaseErr error
 }
 
 func (l *fakeLease) Epoch() residency.ResidencyEpoch { return l.epoch }
@@ -316,7 +319,7 @@ func (l *fakeLease) Release(context.Context) error {
 	if l.onRelease != nil {
 		l.onRelease()
 	}
-	return nil
+	return l.releaseErr
 }
 
 // fakeStore stands in for every durable seam the released store satisfies or,
@@ -355,6 +358,9 @@ type fakeStore struct {
 	// publishRefuse, when set, runs after publishHold and its error, if any,
 	// is the publication's: the row is not stored.
 	publishRefuse func(observation sessionwire.HostLinkRegistryObservation) error
+
+	// leaseReleaseErr makes the grant minted for a session refuse its release.
+	leaseReleaseErr map[sessionwire.SessionID]error
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -431,6 +437,9 @@ func (s *fakeStore) AcquireSessionLease(_ context.Context, tenant sessionwire.Te
 		return nil, fmt.Errorf("catalog invalid (binding.protocol_mode): the session is bound to %s and residency is granted only in disposition mode", mode)
 	}
 	lease := &fakeLease{trace: s.trace, epoch: 9, lost: make(chan struct{})}
+	s.mu.Lock()
+	lease.releaseErr = s.leaseReleaseErr[session]
+	s.mu.Unlock()
 	s.mu.Lock()
 	s.leases[key] = lease
 	s.mu.Unlock()
