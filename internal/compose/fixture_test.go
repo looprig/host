@@ -304,6 +304,7 @@ type fakeLease struct {
 	// released records that this grant was handed back, per grant rather than
 	// per trace, so a test can ask about ONE session's lease.
 	released atomic.Bool
+	releases atomic.Int32
 }
 
 func (l *fakeLease) Epoch() residency.ResidencyEpoch { return l.epoch }
@@ -311,6 +312,7 @@ func (l *fakeLease) Lost() <-chan struct{}           { return l.lost }
 func (l *fakeLease) Release(context.Context) error {
 	l.trace.record("lease.release")
 	l.released.Store(true)
+	l.releases.Add(1)
 	if l.onRelease != nil {
 		l.onRelease()
 	}
@@ -349,6 +351,10 @@ type fakeStore struct {
 	// publishHold, when set, runs inside PublishResidency before the row is
 	// stored, with the writer's context.
 	publishHold func(ctx context.Context, observation sessionwire.HostLinkRegistryObservation)
+
+	// publishRefuse, when set, runs after publishHold and its error, if any,
+	// is the publication's: the row is not stored.
+	publishRefuse func(observation sessionwire.HostLinkRegistryObservation) error
 }
 
 // protocolMode is the immutable catalog binding sessionstore pins on a session,
@@ -448,10 +454,15 @@ func (s *fakeStore) LoadSessionState(ctx context.Context, _ sessionwire.TenantID
 
 func (s *fakeStore) PublishResidency(ctx context.Context, observation sessionwire.HostLinkRegistryObservation) error {
 	s.mu.Lock()
-	hold, publishHold := s.hold, s.publishHold
+	hold, publishHold, publishRefuse := s.hold, s.publishHold, s.publishRefuse
 	s.mu.Unlock()
 	if publishHold != nil {
 		publishHold(ctx, observation)
+	}
+	if publishRefuse != nil {
+		if err := publishRefuse(observation); err != nil {
+			return err
+		}
 	}
 	if hold != nil && observation.Residency == sessionwire.SessionResidencyReleasing {
 		<-hold

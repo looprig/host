@@ -327,7 +327,9 @@ func TestAnAttachThatIgnoresCancellationWithholdsDrained(t *testing.T) {
 	waited := make(chan lifecycle.Report, 1)
 	go func() { waited <- f.svc.drainer.Wait() }()
 	f.clock.fireWhenWaiting(t, cancelAt(f))
-	// The grace was armed when the drain began, before the cancellation.
+	// The grace is armed by the drain's own goroutine, in no fixed order with
+	// the cancellation, so wait for its handle by count rather than by event.
+	f.clock.awaitWaiters(t, f.svc.options.Grace, 1)
 	if fired := f.clock.fire(f.svc.options.Grace); fired == 0 {
 		t.Fatal("nothing had armed the platform grace")
 	}
@@ -457,4 +459,119 @@ func TestACommittedAttachFinishesBeforeTheDrainReleasesIt(t *testing.T) {
 	if records := f.svc.manager.Records(); records != 0 {
 		t.Fatalf("manager.Records() = %d after the drain, want 0: the residency record outlived its release", records)
 	}
+}
+
+// refuseResidentRowOf makes the store refuse sessionB's step-8 `resident`
+// publication — AFTER the attach has committed into the resident set — and
+// optionally parks it first. It returns the park's entry and release.
+func refuseResidentRowOf(f *fixture, park bool) (entered <-chan struct{}, release func()) {
+	parked := make(chan struct{})
+	proceed := make(chan struct{})
+	var first atomic.Bool
+	var open sync.Once
+	f.store.mu.Lock()
+	f.store.publishRefuse = func(row sessionwire.HostLinkRegistryObservation) error {
+		if row.SessionID != sessionB || row.Residency != sessionwire.SessionResidencyResident || !first.CompareAndSwap(false, true) {
+			return nil
+		}
+		if park {
+			close(parked)
+			<-proceed
+		}
+		return errors.New("injected: the resident row could not be written")
+	}
+	f.store.mu.Unlock()
+	return parked, func() { open.Do(func() { close(proceed) }) }
+}
+
+// assertCommittedAttachRolledBackOnce is F1's claim: a committed attach that
+// fails at step 8 leaves the composition holding nothing, and gives back its
+// runtime and grant exactly once.
+func assertCommittedAttachRolledBackOnce(t *testing.T, f *fixture, late *controllableSession) {
+	t.Helper()
+	f.svc.mu.Lock()
+	_, resident := f.svc.sessions[keyB]
+	f.svc.mu.Unlock()
+	if resident {
+		t.Fatal("the rolled-back attach is still tracked as resident: a zombie with a running consumer")
+	}
+	if _, running := f.svc.ConsumerFor(keyB); running {
+		t.Fatal("the rolled-back attach's command consumer is still registered")
+	}
+	if f.svc.warm.Watching(keyB) {
+		t.Fatal("the rolled-back attach is still warm-watched")
+	}
+	if released := late.Released(); released != 1 {
+		t.Fatalf("the runtime was released %d times, want exactly once", released)
+	}
+	if lease := f.store.leaseOf(keyB); lease == nil || lease.releases.Load() != 1 {
+		t.Fatalf("the grant (%v) was not released exactly once", lease)
+	}
+}
+
+// TestACommittedAttachThatFailsAtItsLastStepLeavesNoResident is review finding
+// F1 without a drain. The attach commits into the composition's resident set at
+// step 7 and then fails to publish its `resident` row at step 8. The manager's
+// rollback stopped only the heartbeat, so the composition kept the session
+// resident with its consumer running — and a re-attach of the same key then
+// met the stale warm watch.
+func TestACommittedAttachThatFailsAtItsLastStepLeavesNoResident(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	refuseResidentRowOf(f, false)
+
+	late, attached := attachLate(t, f)
+	if err := await(t, "the attach to answer", attached); err == nil {
+		t.Fatal("the attach whose resident row was refused reported success")
+	}
+	assertCommittedAttachRolledBackOnce(t, f, late)
+
+	f.rig.Session = newControllableSession(testRigSessionID)
+	if _, err := f.svc.Attach(context.Background(), residency.Request{
+		TenantID: tenantA, SessionID: sessionB, AgentID: testAgent, Mode: residency.ModeCreate,
+		Principal: residency.Principal{TenantID: tenantA, ActorID: "actor-again"},
+	}); err != nil {
+		t.Fatalf("a re-attach of the rolled-back session was refused: %v", err)
+	}
+}
+
+// TestADrainWaitingOnACommittedAttachThatRollsBackReportsDrained is F1 with a
+// drain waiting on the attach. It must see the residency ended and release
+// nothing a second time: before the fix it checkpointed the rolled-back
+// session, released its runtime and grant twice, and stayed `draining` on the
+// failed release steps of a heartbeat that was already gone.
+func TestADrainWaitingOnACommittedAttachThatRollsBackReportsDrained(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	parked, release := refuseResidentRowOf(f, true)
+	t.Cleanup(release)
+
+	late, attached := attachLate(t, f)
+	await(t, "the committed attach to reach its resident publication", parked)
+	if resident := f.svc.ResidentSessions(); len(resident) != 1 {
+		t.Fatalf("the parked attach is not in the resident set (%d sessions), so it has not committed", len(resident))
+	}
+	started := make(chan error, 1)
+	go func() {
+		_, err := f.svc.StartDrain(hostlink.DrainScope{})
+		started <- err
+	}()
+	if err := await(t, "the drain to begin", started); err != nil {
+		t.Fatalf("StartDrain: %v", err)
+	}
+	waited := make(chan lifecycle.Report, 1)
+	go func() { waited <- f.svc.drainer.Wait() }()
+
+	release()
+	if err := await(t, "the attach to answer", attached); err == nil {
+		t.Fatal("the attach whose resident row was refused reported success")
+	}
+	report := await(t, "the drain to finish", waited)
+	if report.State != sessionwire.HostLinkDrainStateDrained || len(report.Failures) != 0 {
+		t.Fatalf("the drain reported %+v, want drained with no failures", report)
+	}
+	if f.trace.indexOf("checkpoint") != -1 {
+		t.Fatal("the drain checkpointed a session whose attach had already rolled back")
+	}
+	assertCommittedAttachRolledBackOnce(t, f, late)
 }

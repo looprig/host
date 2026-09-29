@@ -108,15 +108,45 @@ func (o *sessionOwnership) BeginOwnership(ctx context.Context, request residency
 		_ = handle.Stop(ctx)
 		return nil, err
 	}
-	if err := o.service.trackResident(request, halves, work); err != nil {
+	held, err := o.service.trackResident(request, halves, work)
+	if err != nil {
 		work.stop()
 		_ = handle.Stop(ctx)
 		return nil, err
 	}
-	if held := o.service.residentFor(request.Key); held != nil && held.generation == request.Generation {
-		o.service.superviseFaults(ctx, held)
+	if current := o.service.residentFor(request.Key); current != nil && current.generation == request.Generation {
+		o.service.superviseFaults(ctx, current)
 	}
-	return handle, nil
+	return &committedOwnership{OwnershipHandle: handle, service: o.service, held: held}, nil
+}
+
+// committedOwnership is the handle the Manager holds for a residency that has
+// COMMITTED into this composition's resident set.
+//
+// ITS Stop IS THE ATTACH'S ROLLBACK, AND ONLY THAT. The Manager calls an
+// ownership handle's Stop from one place — the unwinder of an attach that fails
+// after step 7 (review finding F1) — and never on a residency that reached step
+// 8: the record it keeps holds the handle and nothing calls Stop through it,
+// because a resident session is released through releaseHalves, by the drain,
+// the warm release or a teardown. So when Stop is called the attach that
+// installed `held` has failed, and stopping only the heartbeat left `held`
+// resident here with its consumer, tail and warm watch running — a zombie, and
+// for a drain waiting on the attach a session it would then release a second
+// time over a heartbeat that was already gone.
+type committedOwnership struct {
+	residency.OwnershipHandle
+	service *Service
+	held    *resident
+}
+
+// Stop ends the composition's hold on the failed residency, then the heartbeat.
+// The Manager's rollback gives back the rest — the tombstone, the registry
+// entry, the runtime and the grant — so this releases none of those.
+func (c *committedOwnership) Stop(ctx context.Context) error {
+	c.held.stopWork()
+	c.service.warm.Forget(c.held.key)
+	c.service.forgetResident(c.held)
+	return c.OwnershipHandle.Stop(ctx)
 }
 
 // beginWork starts one session's durable command consumer, its applier and the
@@ -344,7 +374,7 @@ func (a *closerAdapter) CloseAttempt(
 // DEFECT: it means this Host already holds a watch for the same key, so a second
 // residency has been installed under a live one, and an attach that continued
 // past it would leave two objects believing they own one session's release.
-func (s *Service) trackResident(request residency.OwnershipRequest, halves releaseHalves, work *sessionWork) error {
+func (s *Service) trackResident(request residency.OwnershipRequest, halves releaseHalves, work *sessionWork) (*resident, error) {
 	held := &resident{
 		key:        request.Key,
 		agent:      request.AgentID,
@@ -368,19 +398,19 @@ func (s *Service) trackResident(request residency.OwnershipRequest, halves relea
 	s.mu.Lock()
 	if s.draining {
 		s.mu.Unlock()
-		return drainingAttachRefusal(request.AgentID)
+		return nil, drainingAttachRefusal(request.AgentID)
 	}
 	if request.Commit != nil && !request.Commit() {
 		s.mu.Unlock()
-		return drainingAttachRefusal(request.AgentID)
+		return nil, drainingAttachRefusal(request.AgentID)
 	}
 	s.sessions[request.Key] = held
 	s.mu.Unlock()
 	if err := s.warm.Watch(warmSession{resident: held}); err != nil && !errors.Is(err, residency.ErrWarmReleaserStopped) {
 		s.forgetResident(held)
-		return err
+		return nil, err
 	}
-	return nil
+	return held, nil
 }
 
 // drainingAttachRefusal refuses an attach that reached its commit point after

@@ -222,6 +222,7 @@ func TestAnAttachThatOutlivesTheGraceWithholdsDrained(t *testing.T) {
 	waitFor(t, "the drain to arm its cancellation", func() bool { return clock.pendingFor(cancelAt) == 1 })
 	clock.fireFor(cancelAt)
 	waitFor(t, "the cancellation", func() bool { return attaches.cancelCount() == 1 })
+	waitFor(t, "the drain to arm its grace", func() bool { return clock.pendingFor(testGrace) == 1 })
 	clock.fireFor(testGrace)
 	report := <-reported
 	if report.State != sessionwire.HostLinkDrainStateDraining {
