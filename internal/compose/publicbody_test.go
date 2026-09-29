@@ -254,3 +254,22 @@ func TestTheLiveMappingReadsEveryPageOfTheInbox(t *testing.T) {
 		t.Fatalf("PublicCommand(last) = (%q, %v, %v), want the last admitted command", got, ok, err)
 	}
 }
+
+func TestTenantTailOptionsPropagateToolSteps(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		live    *LiveTextOptions
+		enabled bool
+	}{
+		{name: "enabled", live: &LiveTextOptions{IncludeToolSteps: true}, enabled: true},
+		{name: "reasoning only", live: &LiveTextOptions{IncludeReasoning: true}},
+		{name: "nil"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := &Service{options: Options{LiveText: test.live}}
+			if got := s.tailOptions(composeCaptureWire{}, &countingRoutes{}).IncludeToolSteps; got != test.enabled {
+				t.Fatalf("TailOptions.IncludeToolSteps = %t, want %t", got, test.enabled)
+			}
+		})
+	}
+}

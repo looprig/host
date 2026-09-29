@@ -147,17 +147,22 @@ func (e *MissingCommittedFieldError) Error() string {
 // SubscribeLivePublic opens one ordered Harness subscription for both public
 // classes. Every enduring delivery must carry committed bytes.
 func (s *boundSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
-	return s.subscribeLivePublic(ctx, false)
+	return s.SubscribeLivePublicWith(ctx, department.LiveOptions{})
 }
 
 // SubscribeLivePublicWithReasoning adds visible reasoning deltas to the same
 // ordered subscription. Only visible text is projected; provider state and
 // signatures stay private even when they accompany that text.
 func (s *boundSession) SubscribeLivePublicWithReasoning(ctx context.Context) (<-chan department.LivePublication, error) {
-	return s.subscribeLivePublic(ctx, true)
+	return s.SubscribeLivePublicWith(ctx, department.LiveOptions{IncludeReasoning: true})
 }
 
-func (s *boundSession) subscribeLivePublic(ctx context.Context, includeReasoning bool) (<-chan department.LivePublication, error) {
+// SubscribeLivePublicWith opens the ordered subscription carrying the
+// transient classes options selects. Tool steps are harness's own public
+// projection of ToolCallStarted and ToolCallCompleted: the redacted audit
+// summary and capped result preview, never the raw tool arguments, which
+// stream as ToolUseChunk deltas and stay behind whatever options says.
+func (s *boundSession) SubscribeLivePublicWith(ctx context.Context, options department.LiveOptions) (<-chan department.LivePublication, error) {
 	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
 	})
@@ -165,7 +170,7 @@ func (s *boundSession) subscribeLivePublic(ctx context.Context, includeReasoning
 		return nil, err
 	}
 	published := make(chan department.LivePublication)
-	go s.pumpLive(ctx, subscription, published, includeReasoning)
+	go s.pumpLive(ctx, subscription, published, options)
 	return published, nil
 }
 
@@ -175,7 +180,7 @@ func (s *boundSession) EphemeralDrops() uint64 { return s.ephDrops.Load() }
 
 // pumpLive keeps producer order in a bounded queue. Ephemeral entries have
 // their own limit, so they cannot consume the 256 enduring slots.
-func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscription, out chan<- department.LivePublication, includeReasoning bool) {
+func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscription, out chan<- department.LivePublication, options department.LiveOptions) {
 	defer close(out)
 	defer func() { _ = subscription.Close() }()
 	pending := make([]department.LivePublication, 0, committedEgressBuffer+liveEphemeralBuffer)
@@ -226,27 +231,33 @@ func (s *boundSession) pumpLive(ctx context.Context, subscription event.Subscrip
 				enduring++
 				continue
 			}
-			delta, ok := delivery.Event.(event.TokenDelta)
-			if !ok {
+			var projected any
+			switch value := delivery.Event.(type) {
+			case event.TokenDelta:
+				var preview string
+				switch chunk := value.Chunk.(type) {
+				case *content.TextChunk:
+					if chunk != nil {
+						preview = chunk.Text
+					}
+				case *content.ThinkingChunk:
+					if options.IncludeReasoning && chunk != nil {
+						preview = chunk.Thinking
+					}
+				}
+				if preview != "" && len(preview) <= livetext.MaxBytes {
+					projected = value
+				}
+			case event.ToolCallStarted, event.ToolCallCompleted:
+				if options.IncludeToolSteps {
+					projected = value
+				}
+			}
+			if projected == nil || ephemeral == liveEphemeralBuffer {
 				s.ephDrops.Add(1)
 				continue
 			}
-			var preview string
-			switch chunk := delta.Chunk.(type) {
-			case *content.TextChunk:
-				if chunk != nil {
-					preview = chunk.Text
-				}
-			case *content.ThinkingChunk:
-				if includeReasoning && chunk != nil {
-					preview = chunk.Thinking
-				}
-			}
-			if preview == "" || len(preview) > livetext.MaxBytes || ephemeral == liveEphemeralBuffer {
-				s.ephDrops.Add(1)
-				continue
-			}
-			projection, err := harnesswire.Project(s.tenant, s.session, delta)
+			projection, err := harnesswire.Project(s.tenant, s.session, projected)
 			if err != nil || projection.Class != harnesswire.PublicEphemeral {
 				s.ephDrops.Add(1)
 				continue

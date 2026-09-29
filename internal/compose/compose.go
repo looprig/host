@@ -181,14 +181,17 @@ type Options struct {
 }
 
 // LiveTextOptions configures the opt-in transient relay and shared transport budget.
-// Reasoning requires a runtime implementing both department.LivePublicationSubscriber
-// and department.ReasoningPublicationSubscriber. Separate reasoning blocks within
-// a turn are concatenated without a separator in live previews.
+// Reasoning requires a runtime implementing department.LiveOptionsSubscriber, or
+// both department.LivePublicationSubscriber and
+// department.ReasoningPublicationSubscriber. Separate reasoning blocks within
+// a turn are concatenated without a separator in live previews. Tool steps
+// require department.LiveOptionsSubscriber and share the same budget.
 type LiveTextOptions struct {
 	RateBytesPerSecond int
 	BurstBytes         int
 	FlushInterval      time.Duration
 	IncludeReasoning   bool
+	IncludeToolSteps   bool
 }
 
 // capabilities are the capability tokens this composition's links advertise.
@@ -992,6 +995,7 @@ func (s *Service) tailOptions(publications service.Publications, routes service.
 	return service.TailOptions{
 		Publications: publications, Routes: routes, FlushInterval: s.liveTextFlush(),
 		IncludeReasoning: s.options.LiveText != nil && s.options.LiveText.IncludeReasoning,
+		IncludeToolSteps: s.options.LiveText != nil && s.options.LiveText.IncludeToolSteps,
 		Logger:           s.options.logger(),
 	}
 }

@@ -1663,7 +1663,7 @@ func TestEveryExportedStructCarriesExactlyTheEnumeratedFields(t *testing.T) {
 		// events.go, O5.3. Tails and Tail carry NO exported field on purpose:
 		// a Tail is a handle, and an exported field on one would be a second,
 		// unsynchronized way to read state its own accessors take a lock for.
-		"TailOptions":             {"FlushInterval", "IncludeReasoning", "Logger", "NewFlushTimer", "Publications", "Routes"},
+		"TailOptions":             {"FlushInterval", "IncludeReasoning", "IncludeToolSteps", "Logger", "NewFlushTimer", "Publications", "Routes"},
 		"InvalidTailOptionsError": {"Field", "Reason"},
 		"Tails":                   nil,
 		"Tail":                    nil,
@@ -2468,11 +2468,12 @@ func TestFilesSleepOrPollExactlyWhereTheyAreAllowedTo(t *testing.T) {
 		"time.NewTicker": true, "time.AfterFunc": true, "runtime.Gosched": true,
 	}
 	policies := map[string]waitPolicy{
-		"capacity.go":         banEverything,
-		"capacity_test.go":    banEverything,
-		"events.go":           banRealTimeOnly,
-		"events_test.go":      noBan,
-		"live_events_test.go": noBan,
+		"capacity.go":             banEverything,
+		"capacity_test.go":        banEverything,
+		"events.go":               banRealTimeOnly,
+		"events_test.go":          noBan,
+		"live_events_test.go":     noBan,
+		"live_tool_steps_test.go": noBan,
 	}
 	files := packageFiles(t, true)
 	if !slices.Equal(files, slices.Sorted(maps.Keys(policies))) {

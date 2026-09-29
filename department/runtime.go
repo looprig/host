@@ -314,12 +314,26 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
 	}
+	// LiveOptionsSubscriber is forwarded independently of the older pair, for
+	// the same reason: a wrapper that dropped it would silently turn off tool
+	// step previews a runtime supplies one layer down.
+	options, optionsOK := session.(LiveOptionsSubscriber)
 	if live, ok := session.(LivePublicationSubscriber); ok {
 		wrapped := &liveRigRuntime{rigRuntime: adapted, LivePublicationSubscriber: live}
 		if reasoning, ok := session.(ReasoningPublicationSubscriber); ok {
-			return &reasoningRigRuntime{liveRigRuntime: wrapped, ReasoningPublicationSubscriber: reasoning}, nil
+			withReasoning := &reasoningRigRuntime{liveRigRuntime: wrapped, ReasoningPublicationSubscriber: reasoning}
+			if optionsOK {
+				return &reasoningOptionsRigRuntime{reasoningRigRuntime: withReasoning, LiveOptionsSubscriber: options}, nil
+			}
+			return withReasoning, nil
+		}
+		if optionsOK {
+			return &liveOptionsRigRuntime{liveRigRuntime: wrapped, LiveOptionsSubscriber: options}, nil
 		}
 		return wrapped, nil
+	}
+	if optionsOK {
+		return &optionsRigRuntime{rigRuntime: adapted, LiveOptionsSubscriber: options}, nil
 	}
 	return adapted, nil
 }
@@ -335,6 +349,23 @@ type liveRigRuntime struct {
 type reasoningRigRuntime struct {
 	*liveRigRuntime
 	ReasoningPublicationSubscriber
+}
+
+// The three optionsRigRuntime shapes add LiveOptionsSubscriber to each shape
+// above, and only when the rig session supplies it.
+type optionsRigRuntime struct {
+	*rigRuntime
+	LiveOptionsSubscriber
+}
+
+type liveOptionsRigRuntime struct {
+	*liveRigRuntime
+	LiveOptionsSubscriber
+}
+
+type reasoningOptionsRigRuntime struct {
+	*reasoningRigRuntime
+	LiveOptionsSubscriber
 }
 
 // rigRuntime is the adapter O1.1 said would be mandatory.

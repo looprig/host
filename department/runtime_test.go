@@ -1680,3 +1680,72 @@ func TestTheRuntimeForwardsPersistenceFaultsOnlyWhenOffered(t *testing.T) {
 		}
 	})
 }
+
+type optionsRigSession struct {
+	liveRigSession
+	asked *[]department.LiveOptions
+}
+
+func (s optionsRigSession) SubscribeLivePublicWith(_ context.Context, options department.LiveOptions) (<-chan department.LivePublication, error) {
+	*s.asked = append(*s.asked, options)
+	return s.stream, nil
+}
+
+type optionsReasoningRigSession struct{ optionsRigSession }
+
+func (s optionsReasoningRigSession) SubscribeLivePublicWithReasoning(context.Context) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+
+type optionsOnlyRigSession struct {
+	*testkit.FullSession
+	stream chan department.LivePublication
+}
+
+func (s optionsOnlyRigSession) SubscribeLivePublicWith(context.Context, department.LiveOptions) (<-chan department.LivePublication, error) {
+	return s.stream, nil
+}
+
+func TestRigRuntimeForwardsOptionalLiveOptionsSubscription(t *testing.T) {
+	stream := make(chan department.LivePublication)
+	var asked []department.LiveOptions
+	live := liveRigSession{FullSession: testkit.NewFullSession(rigSessionUUID), stream: stream}
+	for name, session := range map[string]department.RigSession{
+		"live and options":            optionsRigSession{liveRigSession: live, asked: &asked},
+		"live, reasoning and options": optionsReasoningRigSession{optionsRigSession{liveRigSession: live, asked: &asked}},
+		"options only":                optionsOnlyRigSession{FullSession: testkit.NewFullSession(rigSessionUUID), stream: stream},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runtime, err := rigTarget(t, &testkit.FakeRig{Session: session}).Create(t.Context(), launchRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			subscriber, ok := runtime.(department.LiveOptionsSubscriber)
+			if !ok {
+				t.Fatal("adapted runtime lost the live-options subscription")
+			}
+			got, err := subscriber.SubscribeLivePublicWith(t.Context(), department.LiveOptions{IncludeToolSteps: true})
+			if err != nil || got != stream {
+				t.Fatalf("forwarded subscription = (%v, %v), want the rig's channel", got, err)
+			}
+			_, reasoning := session.(department.ReasoningPublicationSubscriber)
+			if _, forwarded := runtime.(department.ReasoningPublicationSubscriber); forwarded != reasoning {
+				t.Fatalf("reasoning capability forwarded = %v, want %v", forwarded, reasoning)
+			}
+			_, liveOK := session.(department.LivePublicationSubscriber)
+			if _, forwarded := runtime.(department.LivePublicationSubscriber); forwarded != liveOK {
+				t.Fatalf("live capability forwarded = %v, want %v", forwarded, liveOK)
+			}
+		})
+	}
+	if len(asked) != 2 || !asked[0].IncludeToolSteps {
+		t.Fatalf("options reaching the rig session = %+v", asked)
+	}
+	legacy, err := rigTarget(t, &testkit.FakeRig{Session: live}).Create(t.Context(), launchRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := legacy.(department.LiveOptionsSubscriber); ok {
+		t.Fatal("runtime without the capability falsely advertises live options")
+	}
+}

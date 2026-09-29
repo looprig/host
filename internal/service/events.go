@@ -13,6 +13,7 @@ import (
 
 	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/livetext"
+	"github.com/looprig/host/internal/livetool"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 )
@@ -58,6 +59,10 @@ type TailOptions struct {
 	Routes           Routes
 	FlushInterval    time.Duration
 	IncludeReasoning bool
+	// IncludeToolSteps relays the runtime's public ToolCallStarted and
+	// ToolCallCompleted bodies. It needs a runtime implementing
+	// department.LiveOptionsSubscriber.
+	IncludeToolSteps bool
 	// NewFlushTimer allows a controlled clock for interval tests.
 	NewFlushTimer func(time.Duration) FlushTimer
 	Logger        *slog.Logger
@@ -116,9 +121,11 @@ type Tails struct {
 	routes               Routes
 	flushInterval        time.Duration
 	includeReasoning     bool
+	includeToolSteps     bool
 	newFlushTimer        func(time.Duration) FlushTimer
 	logger               *slog.Logger
 	reasoningUnavailable sync.Once
+	toolStepsUnavailable sync.Once
 }
 
 // NewTails validates the options and returns a publisher.
@@ -147,7 +154,7 @@ func NewTails(options TailOptions) (*Tails, error) {
 	if options.Logger == nil {
 		options.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Tails{publications: options.Publications, routes: options.Routes, flushInterval: options.FlushInterval, includeReasoning: options.IncludeReasoning, newFlushTimer: options.NewFlushTimer, logger: options.Logger}, nil
+	return &Tails{publications: options.Publications, routes: options.Routes, flushInterval: options.FlushInterval, includeReasoning: options.IncludeReasoning, includeToolSteps: options.IncludeToolSteps, newFlushTimer: options.NewFlushTimer, logger: options.Logger}, nil
 }
 
 // TailEnd is why one tail stopped.
@@ -329,15 +336,24 @@ func (t *Tails) PublishProjected(
 	if len(ephemeralRewrite) > 0 {
 		transient = ephemeralRewrite[0]
 	}
+	options, optionsOK := subscriber.(department.LiveOptionsSubscriber)
 	source, liveOK := subscriber.(department.LivePublicationSubscriber)
 	reasoning, reasoningOK := subscriber.(department.ReasoningPublicationSubscriber)
-	if t.includeReasoning && (!liveOK || !reasoningOK) {
+	if t.includeReasoning && !optionsOK && (!liveOK || !reasoningOK) {
 		t.reasoningUnavailable.Do(func() {
 			t.logger.LogAttrs(ctx, slog.LevelInfo, "host: reasoning previews unavailable",
 				slog.String("tenant_id", string(key.TenantID)), slog.String("session_id", string(key.SessionID)))
 		})
 	}
-	if liveOK && transient != nil {
+	if t.includeToolSteps && !optionsOK {
+		t.toolStepsUnavailable.Do(func() {
+			t.logger.LogAttrs(ctx, slog.LevelInfo, "host: tool step previews unavailable",
+				slog.String("tenant_id", string(key.TenantID)), slog.String("session_id", string(key.SessionID)))
+		})
+	}
+	if optionsOK && transient != nil {
+		live, err = options.SubscribeLivePublicWith(runCtx, department.LiveOptions{IncludeReasoning: t.includeReasoning, IncludeToolSteps: t.includeToolSteps})
+	} else if liveOK && transient != nil {
 		if reasoningOK && t.includeReasoning {
 			live, err = reasoning.SubscribeLivePublicWithReasoning(runCtx)
 		} else {
@@ -374,6 +390,9 @@ type projectedLiveText struct {
 	publication sessionwire.EphemeralPublication
 	text        livetext.Delta
 	ok          bool
+	// tool marks a tool-step body. It is never merged, never pending and never
+	// gapped: it flushes pending text first and is offered to the transport once.
+	tool bool
 }
 
 // relayLive preserves one producer order. Its only pending transient frame is
@@ -443,6 +462,12 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			}
 			value.Body = body
 			decoded, ok := livetext.Parse(body)
+			if !ok && t.includeToolSteps {
+				if step, isTool := livetool.Parse(body); isTool {
+					result <- projectedLiveText{publication: value, tool: true, ok: step.SessionID == string(tail.key.SessionID)}
+					return
+				}
+			}
 			ok = ok && (t.includeReasoning || decoded.Chunk.Type == "text")
 			ok = ok && decoded.SessionID == string(tail.key.SessionID)
 			result <- projectedLiveText{publication: value, text: decoded, ok: ok}
@@ -473,6 +498,14 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 			projectingBody = nil
 			if !result.ok {
 				tail.dropEphemeral()
+			} else if result.tool {
+				// Text the model produced before the call precedes it. When that
+				// text cannot go now, the TOOL frame is the one dropped: the text
+				// keeps its retry and its key stays ungapped.
+				flush()
+				if pending != nil || !t.publishToolStep(tail, result.publication) {
+					tail.dropEphemeral()
+				}
 			} else {
 				value, decoded := result.publication, result.text
 				key := textKey(decoded)
@@ -606,6 +639,25 @@ func (t *Tails) relayLive(ctx context.Context, tail *Tail, stream <-chan departm
 // enduring/control frames. A transport without this admission is disabled.
 type ephemeralPublisher interface {
 	TryPublishEphemeral(channel string, payload []byte) bool
+}
+
+// ephemeralFrameCap is the encoded size bound of one transient frame.
+const ephemeralFrameCap = 4096
+
+// publishToolStep fits one tool-step body under the frame cap and offers it to
+// the transport once. A refusal is final: the committed StepDone supersedes it.
+func (t *Tails) publishToolStep(tail *Tail, publication sessionwire.EphemeralPublication) bool {
+	const emptyBody = `{}`
+	envelope, err := json.Marshal(sessionwire.EphemeralPublication{TenantID: publication.TenantID, SessionID: publication.SessionID, Body: json.RawMessage(emptyBody)})
+	if err != nil {
+		return false
+	}
+	body, ok := livetool.Fit(publication.Body, ephemeralFrameCap-(len(envelope)-len(emptyBody)))
+	if !ok {
+		return false
+	}
+	publication.Body = body
+	return t.publishEphemeral(tail, publication)
 }
 
 func fitsEphemeralFrame(publication sessionwire.EphemeralPublication) bool {

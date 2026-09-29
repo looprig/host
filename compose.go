@@ -201,18 +201,30 @@ type DrainOptions struct {
 // published. Text and reasoning share the same transport budget and limits.
 // Enable only after Factory v0.12.1 or later is deployed; earlier Factory
 // mailboxes charge every frame, and WUI through v0.4.0 discards previews.
+//
+// IncludeToolSteps also streams each tool call's start and completion. It is
+// opt-in and defaults to false. The previews are the tool's own redacted audit
+// summary (never its raw arguments; a tool without one shows only its name)
+// and a result preview of at most 2 KiB, and every viewer of the session sees
+// them — the same content the committed step shows moments later. They share
+// the text budget, are never merged or retried, and a refused one is simply
+// dropped: the committed StepDone supersedes it. They need a runtime
+// implementing department.LiveOptionsSubscriber; a runtime on harness v0.42.0
+// or later also carries tool_use_id, the key a viewer joins the preview to the
+// committed row on, while an older runtime's frames still render by name.
 type LiveTextOptions struct {
 	RateBytesPerSecond int
 	BurstBytes         int
 	FlushInterval      time.Duration
 	IncludeReasoning   bool
+	IncludeToolSteps   bool
 }
 
 func composeLiveText(value *LiveTextOptions) *compose.LiveTextOptions {
 	if value == nil {
 		return nil
 	}
-	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval, IncludeReasoning: value.IncludeReasoning}
+	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval, IncludeReasoning: value.IncludeReasoning, IncludeToolSteps: value.IncludeToolSteps}
 }
 
 // Composition is one runnable Host, described.
@@ -236,8 +248,9 @@ type Composition struct {
 
 	Link  LinkOptions
 	Drain DrainOptions
-	// LiveText is opt-in. Nil keeps the committed-only relay. Reasoning requires
-	// IncludeReasoning as well as a non-nil LiveText option.
+	// LiveText is opt-in. Nil keeps the committed-only relay. Reasoning and tool
+	// steps require IncludeReasoning or IncludeToolSteps as well as a non-nil
+	// LiveText option.
 	LiveText *LiveTextOptions
 
 	// CompatibilityTimeout bounds the synchronous compatibility wait; WorkPoll

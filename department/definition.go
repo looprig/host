@@ -385,6 +385,26 @@ type ReasoningPublicationSubscriber interface {
 	SubscribeLivePublicWithReasoning(context.Context) (<-chan LivePublication, error)
 }
 
+// LiveOptions selects which transient classes a runtime's live stream carries.
+// The zero value is the text-only stream SubscribeLivePublic delivers.
+//
+// IncludeReasoning adds visible reasoning deltas, as
+// SubscribeLivePublicWithReasoning does. IncludeToolSteps adds the public
+// ToolCallStarted and ToolCallCompleted bodies: the tool's redacted audit
+// summary and a capped result preview, never raw tool arguments.
+type LiveOptions struct {
+	IncludeReasoning bool
+	IncludeToolSteps bool
+}
+
+// LiveOptionsSubscriber supersedes the LivePublicationSubscriber and
+// ReasoningPublicationSubscriber pair. Host prefers it when a runtime
+// implements it and falls back to the pair otherwise. Tool-step previews
+// require it; a runtime with only the pair streams text and reasoning alone.
+type LiveOptionsSubscriber interface {
+	SubscribeLivePublicWith(context.Context, LiveOptions) (<-chan LivePublication, error)
+}
+
 // RuntimeCommand is one admitted command as Host hands it to a runtime.
 //
 // IT IS NOT sessionwire.CommandEnvelope, AND THAT WAS A DEFECT RATHER THAN A

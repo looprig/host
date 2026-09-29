@@ -221,3 +221,121 @@ func TestOversizedThinkingChunkIsDroppedBeforeEnduring(t *testing.T) {
 		t.Fatal("enduring event was delayed by oversized reasoning")
 	}
 }
+
+func liveToolHeader() event.Header {
+	return event.Header{
+		EventID:   uuid.MustParse("bbbbbbbb-cccc-dddd-eeee-ffffffffffff"),
+		CreatedAt: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC),
+		Coordinates: identity.Coordinates{
+			SessionID: uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+			LoopID:    uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+			TurnID:    uuid.MustParse("66666666-7777-8888-9999-aaaaaaaaaaaa"),
+			StepID:    uuid.MustParse("77777777-8888-9999-aaaa-bbbbbbbbbbbb"),
+		},
+	}
+}
+
+var liveToolExecution = uuid.MustParse("99999999-8888-7777-6666-555555555555")
+
+func liveToolSteps() []event.Delivery {
+	return []event.Delivery{
+		{Event: event.ToolCallStarted{Header: liveToolHeader(), ToolExecutionID: liveToolExecution, ToolUseID: "toolu_1", ToolName: "Bash", Summary: "ls -la"}},
+		{Event: event.ToolCallCompleted{Header: liveToolHeader(), ToolExecutionID: liveToolExecution, ToolUseID: "toolu_1", ToolName: "Bash", ElapsedMillis: 42, ResultPreview: "total 0"}},
+	}
+}
+
+func TestLiveOptionsSubscriptionProjectsToolStepsWithJoinKey(t *testing.T) {
+	subscription := newFakeSubscription(nil)
+	var filters []event.EventFilter
+	runtime := boundFor(t, liveController{fullController: newFullController(newFakeSubscription(nil), nil, nil), subscription: subscription, filters: &filters})
+	live, ok := runtime.(department.LiveOptionsSubscriber)
+	if !ok {
+		t.Fatal("bound runtime has no live-options subscription")
+	}
+	publications, err := live.SubscribeLivePublicWith(t.Context(), department.LiveOptions{IncludeToolSteps: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The model's raw tool arguments stream as a ToolUseChunk delta; they must
+	// stay behind while the redacted summary crosses.
+	subscription.deliveries <- liveDelta(&content.ToolUseChunk{InputJSON: `{"command":"echo sk-live-secret-marker"}`})
+	for _, delivery := range liveToolSteps() {
+		subscription.deliveries <- delivery
+	}
+	subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
+	for i, want := range []string{
+		`"type":"ToolCallStarted"`,
+		`"type":"ToolCallCompleted"`,
+		"durable",
+	} {
+		select {
+		case got := <-publications:
+			if want == "durable" {
+				if got.Enduring == nil || got.Enduring.EventID != "durable" {
+					t.Fatalf("publication %d = %+v, want the committed event", i, got)
+				}
+				continue
+			}
+			if got.Ephemeral == nil {
+				t.Fatalf("publication %d = %+v, want a tool step", i, got)
+			}
+			body := got.Ephemeral.Body
+			for _, member := range []string{want, `"tool_use_id":"toolu_1"`, `"tool_name":"Bash"`, `"tool_execution_id":"` + liveToolExecution.String() + `"`} {
+				if !bytes.Contains(body, []byte(member)) {
+					t.Fatalf("publication %d = %s, missing %s", i, body, member)
+				}
+			}
+			if bytes.Contains(body, []byte("sk-live-secret-marker")) {
+				t.Fatalf("publication %d leaked raw tool arguments: %s", i, body)
+			}
+			if i == 0 && !bytes.Contains(body, []byte(`"summary":"ls -la"`)) {
+				t.Fatalf("started body = %s, want the audit summary", body)
+			}
+			if i == 1 && (!bytes.Contains(body, []byte(`"elapsed_ms":42`)) || !bytes.Contains(body, []byte(`"result_preview":"total 0"`))) {
+				t.Fatalf("completed body = %s, want elapsed and preview", body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("publication %d did not arrive", i)
+		}
+	}
+}
+
+func TestToolStepsStayBehindUnlessRequested(t *testing.T) {
+	subscribe := map[string]func(runtime any) (<-chan department.LivePublication, error){
+		"legacy text": func(r any) (<-chan department.LivePublication, error) {
+			return r.(department.LivePublicationSubscriber).SubscribeLivePublic(t.Context())
+		},
+		"legacy reasoning": func(r any) (<-chan department.LivePublication, error) {
+			return r.(department.ReasoningPublicationSubscriber).SubscribeLivePublicWithReasoning(t.Context())
+		},
+		"options off": func(r any) (<-chan department.LivePublication, error) {
+			return r.(department.LiveOptionsSubscriber).SubscribeLivePublicWith(t.Context(), department.LiveOptions{IncludeReasoning: true})
+		},
+	}
+	for name, open := range subscribe {
+		t.Run(name, func(t *testing.T) {
+			subscription := newFakeSubscription(nil)
+			var filters []event.EventFilter
+			runtime := boundFor(t, liveController{fullController: newFullController(newFakeSubscription(nil), nil, nil), subscription: subscription, filters: &filters})
+			publications, err := open(runtime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, delivery := range liveToolSteps() {
+				subscription.deliveries <- delivery
+			}
+			subscription.deliveries <- event.Delivery{Event: event.SessionActive{}, EventID: "durable", JournalSeq: 1, CoveredThrough: 1, PublicBody: []byte(`{"type":"SessionActive"}`)}
+			select {
+			case got := <-publications:
+				if got.Enduring == nil || got.Enduring.EventID != "durable" {
+					t.Fatalf("first publication = %+v, want tool steps dropped before the committed event", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("committed event did not arrive")
+			}
+			if drops := runtime.(interface{ EphemeralDrops() uint64 }).EphemeralDrops(); drops != 2 {
+				t.Fatalf("EphemeralDrops = %d, want both tool steps counted", drops)
+			}
+		})
+	}
+}
