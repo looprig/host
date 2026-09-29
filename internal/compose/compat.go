@@ -81,6 +81,14 @@ func (s *Service) AwaitSessionIdle(ctx context.Context, key registry.Key) (Compa
 		poll := s.options.Clock.After(s.options.WorkPoll)
 		select {
 		case err := <-idle:
+			// A WaitIdle ended by the CALLER'S cancellation is the caller's
+			// ending, not the session's. waitCtx derives from ctx, so a
+			// cancelled caller makes this case and ctx.Done() ready together,
+			// and the select would otherwise report `failed` for a wait nobody
+			// but the caller stopped, at random (measured: 2 in 200 under -race).
+			if err != nil && ctx.Err() != nil {
+				return CompatibilityStopped, ctx.Err()
+			}
 			if err != nil {
 				return CompatibilityFailed, err
 			}
