@@ -78,7 +78,7 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` store (currently pinned at v0.14.0), and
-`harnessruntime` to `github.com/looprig/harness` (currently v0.43.0).
+`harnessruntime` to `github.com/looprig/harness` (currently v0.44.0).
 Core is v0.13.1. Check `go.mod` for the exact pins of a given release.
 
 **Since host v0.7.1 Host requires harness ≥ v0.37.1**, which is v0.37.0 plus one
@@ -275,7 +275,7 @@ recording applier and over a real rig.
   internally); `WithBlockDecoder(nil)` is refused with `ErrNilOption`.
 
 No wire, journal or store format changes; nothing here is one-way. Pins harness
-v0.43.0 (additive; no Host-visible change).
+v0.44.0 (additive; no Host-visible change).
 
 ## Command principal and message metadata (v0.11.0)
 

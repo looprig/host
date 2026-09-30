@@ -65,10 +65,11 @@ var publishedLooprigVersions = map[string]string{
 	// body it decoded before the attempt (host v0.11.0). harness v0.42.0 adds
 	// tool_use_id/tool_name/elapsed_ms to the ephemeral tool-call events Host's
 	// live tool steps forward; ephemeral, so no journal impact. harness v0.43.0
-	// (loop.WithReadOnlyAccess) is additive and changes nothing Host relies on;
+	// (loop.WithReadOnlyAccess) and v0.44.0 (loop.WithWorkspaceAccess) are
+	// additive and change nothing Host relies on;
 	// since host v0.16.0 the edge is also PUBLIC API SURFACE, because
 	// harnessruntime names harness's rig and session types.
-	"harness": "v0.43.0",
+	"harness": "v0.44.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package
