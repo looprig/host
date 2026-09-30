@@ -74,6 +74,28 @@ func drainToEnd(t *testing.T, f *fixture) lifecycle.Report {
 	}
 }
 
+// drainFiringOnlyTheGrace advances ONLY the platform grace until the drain
+// finishes. The grace ends the gated session's idle wait and its refused
+// release; the abandon's own bound (the idle boundary) is never fired, so an
+// abandon that answers is never raced by its deadline. Firing every timer
+// raced it: 10 in 100 -race runs reported the answered abandon Parked.
+func drainFiringOnlyTheGrace(t *testing.T, f *fixture) lifecycle.Report {
+	t.Helper()
+	finished := make(chan lifecycle.Report, 1)
+	go func() { finished <- f.drainer.Wait() }()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case report := <-finished:
+			return report
+		case <-deadline:
+			t.Fatal("the drain did not finish")
+		case <-time.After(time.Millisecond):
+			f.clock.fireFor(testGrace)
+		}
+	}
+}
+
 // A RUNTIME THAT REFUSES ITS NONTERMINAL RELEASE IS ABANDONED, NOT PARKED, when
 // it can be: after the refusal and BEFORE FinishRelease hands the residency
 // back, under a context the (spent) grace does not reach. The report names it.
@@ -86,7 +108,7 @@ func TestARefusedReleaseIsAbandonedBeforeTheResidencyIsHandedBack(t *testing.T) 
 	f.residents.sessions = []lifecycle.Session{gated}
 
 	mustStart(t, f.drainer)
-	report := drainToEnd(t, f)
+	report := drainFiringOnlyTheGrace(t, f)
 
 	abandoned, ctxErr := gated.seen()
 	if abandoned != 1 {
