@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -227,6 +228,47 @@ func composeLiveText(value *LiveTextOptions) *compose.LiveTextOptions {
 	return &compose.LiveTextOptions{RateBytesPerSecond: value.RateBytesPerSecond, BurstBytes: value.BurstBytes, FlushInterval: value.FlushInterval, IncludeReasoning: value.IncludeReasoning, IncludeToolSteps: value.IncludeToolSteps}
 }
 
+// RuntimeProfile is how strictly a composition holds its launch targets to
+// the recovery a durable deployment needs.
+//
+// THE ZERO VALUE IS DURABLE, AND THAT IS A BEHAVIOUR CHANGE IN host v0.16.0.
+// Under RuntimeProfileDurable, Compose refuses any registration whose target
+// does not declare both department.Recovery capabilities, because a runtime
+// without them fails silently and late: a failover with an attempt in flight
+// wedges the session's command stream for good (no AttemptCloser), and a
+// latched journal fault leaves the session resident and refusing every
+// command (no PersistenceFaults). A composition that never declared recovery
+// — every one built before v0.16.0 — is therefore refused until it declares
+// (harnessruntime.Target does so by construction) or opts out.
+//
+// The best-effort profile is that opt-out, for fakes, experiments and
+// runtimes that genuinely cannot recover. It admits undeclared targets and is
+// logged at WARN once, on Start. It changes nothing a target DOES declare: a
+// NewRigTarget still refuses, at launch, a session missing a capability its
+// target declared.
+type RuntimeProfile uint8
+
+const (
+	// RuntimeProfileDurable refuses targets that do not declare full recovery.
+	// It is the zero value and the default.
+	RuntimeProfileDurable RuntimeProfile = iota
+
+	// RuntimeProfileBestEffort admits targets without declared recovery.
+	RuntimeProfileBestEffort
+)
+
+// String names the profile.
+func (p RuntimeProfile) String() string {
+	switch p {
+	case RuntimeProfileDurable:
+		return "durable"
+	case RuntimeProfileBestEffort:
+		return "best-effort"
+	default:
+		return "RuntimeProfile(" + strconv.Itoa(int(p)) + ")"
+	}
+}
+
 // Composition is one runnable Host, described.
 type Composition struct {
 	// MaxCommandBodyBytes bounds a referenced command body. Zero defaults to
@@ -262,6 +304,11 @@ type Composition struct {
 	// Clock is optional; nil means the system clock.
 	Clock CompositionClock
 
+	// RuntimeProfile is RuntimeProfileDurable unless set: every registered
+	// target must declare department.Recovery in full or Compose refuses the
+	// composition. See RuntimeProfile.
+	RuntimeProfile RuntimeProfile
+
 	Collaborators Collaborators
 }
 
@@ -295,6 +342,9 @@ type Service struct {
 	store   *sessionstore.Store
 	inner   *compose.Service
 	metrics http.Handler
+
+	// bestEffort is non-nil only under RuntimeProfileBestEffort.
+	bestEffort *bestEffortWarning
 }
 
 // ServiceLifecycleError reports an operation refused by the Host lifecycle.
@@ -379,6 +429,16 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 		closeStore()
 		return nil, &InvalidCompositionError{Field: "Collaborators.Registrar", Reason: "the registrations do not form a Department", Cause: err}
 	}
+	undeclared := undeclaredRecovery(registrations)
+	if blueprint.RuntimeProfile == RuntimeProfileDurable && len(undeclared) != 0 {
+		closeStore()
+		return nil, &InvalidCompositionError{
+			Field: "Collaborators.Registrar",
+			Reason: "under the default RuntimeProfileDurable every target must declare department.Recovery{AttemptCloser, PersistenceFaults}, and " +
+				strings.Join(undeclared, "; ") +
+				" (build the target with harnessruntime.Target, declare Recovery on a runtime that implements both, or set RuntimeProfile: host.RuntimeProfileBestEffort)",
+		}
+	}
 
 	adapterOptions := []sessionstoreadapter.Option{
 		sessionstoreadapter.WithNamespaceLayout(sessionstoreadapter.NamespaceLayout(collaborators.NamespaceLayout)),
@@ -458,12 +518,55 @@ func Compose(ctx context.Context, blueprint Composition) (*Service, error) {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(inner.Metrics())
-	return &Service{
+	service := &Service{
 		host:    &Host{resolved: resolved},
 		store:   store,
 		inner:   inner,
 		metrics: promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-	}, nil
+	}
+	if blueprint.RuntimeProfile == RuntimeProfileBestEffort {
+		service.bestEffort = &bestEffortWarning{logger: collaborators.Logger, undeclared: undeclared}
+	}
+	return service, nil
+}
+
+// undeclaredRecovery names every registration whose target does not declare
+// both recovery capabilities, and which ones it lacks, in registration order.
+func undeclaredRecovery(registrations []department.Registration) []string {
+	var undeclared []string
+	for _, registration := range registrations {
+		recovery := registration.Target.Capabilities().Recovery
+		var lacks []string
+		if !recovery.AttemptCloser {
+			lacks = append(lacks, "AttemptCloser")
+		}
+		if !recovery.PersistenceFaults {
+			lacks = append(lacks, "PersistenceFaults")
+		}
+		if len(lacks) != 0 {
+			undeclared = append(undeclared, "agent "+strconv.Quote(string(registration.AgentID))+" declares no "+strings.Join(lacks, " or "))
+		}
+	}
+	return undeclared
+}
+
+// bestEffortWarning is the one WARN a RuntimeProfileBestEffort Service logs,
+// on the first Start.
+type bestEffortWarning struct {
+	once       sync.Once
+	logger     *slog.Logger
+	undeclared []string
+}
+
+func (w *bestEffortWarning) emit(ctx context.Context) {
+	w.once.Do(func() {
+		if w.logger == nil {
+			return
+		}
+		w.logger.WarnContext(ctx, "host: RuntimeProfileBestEffort admits runtimes without declared recovery; a failover with an attempt in flight can wedge a session's command stream, and a journal fault can leave a session resident and refusing commands",
+			slog.String("runtime_profile", RuntimeProfileBestEffort.String()),
+			slog.Any("undeclared", w.undeclared))
+	})
 }
 
 // validate holds every rule Compose applies before it opens anything.
@@ -515,6 +618,9 @@ func (c Composition) validate() error {
 		if supplied.set {
 			return &InvalidCompositionError{Field: supplied.field, Reason: "must be nil; Compose supplies this collaborator from Collaborators, and a second one beside it would run the Host on two"}
 		}
+	}
+	if c.RuntimeProfile != RuntimeProfileDurable && c.RuntimeProfile != RuntimeProfileBestEffort {
+		return &InvalidCompositionError{Field: "RuntimeProfile", Reason: "is not a known profile; use RuntimeProfileDurable (the zero value) or RuntimeProfileBestEffort"}
 	}
 	if c.Generation == 0 {
 		return &InvalidCompositionError{Field: "Generation", Reason: "must be non-zero; Core refuses every HostLink record carrying a zero generation"}
@@ -607,7 +713,15 @@ func (s *Service) Department() *department.Department { return s.host.Department
 // first publication is synchronous, so a Host whose directory refuses it
 // fails here rather than running invisibly. A Service starts once and returns
 // ErrServiceDisposed after CloseUnstarted begins.
-func (s *Service) Start(ctx context.Context) error { return s.inner.Start(ctx) }
+//
+// A Service composed under RuntimeProfileBestEffort logs one WARN, on the
+// first Start, naming the targets that declare no recovery.
+func (s *Service) Start(ctx context.Context) error {
+	if s.bestEffort != nil {
+		s.bestEffort.emit(ctx)
+	}
+	return s.inner.Start(ctx)
+}
 
 // CloseUnstarted disposes a Service that never started and holds no residency.
 // It closes the SessionStore opened by Compose, but leaves the caller's Storage

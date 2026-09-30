@@ -203,20 +203,19 @@ func (w *realRuntimeWorld) hostWith(t *testing.T, generation uint64, adjust func
 	// The input-shaped decoder is what lets a command admitted through the
 	// durable disposition inbox (admittedTurn) reach the runtime at all; it is
 	// inert for a test that only ever calls Submit on the raw controller.
-	adapter, err := harnessruntime.New(launcher, harnessruntime.WithBlockDecoder(inputDecoder))
+	target, err := harnessruntime.Target(launcher, composeCompat, department.Capabilities{
+		SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
+	}, harnessruntime.WithBlockDecoder(inputDecoder))
 	if err != nil {
-		t.Fatalf("harnessruntime.New: %v", err)
+		t.Fatalf("harnessruntime.Target: %v", err)
 	}
 	blueprint := w.fixture.blueprint(t)
 	blueprint.Generation = generation
+	// A real harness runtime declares its recovery, so this Host runs under
+	// the default durable profile rather than the fixture's best-effort one.
+	blueprint.RuntimeProfile = host.RuntimeProfileDurable
 	blueprint.Collaborators.Registrar = host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
-		target, err := department.NewRigTarget(adapter, composeCompat, department.Capabilities{
-			SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
+		return []department.Registration{harnessruntime.Registration(composeAgent, target)}, nil
 	})
 	adjust(&blueprint)
 	service, err := host.Compose(t.Context(), blueprint)

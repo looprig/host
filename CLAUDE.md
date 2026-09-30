@@ -6,10 +6,16 @@ drain. Factory consumes Host; Host never consumes Factory.
 
 `department/` holds the immutable Department: agent identity to launch target,
 fixed at construction, plus the segregated Harness session capabilities Host
-requires. `harnessruntime` supplies the runtime adapter used by the
-current composition. The adapter translates Core's opaque sessionwire IDs to
-Harness's runtime identity; a Harness session does not directly satisfy the
-Host capability interfaces.
+requires, and `department/departmenttest` holds the exported runtime
+conformance. The public `harnessruntime` package (moved from
+`internal/harnessadapter` in v0.16.0) is the Host runtime backed by harness:
+products build targets with `harnessruntime.Target`, which declares
+`Capabilities.Recovery` because the adapter supplies both capabilities. The
+adapter translates Core's opaque sessionwire IDs to Harness's runtime identity;
+a Harness session does not directly satisfy the Host capability interfaces.
+`host.Composition.RuntimeProfile` defaults to durable and refuses at `Compose` a
+target that does not declare full recovery; test fixtures over fake runtimes
+opt out with `RuntimeProfileBestEffort`, never by declaring what the fake lacks.
 
 ## Dependency boundary
 
@@ -18,6 +24,10 @@ Host capability interfaces.
 - Never import `github.com/looprig/factory`, `wui`, `tui`, or a product or
   integration repository (`carbon`, `client`, `kosa`, `policy53`, `capstan`,
   `tests`) from anywhere in this module, tests included.
+- `department/` (and `department/departmenttest`) never imports harness: it is
+  Host's runtime seam in Host's own vocabulary, and the conformance must be
+  able to check any runtime. The harness edge lives in `harnessruntime` (a
+  public API-surface edge since v0.16.0) and the root composition.
 - Centrifuge is allowed only under `internal/realtime/hostlink/` **of this
   module root**. A second package under `internal/realtime/` does not inherit
   that exemption, and neither does a directory of that name inside a declared

@@ -34,13 +34,15 @@ adapter, credential verifier, storage). See "Deployment and operations".
 | Package | Purpose |
 |---|---|
 | `github.com/looprig/host` | `Options`/`New`, `Composition`/`Compose` (a running `Service`), `Run` (HostLink plus `/readyz`, `/healthz`, `/metrics` on one listener), `PublicJournal`/`NewPublicJournals` |
-| `github.com/looprig/host/department` | The immutable set of launch targets a Host serves and the runtime capabilities it consumes (`LeaseEpochReporter`, `AttemptCloser`, ...) |
+| `github.com/looprig/host/department` | The immutable set of launch targets a Host serves and the runtime capabilities it consumes (`LeaseEpochReporter`, `AttemptCloser`, ...), plus the `Capabilities.Recovery` declaration |
+| `github.com/looprig/host/department/departmenttest` | `RunRuntimeConformance`: launches one session through any `LaunchTarget` and checks the contract Host relies on |
+| `github.com/looprig/host/harnessruntime` | The Host runtime backed by harness: `Target`, `Registration`, `SharedRig`/`RigPerTenant`/`RigsFunc`, `WithBlockDecoder`/`DecodeInputBlocks` |
 | `github.com/looprig/host/cmd/host` | The generic executable; reads `HOST_*` environment variables and needs a product bootstrap |
 | `examples/deploy` | A pooled Kubernetes example (`pooled-cloud.yaml`), checked by its test |
 
 Everything else is under `internal/`: residency, command consumption and
 settlement, gate projection, HostLink (`internal/realtime/hostlink`), and the
-SessionStore and harness adapters.
+SessionStore adapter.
 
 ## Where it sits
 
@@ -76,8 +78,8 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` store (currently pinned at v0.14.0), and
-`harnessruntime` to `github.com/looprig/harness` (currently v0.41.0).
-Core is v0.13.0. Check `go.mod` for the exact pins of a given release.
+`harnessruntime` to `github.com/looprig/harness` (currently v0.43.0).
+Core is v0.13.1. Check `go.mod` for the exact pins of a given release.
 
 **Since host v0.7.1 Host requires harness ≥ v0.37.1**, which is v0.37.0 plus one
 further fix, and both matter to a pooled fleet.
@@ -123,7 +125,9 @@ v0.4.0: gates".
 
 ## Deployment and operations
 
-A product supplies the Department's launch targets and runtime adapter. The
+A product supplies the Department's launch targets; a harness-backed product
+builds each with `harnessruntime.Target` rather than writing a runtime adapter
+(see "Upgrading to v0.16.0"). The
 advertised isolation class, placement and capacity describe what Factory may
 select; they do not make a runtime compatible with a target. Compose the
 product's registered target and verify the runtime adapter before publishing
@@ -177,6 +181,102 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
+## Upgrading to v0.16.0: `harnessruntime`, and Host refuses a runtime that cannot recover
+
+**BEHAVIOUR CHANGE — A COMPOSITION THAT NEVER DECLARED RECOVERY NO LONGER
+COMPOSES.** `host.Composition.RuntimeProfile` is new and its zero value is
+`host.RuntimeProfileDurable`. Under it, `host.Compose` refuses — with
+`*host.InvalidCompositionError{Field: "Collaborators.Registrar"}`, naming each
+agent and what it lacks — any registration whose target does not declare
+`department.Capabilities.Recovery{AttemptCloser: true, PersistenceFaults: true}`.
+Every target built before v0.16.0 declares neither, so **every existing
+composition fails `Compose` on the version bump alone** until it declares or
+opts out. This is intended: without `AttemptCloser` an ordinary failover with an
+attempt in flight wedges a session's whole command stream, and without
+`PersistenceFaults` a journal fault leaves a session resident and refusing every
+command — both compile, pass every probe, and fail only in production.
+
+The declaration is verified, not trusted: a target built with
+`department.NewRigTarget` refuses at launch (with the session released) a
+runtime that lacks a capability its target declared —
+`*department.IncapableRuntimeError` with `Missing: ["declared AttemptCloser
+absent"]` or `["declared PersistenceFaults absent"]`. `host.RuntimeProfileBestEffort`
+is the explicit opt-out, for fakes and experiments; it admits undeclared targets
+and logs one WARN on `Start`.
+
+**`github.com/looprig/host/harnessruntime` is the adapter Host has always used,
+now public** (it moved from `internal/harnessadapter` unchanged). A
+harness-backed product no longer hand-writes a runtime adapter:
+
+```go
+target, err := harnessruntime.Target(
+    harnessruntime.RigPerTenant(map[sessionwire.TenantID]*rig.Rig{"acme": acmeRig}),
+    compatibilityID, // product-owned department.CompatibilityID
+    department.Capabilities{SupportsPooled: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming},
+)
+// Registrar: []department.Registration{harnessruntime.Registration("assistant", target)}
+```
+
+`Target` declares both recovery capabilities because every session it binds
+supplies them: it requires harness's `PersistenceFaultReporter` and
+`ResidencyAbandoner` at bind and forwards `runtimecommand.AttemptCloser`. It also
+forwards `LiveOptionsSubscriber` (text, reasoning, tool steps), copies `Principal`
+on every kind and `Metadata` on create and input, re-presents a create's first
+message, decodes `gate_response`, refuses an unresolved `PayloadRef`, launches
+under the binding's `RigSessionID`, and exposes `EphemeralDrops()`. Resolvers:
+`SharedRig` (one rig), `RigPerTenant` (refuses an unknown tenant with
+`ErrUnknownTenant`), `RigsFunc` (anything else: per-launch workspaces, journal
+stores). The body decoder defaults to `DecodeInputBlocks` — Core's strict
+`InputRequest`, the body Factory admits; name one with `WithBlockDecoder` only
+when your bodies are not Core's.
+
+`departmenttest.RunRuntimeConformance(t, target, launch)` launches one real
+session through any target and checks: recovery declared; `RigSessionID`
+honoured; the required capabilities, a held lease epoch, and both recovery
+capabilities actually present (`AttemptCloserAvailable`,
+`PersistenceFaultsAvailable`); `LiveOptionsSubscriber`; principal and metadata
+reaching the runtime's own applier (through a product-supplied `Recorder`); an
+unresolved `PayloadRef` refused. Host runs it against `harnessruntime` over a
+recording applier and over a real rig.
+
+**Migration — what breaks on the bump, and the fix:**
+
+- **Carbon** (`internal/app/department.go`): `host.Compose` refuses Carbon's
+  target (`carbonCapabilities()` declares no `Recovery`). Minimal fix: add
+  `Recovery: department.Recovery{AttemptCloser: true, PersistenceFaults: true}`
+  to `carbonCapabilities()` (Carbon's runtime already implements both). Intended
+  fix: replace `carbonRig`/`carbonRuntime` and the hand-copied decode, gate and
+  live-subscription code with
+  `harnessruntime.Target(harnessruntime.RigsFunc(create, restore), compatibility, carbonCapabilities())`,
+  keeping `CarbonAgentID`, `CarbonCompatibilityID`, `LaunchScope` and
+  `SessionLauncher`; `DroppedLivePreviews` becomes the bound session's
+  `EphemeralDrops`; Carbon's `MissingCommittedPublicationError` /
+  `PersistenceFaultsMissingError` are replaced by `harnessruntime.IncapableSessionError`.
+  Run `RunRuntimeConformance` against the result.
+- **tests** (`internal/orchestrationtest`): `composedhost.go` and `pooled.go`
+  build targets with `KitCapabilities()`, which declares no `Recovery`, so every
+  composed-Host lane fails `Compose`. Add `Recovery` to `KitCapabilities()` where
+  the runtime really implements both (`pooledSession` must then offer
+  `AttemptCloser` and `PersistenceFaults`, or launches are refused); for a fake
+  runtime that implements neither, set `RuntimeProfile:
+  host.RuntimeProfileBestEffort` on that blueprint. Keep `pooledSession` only
+  where a test asserts on what crossed the seam; lanes that just need a harness
+  runtime move to `harnessruntime.Target`.
+- **Starters** (`browser-app/app.go`): `host.Compose` refuses the hand-written
+  `hostRig`'s target. Delete `runtime.go` and build the target with
+  `harnessruntime.Target(harnessruntime.RigPerTenant(map[sessionwire.TenantID]*rig.Rig{cfg.Tenant: agentRig}), compatibilityID, caps)`.
+- **Any other composition** that calls `department.NewRigTarget` or implements
+  `department.LaunchTarget` itself: declare `Capabilities.Recovery` (only if the
+  runtime implements `department.AttemptCloser` and `department.PersistenceFaults`
+  — a false declaration is refused at the first launch) or set
+  `RuntimeProfileBestEffort`. `cmd/host` runs under the durable default, so a
+  product `Bootstrap`'s `Registrar` must return declared targets.
+- **`harnessruntime.Option` is `func(*Adapter) error`** (it was `func(*Adapter)`
+  internally); `WithBlockDecoder(nil)` is refused with `ErrNilOption`.
+
+No wire, journal or store format changes; nothing here is one-way. Pins harness
+v0.43.0 (additive; no Host-visible change).
+
 ## Command principal and message metadata (v0.11.0)
 
 Host unconditionally advertises `hostlink.attribution.principal`. Every
@@ -191,8 +291,8 @@ The strictly decoded principal crosses to `department.RuntimeCommand` on all
 five kinds, and metadata crosses on create and input. These are recorded
 assertions, not authorization evidence. A product runtime implementing
 `department.CommandApplier` should forward both to `runtimecommand.Admitted`.
-The reference harness adapter does this and hands input bytes unchanged to
-the product `BlockDecoder`; create's first message is re-presented in input
+`harnessruntime` (public since v0.16.0) does this and hands input bytes
+unchanged to the `BlockDecoder`; create's first message is re-presented in input
 shape with its members. A decoder using Core's strict `InputRequest` must use
 core v0.12.0 or later to accept stamped commands.
 
@@ -525,7 +625,8 @@ command stream remains blocked**, including later input and interrupt commands;
 the apply deadline cannot settle an attempt-bearing record. The bound journal
 session must write the closure under its own strictly later journal grant. The
 `department.AttemptCloser` documentation includes a copyable harness-backed
-method.
+method; since v0.16.0 `harnessruntime.Target` supplies it, and the default
+durable `RuntimeProfile` refuses a target that does not declare it.
 
 Host logs `attempt_closer_unavailable` at WARN when it composes a launched
 runtime without the capability, before starting its command consumer. This
@@ -672,7 +773,9 @@ gate response above SessionStore's 64 KiB inline limit, the applier resolves
 `PayloadRef` through the session's control SessionStore, using the command's
 tenant and session and the `command-payload` kind. It checks size and SHA-256
 while reading, then runs the same body checks as an inline command. The runtime
-and Harness adapter receive verified bytes and never dereference the object.
+and `harnessruntime` receive verified bytes and never dereference the object; a
+runtime handed an unresolved `PayloadRef` (only a legacy composition with no
+object reader can produce one) must refuse it, as `harnessruntime` does.
 Missing, foreign, wrong-kind, corrupt, or oversized objects are rejected before
 an attempt. Transient store faults block the pass for retry. The memory limit
 defaults to 8 MiB; `Composition.MaxCommandBodyBytes` may be set above 64 KiB

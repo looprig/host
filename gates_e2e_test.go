@@ -394,12 +394,17 @@ func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct
 	if w.decoder != nil {
 		options = append(options, harnessruntime.WithBlockDecoder(w.decoder))
 	}
-	adapter, err := harnessruntime.New(launcher, options...)
+	target, err := harnessruntime.Target(launcher, composeCompat, department.Capabilities{
+		SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
+	}, options...)
 	if err != nil {
-		t.Fatalf("harnessruntime.New: %v", err)
+		t.Fatalf("harnessruntime.Target: %v", err)
 	}
 	blueprint := w.fixture.blueprint(t)
 	blueprint.Generation = generation
+	// A real harness runtime declares its recovery, so this Host runs under
+	// the default durable profile rather than the fixture's best-effort one.
+	blueprint.RuntimeProfile = host.RuntimeProfileDurable
 	// A command is found by the periodic reconcile, which is what a HostLink
 	// hint only hurries; a short interval keeps the test fast.
 	blueprint.Options.ReconcileInterval = 50 * time.Millisecond
@@ -411,13 +416,7 @@ func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct
 	blueprint.Drain.Grace = 2 * time.Second
 	blueprint.Drain.PublishBound = time.Second
 	blueprint.Collaborators.Registrar = host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
-		target, err := department.NewRigTarget(adapter, composeCompat, department.Capabilities{
-			SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
+		return []department.Registration{harnessruntime.Registration(composeAgent, target)}, nil
 	})
 	if w.adjust != nil {
 		w.adjust(&blueprint)
@@ -885,18 +884,15 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 	blueprint := world.fixture.blueprint(t)
 	blueprint.Generation = 5
 	launcher := &capturingLauncher{rig: gateE2ERig(t, world.journal, world.llm, world.runs, world.ask)}
-	adapter, err := harnessruntime.New(launcher)
+	blueprint.RuntimeProfile = host.RuntimeProfileDurable
+	target, err := harnessruntime.Target(launcher, composeCompat, department.Capabilities{
+		SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	blueprint.Collaborators.Registrar = host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
-		target, err := department.NewRigTarget(adapter, composeCompat, department.Capabilities{
-			SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1, CaptureSafety: department.CaptureSafetyStreaming,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []department.Registration{{AgentID: composeAgent, Target: target}}, nil
+		return []department.Registration{harnessruntime.Registration(composeAgent, target)}, nil
 	})
 	second, err := host.Compose(t.Context(), blueprint)
 	if err != nil {

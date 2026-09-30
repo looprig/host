@@ -190,7 +190,11 @@ func (f *composeFixture) blueprint(t testing.TB) host.Composition {
 			ReconcileInterval: time.Minute,
 			ReconcileBatch:    32,
 		},
-		Generation:           4,
+		Generation: 4,
+		// The fixture's fake rig session offers neither recovery capability,
+		// so it opts out of the default durable profile explicitly. A test
+		// composing a real harness runtime sets RuntimeProfileDurable back.
+		RuntimeProfile:       host.RuntimeProfileBestEffort,
 		Link:                 host.LinkOptions{MaxBindingsPerLink: 4, MaxBindings: 8, MaxTenantLinks: 3},
 		Drain:                host.DrainOptions{Grace: 30 * time.Second, IdleBoundary: 10 * time.Second, PublishBound: 5 * time.Second},
 		CompatibilityTimeout: 20 * time.Second,

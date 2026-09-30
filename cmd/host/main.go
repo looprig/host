@@ -60,6 +60,9 @@ type Bootstrap interface {
 	JournalStores() map[host.EvidenceKey]sessionstore.DispositionEvidenceReader
 
 	// Registrar produces the Department registrations this deployment serves.
+	// The binary composes under host's default RuntimeProfileDurable, so every
+	// target it returns must declare department.Capabilities.Recovery in full
+	// — harnessruntime.Target does — or the Host refuses to compose.
 	Registrar() host.Registrar
 
 	// Checkpointer commits the checkpoints a nonterminal release requires.
