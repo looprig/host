@@ -47,6 +47,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 
+	"github.com/looprig/host/department"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 )
@@ -180,6 +181,12 @@ type ConsumptionHalter interface {
 type Abandoner interface {
 	AbandonResidency(context.Context) error
 }
+
+// ErrResidencyStillHeld is department.ErrResidencyStillHeld: a runtime release
+// or abandon whose error carries it tore the runtime down but did not give its
+// lease back. The drain reports the session Parked, does not abandon on top of
+// the torn-down runtime, and withholds `drained` (settledState).
+var ErrResidencyStillHeld = department.ErrResidencyStillHeld
 
 // ErrNotAbandonable is what an Abandoner returns for a runtime that offers no
 // crash-equivalent release. It is not a failure: the session is reported
@@ -839,7 +846,8 @@ func (d *Drainer) run(sessions []Session) {
 // `draining`, so a Factory waits and eventually escalates instead of deleting.
 // A leaked workload is visible to an operator; deleted work is not.
 //
-// ONLY FinishRelease, AN UNSETTLED ATTACH AND THE RELEASE LEDGER WITHHOLD IT. An attach
+// ONLY FinishRelease, AN UNSETTLED ATTACH, THE RELEASE LEDGER AND A RUNTIME THAT
+// KEPT ITS LEASE (ErrResidencyStillHeld, since v0.17.0) WITHHOLD IT. An attach
 // that did not finish within its bound may still hold a residency grant and a
 // runtime's journal lease, and the ReleaseLedger reports a release by any other path
 // that left one held; each is the same "release did not finish".
@@ -853,6 +861,11 @@ func (d *Drainer) run(sessions []Session) {
 func (d *Drainer) settledState() sessionwire.HostLinkDrainState {
 	for _, failure := range d.failures {
 		if failure.Step == StepFinishRelease || failure.Step == StepSettleAttaches || failure.Step == StepUnreleased {
+			return sessionwire.HostLinkDrainStateDraining
+		}
+		// A RUNTIME THAT KEPT ITS LEASE (ErrResidencyStillHeld) has not
+		// finished release either, whichever step reported it.
+		if errors.Is(failure.Err, ErrResidencyStillHeld) {
 			return sessionwire.HostLinkDrainStateDraining
 		}
 	}
@@ -926,10 +939,18 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	// session's successor restores it the way it restores a crashed Host's.
 	if err := session.ReleaseResidency(graceCtx); err != nil {
 		record(StepReleaseResidency, err)
-		// THE REFUSED RUNTIME IS ABANDONED BEFORE THE RESIDENCY IS HANDED BACK,
-		// so by the time FinishRelease lets a successor in, the journal lease it
-		// needs is free. See Abandoner.
-		d.abandon(session, record)
+		if errors.Is(err, ErrResidencyStillHeld) {
+			// TORN DOWN WITH ITS LEASE STILL HELD: abandoning cannot give back
+			// what the release already failed to, so the session is Parked and
+			// the failure withholds `drained`.
+			key := session.Key()
+			d.book(nil, &key)
+		} else {
+			// THE REFUSED RUNTIME IS ABANDONED BEFORE THE RESIDENCY IS HANDED
+			// BACK, so by the time FinishRelease lets a successor in, the
+			// journal lease it needs is free. See Abandoner.
+			d.abandon(session, record)
+		}
 	}
 	run(StepFinishRelease, session.FinishRelease)
 }

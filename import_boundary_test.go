@@ -66,10 +66,12 @@ var publishedLooprigVersions = map[string]string{
 	// tool_use_id/tool_name/elapsed_ms to the ephemeral tool-call events Host's
 	// live tool steps forward; ephemeral, so no journal impact. harness v0.43.0
 	// (loop.WithReadOnlyAccess) and v0.44.0 (loop.WithWorkspaceAccess) are
-	// additive and change nothing Host relies on;
+	// additive and change nothing Host relies on; v0.45.0 returns
+	// *session.LeaseReleaseError from ReleaseResidency/AbandonResidency, which
+	// harnessruntime maps to department.ErrResidencyStillHeld (host v0.17.0);
 	// since host v0.16.0 the edge is also PUBLIC API SURFACE, because
 	// harnessruntime names harness's rig and session types.
-	"harness": "v0.44.0",
+	"harness": "v0.45.0",
 
 	// inference is here because HARNESS PULLS IT IN. No PRODUCTION file names
 	// github.com/looprig/inference; since v0.3.0 the test-support package

@@ -3,10 +3,13 @@ package lifecycle_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 
 	"github.com/looprig/host/internal/lifecycle"
 	"github.com/looprig/host/internal/registry"
@@ -204,4 +207,48 @@ func TestAReleasedRuntimeIsNeverAbandoned(t *testing.T) {
 	if len(report.Abandoned) != 0 || len(report.Parked) != 0 {
 		t.Fatalf("Abandoned = %v, Parked = %v, want neither", report.Abandoned, report.Parked)
 	}
+}
+
+// A RELEASE OR ABANDON THAT REPORTS THE RESIDENCY STILL HELD (harness v0.45.0's
+// LeaseReleaseError, in Host's vocabulary) is not a hand-off: the session is
+// Parked, it is not abandoned on top of a torn-down runtime, and the drain is
+// NOT `drained`.
+func TestAResidencyStillHeldIsParkedAndWithholdsDrained(t *testing.T) {
+	t.Parallel()
+	held := fmt.Errorf("journal lease release failed: %w", lifecycle.ErrResidencyStillHeld)
+
+	t.Run("on the graceful release", func(t *testing.T) {
+		t.Parallel()
+		session := &abandoningSession{fakeSession: newSession("session-release-held", nil)}
+		session.errs[stepReleaseResidency] = held
+		f := newFixture(t, session.fakeSession)
+		f.residents.sessions = []lifecycle.Session{session}
+		mustStart(t, f.drainer)
+		report := f.drainer.Wait()
+		if abandoned, _ := session.seen(); abandoned != 0 {
+			t.Errorf("a runtime whose release reported its lease held was abandoned %d times", abandoned)
+		}
+		if !slices.Equal(report.Parked, []registry.Key{session.Key()}) || len(report.Abandoned) != 0 {
+			t.Fatalf("Parked = %v, Abandoned = %v, want the session parked", report.Parked, report.Abandoned)
+		}
+		if report.State != sessionwire.HostLinkDrainStateDraining {
+			t.Fatalf("state = %q, want draining: the residency is still held", report.State)
+		}
+	})
+
+	t.Run("on the abandon", func(t *testing.T) {
+		t.Parallel()
+		session := &abandoningSession{fakeSession: newSession("session-abandon-held", nil), err: held}
+		session.errs[stepReleaseResidency] = errors.New("not idle")
+		f := newFixture(t, session.fakeSession)
+		f.residents.sessions = []lifecycle.Session{session}
+		mustStart(t, f.drainer)
+		report := f.drainer.Wait()
+		if !slices.Equal(report.Parked, []registry.Key{session.Key()}) {
+			t.Fatalf("Parked = %v, want the session", report.Parked)
+		}
+		if report.State != sessionwire.HostLinkDrainStateDraining {
+			t.Fatalf("state = %q, want draining: the residency is still held", report.State)
+		}
+	})
 }

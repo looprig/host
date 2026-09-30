@@ -742,6 +742,13 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 		}
 		cancel()
 	}
+	// A RUNTIME THAT KEPT ITS JOURNAL LEASE (department.ErrResidencyStillHeld)
+	// has not handed the session off, whatever FinishRelease then manages; it
+	// goes on the release ledger so every later drain withholds `drained`.
+	if err := errors.Join(failures...); errors.Is(err, department.ErrResidencyStillHeld) {
+		s.recordUnreleased(fmt.Errorf("compose: the lost session %s/%s's runtime kept its lease: %w",
+			held.key.TenantID, held.key.SessionID, err))
+	}
 	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
 		failures = append(failures, err)
 		s.recordUnreleased(fmt.Errorf("compose: the give-up of the lost session %s/%s did not finish: %w",

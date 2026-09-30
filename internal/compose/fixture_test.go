@@ -1032,6 +1032,9 @@ type controllableSession struct {
 	fault     error
 	abandoned int
 	stopOnce  sync.Once
+	// abandonErr, when set, is what AbandonResidency returns after tearing
+	// down: the runtime stopped but (say) kept its lease.
+	abandonErr error
 }
 
 func newControllableSession(id uuid.UUID) *controllableSession {
@@ -1065,7 +1068,7 @@ func (s *controllableSession) AbandonResidency(context.Context) error {
 	s.abandoned++
 	s.mu.Unlock()
 	s.stopOnce.Do(func() { close(s.stopped) })
-	return nil
+	return s.abandonErr
 }
 
 // Abandoned reports how many times the runtime was abandoned.

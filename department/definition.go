@@ -642,6 +642,17 @@ type PersistenceFaults interface {
 	AbandonResidency(context.Context) error
 }
 
+// ErrResidencyStillHeld marks a runtime release or abandon that tore the
+// runtime down but could NOT give its leases back — harness v0.45.0's
+// *session.LeaseReleaseError (journal lease or exclusive workspace-root lease).
+// It is JOINED to the runtime's own error, never substituted.
+//
+// THE RESIDENCY IS STILL HELD, and Host must not report the hand-off complete:
+// no pinned storage backend expires a lease, so a successor — in this process
+// or another — stays locked out until the lease is released. The drain reports
+// such a session Parked and withholds `drained`.
+var ErrResidencyStillHeld = errors.New("department: the runtime tore down but its lease was not released, so its residency is still held")
+
 // ErrNoPersistenceFaults is what a department runtime wrapper answers from
 // AbandonResidency when the runtime it wraps offers no PersistenceFaults.
 var ErrNoPersistenceFaults = errors.New("department: this runtime reports no persistence faults and cannot be abandoned")

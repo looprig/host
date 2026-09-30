@@ -78,7 +78,7 @@ controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
 `github.com/looprig/sessionstore` store (currently pinned at v0.14.0), and
-`harnessruntime` to `github.com/looprig/harness` (currently v0.44.0).
+`harnessruntime` to `github.com/looprig/harness` (currently v0.45.0).
 Core is v0.13.1. Check `go.mod` for the exact pins of a given release.
 
 **Since host v0.7.1 Host requires harness ≥ v0.37.1**, which is v0.37.0 plus one
@@ -214,10 +214,21 @@ offers no `department.PersistenceFaults` (so cannot be abandoned), or the
 abandon returned ANY error or exceeded its bound (also recorded as an
 `abandon_residency` failure): a failed abandon proves nothing about the journal
 lease, so it is never reported Abandoned. An abandon that overruns its bound
-keeps running in the background; `Stop` does not wait for it. **Pin harness ≥
-v0.44.1 with this release**: harness v0.44.0's abandon logged and swallowed a
-failed journal-lease release, so a session could be reported Abandoned with its
-lease still held.
+keeps running in the background; `Stop` does not wait for it. **Requires harness ≥
+v0.45.0** (pinned): harness v0.44.0's teardown logged and swallowed a failed
+journal-lease release, so a session could be reported Abandoned with its lease
+still held. v0.45.0 returns `*session.LeaseReleaseError` from
+`ReleaseResidency` and `AbandonResidency`, and `harnessruntime` joins
+`department.ErrResidencyStillHeld` to it (harness's consumer obligation: the
+residency is still held). On EITHER path — a gated session's abandon or an idle
+session's ordinary graceful release — such a session is reported **Parked**
+(never Abandoned, and never abandoned on top of the torn-down runtime), the
+failure carries the `LeaseReleaseError` (`errors.As`), and the drain is **not
+`drained`**: no pinned backend expires a lease, so a successor stays locked out
+until an operator frees it. A persistence-fault or lost-grant give-up whose
+abandon keeps its lease goes on the release ledger, which withholds `drained`
+on every later drain. A product runtime outside `harnessruntime` should join
+`department.ErrResidencyStillHeld` to the same condition.
 
 **Size the platform's termination grace above `Drain.Grace` + 2 ×
 `Drain.IdleBoundary`** (`HOST_DRAIN_GRACE`, `HOST_DRAIN_IDLE_BOUNDARY`). A gated

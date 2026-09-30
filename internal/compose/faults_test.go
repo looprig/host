@@ -267,3 +267,18 @@ func TestAStaleGiveUpDoesNotUnchargeASuccessor(t *testing.T) {
 		t.Error("a stale give-up removed the successor's residency")
 	}
 }
+
+// A FAULTED RUNTIME WHOSE ABANDON KEPT ITS LEASE (department.ErrResidencyStillHeld,
+// harness v0.45.0's LeaseReleaseError) has not handed the session off: the
+// give-up goes on the release ledger, so a later drain withholds `drained`.
+func TestAFaultedRuntimeThatKeptItsLeaseIsOnTheReleaseLedger(t *testing.T) {
+	f := newFixture(t)
+	f.start()
+	f.runtime.abandonErr = errors.Join(department.ErrResidencyStillHeld, errors.New("journal lease release failed"))
+	f.attach(tenantA, sessionA)
+	f.runtime.Fault(errors.New("injected journal append failure"))
+	awaitCondition(t, "the faulted session to leave this Host", func() bool { return f.svc.residentFor(keyA) == nil })
+	if err := f.svc.Unreleased(); !errors.Is(err, department.ErrResidencyStillHeld) {
+		t.Fatalf("Unreleased() = %v, want the kept lease on the release ledger", err)
+	}
+}

@@ -149,6 +149,11 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 	held.stopWork()
 	if err := held.abandonRuntime(ctx, faults); err != nil {
 		failures = append(failures, err)
+		// KEPT ITS LEASE: the hand-off is not complete (see the lost path).
+		if errors.Is(err, department.ErrResidencyStillHeld) {
+			s.recordUnreleased(fmt.Errorf("compose: the unusable session %s/%s's runtime kept its lease: %w",
+				held.key.TenantID, held.key.SessionID, err))
+		}
 	}
 	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {
 		failures = append(failures, err)

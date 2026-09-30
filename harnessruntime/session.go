@@ -75,7 +75,19 @@ func (s *boundSession) Done() <-chan struct{} { return s.live.Done() }
 
 // ReleaseResidency releases residency without terminating the session.
 func (s *boundSession) ReleaseResidency(ctx context.Context) error {
-	return s.releaser.ReleaseResidency(ctx)
+	return classifyLeaseRelease(s.releaser.ReleaseResidency(ctx))
+}
+
+// classifyLeaseRelease marks harness's *session.LeaseReleaseError as
+// department.ErrResidencyStillHeld, which is harness v0.45.0's consumer
+// obligation: a release or abandon that could not give its lease back leaves
+// the residency held. The released error is joined, never replaced.
+func classifyLeaseRelease(err error) error {
+	var held *session.LeaseReleaseError
+	if errors.As(err, &held) {
+		return errors.Join(department.ErrResidencyStillHeld, err)
+	}
+	return err
 }
 
 // LeaseEpoch reports the journal single-writer lease epoch THIS runtime holds,
@@ -97,7 +109,7 @@ func (s *boundSession) PersistenceFault() error { return s.faults.PersistenceFau
 
 // AbandonResidency gives the runtime up crash-equivalently, writing nothing.
 func (s *boundSession) AbandonResidency(ctx context.Context) error {
-	return s.abandoner.AbandonResidency(ctx)
+	return classifyLeaseRelease(s.abandoner.AbandonResidency(ctx))
 }
 
 // ErrResumeUnsupported is the refusal SubscribeCommitted returns for a non-empty
