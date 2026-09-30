@@ -161,8 +161,12 @@ before it deletes that workload.
 remains readable. Set `HOST_DRAIN_GRACE` inside the platform's termination grace
 with margin; `HOST_DRAIN_IDLE_BOUNDARY` and `HOST_DRAIN_PUBLISH_BOUND` bound
 parts of that work. `/readyz` reports admission readiness and `/healthz`
-reports process liveness. A Host with an open gate must exit after drain;
-releasing a gated runtime gracefully is unsupported.
+reports process liveness. Releasing a gated runtime gracefully is
+unsupported: since v0.16.1 the drain abandons it crash-equivalently (the gate
+stays open, the journal lease is released), so a process may keep running after
+`Stop` and even restore the session again — see "v0.16.1". A runtime the drain
+could not abandon is reported in `DrainReport.Parked`; a process with any
+parked session must exit.
 
 The isolated `/metrics` registry exports `host_sessions` (by state),
 `host_sessions_gate_waiting`, `host_sessions_command_blocked`,
@@ -180,6 +184,44 @@ Keep every Factory gate reader on sessionstore v0.12.0 or later before a Host
 publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
+
+## v0.16.1: a drain abandons a gated runtime instead of parking it
+
+**Before v0.16.1, `Service.Stop` with an agent awaiting a gate left that runtime
+PARKED** — running, uncancelled, holding its harness journal lease until the
+process exited. harness refuses a graceful release of a session that is not
+whole-session idle, and a session at a gate never is. That was safe for
+`cmd/host`, which exits after its drain, and wrong for any embedder that keeps
+running: `Stop` closed the session store beneath a live runtime, the runtime's
+gate timers kept running, and a Host restarted in the same process could never
+restore the session (`lease held`).
+
+**Now the drain abandons it.** After the refused release, and BEFORE the
+residency is tombstoned and its lease handed back, the drain calls the runtime's
+crash-equivalent `department.PersistenceFaults.AbandonResidency` — the path Host
+already used for a faulted runtime — and waits for the runtime to tear down,
+bounded by `Drain.IdleBoundary`. harness seals every durable write first, so
+nothing is journaled: no `TurnInterrupted`, no `GateResolved{abandoned}`. The
+gate stays open in the journal and the projection, the journal lease is
+released, and a successor — in this process or another — restores the session
+with the gate open and answerable. (Plain context cancellation would resolve
+the gate; this does not cancel.)
+
+`DrainReport` gains `Abandoned` and `Parked` (`[]host.DrainSession`). A session
+is **Parked** only when its runtime offers no `department.PersistenceFaults`
+(so cannot be abandoned) or the abandon failed or exceeded its bound (also
+recorded as a `abandon_residency` failure). A parked runtime behaves as before
+v0.16.1, and `Stop` still skips the process-wide context cancellation while any
+is parked. **An embedder that keeps running must treat a non-empty `Parked` as
+a leak.** Every `harnessruntime.Target` runtime can be abandoned.
+
+**This is the default for every drain, `cmd/host` included, with no option.**
+It is safe there because abandonment is exactly what `cmd/host`'s exit already
+did to a parked runtime, minus the parts that were hazards: the runtime stops
+now rather than at exit (its gate timers can no longer resolve a gate against a
+stopped publisher), and its journal lease is released instead of left to lapse,
+so a successor on another Host restores sooner. A HostLink-initiated drain of a
+dedicated session takes the same path. No wire, journal or store format change.
 
 ## Upgrading to v0.16.0: `harnessruntime`, and Host refuses a runtime that cannot recover
 
@@ -408,8 +450,8 @@ or an outage abandon does:
   gate, so a warm release leaves it resident, and **a drain of the Host that
   restored it is crash-equivalent** exactly as a drain of the original Host is:
   the release is refused within the grace, the runtime is left parked, the gate
-  stays projected, and the next Host restores it again. The same rule applies:
-  a Host that drains with a gate open MUST exit.
+  stays projected, and the next Host restores it again. (Since v0.16.1 the
+  refused runtime is abandoned rather than parked; see "v0.16.1".)
 - A restore may journal `GateResolved{abandoned}` for a restored gate the resumed
   turn did not adopt, so a gate can carry more than one close. The gate projection
   folds closes as a set; a duplicate is a no-op.
@@ -751,6 +793,9 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
   **A Host that drains with a gate open MUST exit**; `cmd/host` does. Note also
   that `Stop` skips the manager's context cancellation **for the whole
   process** when any one session's release was refused.
+  **Superseded in v0.16.1:** the drain now abandons the refused runtime
+  crash-equivalently (stopped, lease released, gate preserved), so only a
+  runtime that cannot be abandoned is still parked; see "v0.16.1".
 - **After a restore**, a permission gate is restored open and answerable, but
   the turn that was parked at it is `TurnInterrupted`: the approval is applied
   and nothing runs the tool. An **ask_user** gate is closed at restore
