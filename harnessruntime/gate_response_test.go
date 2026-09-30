@@ -1,4 +1,4 @@
-package harnessadapter
+package harnessruntime
 
 import (
 	"encoding/json"

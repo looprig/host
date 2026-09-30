@@ -6,7 +6,7 @@ drain. Factory consumes Host; Host never consumes Factory.
 
 `department/` holds the immutable Department: agent identity to launch target,
 fixed at construction, plus the segregated Harness session capabilities Host
-requires. `internal/harnessadapter` supplies the runtime adapter used by the
+requires. `harnessruntime` supplies the runtime adapter used by the
 current composition. The adapter translates Core's opaque sessionwire IDs to
 Harness's runtime identity; a Harness session does not directly satisfy the
 Host capability interfaces.

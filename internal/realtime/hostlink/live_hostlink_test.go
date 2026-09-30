@@ -25,7 +25,7 @@ import (
 	"github.com/looprig/storage/memstore"
 
 	"github.com/looprig/host/department"
-	"github.com/looprig/host/internal/harnessadapter"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/host/internal/publicbody"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
@@ -68,12 +68,12 @@ func (l liveBridgeLauncher) RestoreSession(context.Context, uuid.UUID) (session.
 	return l.controller, nil
 }
 
-type liveBridgeRigs struct{ launcher harnessadapter.Launcher }
+type liveBridgeRigs struct{ launcher harnessruntime.Launcher }
 
-func (r liveBridgeRigs) RigForCreate(context.Context, department.RigCreateRequest) (harnessadapter.Launcher, error) {
+func (r liveBridgeRigs) RigForCreate(context.Context, department.RigCreateRequest) (harnessruntime.Launcher, error) {
 	return r.launcher, nil
 }
-func (r liveBridgeRigs) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessadapter.Launcher, error) {
+func (r liveBridgeRigs) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessruntime.Launcher, error) {
 	return r.launcher, nil
 }
 
@@ -110,7 +110,7 @@ func newLiveBridgeSession(t *testing.T, tenant sessionwire.TenantID) *liveBridge
 	}
 	sessionHub := hub.New(rigID, hub.WithAppender(appender))
 	controller := &liveBridgeController{id: rigID, hub: sessionHub, done: make(chan struct{})}
-	adapter, err := harnessadapter.New(liveBridgeRigs{launcher: liveBridgeLauncher{controller: controller}})
+	adapter, err := harnessruntime.New(liveBridgeRigs{launcher: liveBridgeLauncher{controller: controller}})
 	if err != nil {
 		t.Fatal(err)
 	}

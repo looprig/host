@@ -171,7 +171,7 @@ func newApplierHost(t *testing.T) *hostconfig.Host {
 // returns, exactly as testkit's fake does, and against the released modules the
 // real runtime would be no better — harness commits its own records under
 // ("local", <harness uuid>) and not under Host's (TenantID, SessionID). See
-// harnessadapter's TestHostCannotOpenABackendHarnessInitialized.
+// harnessruntime's TestHostCannotOpenABackendHarnessInitialized.
 //
 // THE MEASURED OUTCOME IS "unresolved", NOT "absent", and the difference decides
 // what happens next. Host writes its application prefix BEFORE driving the

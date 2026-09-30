@@ -3,7 +3,7 @@
 //
 // IT IS ITS OWN PACKAGE BECAUSE IT IS THE ONLY PLACE BOTH STORES MEET.
 // internal/compose runs against doubles and one released orchestration store;
-// internal/harnessadapter runs against harness with no orchestration store at
+// harnessruntime runs against harness with no orchestration store at
 // all. Neither can answer the question this package exists for — does a command
 // dispatched by Host's own applier, under a residency grant the released store
 // issued, reach a runtime that writes a real kind-5 disposition frame into a real

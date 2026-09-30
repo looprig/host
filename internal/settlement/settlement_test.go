@@ -374,7 +374,7 @@ func (r *conformingRuntime) ApplyCommand(ctx context.Context, command department
 	}
 	// THE BLOCKS ARE DECODED HERE BECAUSE THEY ARE DECODED THERE. Host hands the
 	// private body across opaque — it is not the semantic validator of a command
-	// body — and internal/harnessadapter's configured block decoder turns it into
+	// body — and harnessruntime's configured block decoder turns it into
 	// content before admission. The released Admitted.Validate refuses an input
 	// carrying no content, so a double that skipped this step would be admitting
 	// a command the production path cannot.

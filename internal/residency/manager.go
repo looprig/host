@@ -64,7 +64,7 @@ import (
 // recorded. THE REASON IS THE go.mod DECISION, NOT AN ABSENCE UPSTREAM, and an
 // earlier version of this comment gave the wrong one: it said released harness
 // v0.30.2 "has none of H4.1's capabilities", which was already false when
-// harnessadapter bound to v0.31.0 — session.IdleWaiter, session.Liveness and
+// harnessruntime bound to v0.31.0 — session.IdleWaiter, session.Liveness and
 // session.Releaser are all exported and are asserted on by name there.
 // sessionstore v0.6.0 does publish a residency grant with Epoch, Lost and
 // Release, but in a SEPARATE epoch domain that must not stamp a journal fence,

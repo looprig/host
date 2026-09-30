@@ -19,13 +19,13 @@ import (
 // layering one. An earlier version of this paragraph gave a different reason —
 // that "the published harness (v0.30.2) does not have H4.1's capabilities at
 // all — no WaitIdle, no Done, no ReleaseResidency" — and that was already false
-// when internal/harnessadapter bound to harness v0.31.0: session.IdleWaiter,
+// when harnessruntime bound to harness v0.31.0: session.IdleWaiter,
 // session.Liveness and session.Releaser are exported and are asserted on by
 // name there. It is recorded rather than quietly deleted because a stale
 // justification for a live decision is the failure the paragraph above this one
 // exists to stop.
 //
-// The standing reason is that the concrete edge is internal/harnessadapter's,
+// The standing reason is that the concrete edge is harnessruntime's,
 // not department's: department declares WHAT Host requires of a runtime in
 // Host's own identities, and the adapter is where a released type is made to
 // satisfy it. CLAUDE.md's paragraph on this is the authority — an adapter is

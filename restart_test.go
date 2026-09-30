@@ -22,7 +22,7 @@ import (
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
-	"github.com/looprig/host/internal/harnessadapter"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/host/internal/harnesstest"
 )
 
@@ -35,7 +35,7 @@ import (
 // re-placed on another started its conversation over — and had the launch
 // named the binding's id, harness would have re-opened that stream with a
 // second SessionStarted and restored nothing. These tests compose real Hosts
-// over the released session store, launch through harnessadapter onto a real
+// over the released session store, launch through harnessruntime onto a real
 // rig over a real harness journal, and read the conversation back out of that
 // journal and out of what the model is sent.
 
@@ -87,12 +87,12 @@ func (l *capturingLauncher) RestoreSession(ctx context.Context, id uuid.UUID) (s
 }
 
 // RigForCreate resolves every launch to the one rig.
-func (l *capturingLauncher) RigForCreate(context.Context, department.RigCreateRequest) (harnessadapter.Launcher, error) {
+func (l *capturingLauncher) RigForCreate(context.Context, department.RigCreateRequest) (harnessruntime.Launcher, error) {
 	return l, nil
 }
 
 // RigForRestore resolves every relaunch to the one rig.
-func (l *capturingLauncher) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessadapter.Launcher, error) {
+func (l *capturingLauncher) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessruntime.Launcher, error) {
 	return l, nil
 }
 
@@ -203,9 +203,9 @@ func (w *realRuntimeWorld) hostWith(t *testing.T, generation uint64, adjust func
 	// The input-shaped decoder is what lets a command admitted through the
 	// durable disposition inbox (admittedTurn) reach the runtime at all; it is
 	// inert for a test that only ever calls Submit on the raw controller.
-	adapter, err := harnessadapter.New(launcher, harnessadapter.WithBlockDecoder(inputDecoder))
+	adapter, err := harnessruntime.New(launcher, harnessruntime.WithBlockDecoder(inputDecoder))
 	if err != nil {
-		t.Fatalf("harnessadapter.New: %v", err)
+		t.Fatalf("harnessruntime.New: %v", err)
 	}
 	blueprint := w.fixture.blueprint(t)
 	blueprint.Generation = generation

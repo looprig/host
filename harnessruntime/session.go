@@ -1,4 +1,4 @@
-package harnessadapter
+package harnessruntime
 
 import (
 	"context"
@@ -95,7 +95,7 @@ func (s *boundSession) AbandonResidency(ctx context.Context) error {
 // the caller's last durable event and the first live one, and neither side could
 // see it — the caller believes it resumed, and the stream believes it started.
 var ErrResumeUnsupported = errors.New(
-	"harnessadapter: the released subscription cannot be positioned after an event")
+	"harnessruntime: the released subscription cannot be positioned after an event")
 
 // SubscribeCommitted delivers committed public journal events.
 //
@@ -141,7 +141,7 @@ type MissingCommittedFieldError struct {
 }
 
 func (e *MissingCommittedFieldError) Error() string {
-	return fmt.Sprintf("harnessadapter: enduring delivery %q at sequence %d lacks committed fields", e.EventID, e.JournalSeq)
+	return fmt.Sprintf("harnessruntime: enduring delivery %q at sequence %d lacks committed fields", e.EventID, e.JournalSeq)
 }
 
 // SubscribeLivePublic opens one ordered Harness subscription for both public

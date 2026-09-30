@@ -27,7 +27,7 @@ import (
 	"github.com/looprig/storage/memstore"
 
 	"github.com/looprig/host/department"
-	"github.com/looprig/host/internal/harnessadapter"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/host/internal/realtime/hostlink"
 	"github.com/looprig/host/internal/registry"
 	"github.com/looprig/host/internal/service"
@@ -133,7 +133,7 @@ func newTails(t *testing.T, publications service.Publications, routes service.Ro
 // Every part of the path that decides what Host publishes is production code:
 // harness's JournalEventAppender writes the canonical public body and reports
 // it, harness's Hub carries it forward on the committed stream, and Host's
-// harnessadapter translates it into a Core publication. Nothing between the
+// harnessruntime translates it into a Core publication. Nothing between the
 // durable append and the assertion is a fake, which is the only way a
 // byte-identity claim can mean anything — a fake that returned the same bytes
 // it was handed would satisfy it by construction.
@@ -200,11 +200,11 @@ func newLiveSession(t *testing.T, tenant sessionwire.TenantID) *liveSession {
 	}
 	sessionHub := hub.New(rigID, hub.WithAppender(appender))
 
-	adapter, err := harnessadapter.New(stubRigs{launcher: &stubLauncher{
+	adapter, err := harnessruntime.New(stubRigs{launcher: &stubLauncher{
 		controller: &liveController{base: controllerBase{id: rigID}, hub: sessionHub},
 	}})
 	if err != nil {
-		t.Fatalf("harnessadapter.New: %v", err)
+		t.Fatalf("harnessruntime.New: %v", err)
 	}
 	key := registry.Key{TenantID: tenant, SessionID: sessionwire.SessionID(rigID.String())}
 	launched, err := adapter.NewSession(t.Context(), department.RigCreateRequest{
@@ -1063,13 +1063,13 @@ func (l *stubLauncher) RestoreSession(context.Context, uuid.UUID) (session.Sessi
 }
 
 // stubRigs resolves every launch to one launcher.
-type stubRigs struct{ launcher harnessadapter.Launcher }
+type stubRigs struct{ launcher harnessruntime.Launcher }
 
-func (r stubRigs) RigForCreate(context.Context, department.RigCreateRequest) (harnessadapter.Launcher, error) {
+func (r stubRigs) RigForCreate(context.Context, department.RigCreateRequest) (harnessruntime.Launcher, error) {
 	return r.launcher, nil
 }
 
-func (r stubRigs) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessadapter.Launcher, error) {
+func (r stubRigs) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessruntime.Launcher, error) {
 	return r.launcher, nil
 }
 

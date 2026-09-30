@@ -1,4 +1,4 @@
-package harnessadapter
+package harnessruntime
 
 import (
 	"context"
@@ -96,10 +96,10 @@ func New(rigs Rigs, options ...Option) (*Adapter, error) {
 }
 
 // ErrNoRigs is the refusal New returns when it is handed no resolver.
-var ErrNoRigs = errors.New("harnessadapter: no rig resolver to adapt")
+var ErrNoRigs = errors.New("harnessruntime: no rig resolver to adapt")
 
 // ErrNilOption is the refusal New returns for a nil option.
-var ErrNilOption = errors.New("harnessadapter: a nil option was supplied")
+var ErrNilOption = errors.New("harnessruntime: a nil option was supplied")
 
 // NewSession launches a session for a create request.
 func (a *Adapter) NewSession(ctx context.Context, request department.RigCreateRequest) (department.RigSession, error) {
@@ -162,7 +162,7 @@ func (a *Adapter) RestoreSession(
 // ErrNoRig is the refusal returned when a resolver reports success and hands
 // back nothing. It is department.ErrNoRigSession one layer up, and it exists for
 // the same reason: a nil rig would otherwise be dereferenced by NewSession.
-var ErrNoRig = errors.New("harnessadapter: the rig resolver reported success and returned no rig")
+var ErrNoRig = errors.New("harnessruntime: the rig resolver reported success and returned no rig")
 
 // isNil reports whether an interface value holds nothing, in either of the two
 // ways Go allows.
@@ -328,7 +328,7 @@ func (a *Adapter) bind(
 
 // ErrNoSession is the refusal returned when a rig reports success and hands back
 // a nil controller.
-var ErrNoSession = errors.New("harnessadapter: the rig reported success and returned no session")
+var ErrNoSession = errors.New("harnessruntime: the rig reported success and returned no session")
 
 // IncapableSessionError reports a launched harness session missing capabilities
 // Host requires.
@@ -337,7 +337,7 @@ type IncapableSessionError struct {
 }
 
 func (e *IncapableSessionError) Error() string {
-	return "harnessadapter: the harness session is missing capabilities Host requires: " +
+	return "harnessruntime: the harness session is missing capabilities Host requires: " +
 		strings.Join(e.Missing, ", ")
 }
 
@@ -350,6 +350,6 @@ type UnsupportedCommandError struct {
 }
 
 func (e *UnsupportedCommandError) Error() string {
-	return "harnessadapter: command " + strconv.Quote(string(e.CommandID)) +
+	return "harnessruntime: command " + strconv.Quote(string(e.CommandID)) +
 		" of kind " + strconv.Quote(e.Kind) + " cannot be applied: " + e.Reason
 }

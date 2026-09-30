@@ -163,7 +163,7 @@
 // which really does want a UUID — but the refusal has to be Host's, stated, and
 // reached before the launch rather than at a parse deep inside it.
 //
-// RELATED TO, AND NOT THE SAME AS, H9's COST 2 in internal/harnessadapter. They
+// RELATED TO, AND NOT THE SAME AS, H9's COST 2 in harnessruntime. They
 // point in OPPOSITE directions over DIFFERENT subjects: this row is Host's seam
 // being too narrow for a durable value the store will hand it, and Cost 2 is
 // Harness's keyspace being too narrow for the identity Factory admitted. They
@@ -291,7 +291,7 @@
 //     epoch parameter — Host holds no journal grant, so there was no number it
 //     could soundly name — and then lost its caller: Host makes no journal write
 //     at any point, so there is nothing left for the fusion to come back into.
-//   - harnessadapter's WithLeaseEpoch is GONE. It let a composition supply the
+//   - harnessruntime's WithLeaseEpoch is GONE. It let a composition supply the
 //     epoch every admitted command was applied under, and harness compares that
 //     number for equality against the lease the runtime itself holds — right
 //     only while two independent counters agreed. boundSession reads the
@@ -348,7 +348,7 @@
 //
 // THE FINDING ROWS CITE TESTS BY NAME AND THE CITATIONS ARE GUARDED.
 // TestCommentsCiteTestsThatExist in the root package resolves every Test…
-// identifier appearing in a comment in this package and in harnessadapter
+// identifier appearing in a comment in this package and in harnessruntime
 // against the module's real test functions. It exists because two rounds of this
 // task shipped a row whose evidence did not exist, and because nothing else
 // notices: TestDocCommentsNameTheirOwnDeclaration asks whether a comment names

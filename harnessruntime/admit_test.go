@@ -1,4 +1,4 @@
-package harnessadapter
+package harnessruntime
 
 import (
 	"context"
@@ -675,7 +675,7 @@ func TestApplyCommandDistinguishesAnUnrecordableDisposition(t *testing.T) {
 			&runtimecommand.DispositionUnsupportedError{CommandID: "command-a", AttemptID: "attempt-9"},
 			true,
 		},
-		{"an ordinary transport failure", errors.New("harnessadapter_test: connection reset"), false},
+		{"an ordinary transport failure", errors.New("harnessruntime_test: connection reset"), false},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			controller := newApplyingController(applierPart{available: true, err: row.err})
@@ -702,7 +702,7 @@ func TestApplyCommandDistinguishesAnUnrecordableDisposition(t *testing.T) {
 // failure through the returned Disposition; the adapter must surface it as
 // department.ErrPrefixCommitted, joined, and only when it is true.
 func TestApplyCommandSurfacesAPrefixThatCommittedBeforeTheFailure(t *testing.T) {
-	failure := errors.New("harnessadapter_test: the disposition append failed")
+	failure := errors.New("harnessruntime_test: the disposition append failed")
 	for _, row := range []struct {
 		name      string
 		prefix    uint64

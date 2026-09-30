@@ -39,7 +39,7 @@ import (
 // host v0.6.0's Compose wired no work-state source, so the warm releaser it
 // builds was never told a session was idle and never armed a countdown: an
 // idle pooled session stayed resident until the Host stopped. These tests
-// compose real Hosts with host.Compose, launch through harnessadapter onto a
+// compose real Hosts with host.Compose, launch through harnessruntime onto a
 // real rig over a real harness journal, and observe the release from OUTSIDE
 // the Host — through the durable residency lease another party can or cannot
 // take — rather than through any internal state.

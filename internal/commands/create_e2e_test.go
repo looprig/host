@@ -5,7 +5,7 @@
 // settlement are sessionstore v0.12.0's over one backend; the evidence the
 // store settles from is a REAL harness journal over another, reached through
 // the same DispositionEvidenceReader a composed Host registers; and the runtime
-// is a real rig behind the production harnessadapter. The only doubles are the
+// is a real rig behind the production harnessruntime. The only doubles are the
 // inference client, which records what the model was sent, and the ownership
 // fence, which is composition rather than durability.
 //
@@ -45,8 +45,8 @@ import (
 	"github.com/looprig/storage/memstore"
 
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/host/internal/commands"
-	"github.com/looprig/host/internal/harnessadapter"
 	"github.com/looprig/host/internal/harnesstest"
 	"github.com/looprig/host/internal/hostconfig"
 	"github.com/looprig/host/internal/registry"
@@ -170,7 +170,7 @@ type liveWorld struct {
 	journal *harnessstore.Store
 
 	llm     *recordingLLM
-	adapter *harnessadapter.Adapter
+	adapter *harnessruntime.Adapter
 	binding sessionstore.SessionBinding
 	host    *hostconfig.Host
 
@@ -181,10 +181,10 @@ func newLiveWorld(t *testing.T) *liveWorld {
 	t.Helper()
 	llm := &recordingLLM{}
 	journal := harnesstest.Store(t, harnesstest.Backend(t), liveTenant)
-	adapter, err := harnessadapter.New(&rigLaunchers{rig: harnesstest.Rig(t, journal, llm)},
-		harnessadapter.WithBlockDecoder(liveDecoder()))
+	adapter, err := harnessruntime.New(&rigLaunchers{rig: harnesstest.Rig(t, journal, llm)},
+		harnessruntime.WithBlockDecoder(liveDecoder()))
 	if err != nil {
-		t.Fatalf("harnessadapter.New: %v", err)
+		t.Fatalf("harnessruntime.New: %v", err)
 	}
 
 	router, err := sessionstoreadapter.NewTenantEvidenceRouter(
@@ -237,7 +237,7 @@ func newLiveWorld(t *testing.T) *liveWorld {
 // clock, claim TTL and identity from. The department holds the SAME adapter the
 // runtime launches through, so nothing here describes a Host that could not
 // have launched the session it is applying commands to.
-func newLiveHost(t *testing.T, adapter *harnessadapter.Adapter) *hostconfig.Host {
+func newLiveHost(t *testing.T, adapter *harnessruntime.Adapter) *hostconfig.Host {
 	t.Helper()
 	target, err := department.NewRigTarget(adapter, liveCompat, department.Capabilities{
 		SupportsPooled: true, SupportsDedicated: true, AdmissionWeight: 1,
@@ -303,14 +303,14 @@ func (openAuth) VerifyTenant(context.Context, sessionwire.TenantID, string) erro
 // Launching the runtime through the production adapter
 // ---------------------------------------------------------------------------
 
-// rigLaunchers is harnessadapter.Rigs over one real rig.
+// rigLaunchers is harnessruntime.Rigs over one real rig.
 type rigLaunchers struct{ rig *rig.Rig }
 
-func (r *rigLaunchers) RigForCreate(context.Context, department.RigCreateRequest) (harnessadapter.Launcher, error) {
+func (r *rigLaunchers) RigForCreate(context.Context, department.RigCreateRequest) (harnessruntime.Launcher, error) {
 	return r.rig, nil
 }
 
-func (r *rigLaunchers) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessadapter.Launcher, error) {
+func (r *rigLaunchers) RigForRestore(context.Context, uuid.UUID, department.RigRestoreRequest) (harnessruntime.Launcher, error) {
 	return r.rig, nil
 }
 
@@ -318,7 +318,7 @@ func (r *rigLaunchers) RigForRestore(context.Context, uuid.UUID, department.RigR
 // INPUT-SHAPED body finding H7 names, and a create's first message reaches it
 // through internal/createbody's re-presentation rather than through a second
 // encoding.
-func liveDecoder() harnessadapter.BlockDecoder {
+func liveDecoder() harnessruntime.BlockDecoder {
 	return func(body []byte) ([]content.Block, error) {
 		var request sessionwire.InputRequest
 		if err := json.Unmarshal(body, &request); err != nil {
@@ -338,7 +338,7 @@ type liveRuntime struct {
 	release session.Releaser
 }
 
-// launch takes the session resident, through harnessadapter's own NewSession or
+// launch takes the session resident, through harnessruntime's own NewSession or
 // RestoreSession, as a composed Host does.
 func (w *liveWorld) launch(restore bool) *liveRuntime {
 	w.t.Helper()
@@ -862,7 +862,7 @@ func TestACreateThenAnInputBothSettleAndTheCursorPassesBoth(t *testing.T) {
 type refusingRuntime struct{}
 
 func (refusingRuntime) ApplyCommand(context.Context, department.RuntimeCommand) error {
-	return errors.New("harnessadapter: harness applies only input, interrupt and gate_response commands")
+	return errors.New("harnessruntime: harness applies only input, interrupt and gate_response commands")
 }
 
 // A STRANDED v0.4.0 CREATE IS CLOSED BY A SUCCESSOR AND THE STREAM UNBLOCKS.

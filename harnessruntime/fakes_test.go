@@ -1,4 +1,4 @@
-package harnessadapter
+package harnessruntime
 
 import (
 	"context"
@@ -62,7 +62,7 @@ func (controllerBase) RestoreWorkspace(context.Context, workspacestore.Ref) erro
 }
 func (controllerBase) Shutdown(context.Context) error { return errNotImplemented }
 
-var errNotImplemented = errors.New("harnessadapter_test: the fake controller implements only the capabilities under test")
+var errNotImplemented = errors.New("harnessruntime_test: the fake controller implements only the capabilities under test")
 
 // The bare base is a SessionController and nothing more, which is the state
 // harness's own doc describes: none of the four capabilities is on the base
@@ -324,7 +324,7 @@ func (l *fakeLauncher) RestoreSession(_ context.Context, id uuid.UUID) (session.
 // is deliberately NOT ErrNoRig: the test asserts the adapter's own refusal, so a
 // fixture answering with the same sentinel would make the assertion pass for the
 // wrong reason.
-var errNilLauncher = errors.New("harnessadapter_test: this launcher is a typed nil and should never have been called")
+var errNilLauncher = errors.New("harnessruntime_test: this launcher is a typed nil and should never have been called")
 
 // The fake is the same seam the released rig satisfies.
 var _ Launcher = (*fakeLauncher)(nil)

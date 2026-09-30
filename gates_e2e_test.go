@@ -29,7 +29,7 @@ import (
 
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
-	"github.com/looprig/host/internal/harnessadapter"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/host/internal/harnesstest"
 )
 
@@ -229,7 +229,7 @@ type gateE2EWorld struct {
 	adjust func(*host.Composition)
 
 	// decoder, when set, is the block decoder input commands are read with.
-	decoder harnessadapter.BlockDecoder
+	decoder harnessruntime.BlockDecoder
 }
 
 // gateE2ETakeover is a journal leaser under which a later Acquire takes a held
@@ -390,13 +390,13 @@ func (h *heldAttach) finish(t *testing.T) {
 func (w *gateE2EWorld) compose(t *testing.T, generation uint64, hold chan struct{}) (*host.Service, *capturingLauncher) {
 	t.Helper()
 	launcher := &capturingLauncher{rig: gateE2ERig(t, w.journal, w.llm, w.runs, w.ask), holdRestore: hold}
-	var options []harnessadapter.Option
+	var options []harnessruntime.Option
 	if w.decoder != nil {
-		options = append(options, harnessadapter.WithBlockDecoder(w.decoder))
+		options = append(options, harnessruntime.WithBlockDecoder(w.decoder))
 	}
-	adapter, err := harnessadapter.New(launcher, options...)
+	adapter, err := harnessruntime.New(launcher, options...)
 	if err != nil {
-		t.Fatalf("harnessadapter.New: %v", err)
+		t.Fatalf("harnessruntime.New: %v", err)
 	}
 	blueprint := w.fixture.blueprint(t)
 	blueprint.Generation = generation
@@ -885,7 +885,7 @@ func TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor(t *testing.T) {
 	blueprint := world.fixture.blueprint(t)
 	blueprint.Generation = 5
 	launcher := &capturingLauncher{rig: gateE2ERig(t, world.journal, world.llm, world.runs, world.ask)}
-	adapter, err := harnessadapter.New(launcher)
+	adapter, err := harnessruntime.New(launcher)
 	if err != nil {
 		t.Fatal(err)
 	}

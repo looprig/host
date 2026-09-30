@@ -1,4 +1,4 @@
-package harnessadapter_test
+package harnessruntime_test
 
 import (
 	"context"

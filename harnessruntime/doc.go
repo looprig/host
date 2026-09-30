@@ -1,4 +1,4 @@
-// Package harnessadapter binds Host's department seams to the released
+// Package harnessruntime binds Host's department seams to the released
 // github.com/looprig/harness rig and session API (v0.35.0 as pinned).
 //
 // # Step-1 inventory
@@ -242,4 +242,4 @@
 // not the rig's UUID. Closing them needs the identity half of H9 above. This
 // package cannot fix that alone; what changed is that it is no longer the whole
 // of the finding.
-package harnessadapter
+package harnessruntime

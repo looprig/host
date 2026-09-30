@@ -61,7 +61,7 @@ var ErrEmptyBody = errors.New("createbody: the command carries no inline body")
 //
 // ONE ENCODING, NOT TWO, AND THAT IS THE WHOLE POINT OF THE RE-PRESENTATION. A
 // composition names the encoding of a command's private content exactly once
-// (harnessadapter's finding H7), and a create's first message is the same
+// (harnessruntime's finding H7), and a create's first message is the same
 // content an input carries — Core spells both as a JSON block array, and
 // CreateRequest.Blocks and InputRequest.Blocks are the same raw member. The
 // blocks are therefore returned inside the record an input would have arrived
