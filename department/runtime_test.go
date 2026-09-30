@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1872,4 +1873,129 @@ func TestADeclaredRecoveryCapabilityIsRequiredAtLaunch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// releaseProbeSession is a session whose release records the context it was
+// given and fails on demand. It offers both recovery capabilities and every
+// required one except LeaseEpochReporter when withoutEpoch is set, and the
+// recovery pair only when recoverable is set.
+type releaseProbeSession struct {
+	id         uuid.UUID
+	releaseErr error
+
+	mu       sync.Mutex
+	released int
+	ctxErr   error
+}
+
+func (s *releaseProbeSession) ID() uuid.UUID                  { return s.id }
+func (s *releaseProbeSession) WaitIdle(context.Context) error { return nil }
+func (s *releaseProbeSession) Done() <-chan struct{}          { return make(chan struct{}) }
+func (s *releaseProbeSession) SubscribeCommitted(context.Context, sessionwire.EventID) (<-chan sessionwire.EnduringPublication, error) {
+	return nil, errors.New("unused")
+}
+func (s *releaseProbeSession) ApplyCommand(context.Context, department.RuntimeCommand) error {
+	return errors.New("unused")
+}
+func (s *releaseProbeSession) ReleaseResidency(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released++
+	s.ctxErr = ctx.Err()
+	return s.releaseErr
+}
+func (s *releaseProbeSession) releaseSeen() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.released, s.ctxErr
+}
+
+// recoverableProbe adds both recovery capabilities but NO LeaseEpochReporter.
+type recoverableProbe struct{ *releaseProbeSession }
+
+func (recoverableProbe) CloseAttempt(context.Context, sessionwire.CommandID, uuid.UUID, string, string, uint64) error {
+	return nil
+}
+func (recoverableProbe) PersistenceFaulted() <-chan struct{}    { return make(chan struct{}) }
+func (recoverableProbe) PersistenceFault() error                { return nil }
+func (recoverableProbe) AbandonResidency(context.Context) error { return nil }
+
+// unavailableRecovery offers the recovery methods but REPORTS them unavailable,
+// which is how an adapter says a wrapper cannot honour them.
+type unavailableRecovery struct {
+	*faultingSession
+}
+
+func (unavailableRecovery) CloseAttempt(context.Context, sessionwire.CommandID, uuid.UUID, string, string, uint64) error {
+	return department.ErrNoAttemptCloser
+}
+func (unavailableRecovery) AttemptCloserAvailable() bool     { return false }
+func (unavailableRecovery) PersistenceFaultsAvailable() bool { return false }
+
+// EVERY REFUSED LAUNCH IS RELEASED, under a context the launch's cancellation
+// cannot reach, and a release that fails is reported rather than swallowed:
+// the refused session holds a journal lease nobody else can reach.
+func TestARefusedLaunchIsReleasedIndependentlyOfTheLaunchContext(t *testing.T) {
+	t.Parallel()
+
+	declared := pooledCapabilities()
+	declared.Recovery = department.Recovery{AttemptCloser: true, PersistenceFaults: true}
+
+	t.Run("a required capability missing while recovery is present", func(t *testing.T) {
+		t.Parallel()
+		session := &releaseProbeSession{id: rigSessionUUID}
+		target, err := department.NewRigTarget(&testkit.FakeRig{Session: recoverableProbe{session}}, "rig-2026-09", declared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err = target.Create(ctx, launchRequest())
+		var incapable *department.IncapableRuntimeError
+		if !errors.As(err, &incapable) || !slices.Equal(incapable.Missing, []string{"LeaseEpochReporter"}) {
+			t.Fatalf("Create = %v, want IncapableRuntimeError naming LeaseEpochReporter", err)
+		}
+		released, ctxErr := session.releaseSeen()
+		if released != 1 {
+			t.Fatalf("the refused session was released %d times, want once", released)
+		}
+		if ctxErr != nil {
+			t.Errorf("the release ran under a context already done (%v); a cancelled launch must not stop cleanup", ctxErr)
+		}
+	})
+
+	t.Run("a failing release is reported with the refusal", func(t *testing.T) {
+		t.Parallel()
+		releaseFailure := errors.New("the lease store is down")
+		session := &releaseProbeSession{id: rigSessionUUID, releaseErr: releaseFailure}
+		target, err := department.NewRigTarget(&testkit.FakeRig{Session: recoverableProbe{session}}, "rig-2026-09", declared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = target.Create(t.Context(), launchRequest())
+		var incapable *department.IncapableRuntimeError
+		if !errors.As(err, &incapable) {
+			t.Fatalf("Create = %v, want an IncapableRuntimeError", err)
+		}
+		if !errors.Is(err, releaseFailure) {
+			t.Errorf("Create = %v, want it to carry the release failure", err)
+		}
+	})
+
+	t.Run("recovery reported unavailable is refused", func(t *testing.T) {
+		t.Parallel()
+		inner := &faultingSession{FullSession: testkit.NewFullSession(rigSessionUUID), faulted: make(chan struct{})}
+		target, err := department.NewRigTarget(&testkit.FakeRig{Session: unavailableRecovery{inner}}, "rig-2026-09", declared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = target.Create(t.Context(), launchRequest())
+		var incapable *department.IncapableRuntimeError
+		if !errors.As(err, &incapable) || !slices.Equal(incapable.Missing, []string{"declared AttemptCloser absent", "declared PersistenceFaults absent"}) {
+			t.Fatalf("Create = %v, want both declared capabilities refused as absent", err)
+		}
+		if inner.Released() != 1 {
+			t.Errorf("released %d times, want once", inner.Released())
+		}
+	})
 }

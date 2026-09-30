@@ -3,9 +3,11 @@ package department
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -224,10 +226,33 @@ func requireRigIdentity(ctx context.Context, want uuid.UUID, session RigSession)
 	if session.ID() == want {
 		return nil
 	}
-	if releaser, ok := session.(Releaser); ok {
-		_ = releaser.ReleaseResidency(ctx)
+	return errors.Join(ErrRigSessionIdentity, releaseRefused(ctx, session))
+}
+
+// refusedReleaseBound bounds the release of a session a launch refused.
+const refusedReleaseBound = 10 * time.Second
+
+// releaseRefused releases, nonterminally, a session this package refuses to
+// hand to Host, and reports a release that failed.
+//
+// THE CONTEXT IS DETACHED FROM THE LAUNCH'S CANCELLATION and bounded on its
+// own. The refused session holds its runtime's single-writer journal lease and
+// nothing else will ever hold a handle to it — Host registers its runtime
+// cleanup only after a launch succeeds — so a launch whose context was
+// cancelled (the very case that often ends in a refusal) must still give the
+// lease back. A session with no Releaser cannot be released; that is reported
+// too, because silence would read as a clean refusal.
+func releaseRefused(ctx context.Context, session RigSession) error {
+	releaser, ok := session.(Releaser)
+	if !ok {
+		return errors.New("department: the refused session offers no Releaser, so its journal lease could not be given back")
 	}
-	return ErrRigSessionIdentity
+	released, cancel := context.WithTimeout(context.WithoutCancel(ctx), refusedReleaseBound)
+	defer cancel()
+	if err := releaser.ReleaseResidency(released); err != nil {
+		return fmt.Errorf("department: releasing the refused session: %w", err)
+	}
+	return nil
 }
 
 // adaptRigSession discovers the capabilities Host requires and refuses a
@@ -243,9 +268,13 @@ func requireRigIdentity(ctx context.Context, want uuid.UUID, session RigSession)
 // A RECOVERY CAPABILITY THE TARGET DECLARED IS REQUIRED HERE, and only then.
 // declared is the target's Capabilities.Recovery: a declaration the launched
 // session cannot honour is a defect in the target, and host.Compose admitted
-// the target on the strength of it, so the launch is refused with the session
-// RELEASED (nonterminal, best-effort) rather than left holding its journal
-// lease. An undeclared capability stays optional and is forwarded when present.
+// the target on the strength of it, so the launch is refused. An undeclared
+// capability stays optional and is forwarded when present; a wrapper that
+// reports one unavailable (AttemptCloserAvailable, PersistenceFaultsAvailable)
+// is believed over its method set.
+//
+// EVERY REFUSAL HERE RELEASES THE SESSION, under a context detached from the
+// launch's (releaseRefused), and a failed release is joined to the refusal.
 func adaptRigSession(
 	ctx context.Context,
 	sessionID sessionwire.SessionID,
@@ -319,26 +348,35 @@ func adaptRigSession(
 	if capability, ok := session.(AttemptCloser); ok {
 		adapted.closer = capability
 	}
+	// A WRAPPER THAT CANNOT HONOUR THE METHOD SAYS SO. An adapter declares the
+	// method for every session it wraps and reports whether the session beneath
+	// really offers it; believing the method alone would accept a declaration
+	// the runtime cannot keep.
+	if reporter, ok := session.(interface{ AttemptCloserAvailable() bool }); ok && !reporter.AttemptCloserAvailable() {
+		adapted.closer = nil
+	}
 	// OPTIONAL AND FORWARDED, for the closer's reasons: a wrapper that dropped it
 	// would leave every faulted session resident and wedged with the capability
 	// one layer down, and a typed nil would advertise an abandon that panics.
 	if capability, ok := session.(PersistenceFaults); ok {
 		adapted.faults = capability
 	}
-	broken := false
+	if reporter, ok := session.(interface{ PersistenceFaultsAvailable() bool }); ok && !reporter.PersistenceFaultsAvailable() {
+		adapted.faults = nil
+	}
 	if declared.AttemptCloser && adapted.closer == nil {
-		missing, broken = append(missing, "declared AttemptCloser absent"), true
+		missing = append(missing, "declared AttemptCloser absent")
 	}
 	if declared.PersistenceFaults && adapted.faults == nil {
-		missing, broken = append(missing, "declared PersistenceFaults absent"), true
-	}
-	if broken {
-		if releaser, ok := session.(Releaser); ok {
-			_ = releaser.ReleaseResidency(ctx)
-		}
+		missing = append(missing, "declared PersistenceFaults absent")
 	}
 	if len(missing) > 0 {
-		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
+		// EVERY REFUSAL RELEASES, whatever was missing: see releaseRefused.
+		refusal := &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
+		if err := releaseRefused(ctx, session); err != nil {
+			return nil, errors.Join(refusal, err)
+		}
+		return nil, refusal
 	}
 	// LiveOptionsSubscriber is forwarded independently of the older pair, for
 	// the same reason: a wrapper that dropped it would silently turn off tool
