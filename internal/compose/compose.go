@@ -832,7 +832,7 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 	// running on one interrupted its turn and journaled GateResolved{abandoned}
 	// after this Host's publisher had stopped, destroying a permission request
 	// a crash would have preserved (spec gate M1, quality gate F1). Since
-	// v0.16.1 the drain gives such a runtime up crash-equivalently
+	// v0.17.0 the drain gives such a runtime up crash-equivalently
 	// (releaseSession.AbandonResidency): sealed, it writes nothing, it stops,
 	// and it hands its journal lease back, so a successor in THIS process can
 	// restore the session with its gate still open. Until v0.16.0 it was left

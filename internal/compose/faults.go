@@ -147,7 +147,7 @@ func (s *Service) releaseUnusable(ctx context.Context, held *resident, faults de
 		cancel()
 	}
 	held.stopWork()
-	if err := held.residencyOnce.run(func() error { return faults.AbandonResidency(ctx) }); err != nil {
+	if err := held.abandonRuntime(ctx, faults); err != nil {
 		failures = append(failures, err)
 	}
 	if err := (releaseSession{resident: held}).FinishRelease(ctx); err != nil {

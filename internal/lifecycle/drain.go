@@ -32,7 +32,7 @@
 // Session here would therefore be a seam nothing in this module can satisfy.
 // The refusal is RECORDED as its own Failure so a reconciler can find it.
 //
-// THE FALLBACK IT DOES TAKE (v0.16.1) IS NOT SHUTDOWN. A Session offering
+// THE FALLBACK IT DOES TAKE (v0.17.0) IS NOT SHUTDOWN. A Session offering
 // Abandoner is given up crash-equivalently after the refusal: nothing
 // terminal is written, the runtime stops and hands back its journal lease,
 // and an open gate survives for a successor. See Abandoner.
@@ -167,7 +167,7 @@ type ConsumptionHalter interface {
 // a successor restores the session as it restores a crashed Host's, in this
 // process or another.
 //
-// BEFORE v0.16.1 THE REFUSED RUNTIME WAS PARKED instead: left running,
+// BEFORE v0.17.0 THE REFUSED RUNTIME WAS PARKED instead: left running,
 // uncancelled, holding its journal lease until the process exited. That was
 // safe only for a process that exits after Stop (cmd/host); an embedder that
 // stays alive could never restore the session again in-process, and its
@@ -183,7 +183,7 @@ type Abandoner interface {
 
 // ErrNotAbandonable is what an Abandoner returns for a runtime that offers no
 // crash-equivalent release. It is not a failure: the session is reported
-// Parked, as every refused runtime was before v0.16.1.
+// Parked, as every refused runtime was before v0.17.0.
 var ErrNotAbandonable = errors.New("lifecycle: the runtime offers no crash-equivalent release")
 
 // EpochReporter is the optional Session method that names the RESIDENCY epoch

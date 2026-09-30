@@ -274,6 +274,9 @@ type gateE2EOptions struct {
 	// replaySafeAsk makes the Ask tool declare tool.UserInputReplaySafe, as
 	// tools' askuser.AskUser does from tools v0.13.0.
 	replaySafeAsk bool
+	// leaser, when set, wraps the journal's leaser (the lease-release fault
+	// seam). It cannot be combined with takeover.
+	leaser func(storage.Leaser) storage.Leaser
 }
 
 // newGateE2EWorld seeds the session over a runtime journal shaped by options.
@@ -290,11 +293,14 @@ func newGateE2EWorld(t *testing.T, options gateE2EOptions) *gateE2EWorld {
 		}
 		fixture.backend = wrapped
 	}
-	if options.ledger != nil || options.takeover {
+	if options.ledger != nil || options.takeover || options.leaser != nil {
 		base := fixture.journalBackend
 		ledger, leaser := base.Ledger, base.Leaser
 		if options.ledger != nil {
 			ledger = options.ledger(ledger)
+		}
+		if options.leaser != nil {
+			leaser = options.leaser(leaser)
 		}
 		if options.takeover {
 			leaser = &gateE2ETakeover{}
@@ -836,7 +842,7 @@ func TestAnAskUserGateOfAReplayUnsafeToolIsClosedAtRestoreAndSettlesNoOp(t *test
 // TestADrainWithAGateOpenEndsAndLeavesTheGateToASuccessor: a graceful drain of
 // a session parked at a gate is CRASH-EQUIVALENT. harness releases a session
 // nonterminally only when it is whole-session idle, and a session at a gate
-// never is, so the release is refused within the drain's grace. Since v0.16.1
+// never is, so the release is refused within the drain's grace. Since v0.17.0
 // the drain then ABANDONS the refused runtime (department.PersistenceFaults'
 // AbandonResidency): sealed, it writes nothing — no TurnInterrupted, no
 // GateResolved{abandoned} — it stops, and it hands its journal lease back. The

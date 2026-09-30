@@ -729,7 +729,7 @@ func (s *Service) releaseLost(ctx context.Context, held *resident, reason reside
 	abandoned := false
 	if faults, ok := persistenceFaultsFor(held.runtime); ok {
 		abandoned = true
-		if err := held.residencyOnce.run(func() error { return faults.AbandonResidency(ctx) }); err != nil {
+		if err := held.abandonRuntime(ctx, faults); err != nil {
 			failures = append(failures, err)
 		}
 	} else {
