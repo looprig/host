@@ -162,9 +162,9 @@ remains readable. Set `HOST_DRAIN_GRACE` inside the platform's termination grace
 with margin; `HOST_DRAIN_IDLE_BOUNDARY` and `HOST_DRAIN_PUBLISH_BOUND` bound
 parts of that work. `/readyz` reports admission readiness and `/healthz`
 reports process liveness. Releasing a gated runtime gracefully is
-unsupported: since v0.16.1 the drain abandons it crash-equivalently (the gate
+unsupported: since v0.17.0 the drain abandons it crash-equivalently (the gate
 stays open, the journal lease is released), so a process may keep running after
-`Stop` and even restore the session again — see "v0.16.1". A runtime the drain
+`Stop` and even restore the session again — see "Upgrading to v0.17.0". A runtime the drain
 could not abandon is reported in `DrainReport.Parked`; a process with any
 parked session must exit.
 
@@ -185,9 +185,9 @@ publishes a gate. Once a Host has applied a gate response, do not roll it back
 below v0.4.0; after a create or restore disposition, do not roll it back below
 v0.5.0. A cold AskUser answer/resume remains unsupported.
 
-## v0.16.1: a drain abandons a gated runtime instead of parking it
+## Upgrading to v0.17.0: a drain abandons a gated runtime instead of parking it
 
-**Before v0.16.1, `Service.Stop` with an agent awaiting a gate left that runtime
+**Before v0.17.0, `Service.Stop` with an agent awaiting a gate left that runtime
 PARKED** — running, uncancelled, holding its harness journal lease until the
 process exited. harness refuses a graceful release of a session that is not
 whole-session idle, and a session at a gate never is. That was safe for
@@ -207,11 +207,23 @@ released, and a successor — in this process or another — restores the sessio
 with the gate open and answerable. (Plain context cancellation would resolve
 the gate; this does not cancel.)
 
-`DrainReport` gains `Abandoned` and `Parked` (`[]host.DrainSession`). A session
-is **Parked** only when its runtime offers no `department.PersistenceFaults`
-(so cannot be abandoned) or the abandon failed or exceeded its bound (also
-recorded as a `abandon_residency` failure). A parked runtime behaves as before
-v0.16.1, and `Stop` still skips the process-wide context cancellation while any
+`DrainReport` gains `Abandoned` and `Parked` (`[]host.DrainSession`) — additive
+API, hence a minor. A session is **Abandoned** only when the abandon returned
+no error and the runtime's liveness ended. It is **Parked** when its runtime
+offers no `department.PersistenceFaults` (so cannot be abandoned), or the
+abandon returned ANY error or exceeded its bound (also recorded as an
+`abandon_residency` failure): a failed abandon proves nothing about the journal
+lease, so it is never reported Abandoned. An abandon that overruns its bound
+keeps running in the background; `Stop` does not wait for it. **Pin harness ≥
+v0.44.1 with this release**: harness v0.44.0's abandon logged and swallowed a
+failed journal-lease release, so a session could be reported Abandoned with its
+lease still held.
+
+**Size the platform's termination grace above `Drain.Grace` + 2 ×
+`Drain.IdleBoundary`** (`HOST_DRAIN_GRACE`, `HOST_DRAIN_IDLE_BOUNDARY`). A gated
+session's refused release spends the whole grace; its abandon then gets a fresh
+budget of one idle boundary, and one more if it ignores cancellation. A parked runtime behaves as before
+v0.17.0, and `Stop` still skips the process-wide context cancellation while any
 is parked. **An embedder that keeps running must treat a non-empty `Parked` as
 a leak.** Every `harnessruntime.Target` runtime can be abandoned.
 
@@ -450,8 +462,8 @@ or an outage abandon does:
   gate, so a warm release leaves it resident, and **a drain of the Host that
   restored it is crash-equivalent** exactly as a drain of the original Host is:
   the release is refused within the grace, the runtime is left parked, the gate
-  stays projected, and the next Host restores it again. (Since v0.16.1 the
-  refused runtime is abandoned rather than parked; see "v0.16.1".)
+  stays projected, and the next Host restores it again. (Since v0.17.0 the
+  refused runtime is abandoned rather than parked; see "Upgrading to v0.17.0".)
 - A restore may journal `GateResolved{abandoned}` for a restored gate the resumed
   turn did not adopt, so a gate can carry more than one close. The gate projection
   folds closes as a set; a duplicate is a no-op.
@@ -793,9 +805,9 @@ Host back below v0.4.0 (harness v0.35.0) after it has applied one.**
   **A Host that drains with a gate open MUST exit**; `cmd/host` does. Note also
   that `Stop` skips the manager's context cancellation **for the whole
   process** when any one session's release was refused.
-  **Superseded in v0.16.1:** the drain now abandons the refused runtime
+  **Superseded in v0.17.0:** the drain now abandons the refused runtime
   crash-equivalently (stopped, lease released, gate preserved), so only a
-  runtime that cannot be abandoned is still parked; see "v0.16.1".
+  runtime that cannot be abandoned is still parked; see "Upgrading to v0.17.0".
 - **After a restore**, a permission gate is restored open and answerable, but
   the turn that was parked at it is `TurnInterrupted`: the approval is applied
   and nothing runs the tool. An **ask_user** gate is closed at restore

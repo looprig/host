@@ -189,8 +189,15 @@ type LinkOptions struct {
 // DrainOptions bound the drain.
 type DrainOptions struct {
 	// Grace is the platform's termination grace; Run also bounds Stop by it.
+	//
+	// SIZE THE PLATFORM'S TERMINATION GRACE ABOVE Grace + 2×IdleBoundary.
+	// Since v0.17.0 a runtime whose release the drain saw refused (a session
+	// awaiting a gate spends the whole Grace being refused) is then abandoned
+	// under a fresh budget of one IdleBoundary, waited up to one more if the
+	// abandon ignores its cancellation, so Stop can run that much past Grace.
 	Grace time.Duration
-	// IdleBoundary bounds the wait for a session to reach a safe boundary.
+	// IdleBoundary bounds the wait for a session to reach a safe boundary, and
+	// the crash-equivalent abandon of a runtime whose release was refused.
 	IdleBoundary time.Duration
 	// PublishBound bounds the nonaccepting publication.
 	PublishBound time.Duration
@@ -956,7 +963,7 @@ type DrainReport struct {
 	// was then given up crash-equivalently: torn down, its journal lease
 	// released, nothing durable written. An open gate is preserved, and a
 	// successor (in this process or another) restores the session and can
-	// answer it. Since v0.16.1.
+	// answer it. Since v0.17.0.
 	Abandoned []DrainSession
 
 	// Parked are the sessions whose runtime refused its release and could not
