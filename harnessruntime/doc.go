@@ -1,5 +1,59 @@
-// Package harnessruntime binds Host's department seams to the released
-// github.com/looprig/harness rig and session API (v0.35.0 as pinned).
+// Package harnessruntime is the Host runtime backed by harness: it binds Host's
+// department seams to the released github.com/looprig/harness rig and session
+// API, so a product registers a harness rig with Host instead of hand-writing
+// the adapter.
+//
+// # Use
+//
+//	target, err := harnessruntime.Target(
+//	    harnessruntime.RigPerTenant(map[sessionwire.TenantID]*rig.Rig{"acme": acmeRig}),
+//	    "my-product-build-7",           // department.CompatibilityID, product-owned
+//	    department.Capabilities{SupportsPooled: true, AdmissionWeight: 1,
+//	        CaptureSafety: department.CaptureSafetyStreaming},
+//	)
+//	registrar := host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
+//	    return []department.Registration{harnessruntime.Registration("assistant", target)}, nil
+//	})
+//
+// Target declares both recovery capabilities (department.Recovery) because the
+// adapter supplies them by construction, so the target passes host.Compose's
+// default RuntimeProfileDurable. Every session the adapter binds has, and
+// Host sees:
+//
+//   - the six required capabilities, each discovered on harness's own
+//     published interface (a harness signature change is a build failure here);
+//   - session.PersistenceFaultReporter and session.ResidencyAbandoner, REQUIRED
+//     at bind — stricter than department, which treats them as optional;
+//   - department.AttemptCloser, forwarding to harness's
+//     runtimecommand.AttemptCloser, so a successor closes a predecessor's
+//     stranded attempt;
+//   - department.LiveOptionsSubscriber and the older live/reasoning pair, so
+//     host.Composition.LiveText can relay text, reasoning and tool steps;
+//   - EphemeralDrops() uint64, the count of preview frames dropped or refused.
+//
+// Every admitted command crosses with its Principal (all kinds) and Metadata
+// (create and input); a create's first message is re-presented in the
+// input-shaped body the BlockDecoder reads; a gate_response is decoded from
+// Core's stored body; an unresolved PayloadRef is refused (Host resolves
+// referenced bodies before the attempt, see department.RuntimeCommand); and a
+// create launches under the binding's RigSessionID (rig.WithSessionID).
+//
+// # Customisation points
+//
+//   - Per-tenant or per-launch rigs, journal stores and workspaces go through
+//     Rigs: the product assembles each rig with rig.WithSessionStore over the
+//     tenant's harness store, its workspace root, rig.WithToolResultObjects,
+//     presenters, MCP and so on. SharedRig, RigPerTenant and RigsFunc cover the
+//     common shapes. The adapter never opens a store.
+//   - Presenters, live options and tool-result capture are rig and loop
+//     options in the product's Rigs; host.Composition.LiveText decides what
+//     Host relays. There is no presenter option here.
+//   - Body encoding: WithBlockDecoder, only when the product's create/input
+//     body is not Core's InputRequest (the default, DecodeInputBlocks).
+//   - The compatibility id is product-owned.
+//
+// The rest of this comment is the adapter's design record: the inventory of
+// what it binds to and the findings (H1–H9) each non-obvious choice answers.
 //
 // # Step-1 inventory
 //
@@ -160,8 +214,11 @@
 // OPAQUE BYTES. department.RuntimeCommand documents the body as travelling
 // opaque because "Host is not the semantic validator of a command body —
 // Harness is". Admitted.Blocks is []content.Block and Validate refuses an input
-// with none, so somebody must decode. This adapter takes a decoder rather than
-// guessing an encoding, and refuses when it has none.
+// with none, so somebody must decode. This adapter takes a decoder, and since
+// it became public (host v0.16.0) defaults to DecodeInputBlocks — Core's own
+// InputRequest, the body Factory admits — rather than refusing every input a
+// product that named no decoder receives. A bound session with no decoder at
+// all (unreachable through New) still refuses.
 //
 // H8. AN OBJECT-REFERENCED PAYLOAD IS DEREFERENCED BY THE APPLIER, NEVER BY
 // THE ADAPTER. The applier reads and verifies the private body in the command's

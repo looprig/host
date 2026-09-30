@@ -2,7 +2,9 @@ package harnessruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -67,38 +69,79 @@ type Adapter struct {
 // purpose — department.RuntimeCommand says so in as many words — and
 // runtimecommand.Admitted.Validate refuses an input command carrying no
 // content.Block. Those two cannot both hold, so an encoding has to be named
-// somewhere; naming it here rather than inside the adapter keeps it a
-// composition decision, and leaving it unset makes an input command refuse
-// rather than apply an empty turn.
+// somewhere. The default is DecodeInputBlocks, Core's own InputRequest, which
+// is the body Factory admits and the shape Host re-presents a create's first
+// message in; a product names another only when its bodies are not Core's.
 type BlockDecoder func([]byte) ([]content.Block, error)
 
-// Option configures an Adapter.
-type Option func(*Adapter)
+// DecodeInputBlocks strictly decodes Core's InputRequest (the input-shaped body
+// Host re-presents a create in) and unmarshals its Blocks. It is the default so
+// a product that names no decoder gets the byte-identical body Factory
+// admitted, not a refusal.
+//
+// Both halves are Core's own strict decoders: sessionwire.InputRequest refuses
+// an unknown member or a body with no blocks, and content.UnmarshalBlocks
+// decodes every Core block type, so a multi-block or non-text message crosses
+// faithfully.
+func DecodeInputBlocks(body []byte) ([]content.Block, error) {
+	var request sessionwire.InputRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, fmt.Errorf("harnessruntime: the body is not a Core InputRequest: %w", err)
+	}
+	blocks, err := content.UnmarshalBlocks(request.Blocks)
+	if err != nil {
+		return nil, fmt.Errorf("harnessruntime: the body's blocks are not Core content blocks: %w", err)
+	}
+	return blocks, nil
+}
 
-// WithBlockDecoder supplies the decoder an input command's body is read with.
+// Option configures an Adapter. An option that returns an error fails New.
+type Option func(*Adapter) error
+
+// WithBlockDecoder replaces DecodeInputBlocks as the decoder an input command's
+// body, and a create's re-presented first message, is read with. A nil decoder
+// is refused with ErrNilOption rather than silently keeping the default.
 func WithBlockDecoder(decode BlockDecoder) Option {
-	return func(a *Adapter) { a.decode = decode }
+	return func(a *Adapter) error {
+		if decode == nil {
+			return ErrNilOption
+		}
+		a.decode = decode
+		return nil
+	}
 }
 
 // New adapts a rig resolver into the department.Rig Host launches through.
+//
+// Most products want Target instead, which also builds the launch target and
+// declares the recovery capabilities every adapted session offers.
 func New(rigs Rigs, options ...Option) (*Adapter, error) {
-	if rigs == nil {
+	if isNil(rigs) {
 		return nil, ErrNoRigs
 	}
-	adapted := &Adapter{rigs: rigs}
+	if resolver, ok := rigs.(rigsFunc); ok && (resolver.create == nil || resolver.restore == nil) {
+		return nil, ErrNoRigs
+	}
+	adapted := &Adapter{rigs: rigs, decode: DecodeInputBlocks}
 	for _, option := range options {
 		if option == nil {
 			return nil, ErrNilOption
 		}
-		option(adapted)
+		if err := option(adapted); err != nil {
+			return nil, err
+		}
 	}
 	return adapted, nil
 }
 
+// The adapter is the rig Host launches through.
+var _ department.Rig = (*Adapter)(nil)
+
 // ErrNoRigs is the refusal New returns when it is handed no resolver.
 var ErrNoRigs = errors.New("harnessruntime: no rig resolver to adapt")
 
-// ErrNilOption is the refusal New returns for a nil option.
+// ErrNilOption is the refusal New returns for a nil option, or for
+// WithBlockDecoder given a nil decoder.
 var ErrNilOption = errors.New("harnessruntime: a nil option was supplied")
 
 // NewSession launches a session for a create request.
