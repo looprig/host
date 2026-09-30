@@ -2,7 +2,6 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -31,11 +30,15 @@ import (
 //	abandoning --success-->  released
 //	abandoning --failure-->  failed            (terminal)
 //
-// ABANDONING DOMINATES. An abandon requested while a graceful flight runs
-// cancels that flight's context (which ends harness's idle wait; a teardown
-// already begun ignores it), waits for its outcome, and abandons only if it
-// failed. A release requested while abandoning — or after a failed teardown —
-// never issues a release; it joins that flight's outcome.
+// ABANDONING DOMINATES, AND IS REMEMBERED. An abandon requested while a
+// graceful flight runs records abandonPending, cancels that flight's context
+// (which ends harness's idle wait; a teardown already begun ignores it), and
+// waits. The flight's own completion — not any waiter — then starts the
+// abandon if the release failed without tearing the runtime down, in the same
+// critical section that records the failure, so no release can be elected in
+// between and an abandon whose waiter gave up still happens. A release
+// requested while abandoning, while an abandon is pending, or after a failed
+// teardown never issues a release; it joins.
 //
 // EVERY FLIGHT IS AN IMMUTABLE OBJECT created at its election. A waiter keeps
 // the flight it joined and reads only that flight's result, so a later flight
@@ -43,13 +46,13 @@ import (
 // WAITING when it ends; the flight runs on, on a context detached from every
 // caller, and its completion still transitions the phase.
 //
-// SUCCESS IS THE RUNTIME'S OUTCOME, NOT THE CALLER'S DEADLINE. harness v0.45.0
-// finishes a teardown that has begun whatever its caller's context says, and
-// then reports the context's error beside a successful cleanup. So when a call
-// fails with a context error after the runtime's liveness has ended (the
-// teardown began), the outcome is read by joining that teardown with a fresh
-// context: harness answers a join with the teardown's own cleanup result. That
-// second call joins; it does not start a second teardown.
+// SUCCESS IS THE RUNTIME'S OUTCOME. Each flight calls the runtime exactly
+// once, on a context detached from its callers, and takes its result as the
+// outcome: department.Releaser obliges a runtime to report its teardown's own
+// result rather than its caller's deadline (harnessruntime does so for
+// harness by joining a begun teardown itself). An error after the runtime's
+// liveness ended is a teardown that happened and failed: terminal, never
+// retried here.
 //
 // THE TERMINAL SUCCESS RUNS THE REGISTERED onReleased CALLBACKS, outside the
 // lock. The composition registers one that cancels the session context when it
@@ -60,6 +63,10 @@ type teardown struct {
 	phase      teardownPhase
 	flight     *teardownFlight
 	onReleased []func()
+
+	// pendingAbandon, when set while releasing, is the abandon a caller asked
+	// for; the graceful flight's completion starts it if the release failed.
+	pendingAbandon func(context.Context) error
 
 	// waited, when set, runs after a waiter observed its flight complete and
 	// before it reads the result. It exists so a test can hold a waiter at
@@ -99,14 +106,15 @@ type teardownFlight struct {
 
 	// err is written exactly once, before done closes, and never after.
 	err error
+
+	// handedTo is the pending abandon this graceful flight's failure started,
+	// or nil; like err it is set before done closes.
+	handedTo *teardownFlight
 }
 
 // teardownFlightBound is the generous bound on one runtime teardown call. It
 // is a safety net, not a policy: callers bound their own waits.
 const teardownFlightBound = 5 * time.Minute
-
-// teardownJoinBound bounds the join that reads a begun teardown's outcome.
-const teardownJoinBound = time.Minute
 
 // teardownRuntime is what the state machine calls on the runtime.
 type teardownRuntime interface {
@@ -136,21 +144,35 @@ func (t *teardown) whenReleased(callback func()) {
 }
 
 // release gives the runtime up gracefully, or joins the teardown already in
-// flight, waiting for it bounded by ctx.
+// flight, waiting for it bounded by ctx. A graceful flight that failed and
+// handed over to a pending abandon is followed into that abandon, so a caller
+// asking for the runtime to be released learns how its release actually ended.
 func (t *teardown) release(ctx context.Context, runtime teardownRuntime) error {
 	t.mu.Lock()
+	var flight *teardownFlight
 	switch t.phase {
 	case phaseReleased:
 		t.mu.Unlock()
 		return nil
-	case phaseReleasing, phaseAbandoning, phaseFailed:
-		flight := t.flight
+	case phaseAbandoning, phaseFailed:
+		flight = t.flight
 		t.mu.Unlock()
 		return t.wait(ctx, flight)
+	case phaseReleasing:
+		flight = t.flight
+	default:
+		flight = t.electLocked(kindGraceful, ctx, runtime, runtime.ReleaseResidency)
 	}
-	flight := t.electLocked(kindGraceful, ctx, runtime, runtime.ReleaseResidency)
 	t.mu.Unlock()
-	return t.wait(ctx, flight)
+	if err := t.waitFor(ctx, flight); err != nil {
+		return err
+	}
+	// HANDED OVER when this flight's failure started the pending abandon:
+	// follow that abandon. Any other later flight is not this caller's.
+	if flight.err != nil && flight.handedTo != nil {
+		return t.wait(ctx, flight.handedTo)
+	}
+	return flight.err
 }
 
 // abandon gives the runtime up crash-equivalently, waiting bounded by ctx. A
@@ -169,10 +191,11 @@ func (t *teardown) abandon(ctx context.Context, runtime teardownRuntime, faults 
 			return t.wait(ctx, flight)
 		case phaseReleasing:
 			flight := t.flight
+			t.pendingAbandon = faults.AbandonResidency // the flight's completion honours it
 			flight.cancel()
 			t.mu.Unlock()
 			if err := t.waitFor(ctx, flight); err != nil {
-				return err // still in flight past ctx
+				return err // still in flight past ctx; the pending abandon still happens
 			}
 			continue // re-decide under the lock with the flight's outcome in place
 		}
@@ -206,24 +229,26 @@ func (t *teardown) electLocked(kind teardownKind, caller context.Context, runtim
 // run performs one flight's runtime call and transitions the phase.
 func (t *teardown) run(ctx context.Context, flight *teardownFlight, runtime teardownRuntime, call func(context.Context) error) {
 	err := call(ctx)
-	if err != nil && isContextDone(err) && channelClosed(runtime.Done()) {
-		// The teardown began and the call reported its context beside it: read
-		// the teardown's own outcome by joining it.
-		joinCtx, cancel := context.WithTimeout(context.Background(), teardownJoinBound)
-		err = call(joinCtx)
-		cancel()
-	}
 	flight.cancel()
 
 	t.mu.Lock()
 	flight.err = err
 	var callbacks []func()
+	pending := t.pendingAbandon
+	t.pendingAbandon = nil
 	switch {
 	case err == nil:
 		t.phase = phaseReleased
 		callbacks, t.onReleased = t.onReleased, nil
 	case flight.kind == kindGraceful && !channelClosed(runtime.Done()):
-		t.phase = phaseResident // nothing was torn down; a later release may retry
+		if pending != nil {
+			// THE PENDING ABANDON STARTS HERE, in the same critical section
+			// that records the failed release, so no release can win the
+			// interval and no waiter has to be present for it to happen.
+			flight.handedTo = t.electLocked(kindAbandon, context.Background(), runtime, pending)
+		} else {
+			t.phase = phaseResident // nothing was torn down; a later release may retry
+		}
 	default:
 		t.phase = phaseFailed
 	}
@@ -254,11 +279,6 @@ func (t *teardown) waitFor(ctx context.Context, flight *teardownFlight) error {
 	case <-ctx.Done():
 		return fmt.Errorf("compose: the runtime's %s is still in flight: %w", flight.kind, ctx.Err())
 	}
-}
-
-// isContextDone reports whether err carries a context's cancellation or expiry.
-func isContextDone(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // channelClosed reports, without blocking, whether channel is closed.

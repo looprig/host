@@ -398,6 +398,15 @@ type Liveness interface {
 // Releaser releases RESIDENCY, which is nonterminal: the session remains
 // resumable and no SessionStopped is appended. H4.1's shape, including the
 // name, because the name is the part that carries the distinction.
+//
+// THE RESULT MUST BE THE TEARDOWN'S OWN OUTCOME, and this applies equally to
+// PersistenceFaults.AbandonResidency. Host calls each at most once per attempt
+// and never "joins" a teardown by calling again, so a runtime that finishes a
+// begun teardown after its caller's context ended must still report how the
+// teardown went — not the caller's deadline. Host reads an error as a failed
+// release; if the runtime's liveness (Done) has closed by then, the teardown is
+// taken to have happened and failed, and is not retried. harnessruntime meets
+// this for harness by joining a begun teardown itself.
 type Releaser interface {
 	ReleaseResidency(context.Context) error
 }

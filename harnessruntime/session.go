@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -74,8 +75,45 @@ func (s *boundSession) WaitIdle(ctx context.Context) error { return s.idle.WaitI
 func (s *boundSession) Done() <-chan struct{} { return s.live.Done() }
 
 // ReleaseResidency releases residency without terminating the session.
+//
+// IT REPORTS THE TEARDOWN'S OWN OUTCOME, NOT ITS CALLER'S DEADLINE. See
+// teardownOutcome.
 func (s *boundSession) ReleaseResidency(ctx context.Context) error {
-	return classifyLeaseRelease(s.releaser.ReleaseResidency(ctx))
+	return classifyLeaseRelease(s.teardownOutcome(ctx, s.releaser.ReleaseResidency))
+}
+
+// teardownJoinBound bounds the join that reads a begun teardown's result.
+const teardownJoinBound = time.Minute
+
+// teardownOutcome runs one harness teardown call and returns the teardown's
+// own result.
+//
+// harness v0.45.0 finishes a teardown that has begun whatever its caller's
+// context says, then returns the context's error beside the cleanup result, so
+// a caller whose deadline passed mid-teardown is told "context done" about a
+// teardown that may have succeeded. When the call reports a context error AND
+// the session's liveness has ended — the teardown began — this calls again
+// with a fresh bounded context: harness answers a call on a begun teardown by
+// JOINING it and returning its cleanup result, so the second call starts
+// nothing. A refusal before any teardown began (the idle wait ending) is
+// returned as it is.
+//
+// THIS IS HARNESS SEMANTICS AND LIVES HERE, not in Host's runtime-neutral
+// teardown, which never calls a runtime twice: a department runtime owes Host
+// its teardown's own outcome, and this is how the harness adapter pays it.
+func (s *boundSession) teardownOutcome(ctx context.Context, call func(context.Context) error) error {
+	err := call(ctx)
+	if err == nil || !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+	select {
+	case <-s.live.Done():
+	default:
+		return err
+	}
+	joinCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownJoinBound)
+	defer cancel()
+	return call(joinCtx)
 }
 
 // classifyLeaseRelease marks harness's *session.LeaseReleaseError as
@@ -109,7 +147,7 @@ func (s *boundSession) PersistenceFault() error { return s.faults.PersistenceFau
 
 // AbandonResidency gives the runtime up crash-equivalently, writing nothing.
 func (s *boundSession) AbandonResidency(ctx context.Context) error {
-	return classifyLeaseRelease(s.abandoner.AbandonResidency(ctx))
+	return classifyLeaseRelease(s.teardownOutcome(ctx, s.abandoner.AbandonResidency))
 }
 
 // ErrResumeUnsupported is the refusal SubscribeCommitted returns for a non-empty

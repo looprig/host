@@ -159,25 +159,21 @@ func TestAWaiterReadsOnlyItsOwnFlightsResult(t *testing.T) {
 	}
 }
 
-// Codex P2: a teardown that completes after its caller's deadline — harness
-// finishes a begun teardown and reports the context error beside it — was
-// counted a failure, and its session context could not be cancelled once the
-// manager record was pruned. Now the outcome is read by joining the teardown,
-// and the registered callback (the context's cancel) runs on the late success.
+// Codex round 3 P2 / round 4: a teardown that completes after its caller's
+// deadline is counted by the runtime's own outcome, and its session context
+// is still cancelled although the manager record was pruned meanwhile. The
+// runtime reports its own outcome (department.Releaser); Host calls it once.
 func TestALateSuccessIsASuccessAndStillCancels(t *testing.T) {
 	runtime := newScriptedRuntime()
 	begun := make(chan struct{})
 	finish := make(chan struct{})
 	runtime.release = []func(context.Context) error{
 		func(ctx context.Context) error {
-			runtime.tearDown() // the teardown begins: liveness ends
+			runtime.tearDown()
 			close(begun)
-			<-finish // and runs to completion whatever the context says
-			<-ctx.Done()
-			return fmt.Errorf("session: context done: %w", ctx.Err())
+			<-finish // runs to completion whatever the context says
+			return nil
 		},
-		// the join: harness answers it with the teardown's own (clean) result
-		func(context.Context) error { return nil },
 	}
 	var td teardown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,7 +181,7 @@ func TestALateSuccessIsASuccessAndStillCancels(t *testing.T) {
 	go func() { waited <- td.release(ctx, runtime) }()
 	<-begun
 	cancel()
-	if err := <-waited; err == nil || !errors.Is(err, context.Canceled) {
+	if err := <-waited; !errors.Is(err, context.Canceled) {
 		t.Fatalf("the waiter whose context ended got %v, want an in-flight error", err)
 	}
 	cancelled := make(chan struct{})
@@ -196,8 +192,100 @@ func TestALateSuccessIsASuccessAndStillCancels(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the late success did not run the registered cancellation")
 	}
-	if !td.released() {
-		t.Fatal("a teardown that completed cleanly after its caller's deadline was not counted released")
+	if releases, _ := runtime.counts(); !td.released() || releases != 1 {
+		t.Fatalf("released=%v after %d calls, want released after exactly one", td.released(), releases)
+	}
+}
+
+// Codex round 4, finding 1: Host's teardown never calls a runtime twice to
+// "join" it. A runtime that reports its caller's context error after its
+// teardown began — and would reject or repeat a second call — is taken at its
+// word: one call, a failed teardown, no callbacks.
+func TestTheTeardownNeverCallsARuntimeASecondTimeToJoin(t *testing.T) {
+	runtime := newScriptedRuntime()
+	runtime.release = []func(context.Context) error{
+		func(ctx context.Context) error {
+			runtime.tearDown()
+			<-ctx.Done()
+			return fmt.Errorf("context done: %w", ctx.Err())
+		},
+		func(context.Context) error { return errors.New("a second release was issued") },
+	}
+	var td teardown
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan error, 1)
+	go func() { waited <- td.release(ctx, runtime) }()
+	eventually(t, "the release to be issued", func() bool { r, _ := runtime.counts(); return r == 1 })
+	cancel()
+	<-waited
+	ran := false
+	td.whenReleased(func() { ran = true })
+	eventually(t, "the flight to finish", func() bool {
+		td.mu.Lock()
+		defer td.mu.Unlock()
+		return td.phase == phaseFailed
+	})
+	if releases, _ := runtime.counts(); releases != 1 || td.released() || ran {
+		t.Fatalf("releases=%d released=%v callback=%v, want one call, not released, no callback", releases, td.released(), ran)
+	}
+	if err := td.release(context.Background(), runtime); err == nil {
+		t.Fatal("a release after the failed teardown reported success")
+	}
+	if releases, _ := runtime.counts(); releases != 1 {
+		t.Fatalf("a failed teardown was retried: %d calls", releases)
+	}
+}
+
+// Codex round 4, finding 2: an abandon requested during a graceful flight is
+// REMEMBERED. Its waiter may give up, and a release may be requested in the
+// meantime; when the flight fails, its own completion starts the abandon.
+func TestAPendingAbandonHappensAfterItsWaiterGaveUp(t *testing.T) {
+	runtime := newScriptedRuntime()
+	never := make(chan struct{})
+	runtime.release = []func(context.Context) error{blocking(never, false, nil)}
+	gate := make(chan struct{})
+	runtime.abandon = []func(context.Context) error{blocking(gate, true, func(context.Context) error { runtime.tearDown(); return nil })}
+	var td teardown
+
+	// The graceful flight is elected by a caller that will outlast everything.
+	releaser := make(chan error, 1)
+	holdRelease := make(chan struct{})
+	td.waited = func(*teardownFlight) {}
+	go func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { <-holdRelease; cancel() }()
+		releaser <- td.release(ctx, runtime)
+	}()
+	eventually(t, "the release to be issued", func() bool { r, _ := runtime.counts(); return r == 1 })
+
+	// The abandon's waiter gives up at once; the release it cancelled then
+	// fails. Meanwhile another release is requested: it must join, not elect.
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+	if err := td.abandon(expired, runtime, runtime); err == nil {
+		t.Fatal("an abandon whose waiter expired reported an outcome")
+	}
+	joined := make(chan error, 1)
+	go func() { joined <- td.release(context.Background(), runtime) }()
+	eventually(t, "the pending abandon to be issued by the flight's completion", func() bool { _, a := runtime.counts(); return a == 1 })
+	if releases, _ := runtime.counts(); releases != 1 {
+		t.Fatalf("a release won the interval: %d releases issued", releases)
+	}
+	ran := make(chan struct{})
+	td.whenReleased(func() { close(ran) })
+	close(gate)
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending abandon's success did not run the callback")
+	}
+	close(holdRelease)
+	if err := <-releaser; err != nil {
+		t.Fatalf("the release whose flight handed over to the abandon = %v, want the abandon's success", err)
+	}
+	if err := <-joined; err != nil {
+		t.Fatalf("the release requested during the pending abandon = %v, want the abandon's success", err)
 	}
 }
 
@@ -217,8 +305,8 @@ func TestReleaseAndAbandonAreElectedAsOne(t *testing.T) {
 		if err := td.abandon(context.Background(), runtime, runtime); err != nil {
 			t.Fatalf("abandon = %v", err)
 		}
-		if err := <-released; err == nil {
-			t.Fatal("the cancelled graceful release reported success")
+		if err := <-released; err != nil {
+			t.Fatalf("the release that handed over to the abandon = %v, want its success", err)
 		}
 		if releases, abandons := runtime.counts(); releases != 1 || abandons != 1 || !td.released() {
 			t.Fatalf("releases=%d abandons=%d released=%v, want 1, 1, true", releases, abandons, td.released())
