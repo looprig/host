@@ -150,6 +150,9 @@ type resident struct {
 	beginOnce      onceOnSuccess
 	finishOnce     onceOnSuccess
 	residencyOnce  onceOnSuccess
+
+	// release is the in-flight graceful release; see ReleaseResidency.
+	release releaseFlight
 }
 
 // onceOnSuccess runs an action at most once SUCCESSFULLY, serializing concurrent
@@ -226,9 +229,96 @@ func (r *resident) Checkpoint(ctx context.Context) error {
 // HEARTBEAT is deliberately not stopped here: the release is not finished, and
 // the two remaining durable writes — the tombstone and, on a drain, the lease
 // release — go through it.
+//
+// THE RUNTIME'S RELEASE NEVER HOLDS A CALLER PAST ITS CONTEXT, and never races
+// an abandon. harness joins a teardown already underway with an unconditional
+// wait that the caller's context does not interrupt, so a graceful release
+// issued while a give-up's abandon runs (a fault, a lost grant) would block
+// the drain until that abandon finished — however long it overran. So:
+//
+//   - if an abandon flight exists, no release is issued at all: the caller
+//     waits on THAT flight, bounded by ctx, and gets its outcome or an
+//     in-flight error (the drain then reports the session Parked);
+//   - otherwise the release runs on its own goroutine as a single flight
+//     (concurrent callers share it; a failed one may be retried by a later
+//     caller, as residencyOnce allowed), and a caller whose context ends stops
+//     waiting with an in-flight error rather than joining it unboundedly.
+//
+// Success — the runtime released — is still recorded in residencyOnce, and only
+// then; runtimeReleased reads it without waiting on any flight.
 func (r *resident) ReleaseResidency(ctx context.Context) error {
 	r.stopWork()
-	return r.residencyOnce.run(func() error { return r.runtime.ReleaseResidency(ctx) })
+	if r.runtimeReleased() {
+		return nil
+	}
+	if done := r.abandonStarted(); done != nil {
+		return r.awaitAbandon(ctx, done)
+	}
+	r.release.mu.Lock()
+	if !r.release.running {
+		r.release.running = true
+		r.release.done = make(chan struct{})
+		// The release belongs to the residency once issued; its caller's
+		// context still bounds the runtime's own idle wait.
+		// #nosec G118 -- the flight outlives a caller that stops waiting.
+		go r.runRelease(ctx)
+	}
+	done := r.release.done
+	r.release.mu.Unlock()
+	select {
+	case <-done:
+		r.release.mu.Lock()
+		defer r.release.mu.Unlock()
+		return r.release.err
+	case <-ctx.Done():
+		return fmt.Errorf("compose: the runtime's release is still in flight: %w", ctx.Err())
+	}
+}
+
+// releaseFlight is one in-flight graceful release of the runtime.
+type releaseFlight struct {
+	mu      sync.Mutex
+	running bool
+	done    chan struct{}
+	err     error
+}
+
+// runRelease performs one graceful release and publishes its outcome.
+func (r *resident) runRelease(ctx context.Context) {
+	err := r.runtime.ReleaseResidency(ctx)
+	if err == nil {
+		r.residencyOnce.mu.Lock()
+		r.residencyOnce.done = true
+		r.residencyOnce.mu.Unlock()
+	}
+	r.release.mu.Lock()
+	r.release.err = err
+	r.release.running = false
+	close(r.release.done)
+	r.release.mu.Unlock()
+}
+
+// abandonStarted returns the abandon flight's completion channel, or nil when
+// no abandon has begun.
+func (r *resident) abandonStarted() chan struct{} {
+	r.abandon.mu.Lock()
+	defer r.abandon.mu.Unlock()
+	if !r.abandon.started {
+		return nil
+	}
+	return r.abandon.done
+}
+
+// awaitAbandon waits, bounded by ctx, for the abandon flight to finish.
+func (r *resident) awaitAbandon(ctx context.Context, done chan struct{}) error {
+	select {
+	case <-done:
+		r.abandon.mu.Lock()
+		defer r.abandon.mu.Unlock()
+		return r.abandon.err
+	case <-ctx.Done():
+		return fmt.Errorf("compose: the runtime's abandon is still in flight: %w", ctx.Err())
+	}
 }
 
 // sharedOnce runs one action once and hands every caller its completion and its
@@ -455,14 +545,7 @@ func (r *resident) abandonRuntime(ctx context.Context, faults department.Persist
 	}
 	done := r.abandon.done
 	r.abandon.mu.Unlock()
-	select {
-	case <-done:
-		r.abandon.mu.Lock()
-		defer r.abandon.mu.Unlock()
-		return r.abandon.err
-	case <-ctx.Done():
-		return fmt.Errorf("compose: the runtime's abandon is still in flight: %w", ctx.Err())
-	}
+	return r.awaitAbandon(ctx, done)
 }
 
 // runAbandon performs the one abandon and publishes its outcome.

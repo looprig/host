@@ -133,3 +133,97 @@ func TestComposedStopReportsASuccessfulAbandon(t *testing.T) {
 		t.Fatalf("Abandoned = %+v, Parked = %+v, want the session abandoned", report.Abandoned, report.Parked)
 	}
 }
+
+// joiningSession is a runtime that faults, whose crash-equivalent abandon
+// ignores its context until unblocked, and whose graceful release — once an
+// abandon has begun — JOINS that teardown and waits for it regardless of its
+// own context, as harness v0.45.0's does (an unconditional wait on the running
+// cleanup).
+type joiningSession struct {
+	*testkit.FullSession
+	faulted  chan struct{}
+	unblock  chan struct{}
+	abandons atomic.Int32
+	releases atomic.Int32
+}
+
+func (s *joiningSession) PersistenceFaulted() <-chan struct{} { return s.faulted }
+func (s *joiningSession) PersistenceFault() error {
+	return errors.New("injected journal append failure")
+}
+func (s *joiningSession) AbandonResidency(context.Context) error {
+	s.abandons.Add(1)
+	<-s.unblock
+	s.Stop()
+	return nil
+}
+func (s *joiningSession) ReleaseResidency(context.Context) error {
+	s.releases.Add(1)
+	if s.abandons.Load() > 0 {
+		<-s.unblock // joins the running teardown; its context cannot end this
+	}
+	return nil
+}
+
+// AN ABANDON A GIVE-UP STARTED MUST NOT HOLD STOP EITHER. A persistence fault
+// starts the crash-equivalent abandon while the session is still resident; it
+// overruns. The drain then reaches the same session, and a graceful release
+// issued synchronously would join that teardown and wait for it forever. The
+// drain waits on the one abandon flight, bounded, and reports the session
+// Parked.
+func TestComposedStopReturnsWhenAGiveUpAbandonOverruns(t *testing.T) {
+	runtime := &joiningSession{faulted: make(chan struct{}), unblock: make(chan struct{})}
+	t.Cleanup(func() { close(runtime.unblock) })
+	f := newComposeFixture(t)
+	runtime.FullSession = f.session
+	f.rig.Session = runtime
+	f.seedDispositionSession(t, f.otherParty(t), composeSession)
+	blueprint := f.blueprint(t)
+	blueprint.Drain = host.DrainOptions{Grace: time.Second, IdleBoundary: 200 * time.Millisecond, PublishBound: 500 * time.Millisecond}
+	service, err := host.Compose(t.Context(), blueprint)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	if err := service.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := attachAsFactoryDoes(t, service); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	close(runtime.faulted)
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.abandons.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the fault did not start the give-up's abandon")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	stopped := make(chan host.DrainReport, 1)
+	go func() {
+		report, err := service.Stop(ctx)
+		if err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+		stopped <- report
+	}()
+	var report host.DrainReport
+	select {
+	case report = <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return: the drain joined a give-up's overrunning abandon")
+	}
+	want := []host.DrainSession{{TenantID: composeTenant, SessionID: composeSession}}
+	if !slices.Equal(report.Parked, want) || len(report.Abandoned) != 0 {
+		t.Fatalf("Parked = %+v, Abandoned = %+v, want the session parked", report.Parked, report.Abandoned)
+	}
+	if runtime.releases.Load() != 0 {
+		t.Errorf("the drain issued %d graceful releases into a runtime already being abandoned", runtime.releases.Load())
+	}
+	if runtime.abandons.Load() != 1 {
+		t.Errorf("abandoned %d times, want the one give-up flight", runtime.abandons.Load())
+	}
+}
