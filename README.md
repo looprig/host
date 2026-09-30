@@ -214,7 +214,9 @@ offers no `department.PersistenceFaults` (so cannot be abandoned), or the
 abandon returned ANY error or exceeded its bound (also recorded as an
 `abandon_residency` failure): a failed abandon proves nothing about the journal
 lease, so it is never reported Abandoned. An abandon that overruns its bound
-keeps running in the background; `Stop` does not wait for it. **Requires harness ≥
+keeps running in the background; `Stop` does not wait for it. `Parked` is a
+snapshot at report time: a teardown that later succeeds still has its session
+context cancelled, and the late success is logged at INFO. **Requires harness ≥
 v0.45.0** (pinned): harness v0.44.0's teardown logged and swallowed a failed
 journal-lease release, so a session could be reported Abandoned with its lease
 still held. v0.45.0 returns `*session.LeaseReleaseError` from

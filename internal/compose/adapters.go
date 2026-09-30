@@ -830,7 +830,11 @@ func (s *Service) forget(key registry.Key, generation uint64) {
 		delete(s.sessions, key)
 	}
 	s.mu.Unlock()
-	s.manager.EndResidency(key, generation, current && held.runtimeReleased())
+	if current {
+		s.endResidency(held)
+		return
+	}
+	s.manager.EndResidency(key, generation, false)
 }
 
 // forgetReleased is forget for a residency whose runtime is KNOWN to have
@@ -838,10 +842,16 @@ func (s *Service) forget(key registry.Key, generation uint64) {
 // handle the key maps to now.
 func (s *Service) forgetReleased(key registry.Key, generation uint64) {
 	s.mu.Lock()
-	if held, present := s.sessions[key]; present && held.generation == generation {
+	held, present := s.sessions[key]
+	current := present && held.generation == generation
+	if current {
 		delete(s.sessions, key)
 	}
 	s.mu.Unlock()
+	if current {
+		s.endResidency(held)
+		return
+	}
 	s.manager.EndResidency(key, generation, true)
 }
 
@@ -858,7 +868,35 @@ func (s *Service) forgetResident(held *resident) {
 		delete(s.sessions, held.key)
 	}
 	s.mu.Unlock()
-	s.manager.EndResidency(held.key, held.generation, held.runtimeReleased())
+	s.endResidency(held)
+}
+
+// endResidency prunes the Manager's record of a residency and hands its
+// session-context cancellation to the residency's teardown, which runs it the
+// moment the runtime has released — now, or LATER.
+//
+// A LATE SUCCESS STILL CANCELS. A drain that gave up waiting reports the
+// session Parked and prunes the record; before, a runtime that finished
+// tearing down after that kept its session context uncancelled forever,
+// because the pruned record was the only handle on it. The cancellation now
+// outlives the record, and the late success is logged.
+func (s *Service) endResidency(held *resident) {
+	cancel, pruned := s.manager.PruneResidency(held.key, held.generation)
+	if !pruned {
+		return
+	}
+	if held.runtimeReleased() {
+		cancel()
+		return
+	}
+	held.teardown.whenReleased(func() {
+		cancel()
+		s.options.logger().LogAttrs(context.Background(), slog.LevelInfo,
+			"host: a runtime reported still tearing down has now released; its session context is cancelled",
+			slog.String("tenant_id", string(held.key.TenantID)),
+			slog.String("session_id", string(held.key.SessionID)),
+			slog.Uint64("generation", held.generation))
+	})
 }
 
 // leaseFor returns the residency grant recorded for a key by the lease recorder.

@@ -972,6 +972,11 @@ type DrainReport struct {
 	// journal lease until the process exits, so a process that stays alive
 	// after Stop cannot restore these sessions and should treat a non-empty
 	// Parked as a leak. The abandon failure, if any, is also in Failures.
+	//
+	// PARKED IS A SNAPSHOT AT REPORT TIME. A teardown that was still in flight
+	// when the drain gave up waiting keeps running; if it later succeeds, the
+	// session context is cancelled then and the success is logged, but this
+	// report is not revised.
 	Parked []DrainSession
 }
 

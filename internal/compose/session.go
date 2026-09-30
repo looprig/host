@@ -3,7 +3,6 @@ package compose
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -137,10 +136,6 @@ type resident struct {
 	// once, whether a persistence fault or a stranded attempt reported it first.
 	giveUpOnce sync.Once
 
-	// abandon is the ONE crash-equivalent abandon of this residency's runtime,
-	// shared by the drain and the give-up paths; see abandonRuntime.
-	abandon abandonFlight
-
 	// drainHalted records that a drain halted this session's consumer. It is
 	// never cleared: no drain path returns a session to resident, so a warm
 	// release racing the drain must not Resume what the drain halted.
@@ -149,10 +144,9 @@ type resident struct {
 	checkpointOnce onceOnSuccess
 	beginOnce      onceOnSuccess
 	finishOnce     onceOnSuccess
-	residencyOnce  onceOnSuccess
 
-	// release is the in-flight graceful release; see ReleaseResidency.
-	release releaseFlight
+	// teardown is the runtime's release and abandon, as one state machine.
+	teardown teardown
 }
 
 // onceOnSuccess runs an action at most once SUCCESSFULLY, serializing concurrent
@@ -230,95 +224,13 @@ func (r *resident) Checkpoint(ctx context.Context) error {
 // the two remaining durable writes — the tombstone and, on a drain, the lease
 // release — go through it.
 //
-// THE RUNTIME'S RELEASE NEVER HOLDS A CALLER PAST ITS CONTEXT, and never races
-// an abandon. harness joins a teardown already underway with an unconditional
-// wait that the caller's context does not interrupt, so a graceful release
-// issued while a give-up's abandon runs (a fault, a lost grant) would block
-// the drain until that abandon finished — however long it overran. So:
-//
-//   - if an abandon flight exists, no release is issued at all: the caller
-//     waits on THAT flight, bounded by ctx, and gets its outcome or an
-//     in-flight error (the drain then reports the session Parked);
-//   - otherwise the release runs on its own goroutine as a single flight
-//     (concurrent callers share it; a failed one may be retried by a later
-//     caller, as residencyOnce allowed), and a caller whose context ends stops
-//     waiting with an in-flight error rather than joining it unboundedly.
-//
-// Success — the runtime released — is still recorded in residencyOnce, and only
-// then; runtimeReleased reads it without waiting on any flight.
+// THE RUNTIME'S RELEASE IS THE TEARDOWN STATE MACHINE'S (see teardown): it is
+// elected atomically with every success check and with any abandon, it never
+// holds a caller past its context, and it never issues a release into an
+// abandon in progress — it joins that abandon instead.
 func (r *resident) ReleaseResidency(ctx context.Context) error {
 	r.stopWork()
-	if r.runtimeReleased() {
-		return nil
-	}
-	if done := r.abandonStarted(); done != nil {
-		return r.awaitAbandon(ctx, done)
-	}
-	r.release.mu.Lock()
-	if !r.release.running {
-		r.release.running = true
-		r.release.done = make(chan struct{})
-		// The release belongs to the residency once issued; its caller's
-		// context still bounds the runtime's own idle wait.
-		// #nosec G118 -- the flight outlives a caller that stops waiting.
-		go r.runRelease(ctx)
-	}
-	done := r.release.done
-	r.release.mu.Unlock()
-	select {
-	case <-done:
-		r.release.mu.Lock()
-		defer r.release.mu.Unlock()
-		return r.release.err
-	case <-ctx.Done():
-		return fmt.Errorf("compose: the runtime's release is still in flight: %w", ctx.Err())
-	}
-}
-
-// releaseFlight is one in-flight graceful release of the runtime.
-type releaseFlight struct {
-	mu      sync.Mutex
-	running bool
-	done    chan struct{}
-	err     error
-}
-
-// runRelease performs one graceful release and publishes its outcome.
-func (r *resident) runRelease(ctx context.Context) {
-	err := r.runtime.ReleaseResidency(ctx)
-	if err == nil {
-		r.residencyOnce.mu.Lock()
-		r.residencyOnce.done = true
-		r.residencyOnce.mu.Unlock()
-	}
-	r.release.mu.Lock()
-	r.release.err = err
-	r.release.running = false
-	close(r.release.done)
-	r.release.mu.Unlock()
-}
-
-// abandonStarted returns the abandon flight's completion channel, or nil when
-// no abandon has begun.
-func (r *resident) abandonStarted() chan struct{} {
-	r.abandon.mu.Lock()
-	defer r.abandon.mu.Unlock()
-	if !r.abandon.started {
-		return nil
-	}
-	return r.abandon.done
-}
-
-// awaitAbandon waits, bounded by ctx, for the abandon flight to finish.
-func (r *resident) awaitAbandon(ctx context.Context, done chan struct{}) error {
-	select {
-	case <-done:
-		r.abandon.mu.Lock()
-		defer r.abandon.mu.Unlock()
-		return r.abandon.err
-	case <-ctx.Done():
-		return fmt.Errorf("compose: the runtime's abandon is still in flight: %w", ctx.Err())
-	}
+	return r.teardown.release(ctx, r.runtime)
 }
 
 // sharedOnce runs one action once and hands every caller its completion and its
@@ -337,12 +249,8 @@ func (o *sharedOnce) run(action func() error) error {
 }
 
 // runtimeReleased reports whether the runtime was released or abandoned, so
-// the session context it runs on may be cancelled.
-func (r *resident) runtimeReleased() bool {
-	r.residencyOnce.mu.Lock()
-	defer r.residencyOnce.mu.Unlock()
-	return r.residencyOnce.done
-}
+// the session context it runs on may be cancelled. It never waits.
+func (r *resident) runtimeReleased() bool { return r.teardown.released() }
 
 // stopWork ends the consumer and the tail, once.
 func (r *resident) stopWork() {
@@ -487,10 +395,10 @@ func (s releaseSession) ResidencyEpoch() uint64 {
 // IT IS THE FAULT PATH'S ABANDON (releaseUnusable), reached from the drain: the
 // runtime seals its durable writes, stops and hands its journal lease back,
 // writing nothing — so a gate open when the drain began stays open in the
-// journal and the projection, for a successor to restore and answer. It is
-// abandonRuntime's single flight, so a caller that stops waiting (the drain's
-// bound) leaves the abandon running without holding anything FinishRelease
-// needs; see abandonRuntime.
+// journal and the projection, for a successor to restore and answer. It is the
+// teardown state machine's abandon, so a caller that stops waiting (the
+// drain's bound) leaves it running without holding anything FinishRelease
+// needs, and its late success still cancels the session context.
 //
 // A runtime without the capability is ErrNotAbandonable: the drain reports it
 // Parked, as every refused runtime was before v0.17.0.
@@ -502,68 +410,11 @@ func (s releaseSession) AbandonResidency(ctx context.Context) error {
 	return s.abandonRuntime(ctx, faults)
 }
 
-// abandonFlight is one residency's crash-equivalent abandon: started once, run
-// on its own goroutine, observed by every caller.
-type abandonFlight struct {
-	mu      sync.Mutex
-	started bool
-	done    chan struct{}
-	err     error
-}
-
-// abandonRuntime abandons the runtime once, waits for it — bounded by ctx —
-// and reports its outcome, or that it is still in flight.
-//
-// THE ABANDON RUNS OUTSIDE EVERY LOCK THIS RESIDENCY'S RELEASE STEPS TAKE. An
-// earlier version ran it inside residencyOnce, whose mutex runtimeReleased
-// also takes: an abandon that overran its bound (harness tears down on a
-// private background context, so cancellation cannot shorten it) blocked
-// FinishRelease on that mutex after the drain had already given up, and Stop
-// never returned. Now the abandon runs on its own goroutine; a caller whose
-// context ends stops WAITING and is told it is still in flight, which the
-// drain reports as Parked; FinishRelease reads runtimeReleased without waiting
-// and so treats an in-flight abandon as parked (no context cancellation).
-//
-// THE ABANDON ITSELF IS NOT CANCELLED when a waiter gives up: a half-abandoned
-// runtime is worse than either outcome, and harness's teardown does not honour
-// cancellation anyway. Success is recorded in residencyOnce — the runtime is
-// released — only after the abandon returned nil AND the runtime's liveness
-// ended; an error, however partial, is never success, because nothing then
-// proves the journal lease was handed back.
+// abandonRuntime abandons the runtime crash-equivalently through the teardown
+// state machine, waiting bounded by ctx. The drain and both give-up paths come
+// through here, so there is one abandon however many ask for it.
 func (r *resident) abandonRuntime(ctx context.Context, faults department.PersistenceFaults) error {
-	if r.runtimeReleased() {
-		return nil
-	}
-	r.abandon.mu.Lock()
-	if !r.abandon.started {
-		r.abandon.started = true
-		r.abandon.done = make(chan struct{})
-		// The abandon belongs to the residency, not to the caller that happened
-		// to start it: see above.
-		// #nosec G118 -- cancellation must not interrupt a crash-equivalent teardown.
-		go r.runAbandon(faults)
-	}
-	done := r.abandon.done
-	r.abandon.mu.Unlock()
-	return r.awaitAbandon(ctx, done)
-}
-
-// runAbandon performs the one abandon and publishes its outcome.
-func (r *resident) runAbandon(faults department.PersistenceFaults) {
-	err := faults.AbandonResidency(context.Background())
-	if err == nil {
-		// Torn down means the runtime's liveness has ended; harness returns
-		// only after teardown, and this makes that a checked property rather
-		// than an assumed one.
-		<-r.runtime.Done()
-		r.residencyOnce.mu.Lock()
-		r.residencyOnce.done = true
-		r.residencyOnce.mu.Unlock()
-	}
-	r.abandon.mu.Lock()
-	r.abandon.err = err
-	close(r.abandon.done)
-	r.abandon.mu.Unlock()
+	return r.teardown.abandon(ctx, r.runtime, faults)
 }
 
 // FinishRelease writes the tombstone, ends the heartbeat, releases the residency
@@ -593,7 +444,7 @@ func (s releaseSession) FinishRelease(ctx context.Context) error {
 	// left parked. The lost and fault paths reach
 	// this method with no service and prune through Service.forget instead.
 	if s.service != nil {
-		s.service.manager.EndResidency(s.key, s.generation, s.runtimeReleased())
+		s.service.endResidency(s.resident)
 	}
 	return errors.Join(failures...)
 }

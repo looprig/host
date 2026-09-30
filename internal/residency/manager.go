@@ -913,6 +913,19 @@ func (m *Manager) Close() {
 // of the same key reached step 8 first, the older record was moved aside rather
 // than overwritten, and it is pruned — and cancelled on the same rule — here.
 func (m *Manager) EndResidency(key registry.Key, generation uint64, runtimeReleased bool) bool {
+	cancel, pruned := m.PruneResidency(key, generation)
+	if pruned && runtimeReleased {
+		cancel()
+	}
+	return pruned
+}
+
+// PruneResidency is EndResidency that hands the session context's
+// cancellation to the caller instead of deciding it now. A caller whose
+// runtime may still finish tearing down LATER keeps it and cancels then; the
+// record itself is pruned at once, fenced by generation exactly as
+// EndResidency is.
+func (m *Manager) PruneResidency(key registry.Key, generation uint64) (context.CancelFunc, bool) {
 	m.mu.Lock()
 	record, held := m.sessions[key]
 	switch {
@@ -923,15 +936,12 @@ func (m *Manager) EndResidency(key registry.Key, generation uint64, runtimeRelea
 		record, held = m.overtaken[aside]
 		if !held {
 			m.mu.Unlock()
-			return false
+			return nil, false
 		}
 		delete(m.overtaken, aside)
 	}
 	m.mu.Unlock()
-	if runtimeReleased {
-		record.cancel()
-	}
-	return true
+	return record.cancel, true
 }
 
 // Attach creates or restores a session under its lease and reports the
