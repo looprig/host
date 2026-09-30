@@ -117,6 +117,9 @@ func importVerdict(fileRelative, importPath string) (bool, string) {
 		if reason, forbidden := forbiddenLooprigModules[module]; forbidden {
 			return false, reason
 		}
+		if module == "harness" && underDirectory(fileRelative, departmentDir) {
+			return false, "department declares what Host requires of a runtime in Host's own vocabulary, so any runtime can satisfy it; the harness binding is harnessruntime's, and a harness import here would make every product's runtime seam a harness one"
+		}
 		return true, ""
 	}
 	if isCentrifugal(segments) {
@@ -126,6 +129,18 @@ func importVerdict(fileRelative, importPath string) (bool, string) {
 		return false, "Centrifuge is permitted only under " + centrifugeExemptDir + "/ at the host module root, and this file is outside it"
 	}
 	return true, ""
+}
+
+// departmentDir is Host's runtime seam, including its departmenttest
+// conformance, which must stay harness-free so it can check any runtime.
+const departmentDir = "department"
+
+// underDirectory reports whether fileRelative lies inside dir, compared by
+// segment so a sibling whose name merely begins with dir is outside it.
+func underDirectory(fileRelative, dir string) bool {
+	scope := strings.Split(dir, "/")
+	segments := strings.Split(path.Clean(fileRelative), "/")
+	return len(segments) > len(scope) && slices.Equal(segments[:len(scope)], scope)
 }
 
 // looprigModule returns the looprig module name a segmented import path names.
@@ -289,7 +304,9 @@ func TestImportClassification(t *testing.T) {
 		{name: "core sessionwire", file: "host.go", imp: "github.com/looprig/core/sessionwire/v1", allow: true},
 		{name: "storage", file: "host.go", imp: "github.com/looprig/storage", allow: true},
 		{name: "sessionstore", file: "host.go", imp: "github.com/looprig/sessionstore", allow: true},
-		{name: "harness", file: "department/runtime.go", imp: "github.com/looprig/harness", allow: true},
+		{name: "harness in harnessruntime", file: "harnessruntime/rig.go", imp: "github.com/looprig/harness/pkg/rig", allow: true},
+		{name: "harness at the root", file: "host.go", imp: "github.com/looprig/harness/pkg/sessionstore", allow: true},
+		{name: "harness in a department-prefixed sibling", file: "departments/x.go", imp: "github.com/looprig/harness", allow: true},
 		{name: "own module", file: "host.go", imp: "github.com/looprig/host/department", allow: true},
 		{name: "drain", file: "internal/lifecycle/drain.go", imp: "github.com/looprig/drain", allow: true},
 		{name: "ordinary third party", file: "internal/service/service.go", imp: "golang.org/x/sync/errgroup", allow: true},
@@ -315,6 +332,11 @@ func TestImportClassification(t *testing.T) {
 		{name: "capstan", file: "host.go", imp: "github.com/looprig/capstan", allow: false},
 		{name: "tests", file: "host.go", imp: "github.com/looprig/tests/harnessfake", allow: false},
 		{name: "cgo pseudo-package", file: "host.go", imp: "C", allow: false},
+		// department is Host's runtime seam and stays harness-free; so does
+		// its exported conformance, which must be able to check any runtime.
+		{name: "harness in department", file: "department/runtime.go", imp: "github.com/looprig/harness", allow: false},
+		{name: "harness package in a department test", file: "department/runtime_test.go", imp: "github.com/looprig/harness/pkg/session", allow: false},
+		{name: "harness in departmenttest", file: "department/departmenttest/conformance.go", imp: "github.com/looprig/harness/pkg/runtimecommand", allow: false},
 
 		// Centrifuge: scoped by path, structurally.
 		{name: "centrifuge in hostlink", file: centrifugeExemptDir + "/centrifuge.go", imp: "github.com/centrifugal/centrifuge", allow: true},

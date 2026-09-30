@@ -2123,14 +2123,19 @@ func TestTheSnapshotCopiesEverythingItsSourcesCanHold(t *testing.T) {
 	// the whole package. A guard whose detecting code only the payload reaches
 	// is a guard nobody has tested, which is the third time that shape has
 	// turned up in this file.
+	type nestedValue struct {
+		Fine  bool
+		Slice []string
+	}
 	type referenceBearing struct {
 		Fine    bool
 		Slice   []string
 		Map     map[string]int
 		Pointer *int
+		Nested  nestedValue
 	}
-	if got := referenceFields(reflect.TypeOf(referenceBearing{})); !slices.Equal(got, []string{"Map", "Pointer", "Slice"}) {
-		t.Errorf("referenceFields over a struct carrying a slice, a map and a pointer = %v, want all three named", got)
+	if got := referenceFields(reflect.TypeOf(referenceBearing{})); !slices.Equal(got, []string{"Map", "Nested.Slice", "Pointer", "Slice"}) {
+		t.Errorf("referenceFields over a struct carrying a slice, a map, a pointer and a nested slice = %v, want all four named", got)
 	}
 
 	if got := referenceFields(reflect.TypeOf(department.Capabilities{})); len(got) != 0 {
@@ -2180,6 +2185,12 @@ func referenceFields(structure reflect.Type) []string {
 			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 			reflect.Float32, reflect.Float64:
+		case reflect.Struct:
+			// A NESTED VALUE STRUCT is copied with its parent, so it is safe
+			// exactly when its own fields are: department.Recovery is one.
+			for _, nested := range referenceFields(field.Type) {
+				shared = append(shared, field.Name+"."+nested)
+			}
 		default:
 			shared = append(shared, field.Name)
 		}

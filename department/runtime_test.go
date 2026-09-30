@@ -1749,3 +1749,127 @@ func TestRigRuntimeForwardsOptionalLiveOptionsSubscription(t *testing.T) {
 		t.Fatal("runtime without the capability falsely advertises live options")
 	}
 }
+
+// recoverableSession offers both recovery capabilities on top of the six
+// required ones.
+type recoverableSession struct {
+	*faultingSession
+}
+
+func (recoverableSession) CloseAttempt(context.Context, sessionwire.CommandID, uuid.UUID, string, string, uint64) error {
+	return nil
+}
+
+// closerOnlySession offers the recovery closure and no fault supervision.
+type closerOnlySession struct {
+	*testkit.FullSession
+}
+
+func (closerOnlySession) CloseAttempt(context.Context, sessionwire.CommandID, uuid.UUID, string, string, uint64) error {
+	return nil
+}
+
+// TestADeclaredRecoveryCapabilityIsRequiredAtLaunch holds Gap A's launch-time
+// half: a target that DECLARES a recovery capability refuses, and releases, a
+// session that does not offer it, on both launch paths; an undeclared one stays
+// optional. A declaration the runtime cannot honour is caught at the first
+// launch, not at the first failover that needed it.
+func TestADeclaredRecoveryCapabilityIsRequiredAtLaunch(t *testing.T) {
+	t.Parallel()
+
+	full := func() *faultingSession {
+		return &faultingSession{FullSession: testkit.NewFullSession(rigSessionUUID), faulted: make(chan struct{})}
+	}
+	for _, row := range []struct {
+		name     string
+		session  func() (department.RigSession, *testkit.FullSession)
+		declared department.Recovery
+		missing  []string
+	}{
+		{
+			name: "both declared, both offered",
+			session: func() (department.RigSession, *testkit.FullSession) {
+				s := full()
+				return recoverableSession{s}, s.FullSession
+			},
+			declared: department.Recovery{AttemptCloser: true, PersistenceFaults: true},
+		},
+		{
+			name: "both declared, neither offered",
+			session: func() (department.RigSession, *testkit.FullSession) {
+				s := testkit.NewFullSession(rigSessionUUID)
+				return s, s
+			},
+			declared: department.Recovery{AttemptCloser: true, PersistenceFaults: true},
+			missing:  []string{"declared AttemptCloser absent", "declared PersistenceFaults absent"},
+		},
+		{
+			name:     "closer declared, faults only offered",
+			session:  func() (department.RigSession, *testkit.FullSession) { s := full(); return s, s.FullSession },
+			declared: department.Recovery{AttemptCloser: true},
+			missing:  []string{"declared AttemptCloser absent"},
+		},
+		{
+			name: "faults declared, closer only offered",
+			session: func() (department.RigSession, *testkit.FullSession) {
+				s := testkit.NewFullSession(rigSessionUUID)
+				return closerOnlySession{s}, s
+			},
+			declared: department.Recovery{PersistenceFaults: true},
+			missing:  []string{"declared PersistenceFaults absent"},
+		},
+		{
+			name: "nothing declared, nothing offered",
+			session: func() (department.RigSession, *testkit.FullSession) {
+				s := testkit.NewFullSession(rigSessionUUID)
+				return s, s
+			},
+		},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			capabilities := pooledCapabilities()
+			capabilities.Recovery = row.declared
+			session, released := row.session()
+			target, err := department.NewRigTarget(&testkit.FakeRig{Session: session}, "rig-2026-09", capabilities)
+			if err != nil {
+				t.Fatalf("NewRigTarget: %v", err)
+			}
+			if got := target.Capabilities().Recovery; got != row.declared {
+				t.Fatalf("Capabilities().Recovery = %+v, want the declared %+v", got, row.declared)
+			}
+
+			for _, launch := range []struct {
+				name string
+				run  func() (department.Runtime, error)
+			}{
+				{"create", func() (department.Runtime, error) { return target.Create(t.Context(), launchRequest()) }},
+				{"restore", func() (department.Runtime, error) {
+					return target.Restore(t.Context(), restoreRequest("rig-2026-09"))
+				}},
+			} {
+				before := released.Released()
+				runtime, err := launch.run()
+				if row.missing == nil {
+					if err != nil || runtime == nil {
+						t.Fatalf("%s = (%v, %v), want a runtime", launch.name, runtime, err)
+					}
+					if released.Released() != before {
+						t.Errorf("%s released an accepted session", launch.name)
+					}
+					continue
+				}
+				var incapable *department.IncapableRuntimeError
+				if !errors.As(err, &incapable) || runtime != nil {
+					t.Fatalf("%s = (%v, %v), want *IncapableRuntimeError and no runtime", launch.name, runtime, err)
+				}
+				if !slices.Equal(incapable.Missing, row.missing) {
+					t.Errorf("%s Missing = %q, want %q", launch.name, incapable.Missing, row.missing)
+				}
+				if released.Released() != before+1 {
+					t.Errorf("%s released the refused session %d times, want once", launch.name, released.Released()-before)
+				}
+			}
+		})
+	}
+}

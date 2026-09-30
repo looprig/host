@@ -40,7 +40,7 @@ func TestAnAdaptedRuntimeWithNoCloserRefusesTheClosure(t *testing.T) {
 		{"a session offering one", capableSessionWithCloser{}, false},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			runtime, err := adaptRigSession("session-a", "agent-a", row.session)
+			runtime, err := adaptRigSession(context.Background(), "session-a", "agent-a", row.session, Recovery{})
 			if err != nil {
 				t.Fatalf("adaptRigSession: %v", err)
 			}

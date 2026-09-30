@@ -9,6 +9,18 @@
 //
 // Nothing here is a Factory type. A Runtime is a composition of narrow Harness
 // session capabilities that Host requires, declared on Host's side.
+//
+// Command bodies reach a runtime as bytes. Every Host built by host.Compose
+// wires the control store's object reader into its disposition applier and
+// advertises Core's hostlink.payload.reference capability, so a body Factory
+// stored by reference is resolved and verified by Host before the attempt; see
+// RuntimeCommand.
+//
+// A harness-backed product does not implement these interfaces itself:
+// github.com/looprig/host/harnessruntime adapts a harness rig into a
+// LaunchTarget that declares and supplies every capability, recovery
+// included. departmenttest.RunRuntimeConformance checks any target against
+// the same contract.
 package department
 
 import (
@@ -107,7 +119,42 @@ type Capabilities struct {
 
 	// CaptureSafety describes the target's highest-output tool.
 	CaptureSafety CaptureSafety
+
+	// Recovery declares the recovery capabilities every runtime this target
+	// launches offers. It is additive and Validate does not read it: the zero
+	// value declares nothing, which is what every target built before host
+	// v0.16.0 declared.
+	//
+	// IT IS A DECLARATION THAT IS CHECKED TWICE. host.Compose reads it at
+	// composition time — under the default RuntimeProfileDurable a target that
+	// does not declare both is refused before anything runs — and a target
+	// built with NewRigTarget verifies it at every launch, refusing (and
+	// releasing) a session that lacks a capability its target declared. So a
+	// declaration the runtime cannot honour is caught at the first launch
+	// rather than at the first crash, which is when a missing recovery
+	// capability would otherwise surface.
+	Recovery Recovery
 }
+
+// Recovery is the pair of optional runtime capabilities a durable deployment
+// cannot run without. Both are discovered by assertion on the Runtime and
+// neither is part of Runtime, for the reasons AttemptCloser and
+// PersistenceFaults give; this is where a target PROMISES them.
+//
+//   - AttemptCloser: the runtime implements AttemptCloser, so a successor can
+//     close a predecessor's stranded attempt. Without it an ordinary failover
+//     with an attempt in flight wedges the session's whole command stream.
+//   - PersistenceFaults: the runtime implements PersistenceFaults, so Host
+//     notices a latched journal fault and gives the runtime up for a successor
+//     to restore. Without it a faulted session stays resident and refuses every
+//     command.
+type Recovery struct {
+	AttemptCloser     bool
+	PersistenceFaults bool
+}
+
+// Complete reports whether both recovery capabilities are declared.
+func (r Recovery) Complete() bool { return r.AttemptCloser && r.PersistenceFaults }
 
 // Validate holds every rule about a Capabilities value, in one place, so the
 // registry and the rig-target constructor cannot disagree about what a legal
@@ -418,11 +465,13 @@ type LiveOptionsSubscriber interface {
 // it is being asked to apply. An input command applied across that seam was a
 // durable no-op.
 //
-// THE PAYLOAD MAY BE A REFERENCE INSTEAD OF BYTES, and Host does not
-// dereference it. §10.1 gives a private body an independent immutable object
-// reference once it exceeds its inline threshold, and at most one of the two is
-// ever set; the runtime resolves the reference through its own object read
-// rather than having the bytes copied through Host's memory.
+// Payload is the verified private body. The disposition applier resolves a
+// body stored by reference through the session's control store (size, SHA-256,
+// kind and scope checked) before the attempt, so a runtime launched by
+// host.Compose always receives bytes and never dereferences an object.
+// PayloadRef is set only by a composition that gave the applier no object
+// reader (legacy commands.Applier); a runtime MUST refuse such a command rather
+// than resolve it, as harnessruntime does.
 //
 // The optional principal and metadata are the only decoded values crossing
 // this seam. The private body still travels unchanged.
@@ -440,7 +489,9 @@ type RuntimeCommand struct {
 	Kind string
 
 	// Payload and PayloadRef are the private body. At most one is set, and
-	// neither is set for a command that has none.
+	// neither is set for a command that has none. Under host.Compose only
+	// Payload is ever set; see the type's doc for why a runtime must refuse a
+	// PayloadRef rather than resolve it.
 	Payload    []byte
 	PayloadRef sessionwire.ObjectReference
 

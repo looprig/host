@@ -19,7 +19,8 @@ import (
 // layering one. An earlier version of this paragraph gave a different reason —
 // that "the published harness (v0.30.2) does not have H4.1's capabilities at
 // all — no WaitIdle, no Done, no ReleaseResidency" — and that was already false
-// when harnessruntime bound to harness v0.31.0: session.IdleWaiter,
+// when internal/harnessadapter (now harnessruntime) bound to harness v0.31.0:
+// session.IdleWaiter,
 // session.Liveness and session.Releaser are exported and are asserted on by
 // name there. It is recorded rather than quietly deleted because a stale
 // justification for a live decision is the failure the paragraph above this one
@@ -143,7 +144,7 @@ func (t *rigTarget) Create(ctx context.Context, request CreateRequest) (Runtime,
 	if err := requireRigIdentity(ctx, request.RigSessionID, session); err != nil {
 		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "create", Cause: err}
 	}
-	return adaptRigSession(request.SessionID, request.AgentID, session)
+	return adaptRigSession(ctx, request.SessionID, request.AgentID, session, t.capabilities.Recovery)
 }
 
 // Restore relaunches a session over existing durable state, refusing a state
@@ -189,7 +190,7 @@ func (t *rigTarget) Restore(ctx context.Context, request RestoreRequest) (Runtim
 	if err := requireRigIdentity(ctx, request.RigSessionID, session); err != nil {
 		return nil, &RigLaunchError{AgentID: request.AgentID, SessionID: request.SessionID, Operation: "restore", Cause: err}
 	}
-	return adaptRigSession(request.SessionID, request.AgentID, session)
+	return adaptRigSession(ctx, request.SessionID, request.AgentID, session, t.capabilities.Recovery)
 }
 
 // ErrRigSessionIdentity is the cause of a RigLaunchError raised when a Rig
@@ -238,7 +239,20 @@ func requireRigIdentity(ctx context.Context, want uuid.UUID, session RigSession)
 // the strongest form of "rejected before publication" this seam can offer —
 // publication is a later task's, and what this one can guarantee is that
 // nothing reaches it.
-func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentID, session RigSession) (Runtime, error) {
+//
+// A RECOVERY CAPABILITY THE TARGET DECLARED IS REQUIRED HERE, and only then.
+// declared is the target's Capabilities.Recovery: a declaration the launched
+// session cannot honour is a defect in the target, and host.Compose admitted
+// the target on the strength of it, so the launch is refused with the session
+// RELEASED (nonterminal, best-effort) rather than left holding its journal
+// lease. An undeclared capability stays optional and is forwarded when present.
+func adaptRigSession(
+	ctx context.Context,
+	sessionID sessionwire.SessionID,
+	agentID sessionwire.AgentID,
+	session RigSession,
+	declared Recovery,
+) (Runtime, error) {
 	if isNilSession(session) {
 		return nil, &RigLaunchError{
 			AgentID:   agentID,
@@ -310,6 +324,18 @@ func adaptRigSession(sessionID sessionwire.SessionID, agentID sessionwire.AgentI
 	// one layer down, and a typed nil would advertise an abandon that panics.
 	if capability, ok := session.(PersistenceFaults); ok {
 		adapted.faults = capability
+	}
+	broken := false
+	if declared.AttemptCloser && adapted.closer == nil {
+		missing, broken = append(missing, "declared AttemptCloser absent"), true
+	}
+	if declared.PersistenceFaults && adapted.faults == nil {
+		missing, broken = append(missing, "declared PersistenceFaults absent"), true
+	}
+	if broken {
+		if releaser, ok := session.(Releaser); ok {
+			_ = releaser.ReleaseResidency(ctx)
+		}
 	}
 	if len(missing) > 0 {
 		return nil, &IncapableRuntimeError{AgentID: agentID, SessionID: sessionID, Missing: missing}
