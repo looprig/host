@@ -825,20 +825,24 @@ func (s *Service) Stop(ctx context.Context) (lifecycle.Report, error) {
 		<-done
 	}
 	s.warm.Stop()
-	// A RUNTIME WHOSE RELEASE WAS REFUSED IS LEFT PARKED, and that is what
-	// makes the drain of a gated session crash-equivalent (spec gate M1,
-	// quality gate F1). harness refuses a nonterminal release of a session that
+	// A RUNTIME WHOSE RELEASE WAS REFUSED IS ABANDONED BY THE DRAIN, NOT
+	// CANCELLED HERE. harness refuses a nonterminal release of a session that
 	// is not whole-session idle — a session at a gate never is — and the
-	// manager's Close cancels every session context, which a refused runtime
-	// still runs on: cancelled, it interrupted its turn and journaled
-	// GateResolved{abandoned} after this Host's publisher had stopped, so the
-	// projection showed a gate that no longer existed and a permission request
-	// a crash would have preserved was destroyed. Parked, it writes nothing
-	// further; it keeps its journal lease until this process exits, and its
-	// successor restores the session as it restores a crashed Host's. Every
-	// session whose release succeeded has already torn itself down, so
-	// skipping the cancellation affects only the parked ones.
-	if !releaseRefused(report) {
+	// manager's Close cancels every session context: a refused runtime still
+	// running on one interrupted its turn and journaled GateResolved{abandoned}
+	// after this Host's publisher had stopped, destroying a permission request
+	// a crash would have preserved (spec gate M1, quality gate F1). Since
+	// v0.16.1 the drain gives such a runtime up crash-equivalently
+	// (releaseSession.AbandonResidency): sealed, it writes nothing, it stops,
+	// and it hands its journal lease back, so a successor in THIS process can
+	// restore the session with its gate still open. Until v0.16.0 it was left
+	// PARKED instead, holding that lease until the process exited — safe for
+	// cmd/host, a leak for an embedder that keeps running.
+	//
+	// A RUNTIME THAT COULD NOT BE ABANDONED IS STILL PARKED, and then the
+	// cancellation is still skipped, for the original reason. Such sessions are
+	// named in report.Parked and logged at ERROR.
+	if len(report.Parked) == 0 {
 		s.manager.Close()
 	}
 
@@ -942,16 +946,18 @@ func (s *Service) logDrainFailures(ctx context.Context, report lifecycle.Report)
 			slog.Uint64("host_generation", report.Generation),
 			slog.String("error", failure.Err.Error()))
 	}
-}
-
-// releaseRefused reports whether any session's runtime refused its release.
-func releaseRefused(report lifecycle.Report) bool {
-	for _, failure := range report.Failures {
-		if failure.Step == lifecycle.StepReleaseResidency {
-			return true
-		}
+	for _, key := range report.Abandoned {
+		logger.LogAttrs(ctx, slog.LevelWarn, "host: drain abandoned a runtime that refused its release; nothing was written and its journal lease was released, so a successor restores the session with any open gate intact",
+			slog.String("tenant_id", string(key.TenantID)),
+			slog.String("session_id", string(key.SessionID)),
+			slog.Uint64("host_generation", report.Generation))
 	}
-	return false
+	for _, key := range report.Parked {
+		logger.LogAttrs(ctx, slog.LevelError, "host: drain parked a runtime that refused its release and could not be abandoned; it keeps its journal lease until this process exits, so no successor can restore the session before then",
+			slog.String("tenant_id", string(key.TenantID)),
+			slog.String("session_id", string(key.SessionID)),
+			slog.Uint64("host_generation", report.Generation))
+	}
 }
 
 // settleAttach records how an attach ended, BEFORE the attach is taken out of

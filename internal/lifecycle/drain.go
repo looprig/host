@@ -30,8 +30,12 @@
 // LeaseEpochReporter — and department's own comment on Releaser records that
 // residency release "is NONTERMINAL and is not Shutdown". A Shutdown method on
 // Session here would therefore be a seam nothing in this module can satisfy.
-// The refusal is RECORDED as its own Failure so a reconciler can find it; the
-// fallback belongs to H4.1 and to O7.1's composition.
+// The refusal is RECORDED as its own Failure so a reconciler can find it.
+//
+// THE FALLBACK IT DOES TAKE (v0.16.1) IS NOT SHUTDOWN. A Session offering
+// Abandoner is given up crash-equivalently after the refusal: nothing
+// terminal is written, the runtime stops and hands back its journal lease,
+// and an open gate survives for a successor. See Abandoner.
 package lifecycle
 
 import (
@@ -149,6 +153,38 @@ type Session interface {
 type ConsumptionHalter interface {
 	HaltConsumption(context.Context) error
 }
+
+// Abandoner is the optional Session method the drain falls back to when a
+// runtime REFUSES its nonterminal release — harness refuses one for a session
+// that is not whole-session idle, and a session parked at an open gate never
+// is.
+//
+// IT IS CRASH-EQUIVALENT AND WRITES NOTHING DURABLE: the runtime seals its
+// durable writes, stops, and hands its journal lease back, exactly as a
+// process crash would except that the lease is released instead of left to
+// lapse. So an open gate stays open in the journal and in the projection —
+// cancelling the runtime's context instead would resolve it (abandoned) — and
+// a successor restores the session as it restores a crashed Host's, in this
+// process or another.
+//
+// BEFORE v0.16.1 THE REFUSED RUNTIME WAS PARKED instead: left running,
+// uncancelled, holding its journal lease until the process exited. That was
+// safe only for a process that exits after Stop (cmd/host); an embedder that
+// stays alive could never restore the session again in-process, and its
+// storage was closed beneath a live runtime.
+//
+// An implementation returns ErrNotAbandonable when the runtime offers no
+// crash-equivalent release; the drain then reports the session Parked. It
+// must return only once the runtime has torn down, and must honour
+// cancellation; the drain bounds it by the idle boundary.
+type Abandoner interface {
+	AbandonResidency(context.Context) error
+}
+
+// ErrNotAbandonable is what an Abandoner returns for a runtime that offers no
+// crash-equivalent release. It is not a failure: the session is reported
+// Parked, as every refused runtime was before v0.16.1.
+var ErrNotAbandonable = errors.New("lifecycle: the runtime offers no crash-equivalent release")
 
 // EpochReporter is the optional Session method that names the RESIDENCY epoch
 // the session is held under, so each Failure records the epoch it happened at.
@@ -336,6 +372,12 @@ const (
 	StepReleaseResidency Step = "release_residency"
 	StepFinishRelease    Step = "finish_release"
 
+	// StepAbandonResidency is the crash-equivalent fallback after a refused
+	// ReleaseResidency (see Abandoner). Its failure leaves the session Parked
+	// and, like the refusal before it, does not withhold `drained`: the
+	// residency tombstone and lease release still run.
+	StepAbandonResidency Step = "abandon_residency"
+
 	// StepSettleAttaches is the wait for the attaches in flight when the drain
 	// began (see Attaches). The Host-wide wait's failure carries no session key
 	// — it names the attaches in its error — while a wait for one session's own
@@ -406,6 +448,20 @@ type Report struct {
 	// FinishRelease means release did not finish, so State stays `draining` and
 	// a Factory does not delete the workload. See settledState.
 	Failures []Failure
+
+	// Abandoned are the sessions whose runtime refused its nonterminal release
+	// and was then given up crash-equivalently (see Abandoner): torn down,
+	// journal lease released, nothing durable written, so an open gate is
+	// preserved for a successor.
+	Abandoned []registry.Key
+
+	// Parked are the sessions whose runtime refused its release and could NOT
+	// be abandoned (no Abandoner, ErrNotAbandonable, or a failed or unbounded
+	// abandon). Such a runtime is left running and keeps its journal lease
+	// until the process exits, so no successor — in this process or another —
+	// can restore the session before then. A caller that keeps the process
+	// alive must treat a non-empty Parked as a leak.
+	Parked []registry.Key
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +503,8 @@ type Drainer struct {
 	begun      bool
 	drainState sessionwire.HostLinkDrainState
 	failures   []Failure
+	abandoned  []registry.Key
+	parked     []registry.Key
 
 	// begunScope is the scope the call that BEGAN this drain named, kept so the
 	// caller that began it can still be attributed after its session has been
@@ -696,6 +754,8 @@ func (d *Drainer) Wait() Report {
 		Generation: d.options.Generation,
 		State:      d.drainState,
 		Failures:   append([]Failure(nil), d.failures...),
+		Abandoned:  append([]registry.Key(nil), d.abandoned...),
+		Parked:     append([]registry.Key(nil), d.parked...),
 	}
 }
 
@@ -860,14 +920,75 @@ func (d *Drainer) release(graceCtx context.Context, session Session) {
 	// not whole-session idle and WAITS for idle first — so a session parked at
 	// an open gate, which is never idle, held this call, the drain and Stop
 	// forever (measured on a composed Host with a permission gate open). A
-	// refusal here is already a path this sequence takes: it is recorded and
-	// FinishRelease still runs. The runtime keeps its own journal lease until
-	// the process exits, so the session's successor restores it the way it
-	// restores a crashed Host's.
+	// refusal here is already a path this sequence takes: it is recorded, the
+	// runtime is abandoned where it can be (else parked, holding its journal
+	// lease until the process exits), and FinishRelease still runs. The
+	// session's successor restores it the way it restores a crashed Host's.
 	if err := session.ReleaseResidency(graceCtx); err != nil {
 		record(StepReleaseResidency, err)
+		// THE REFUSED RUNTIME IS ABANDONED BEFORE THE RESIDENCY IS HANDED BACK,
+		// so by the time FinishRelease lets a successor in, the journal lease it
+		// needs is free. See Abandoner.
+		d.abandon(session, record)
 	}
 	run(StepFinishRelease, session.FinishRelease)
+}
+
+// abandon gives up a runtime whose release was refused, crash-equivalently,
+// and books the session Abandoned or Parked.
+//
+// ITS BOUND IS THE IDLE BOUNDARY, ON A FRESH CONTEXT. The grace is normally
+// spent by now — a gated runtime's release waits for it — and an abandon cut
+// short by an expired context would leave exactly the lease this exists to
+// free. An abandon that ignores its cancellation is waited one more boundary
+// and then left, recorded, and the session reported Parked.
+func (d *Drainer) abandon(session Session, record func(Step, error)) {
+	key := session.Key()
+	abandoner, ok := session.(Abandoner)
+	if !ok {
+		d.book(nil, &key)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	answered := make(chan error, 1)
+	go func() { answered <- abandoner.AbandonResidency(ctx) }()
+	var err error
+	select {
+	case err = <-answered:
+	case <-d.options.Clock.After(d.options.IdleBoundary):
+		cancel()
+		select {
+		case err = <-answered:
+			if err == nil {
+				err = context.Canceled
+			}
+			err = errors.Join(ErrIdleBoundary, err)
+		case <-d.options.Clock.After(d.options.IdleBoundary):
+			err = errors.Join(ErrIdleBoundary, ErrWaitAbandoned)
+		}
+	}
+	switch {
+	case err == nil:
+		d.book(&key, nil)
+	case errors.Is(err, ErrNotAbandonable):
+		d.book(nil, &key)
+	default:
+		record(StepAbandonResidency, err)
+		d.book(nil, &key)
+	}
+}
+
+// book records one session as abandoned or parked.
+func (d *Drainer) book(abandoned, parked *registry.Key) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if abandoned != nil {
+		d.abandoned = append(d.abandoned, *abandoned)
+	}
+	if parked != nil {
+		d.parked = append(d.parked, *parked)
+	}
 }
 
 // settleAttaches waits for the attaches in flight when this drain began,

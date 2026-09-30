@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -345,6 +346,7 @@ var (
 	_ lifecycle.ConsumptionHalter = releaseSession{}
 	_ lifecycle.EpochReporter     = releaseSession{}
 	_ lifecycle.Ender             = releaseSession{}
+	_ lifecycle.Abandoner         = releaseSession{}
 )
 
 // Ended reports that the attach which installed this residency failed AFTER
@@ -385,6 +387,38 @@ func (s releaseSession) ResidencyEpoch() uint64 {
 	return uint64(s.lease.Epoch())
 }
 
+// AbandonResidency gives up a runtime whose nonterminal release the drain saw
+// refused, crash-equivalently, and returns once it has torn down.
+//
+// IT IS THE FAULT PATH'S ABANDON (releaseUnusable), reached from the drain: the
+// runtime seals its durable writes, stops and hands its journal lease back,
+// writing nothing — so a gate open when the drain began stays open in the
+// journal and the projection, for a successor to restore and answer. It runs
+// under residencyOnce, the same guard as the release, so a success counts as
+// the runtime released (FinishRelease may then cancel the session context,
+// which a torn-down runtime no longer reads) and the one runtime is never
+// released or abandoned twice.
+//
+// A runtime without the capability is ErrNotAbandonable: the drain reports it
+// Parked, as every refused runtime was before v0.16.1.
+func (s releaseSession) AbandonResidency(ctx context.Context) error {
+	faults, ok := persistenceFaultsFor(s.runtime)
+	if !ok {
+		return lifecycle.ErrNotAbandonable
+	}
+	return s.residencyOnce.run(func() error {
+		if err := faults.AbandonResidency(ctx); err != nil {
+			return err
+		}
+		select {
+		case <-s.runtime.Done():
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("compose: the abandoned runtime did not finish tearing down: %w", ctx.Err())
+		}
+	})
+}
+
 // FinishRelease writes the tombstone, ends the heartbeat, releases the residency
 // grant and drops local state, which is what this seam's FinishRelease means.
 func (s releaseSession) FinishRelease(ctx context.Context) error {
@@ -408,7 +442,8 @@ func (s releaseSession) FinishRelease(ctx context.Context) error {
 	}
 	// THE DRAIN'S END OF THE RESIDENCY (booked finding B1): the Manager's
 	// record is pruned here, and its context cancelled only if the runtime
-	// released — a refused one is left parked. The lost and fault paths reach
+	// released or abandoned — a refused one that could not be abandoned is
+	// left parked. The lost and fault paths reach
 	// this method with no service and prune through Service.forget instead.
 	if s.service != nil {
 		s.service.manager.EndResidency(s.key, s.generation, s.runtimeReleased())

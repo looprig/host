@@ -950,6 +950,28 @@ type DrainReport struct {
 	Generation uint64
 	State      sessionwire.HostLinkDrainState
 	Failures   []DrainFailure
+
+	// Abandoned are the sessions whose runtime refused a graceful release —
+	// a session awaiting a gate is never idle, so harness refuses it — and
+	// was then given up crash-equivalently: torn down, its journal lease
+	// released, nothing durable written. An open gate is preserved, and a
+	// successor (in this process or another) restores the session and can
+	// answer it. Since v0.16.1.
+	Abandoned []DrainSession
+
+	// Parked are the sessions whose runtime refused its release and could not
+	// be abandoned (it offers no department.PersistenceFaults, or the abandon
+	// failed or exceeded its bound). Such a runtime keeps running and holds its
+	// journal lease until the process exits, so a process that stays alive
+	// after Stop cannot restore these sessions and should treat a non-empty
+	// Parked as a leak. The abandon failure, if any, is also in Failures.
+	Parked []DrainSession
+}
+
+// DrainSession names one session a DrainReport lists.
+type DrainSession struct {
+	TenantID  sessionwire.TenantID
+	SessionID sessionwire.SessionID
 }
 
 // StepCloseStore names the Stop step that closes the session store Compose
@@ -973,6 +995,12 @@ func (s *Service) Stop(ctx context.Context) (DrainReport, error) {
 			Step:      string(failure.Step),
 			Err:       failure.Err,
 		})
+	}
+	for _, key := range report.Abandoned {
+		exported.Abandoned = append(exported.Abandoned, DrainSession{TenantID: key.TenantID, SessionID: key.SessionID})
+	}
+	for _, key := range report.Parked {
+		exported.Parked = append(exported.Parked, DrainSession{TenantID: key.TenantID, SessionID: key.SessionID})
 	}
 	if err := s.store.Close(ctx); err != nil {
 		exported.Failures = append(exported.Failures, DrainFailure{Step: StepCloseStore, Err: err})
