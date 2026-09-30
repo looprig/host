@@ -15,10 +15,13 @@
 //	    return []department.Registration{harnessruntime.Registration("assistant", target)}, nil
 //	})
 //
-// Target declares both recovery capabilities (department.Recovery) because the
-// adapter supplies them by construction, so the target passes host.Compose's
-// default RuntimeProfileDurable. Every session the adapter binds has, and
-// Host sees:
+// Target declares both recovery capabilities (department.Recovery), so the
+// target passes host.Compose's default RuntimeProfileDurable, and holds the
+// declaration true at every bind: a session whose applier is not a
+// runtimecommand.AttemptCloser, or whose fault channel is nil, is refused. Any
+// session bind refuses is released first (detached from the launch context;
+// a failed release is joined to the refusal). Every session the adapter binds
+// has, and Host sees:
 //
 //   - the six required capabilities, each discovered on harness's own
 //     published interface (a harness signature change is a build failure here);

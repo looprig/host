@@ -63,7 +63,7 @@ func TestBindReachesEveryDiscoveredCapability(t *testing.T) {
 	controller := newFullController(subscription, &filters, &released)
 
 	adapter := newAdapter(t, stubRigs{})
-	bound, err := adapter.bind(controller, testTenant, testSession)
+	bound, err := adapter.bind(t.Context(), controller, testTenant, testSession)
 	if err != nil {
 		t.Fatalf("bind a fully capable session: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestBindRefusesASessionShortOfAnyCapability(t *testing.T) {
 	} {
 		t.Run(tt.omit, func(t *testing.T) {
 			adapter := newAdapter(t, stubRigs{})
-			_, err := adapter.bind(tt.build(), testTenant, testSession)
+			_, err := adapter.bind(t.Context(), tt.build(), testTenant, testSession)
 			var incapable *IncapableSessionError
 			if !errors.As(err, &incapable) {
 				t.Fatalf("bind without %s = %v, want IncapableSessionError", tt.omit, err)
@@ -279,7 +279,7 @@ func TestBindRefusesASessionWhoseCommittedEventsAreUnavailable(t *testing.T) {
 	}
 
 	adapter := newAdapter(t, stubRigs{})
-	_, err := adapter.bind(controller, testTenant, testSession)
+	_, err := adapter.bind(t.Context(), controller, testTenant, testSession)
 	var incapable *IncapableSessionError
 	if !errors.As(err, &incapable) {
 		t.Fatalf("bind of a headless session = %v, want IncapableSessionError", err)
@@ -304,7 +304,7 @@ func TestBindRefusesANilCommittedEventSource(t *testing.T) {
 	}{leaseEpochPart: leaseEpochPart{epoch: 7, held: true}}
 
 	adapter := newAdapter(t, stubRigs{})
-	if _, err := adapter.bind(controller, testTenant, testSession); err == nil {
+	if _, err := adapter.bind(t.Context(), controller, testTenant, testSession); err == nil {
 		t.Fatal("bind accepted a provider that reported available with a nil source")
 	}
 }
@@ -312,7 +312,7 @@ func TestBindRefusesANilCommittedEventSource(t *testing.T) {
 // A session short of everything names everything, rather than the first thing.
 func TestBindNamesEveryMissingCapabilityAtOnce(t *testing.T) {
 	adapter := newAdapter(t, stubRigs{})
-	_, err := adapter.bind(controllerBase{}, testTenant, testSession)
+	_, err := adapter.bind(t.Context(), controllerBase{}, testTenant, testSession)
 	var incapable *IncapableSessionError
 	if !errors.As(err, &incapable) {
 		t.Fatalf("bind of a bare controller = %v, want IncapableSessionError", err)
@@ -345,7 +345,7 @@ func TestBindRefusesEveryWayALaunchHandsBackNoSession(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			adapter := newAdapter(t, stubRigs{})
-			bound, err := adapter.bind(tt.controller, testTenant, testSession)
+			bound, err := adapter.bind(t.Context(), tt.controller, testTenant, testSession)
 			if !errors.Is(err, ErrNoSession) {
 				t.Fatalf("bind(%s) = (%v, %v), want ErrNoSession", tt.name, bound, err)
 			}
@@ -551,7 +551,7 @@ func TestLaunchRefusesARigThatReportsSuccessAndReturnsNoSession(t *testing.T) {
 func boundFor(t *testing.T, controller session.SessionController, options ...Option) capabilities {
 	t.Helper()
 	adapter := newAdapter(t, stubRigs{}, options...)
-	launched, err := adapter.bind(controller, testTenant, testSession)
+	launched, err := adapter.bind(t.Context(), controller, testTenant, testSession)
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
@@ -884,7 +884,7 @@ func TestTheBoundSessionForwardsThePersistenceFaultPair(t *testing.T) {
 	controller.faultsPart = faultsPart{faulted: faulted, fault: fault, abandoned: &abandoned, err: abandonErr}
 
 	adapter := newAdapter(t, stubRigs{})
-	launched, err := adapter.bind(controller, testTenant, testSession)
+	launched, err := adapter.bind(t.Context(), controller, testTenant, testSession)
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}

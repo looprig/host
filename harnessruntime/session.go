@@ -48,7 +48,21 @@ type boundSession struct {
 
 	decode   BlockDecoder
 	ephDrops atomic.Uint64
+
+	// closerAvailable and faultsAvailable are what bind MEASURED: see bind.
+	closerAvailable bool
+	faultsAvailable bool
 }
+
+// AttemptCloserAvailable reports whether CloseAttempt can write a closure: the
+// session's runtime-command applier is a runtimecommand.AttemptCloser. The
+// method exists on every bound session, so department reads this instead of
+// the method set.
+func (s *boundSession) AttemptCloserAvailable() bool { return s.closerAvailable }
+
+// PersistenceFaultsAvailable reports whether the session's fault channel can
+// fire (it is not nil).
+func (s *boundSession) PersistenceFaultsAvailable() bool { return s.faultsAvailable }
 
 // ID is Harness's identity for the session.
 func (s *boundSession) ID() uuid.UUID { return s.controller.SessionID() }

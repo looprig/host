@@ -217,9 +217,15 @@ target, err := harnessruntime.Target(
 // Registrar: []department.Registration{harnessruntime.Registration("assistant", target)}
 ```
 
-`Target` declares both recovery capabilities because every session it binds
-supplies them: it requires harness's `PersistenceFaultReporter` and
-`ResidencyAbandoner` at bind and forwards `runtimecommand.AttemptCloser`. It also
+`Target` declares both recovery capabilities and holds the declaration true at
+every bind: it requires harness's `PersistenceFaultReporter` and
+`ResidencyAbandoner` with a non-nil fault channel, and a runtime-command applier
+that is a `runtimecommand.AttemptCloser`, refusing any session that lacks one.
+Every refused launch — in `harnessruntime` or in `department` — is released under
+a context detached from the launch's, and a failed release is joined to the
+refusal. A bound session reports `AttemptCloserAvailable`/`PersistenceFaultsAvailable`,
+so a product declaring `Recovery` itself on `NewRigTarget(harnessruntime.New(...))`
+is held to the same truth. It also
 forwards `LiveOptionsSubscriber` (text, reasoning, tool steps), copies `Principal`
 on every kind and `Metadata` on create and input, re-presents a create's first
 message, decodes `gate_response`, refuses an unresolved `PayloadRef`, launches

@@ -11,13 +11,12 @@ import (
 // capabilities.Recovery = {AttemptCloser: true, PersistenceFaults: true} forced
 // on.
 //
-// THE DECLARATION IS FORCED BECAUSE THE ADAPTER HONOURS IT BY CONSTRUCTION.
-// Every session it binds must be a session.PersistenceFaultReporter and a
-// session.ResidencyAbandoner or the launch is refused, and every bound session
-// carries CloseAttempt, forwarding to harness's runtimecommand.AttemptCloser.
-// So a Target always passes host.Compose's RuntimeProfileDurable check, and the
-// department's launch-time verification can never find a declared capability
-// absent. Whatever the caller put in capabilities.Recovery is overwritten.
+// THE DECLARATION IS FORCED, AND THEN HELD TRUE AT EVERY BIND. A Target's
+// adapter refuses (and releases) a launched session that cannot honour it: one
+// that is not a session.PersistenceFaultReporter and ResidencyAbandoner, whose
+// fault channel is nil, or whose runtime-command applier is not a
+// runtimecommand.AttemptCloser. So a Target always passes the durable-profile
+// check in host.Compose and never runs a session under a false declaration. Whatever the caller put in capabilities.Recovery is overwritten.
 //
 // The compatibility id is the product's: it names the runtime build, and a
 // restore onto a different one is refused before launch.
@@ -31,6 +30,7 @@ func Target(
 	if err != nil {
 		return nil, err
 	}
+	adapter.requireRecovery = true
 	capabilities.Recovery = department.Recovery{AttemptCloser: true, PersistenceFaults: true}
 	return department.NewRigTarget(adapter, compatibility, capabilities)
 }

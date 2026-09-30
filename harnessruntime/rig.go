@@ -8,11 +8,13 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/rig"
+	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
 
 	"github.com/looprig/host/department"
@@ -60,6 +62,11 @@ type Adapter struct {
 	rigs Rigs
 
 	decode BlockDecoder
+
+	// requireRecovery is set by Target, which declares both recovery
+	// capabilities on the adapter's behalf: bind then refuses a session that
+	// cannot honour either, rather than letting the declaration be false.
+	requireRecovery bool
 }
 
 // BlockDecoder turns a command's private body into the content blocks Harness
@@ -173,7 +180,7 @@ func (a *Adapter) NewSession(ctx context.Context, request department.RigCreateRe
 	if err != nil {
 		return nil, err
 	}
-	return a.bind(controller, request.TenantID, request.SessionID)
+	return a.bind(ctx, controller, request.TenantID, request.SessionID)
 }
 
 // RestoreSession relaunches a session over existing durable state.
@@ -199,7 +206,7 @@ func (a *Adapter) RestoreSession(
 	if err != nil {
 		return nil, err
 	}
-	return a.bind(controller, request.TenantID, request.SessionID)
+	return a.bind(ctx, controller, request.TenantID, request.SessionID)
 }
 
 // ErrNoRig is the refusal returned when a resolver reports success and hands
@@ -240,6 +247,7 @@ func isNil(value any) bool {
 // The names asserted on are HARNESS'S, so a released signature change is a build
 // failure here rather than a run-time IncapableSessionError.
 func (a *Adapter) bind(
+	ctx context.Context,
 	controller session.SessionController,
 	tenant sessionwire.TenantID,
 	sessionID sessionwire.SessionID,
@@ -363,10 +371,80 @@ func (a *Adapter) bind(
 		bound.committed = source
 	}
 
+	// RECOVERY IS MEASURED, NOT INFERRED FROM THE METHOD SET. The bound
+	// session carries CloseAttempt and the fault pair for every session, so a
+	// caller's assertion cannot tell whether the harness session beneath can
+	// honour them. What can: an applier that is a runtimecommand.AttemptCloser,
+	// and a fault channel that is not nil (a nil one never fires, so a fault
+	// would go unnoticed). The answers are reported to department through
+	// AttemptCloserAvailable and PersistenceFaultsAvailable, and a Target — which
+	// declares both — refuses a session missing either here.
+	bound.closerAvailable = recoveryCloserAvailable(controller)
+	bound.faultsAvailable = bound.faults != nil && bound.faults.PersistenceFaulted() != nil
+	if a.requireRecovery && bound.faults != nil && bound.abandoner != nil {
+		if !bound.closerAvailable {
+			missing = append(missing, "runtimecommand.AttemptCloser (the session has no durable runtime-command applier that can close a stranded attempt)")
+		}
+		if !bound.faultsAvailable {
+			missing = append(missing, "a persistence fault channel (PersistenceFaulted returned nil, so a fault would never be noticed)")
+		}
+	}
+
 	if len(missing) > 0 {
-		return nil, &IncapableSessionError{Missing: missing}
+		refusal := &IncapableSessionError{Missing: missing}
+		if err := releaseRefused(ctx, controller); err != nil {
+			return nil, errors.Join(refusal, err)
+		}
+		return nil, refusal
 	}
 	return bound, nil
+}
+
+// recoveryCloserAvailable reports whether a session's released runtime-command
+// applier can write a recovery closure, on the two-result form's own answer.
+func recoveryCloserAvailable(controller session.SessionController) bool {
+	provider, ok := controller.(runtimecommand.Provider)
+	if !ok {
+		return false
+	}
+	applier, ok := provider.RuntimeCommands()
+	if !ok || applier == nil {
+		return false
+	}
+	_, ok = applier.(runtimecommand.AttemptCloser)
+	return ok
+}
+
+// refusedReleaseBound bounds the release of a session bind refused.
+const refusedReleaseBound = 10 * time.Second
+
+// releaseRefused gives back a launched session bind refuses, and reports a
+// release that failed.
+//
+// BIND OWNS THE SESSION UNTIL IT RETURNS ONE. The launched harness session
+// holds its single-writer journal lease, and Host registers runtime cleanup
+// only after a launch succeeds, so a refused session nobody releases keeps
+// that lease — and every successor fails to hydrate the session. The context
+// is detached from the launch's cancellation and bounded on its own, because
+// a cancelled launch is exactly when a refusal is likely. A nonterminal
+// Releaser is preferred; a session without one is abandoned crash-equivalently
+// (it writes nothing); a session with neither is reported, never silent.
+func releaseRefused(ctx context.Context, controller session.SessionController) error {
+	released, cancel := context.WithTimeout(context.WithoutCancel(ctx), refusedReleaseBound)
+	defer cancel()
+	if releaser, ok := controller.(session.Releaser); ok {
+		if err := releaser.ReleaseResidency(released); err != nil {
+			return fmt.Errorf("harnessruntime: releasing the refused session: %w", err)
+		}
+		return nil
+	}
+	if abandoner, ok := controller.(session.ResidencyAbandoner); ok {
+		if err := abandoner.AbandonResidency(released); err != nil {
+			return fmt.Errorf("harnessruntime: abandoning the refused session: %w", err)
+		}
+		return nil
+	}
+	return errors.New("harnessruntime: the refused session offers neither ReleaseResidency nor AbandonResidency, so its journal lease could not be given back")
 }
 
 // ErrNoSession is the refusal returned when a rig reports success and hands back
