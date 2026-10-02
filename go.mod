@@ -10,7 +10,7 @@ require (
 	github.com/looprig/core v0.13.1
 	github.com/looprig/harness v0.45.0
 	github.com/looprig/inference v0.14.1
-	github.com/looprig/sessionstore v0.14.0
+	github.com/looprig/sessionstore v0.15.0
 	github.com/looprig/storage v0.7.0
 	github.com/prometheus/client_golang v1.24.1
 	go.yaml.in/yaml/v2 v2.4.4

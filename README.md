@@ -50,6 +50,20 @@ Tier 5 (orchestration) of the Looprig workspace. Direct Looprig dependencies:
 `core`, `harness`, `inference`, `sessionstore` and `storage`. Factory consumes
 Host over HostLink; Host imports no Factory package.
 
+## Upgrading to v0.18.0
+
+Host now pins centrifuge v0.39.3, protocol v0.22.1 and the test-only
+centrifuge-go client v0.12.1. The transport update fixes the metrics aggregator
+goroutine leak on shutdown and includes the GHSA-4r3x-2rwr-6w65 decoder fix.
+Wire version 1 is unchanged; mixed Host fleets interoperate.
+
+SessionStore is pinned at v0.15.0. `PublicJournals` forwards reads to that
+store, giving Host compositions the `TipOnly` request and the object-backed
+public-body reader supporting up to 16 MiB. Callers needing only the journal
+tip should use `TipOnly`. Upgrade Factory readers to sessionstore v0.15.0
+before serving offloaded public bodies above 512 KiB; older readers fail the
+entire page. No durable format changes. Harness remains pinned at v0.45.0.
+
 ## Status
 
 Department, residency, HostLink, warm release and drain are built.
@@ -77,7 +91,7 @@ controller's desire and the Pod all still name it, and no released Factory or
 controller has been proven against that state. Its session ends through the
 controller's drain-before-delete, as before.
 `internal/sessionstoreadapter` binds them to the released
-`github.com/looprig/sessionstore` store (currently pinned at v0.14.0), and
+`github.com/looprig/sessionstore` store (currently pinned at v0.15.0), and
 `harnessruntime` to `github.com/looprig/harness` (currently v0.45.0).
 Core is v0.13.1. Check `go.mod` for the exact pins of a given release.
 
