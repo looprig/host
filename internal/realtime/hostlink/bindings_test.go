@@ -1641,7 +1641,7 @@ func waitForReplicas(t *testing.T, mux *hostlink.Multiplexer, subject registry.K
 // TestClientCannotSelectTheFramePingPongMechanism settles the key O5.1 handed
 // over undecided, and settles it by refusing it.
 //
-// centrifuge@v0.38.0 handler_websocket.go:142 reads cf_ws_frame_ping_pong from
+// centrifuge@v0.39.3 handler_websocket.go:194 reads cf_ws_frame_ping_pong from
 // the query and, when it is "true", hands the transport a PingPongConfig of
 // {-1,-1}. A zero-configured HostLink sends no PingPongConfig of its own, so on
 // that path the transport's would win and the connect reply would carry neither

@@ -756,10 +756,10 @@ func TestOneStuckSessionBlocksNeitherAnotherSessionNorAnotherReplica(t *testing.
 // "Sent once per interested Factory replica" has two halves and they live in
 // different places. Host's half — exactly one message per event, on the
 // session's channel, addressed to no replica — is held by the tests above. The
-// other half is the transport's: centrifuge@v0.38.0 delivers one publication to
+// other half is the transport's: centrifuge@v0.39.3 delivers one publication to
 // every subscriber of a channel by enqueueing it on each subscriber's OWN write
-// queue (hub.go:892 -> client.go:669 -> writer.go:92), and an overflow of that
-// queue returns DisconnectSlow (writer.go:92-102; disconnect.go:82-86, code
+// queue (hub.go:1398 -> client.go:776 -> writer.go:294), and an overflow of that
+// queue returns DisconnectSlow (writer.go:294-301; disconnect.go:82-86, code
 // 3008) which closes THAT connection alone — reaching hostlink's existing
 // OnDisconnect and dropping only that link's bindings.
 //

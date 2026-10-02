@@ -1168,7 +1168,7 @@ func TestOnlyAnAuthenticatedServicePrincipalReachesTheDrainRPC(t *testing.T) {
 // authenticate.
 //
 // IT WALKS THE WHOLE PACKAGE, and that is the correction a probe forced. An
-// earlier version parsed a hard-coded "centrifuge.go". centrifuge@v0.38.0's
+// earlier version parsed a hard-coded "centrifuge.go". centrifuge's
 // Node.OnConnecting is a SILENT SETTER — the last registration wins and none of
 // them is refused — so a second gate declared in ANY OTHER FILE of this package
 // installed the exact defect this guard exists to catch and the whole suite

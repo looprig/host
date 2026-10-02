@@ -340,8 +340,8 @@ func TestHostPinsTheCentrifugeServer(t *testing.T) {
 	}
 	for _, requirement := range parsed.Require {
 		if requirement.Mod.Path == "github.com/centrifugal/centrifuge" {
-			if requirement.Mod.Version != "v0.38.0" {
-				t.Fatalf("centrifuge version = %q, want exact v0.38.0", requirement.Mod.Version)
+			if requirement.Mod.Version != "v0.39.3" {
+				t.Fatalf("centrifuge version = %q, want exact v0.39.3", requirement.Mod.Version)
 			}
 			if requirement.Indirect {
 				t.Fatal("centrifuge is indirect; the HostLink server must own the dependency")

@@ -30,7 +30,7 @@ type Config struct {
 	// setting one without the other is rejected. When both are zero HostLink
 	// sends no PingPongConfig at all and the heartbeat falls to Centrifuge's
 	// own application-level defaults of 25s ping and 10s pong
-	// (centrifuge@v0.38.0 config.go:218 and config.go:224) — zero does not mean
+	// (centrifuge@v0.39.3 config.go:519 and config.go:525) — zero does not mean
 	// "no heartbeat". That route held one exception until O5.2 removed it:
 	// cf_ws_frame_ping_pong would have moved a zero-configured link onto
 	// WebSocket frame ping instead, and rejectedTransportQueryKeys now refuses

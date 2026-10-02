@@ -18,7 +18,7 @@ import (
 
 // disconnectAuthentication and disconnectUnsupportedVersion are the two
 // terminal HostLink disconnect codes. Both sit in 4500-4999, documented by
-// centrifuge@v0.38.0 disconnect.go:26 as an application terminal range in
+// centrifuge@v0.39.3 disconnect.go:26 as an application terminal range in
 // which a client should perform no automatic reconnect — that line states a
 // convention for client implementations, not a behaviour this server enforces.
 // The codes are distinct because they distinguish two different failures to the
@@ -77,14 +77,14 @@ func NewCentrifugeServer(config Config) (Server, error) {
 		return nil, errors.New("hostlink: ping interval and pong timeout must be configured together")
 	}
 	// One second is the resolution of the wire, not a preference: Centrifuge
-	// advertises the interval as whole seconds — client.go:2466 sends
+	// advertises the interval as whole seconds — centrifuge@v0.39.3 client.go:3384 sends
 	// res.Ping = uint32(c.pingInterval.Seconds()) — so a sub-second interval
 	// truncates to ping: 0, which a client cannot tell apart from no ping.
 	if config.PingInterval > 0 && config.PingInterval < time.Second {
 		return nil, errors.New("hostlink: ping interval must be at least one second")
 	}
 	// Deliberately stricter than the dependency: Centrifuge only logs a warning
-	// for this configuration (warnAboutIncorrectPingPongConfig, config.go:229-231)
+	// for this configuration (warnAboutIncorrectPingPongConfig, config.go:530-541)
 	// and then runs with it. HostLink rejects it at construction instead.
 	if config.PingInterval > 0 && config.PongTimeout > 0 && config.PongTimeout >= config.PingInterval {
 		return nil, errors.New("hostlink: pong timeout must be shorter than ping interval")
@@ -112,7 +112,7 @@ func NewCentrifugeServer(config Config) (Server, error) {
 	}
 	if config.Multiplexer != nil {
 		// ONE budget, not two. Centrifuge defaults ClientChannelLimit to 128
-		// (centrifuge@v0.38.0 node.go:135-137), which would be a second and
+		// (centrifuge@v0.39.3 node.go:146-148), which would be a second and
 		// silently different answer to "how many sessions may one link hold" —
 		// and the transport's refusal would arrive at subscribe, after the
 		// Multiplexer had already accepted the bind. Taking the limit from the
@@ -336,12 +336,12 @@ func (s *centrifugeServer) Close(ctx context.Context) error { return s.node.Shut
 // handler.
 //
 // Provenance of the two query keys. "format" and "cf_protocol" are not names
-// HostLink chose; they mirror centrifuge@v0.38.0 handler_websocket.go:139,
+// HostLink chose; they mirror centrifuge@v0.39.3 handler_websocket.go:191,
 // which selects the protobuf protocol when
 // query.Get("format") == "protobuf" || query.Get("cf_protocol") == "protobuf".
 // Mirroring a dependency's private selection logic is only safe while the
 // dependency cannot add a third key underneath the mirror, which is why the
-// version guard in server_test.go asserts the exact version v0.38.0 rather
+// version guard in server_test.go asserts the exact version v0.39.3 rather
 // than a minimum. That guard and this function are one unit: moving the pin
 // obliges re-reading handler_websocket.go's key list.
 //
@@ -398,8 +398,8 @@ func selectsJSONProtocol(request *http.Request) bool {
 // rejectedTransportQueryKeys are query keys that reconfigure the TRANSPORT
 // rather than select a protocol, and that HostLink refuses outright.
 //
-// There is one, and O5.1 handed it over undecided. centrifuge@v0.38.0
-// handler_websocket.go:142 reads query.Get("cf_ws_frame_ping_pong") == "true"
+// There is one, and O5.1 handed it over undecided. centrifuge@v0.39.3
+// handler_websocket.go:194 reads query.Get("cf_ws_frame_ping_pong") == "true"
 // and, when it is set, gives the transport a PingPongConfig of {-1,-1}. A
 // zero-configured HostLink sends no PingPongConfig of its own, so on that path
 // the transport's wins and the connect reply carries no ping or pong field at

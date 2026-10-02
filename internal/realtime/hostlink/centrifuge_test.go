@@ -278,7 +278,7 @@ func TestHostLinkAcceptsExplicitJSONSelectors(t *testing.T) {
 		// The selector reads only "format" and "cf_protocol", so an unrecognized
 		// query key must not turn a valid selection into a rejection. This row is
 		// named for that property: cf_protocol_version appears nowhere in
-		// centrifuge@v0.38.0's production code, so no value of it can be read.
+		// centrifuge@v0.39.3's production code, so no value of it can be read.
 		{name: "unrecognized query key alongside JSON", suffix: "?format=json&cf_protocol_version=v1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

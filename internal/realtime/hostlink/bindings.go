@@ -974,7 +974,7 @@ const ChannelPrefix = sessionwire.HostLinkChannelPrefix
 // function were derived by running this function on a Host pinned to core
 // v0.7.0, so the two are byte-identical by construction and by test.
 //
-// This says nothing about characters centrifuge@v0.38.0 treats specially,
+// This says nothing about characters centrifuge@v0.39.3 treats specially,
 // because it treats none specially: its own channel handling is exact string
 // comparison and map keys, and the ':' and '#' conventions belong to
 // Centrifugo, which this Host does not run. The one channel rule the library
@@ -988,8 +988,8 @@ func ChannelFor(key registry.Key) string {
 // It is DERIVED from the encoding and Core's own identity ceiling rather than
 // measured from a sample, so a Core release that widens sessionwire.MaxIDBytes
 // widens this with it. Centrifuge defaults ChannelMaxLength to 255
-// (centrifuge@v0.38.0 node.go:138-140) and refuses a longer channel with
-// ErrorBadRequest at subscribe (client.go:2804-2807), which two maximum-length
+// (centrifuge@v0.39.3 node.go:149-151) and refuses a longer channel with
+// ErrorBadRequest at subscribe (client.go:3958-3961), which two maximum-length
 // Core identifiers exceed comfortably, so NewCentrifugeServer raises the node's
 // ceiling to this value instead of leaving a legal session unroutable.
 var MaxChannelBytes = len(ChannelPrefix) + 1 + 2*base64.RawURLEncoding.EncodedLen(sessionwire.MaxIDBytes)
