@@ -1,20 +1,20 @@
 module github.com/looprig/host
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/centrifugal/centrifuge v0.39.3
 	github.com/centrifugal/centrifuge-go v0.12.1
 	github.com/centrifugal/protocol v0.22.1
 	github.com/gorilla/websocket v1.5.3
-	github.com/looprig/core v0.13.1
-	github.com/looprig/harness v0.45.0
-	github.com/looprig/inference v0.14.1
-	github.com/looprig/sessionstore v0.15.0
-	github.com/looprig/storage v0.7.0
+	github.com/looprig/core v0.13.2
+	github.com/looprig/harness v0.45.2
+	github.com/looprig/inference v0.15.2
+	github.com/looprig/sessionstore v0.15.1
+	github.com/looprig/storage v0.9.1
 	github.com/prometheus/client_golang v1.24.1
 	go.yaml.in/yaml/v2 v2.4.4
-	golang.org/x/mod v0.40.0
+	golang.org/x/mod v0.42.0
 )
 
 require (
@@ -40,7 +40,7 @@ require (
 	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

@@ -1284,7 +1284,7 @@ structurally. **Do not reinstate it.**
 
 ## Build and test
 
-The Go baseline is 1.26.8. Verify standalone, against the pinned dependencies:
+The Go baseline is 1.26.9. Verify standalone, against the pinned dependencies:
 
 ```sh
 GOWORK=off go test -race ./...
